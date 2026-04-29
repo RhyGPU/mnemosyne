@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use db::{connection_path, init_connection};
 use rusqlite::Connection;
+use tauri::Manager;
 
 pub struct AppState {
     pub conn: Mutex<Connection>,
