@@ -10,6 +10,8 @@ pub struct Soul {
     pub schema_version: u32,
     pub character_id: String,
     pub character_name: String,
+    #[serde(default)]
+    pub profile: CharacterProfile,
     pub last_updated: i64,
     pub turn_counter: u64,
     pub turns_since_consolidation: u64,
@@ -18,6 +20,14 @@ pub struct Soul {
     pub relationships: HashMap<String, Relationship>,
     pub memory: MemoryStore,
     pub world: WorldLog,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CharacterProfile {
+    pub description: String,
+    pub appearance: String,
+    pub personality: String,
+    pub scenario: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,6 +123,7 @@ impl Soul {
             schema_version: CURRENT_SCHEMA_VERSION,
             character_id: Uuid::new_v4().to_string(),
             character_name: character_name.trim().to_string(),
+            profile: CharacterProfile::default(),
             last_updated: now as i64,
             turn_counter: 0,
             turns_since_consolidation: 0,
@@ -184,5 +195,15 @@ mod tests {
         assert_eq!(decoded.turn_counter, 0);
         assert!(decoded.relationships.contains_key("user"));
     }
-}
 
+    #[test]
+    fn legacy_soul_json_defaults_profile() {
+        let soul = new_default_soul("Aurora Schwarz");
+        let mut value = serde_json::to_value(&soul).expect("value");
+        value.as_object_mut().expect("object").remove("profile");
+        let decoded: Soul = serde_json::from_value(value).expect("deserialize");
+
+        assert_eq!(decoded.character_name, "Aurora Schwarz");
+        assert_eq!(decoded.profile, CharacterProfile::default());
+    }
+}

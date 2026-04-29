@@ -20,6 +20,7 @@ body {
 
 button,
 input,
+textarea,
 select {
   font: inherit;
 }
@@ -122,6 +123,7 @@ h2 {
 }
 
 .field input,
+.field textarea,
 .field select,
 .composer input {
   width: 100%;
@@ -138,7 +140,15 @@ h2 {
   padding: 0 12px;
 }
 
+.field textarea {
+  min-height: 76px;
+  resize: vertical;
+  padding: 10px 12px;
+  line-height: 1.4;
+}
+
 .field input:focus,
+.field textarea:focus,
 .field select:focus,
 .composer input:focus {
   border-color: #1d5e52;
@@ -170,6 +180,7 @@ button:disabled {
 }
 
 .compact-list,
+.creator-section,
 .memory-section,
 .context-preview {
   display: grid;
@@ -177,9 +188,51 @@ button:disabled {
 }
 
 .compact-list h2,
+.creator-section h2,
 .memory-section h2,
 .context-preview h2 {
   color: #284239;
+}
+
+.creator-section {
+  padding-top: 4px;
+}
+
+.slider-group {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #d9d3c3;
+  border-radius: 6px;
+  background: rgba(255, 253, 248, 0.66);
+}
+
+.slider-group h3 {
+  margin: 0 0 2px;
+  color: #48584f;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.range-field {
+  display: grid;
+  grid-template-columns: minmax(92px, 1fr) minmax(90px, 1fr) 42px;
+  align-items: center;
+  gap: 8px;
+  color: #48584f;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.range-field input {
+  width: 100%;
+  accent-color: #1d5e52;
+}
+
+.range-field strong {
+  color: #c25340;
+  text-align: right;
 }
 
 .muted {
@@ -351,6 +404,19 @@ button:disabled {
 
 .button-grid .danger-button {
   background: #a84234;
+}
+
+.provider-settings {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid #d9d3c3;
+  border-radius: 6px;
+  background: rgba(255, 253, 248, 0.75);
+}
+
+.hidden-file {
+  display: none;
 }
 
 .context-preview pre {

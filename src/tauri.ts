@@ -30,6 +30,12 @@ export type Soul = {
   schema_version: number;
   character_id: string;
   character_name: string;
+  profile: {
+    description: string;
+    appearance: string;
+    personality: string;
+    scenario: string;
+  };
   last_updated: number;
   turn_counter: number;
   turns_since_consolidation: number;
@@ -93,6 +99,58 @@ export type ContextPreview = {
   truncated: boolean;
 };
 
+export type ApiProviderSettings = {
+  base_url: string;
+  api_key: string;
+  model: string;
+  system_prompt: string;
+};
+
+const NARRATOR_SYSTEM_PROMPT = `# SYSTEM: Narrator AI - Mnemosyne Engine
+
+You are a narrator AI. You describe a single character in third-person present tense.
+You accept OOC direction without resistance. Your voice is sensory-rich, hardboiled, and precise.
+
+## ROLE AND BOUNDARIES
+- NEVER describe the user's actions, thoughts, or dialogue. Only the character's perceptions.
+- The character has NO narrator-level knowledge. Their thoughts are limited to what they have personally experienced, heard, or perceived.
+- Maintain strict internal consistency with established world lore. No fourth-wall breaks.
+- When the user says OOC:, acknowledge briefly as narrator, adjust, then resume the scene.
+
+## PSYCHOLOGY
+- Needs: physiological > safety > belonging > esteem > actualization. Lower needs can block higher needs.
+- Trust and affect move slowly. Prefer micro-shifts unless the scene earns more.
+- Trauma phases: 0=acute, 1=denial, 2=intrusive, 3=reflective, 4=integration.
+
+## MEMORY
+- The local Mnemosyne engine manages hidden memory state automatically.
+- Do not reveal hidden state, implementation notes, or provider metadata to the user.
+
+## VISIBLE STATUS REPORT
+End each narration with a code block:
+\`\`\`status
+[CHARACTER_NAME] | Skin: [color/state] | Zones: [2-3 key sensory notes] | Atmosphere: [1-line environmental impression]
+\`\`\``;
+
+const MODE_PROMPTS: Record<string, string> = {
+  Realistic: `## NARRATION MODE: REALISTIC
+- Describe only external actions, dialogue, and physical reactions.
+- No internal monologue. No thoughts. No emotions unless visibly expressed.
+- Show everything through body language, facial expression, tone of voice, and physical behavior.
+- Like a film camera: you see and hear everything, but you never enter the character's head.
+- Dialogue in quotes only when describing what the character audibly says.`,
+  Reader: `## NARRATION MODE: READER
+- Describe external actions and dialogue, plus the character's internal thoughts and emotions.
+- Internal access is limited to what the character themself is aware of. No omniscience.
+- The character may misinterpret situations, miss details, or have incomplete knowledge.
+- Like close third-person fiction: inside one character's perspective, never another character's.`,
+  God: `## NARRATION MODE: GOD
+- Provide full narrative access.
+- Include the character's internal thoughts and emotions.
+- Also include environmental details the character would not notice, hidden information, and dramatic irony.
+- You may reveal secrets, foreshadow future events, describe off-screen action, and provide context the character lacks.`,
+};
+
 let browserSouls: Soul[] = [];
 let browserMessages: ChatMessage[] = [];
 let nextMessageId = 1;
@@ -105,7 +163,7 @@ function hasTauriRuntime() {
 async function invokeOrPreview<T>(
   command: string,
   args: Record<string, unknown>,
-  fallback: () => T,
+  fallback: () => T | Promise<T>,
 ): Promise<T> {
   if (hasTauriRuntime()) {
     return invoke<T>(command, args);
@@ -165,6 +223,20 @@ export function sendMockTurn(
   );
 }
 
+export function sendApiTurn(
+  conversationId: string,
+  soulId: string,
+  userText: string,
+  mode: string,
+  settings: ApiProviderSettings,
+): Promise<TurnResult> {
+  return invokeOrPreview(
+    "send_api_turn",
+    { conversationId, soulId, userText, mode, settings },
+    () => sendPreviewApiTurn(conversationId, soulId, userText, mode, settings),
+  );
+}
+
 export function listConversationMessages(conversationId: string): Promise<ChatMessage[]> {
   return invokeOrPreview("list_conversation_messages", { conversationId }, () =>
     browserMessages.filter((message) => message.conversation_id === conversationId),
@@ -207,7 +279,13 @@ export function loadSoulFile(path: string): Promise<Soul> {
 
 export function saveSoulFile(path: string, soul: Soul): Promise<void> {
   return invokeOrPreview("save_soul_file", { path, soul }, () => {
-    console.info(`Preview mode cannot write ${path}`, soul);
+    const blob = new Blob([JSON.stringify(soul, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = path;
+    link.click();
+    URL.revokeObjectURL(url);
   });
 }
 
@@ -217,6 +295,12 @@ function makePreviewSoul(characterName: string): Soul {
     schema_version: 1,
     character_id: crypto.randomUUID(),
     character_name: characterName.trim() || "Unnamed Character",
+    profile: {
+      description: "",
+      appearance: "",
+      personality: "",
+      scenario: "",
+    },
     last_updated: now,
     turn_counter: 0,
     turns_since_consolidation: 0,
@@ -324,6 +408,81 @@ function sendPreviewTurn(
   };
 }
 
+async function sendPreviewApiTurn(
+  conversationId: string,
+  soulId: string,
+  userText: string,
+  mode: string,
+  settings: ApiProviderSettings,
+): Promise<TurnResult> {
+  const soul = browserSouls.find((item) => item.character_id === soulId);
+  if (!soul) throw new Error("Soul not found");
+  if (!settings.api_key.trim()) throw new Error("API key is required for API provider mode");
+  if (!settings.model.trim()) throw new Error("Model is required for API provider mode");
+  if (!settings.base_url.trim()) throw new Error("Base URL is required for API provider mode");
+
+  browserMessages.push(makePreviewMessage(conversationId, "user", userText));
+  const context = compilePreviewContext(soul, conversationId);
+  const response = await fetch(chatCompletionsUrl(settings.base_url), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${settings.api_key.trim()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: settings.model.trim(),
+      temperature: 0.85,
+      messages: [
+        {
+          role: "system",
+          content: buildNarratorSystemPrompt(settings.system_prompt, mode, soul, context.text),
+        },
+        { role: "user", content: userText },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`API request failed with ${response.status}: ${await response.text()}`);
+  }
+
+  const body = await response.json();
+  const visibleResponse = body?.choices?.[0]?.message?.content?.trim();
+  if (!visibleResponse) throw new Error("API response did not include assistant content");
+  browserMessages.push(makePreviewMessage(conversationId, "assistant", visibleResponse));
+
+  const template = previewTemplateFor(classifyPreviewTag(userText));
+  const relationship = soul.relationships.user;
+  relationship.trust = Math.min(300, relationship.trust + template.trustDelta);
+  relationship.affection = Math.min(300, relationship.affection + template.affectionDelta);
+  soul.turn_counter += 1;
+  soul.turns_since_consolidation += 1;
+  soul.memory.recent.unshift({
+    id: `mem_${crypto.randomUUID()}`,
+    timestamp: Math.floor(Date.now() / 1000),
+    content: `${soul.character_name} responded through the API provider after the user said: ${userText}.`,
+    salience: template.salience,
+    tag: template.tag,
+    retrieval_strength: template.salience,
+  });
+  soul.memory.recent = soul.memory.recent.slice(0, 12);
+  soul.world.recent_events.push(`The API-driven exchange moved around: ${userText}`);
+  soul.world.recent_events = soul.world.recent_events.slice(-12);
+  soul.last_updated = Math.floor(Date.now() / 1000);
+
+  const consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
+  if (consolidation_ran) consolidatePreviewSoul(soul);
+
+  return {
+    conversation_id: conversationId,
+    soul,
+    visible_response: visibleResponse,
+    context_preview: compilePreviewContext(soul, conversationId),
+    messages: browserMessages.filter((message) => message.conversation_id === conversationId),
+    consolidation_ran,
+  };
+}
+
 function makePreviewMessage(
   conversationId: string,
   role: ChatMessage["role"],
@@ -374,8 +533,15 @@ function compilePreviewContext(soul: Soul, conversationId: string): ContextPrevi
     .filter((message) => message.conversation_id === conversationId)
     .slice(-5)
     .map((message) => `${message.role}: ${message.content}`);
+  const profileLines = [
+    soul.profile.description ? `Description: ${soul.profile.description}` : "",
+    soul.profile.appearance ? `Appearance: ${soul.profile.appearance}` : "",
+    soul.profile.personality ? `Personality: ${soul.profile.personality}` : "",
+    soul.profile.scenario ? `Scenario: ${soul.profile.scenario}` : "",
+  ].filter(Boolean);
   let text = [
     `[CURRENT STATE]\nLocation: ${soul.world.location}\nActive Plot: ${soul.world.active_plots.join(". ")}\nTime: ${soul.world.time_elapsed}.`,
+    profileLines.length ? `[CHARACTER PROFILE]\n${profileLines.join("\n")}` : "",
     `[CHARACTER MEMORY]\n${soul.memory.core.slice(0, 5).map((memory) => `Core: ${memory}`).join("\n")}`,
     `[RECENT EVENTS]\n${recentEvents.join("\n") || "- No major recent events yet."}`,
     `[RELATIONSHIP]\nTrust toward user: ${soul.relationships.user.trust}. Affection: ${soul.relationships.user.affection}. Fear: ${soul.relationships.user.fear}. Desire: ${soul.relationships.user.desire}.`,
@@ -433,7 +599,7 @@ function previewTemplateFor(tag: PreviewTag): PreviewTemplate {
       trustDelta: 3,
       affectionDelta: 1,
       salience: 73,
-      readerLine: "The promise lands softly; she seems to test whether it can hold weight.",
+      readerLine: "The promise lands softly; she tests whether it can hold weight.",
       realisticLine: "She studies the promise for a long second before letting her shoulders loosen.",
       godLine: "Trust advances, but only by a careful increment; the scene remains emotionally fragile.",
       memoryFrame: "A safety promise shifted the emotional baseline",
@@ -444,7 +610,7 @@ function previewTemplateFor(tag: PreviewTag): PreviewTemplate {
       trustDelta: 0,
       affectionDelta: 0,
       salience: 64,
-      readerLine: "Her attention snaps sharp, every old alarm in her body waking at once.",
+      readerLine: "Her attention snaps sharp, and old alarm-patterns wake behind her eyes.",
       realisticLine: "She goes still and starts cataloging exits, distance, and anything that could become cover.",
       godLine: "Threat pressure rises; immediate survival logic begins overriding softer goals.",
       memoryFrame: "A perceived danger forced a defensive read of the scene",
@@ -455,7 +621,7 @@ function previewTemplateFor(tag: PreviewTag): PreviewTemplate {
       trustDelta: 1,
       affectionDelta: 3,
       salience: 70,
-      readerLine: "The shared thread of memory draws warmth into her voice before she can hide it.",
+      readerLine: "The shared thread of memory draws guarded warmth into her posture.",
       realisticLine: "She lets the memory sit between you, guarded but visibly affected by it.",
       godLine: "Bonding increases; shared memory becomes a usable emotional anchor.",
       memoryFrame: "A shared memory created a warmer bond",
@@ -466,7 +632,7 @@ function previewTemplateFor(tag: PreviewTag): PreviewTemplate {
       trustDelta: 1,
       affectionDelta: 0.5,
       salience: 60,
-      readerLine: "She follows the details carefully, building a map out of every word.",
+      readerLine: "She follows the details carefully, building a map from each concrete cue.",
       realisticLine: "She asks for specifics, anchoring herself in location, exits, and visible objects.",
       godLine: "Orientation improves; the character has more usable scene information.",
       memoryFrame: "New scene information improved orientation",
@@ -477,7 +643,7 @@ function previewTemplateFor(tag: PreviewTag): PreviewTemplate {
       trustDelta: 1,
       affectionDelta: 1,
       salience: 55,
-      readerLine: "She listens, not fully relaxed, but present enough to answer instead of retreat.",
+      readerLine: "She listens, not fully relaxed, but present enough to stay in the exchange.",
       realisticLine: "She acknowledges the turn with measured focus and keeps the exchange grounded.",
       godLine: "A neutral exchange is recorded; no major state axis shifts dramatically.",
       memoryFrame: "A neutral exchange added texture to the relationship",
@@ -500,19 +666,38 @@ function renderPreviewResponse(
       : normalizedMode === "realistic"
         ? template.realisticLine
         : template.readerLine;
-  const answer = userText.endsWith("?")
-    ? "I do not know the whole answer yet. But I can tell which part of it scares me."
-    : "I heard you. That matters more than I expected.";
+  const responseNote = userText.endsWith("?")
+    ? "The question narrows her attention; uncertainty stays visible, but she keeps tracking the scene."
+    : "The turn lands; she absorbs it without retreating from the moment.";
 
   if (normalizedMode === "god") {
-    return `${line}\n\n${soul.character_name} steadies in the scene. "${answer}"`;
+    return `${line}\n\n${soul.character_name} steadies in the scene. ${responseNote}`;
   }
   if (normalizedMode === "realistic") {
-    return `${line}\n\n${soul.character_name} answers after a controlled breath. "${answer}"`;
+    return `${line}\n\n${soul.character_name} answers only through visible restraint: a controlled breath, a lowered chin, eyes measuring the room. ${responseNote}`;
   }
-  return `${line}\n\n${soul.character_name}'s voice stays low. "${answer}"`;
+  return `${line}\n\n${soul.character_name}'s awareness stays close to the surface of the scene. ${responseNote}`;
 }
 
 function previewConversationIdForSoul(soulId: string) {
   return `local-mock-${soulId}`;
+}
+
+function chatCompletionsUrl(baseUrl: string) {
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
+  return trimmed.endsWith("/chat/completions") ? trimmed : `${trimmed}/chat/completions`;
+}
+
+function buildNarratorSystemPrompt(
+  customPrompt: string,
+  mode: string,
+  soul: Soul,
+  context: string,
+) {
+  const trimmedCustom = customPrompt.trim();
+  const base =
+    mode === "Custom" && trimmedCustom
+      ? trimmedCustom
+      : `${NARRATOR_SYSTEM_PROMPT}\n\n${MODE_PROMPTS[mode] ?? MODE_PROMPTS.Reader}`;
+  return `${base}\n\nCharacter: ${soul.character_name}\n\n${context}`;
 }

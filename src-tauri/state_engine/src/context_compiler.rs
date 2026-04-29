@@ -28,6 +28,23 @@ pub fn compile_context_for_messages(soul: &Soul, messages: &[ContextMessage]) ->
         soul.world.time_elapsed
     ));
 
+    let mut profile_lines = Vec::new();
+    if !soul.profile.description.trim().is_empty() {
+        profile_lines.push(format!("Description: {}", soul.profile.description));
+    }
+    if !soul.profile.appearance.trim().is_empty() {
+        profile_lines.push(format!("Appearance: {}", soul.profile.appearance));
+    }
+    if !soul.profile.personality.trim().is_empty() {
+        profile_lines.push(format!("Personality: {}", soul.profile.personality));
+    }
+    if !soul.profile.scenario.trim().is_empty() {
+        profile_lines.push(format!("Scenario: {}", soul.profile.scenario));
+    }
+    if !profile_lines.is_empty() {
+        sections.push(format!("[CHARACTER PROFILE]\n{}", profile_lines.join("\n")));
+    }
+
     let mut memory_lines = Vec::new();
     for memory in soul.memory.core.iter().take(5) {
         memory_lines.push(format!("Core: {memory}"));

@@ -5,13 +5,16 @@ use tauri::State;
 use state_engine::{
     consolidation::consolidate_soul,
     context_compiler::{compile_context_for_messages, ContextMessage, ContextPreview},
-    hidden_state::parse_hidden_state,
+    hidden_state::{parse_hidden_state, HiddenState},
     soul::{new_default_soul, Soul},
 };
 
 use crate::{
     db::{self, ChatMessage, SoulSummary},
-    providers::mock::MockProvider,
+    providers::{
+        api::{ApiProvider, ApiProviderSettings},
+        mock::MockProvider,
+    },
     AppState,
 };
 
@@ -161,6 +164,75 @@ pub fn send_mock_turn(
     })
 }
 
+#[tauri::command]
+pub async fn send_api_turn(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    soul_id: String,
+    user_text: String,
+    mode: String,
+    settings: ApiProviderSettings,
+) -> Result<TurnResult, String> {
+    let (mut soul, context_preview) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
+        db::ensure_conversation(&conn, &conversation_id, &soul.character_id)
+            .map_err(|err| err.to_string())?;
+        db::insert_message(&conn, &conversation_id, "user", &user_text)
+            .map_err(|err| err.to_string())?;
+
+        let before_messages =
+            db::list_messages(&conn, &conversation_id, 5).map_err(|err| err.to_string())?;
+        let context_preview =
+            compile_context_for_messages(&soul, &messages_to_context(before_messages));
+        (soul, context_preview)
+    };
+
+    let provider = ApiProvider::default();
+    let raw_response = provider
+        .complete(&settings, &soul, &context_preview.text, &user_text, &mode)
+        .await?;
+    let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
+    let hidden_state = if hidden_state_is_empty(&parsed.hidden_state) {
+        generated_api_hidden_state(&soul, &user_text, &parsed.visible_text)
+    } else {
+        parsed.hidden_state.clone()
+    };
+
+    hidden_state.apply_to_soul(&mut soul);
+    soul.turn_counter += 1;
+    soul.turns_since_consolidation += 1;
+    let visible_response = parsed.visible_text;
+
+    let (messages, context_preview, consolidation_ran) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::insert_message(&conn, &conversation_id, "assistant", &visible_response)
+            .map_err(|err| err.to_string())?;
+
+        let consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
+        if consolidation_ran {
+            consolidate_soul(&mut soul);
+        }
+
+        db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
+        let messages =
+            db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?;
+        let context_preview =
+            compile_context_for_messages(&soul, &messages_to_context(messages.clone()));
+
+        (messages, context_preview, consolidation_ran)
+    };
+
+    Ok(TurnResult {
+        conversation_id,
+        soul,
+        visible_response,
+        context_preview,
+        messages,
+        consolidation_ran,
+    })
+}
+
 fn messages_to_context(messages: Vec<ChatMessage>) -> Vec<ContextMessage> {
     messages
         .into_iter()
@@ -169,6 +241,52 @@ fn messages_to_context(messages: Vec<ChatMessage>) -> Vec<ContextMessage> {
             content: message.content,
         })
         .collect()
+}
+
+fn hidden_state_is_empty(hidden_state: &HiddenState) -> bool {
+    hidden_state.memory.is_none()
+        && hidden_state.tag.is_none()
+        && hidden_state.trust_delta.is_none()
+        && hidden_state.affection_delta.is_none()
+        && hidden_state.world_event.is_none()
+}
+
+fn generated_api_hidden_state(soul: &Soul, user_text: &str, visible_text: &str) -> HiddenState {
+    let tag = classify_turn_tag(user_text);
+    let assistant_excerpt = visible_text.chars().take(180).collect::<String>();
+    HiddenState {
+        memory: Some(format!(
+            "{} responded through the API provider after the user said: {} Assistant cue: {}",
+            soul.character_name,
+            user_text.trim(),
+            assistant_excerpt.trim()
+        )),
+        tag: Some(tag.into()),
+        trust_delta: Some(if tag == "trust_building" { 3.0 } else { 1.0 }),
+        affection_delta: Some(if tag == "bonding" { 3.0 } else { 1.0 }),
+        world_event: Some(format!(
+            "The API-driven exchange moved around: {}",
+            user_text.trim()
+        )),
+    }
+}
+
+fn classify_turn_tag(text: &str) -> &'static str {
+    let lower = text.to_lowercase();
+    if lower.contains("trust") || lower.contains("promise") || lower.contains("safe") {
+        "trust_building"
+    } else if lower.contains("hurt") || lower.contains("blood") || lower.contains("danger") {
+        "threat"
+    } else if lower.contains("remember")
+        || lower.contains("childhood")
+        || lower.contains("together")
+    {
+        "bonding"
+    } else if lower.contains("where") || lower.contains("look") || lower.contains("room") {
+        "orientation"
+    } else {
+        "observation"
+    }
 }
 
 #[cfg(test)]

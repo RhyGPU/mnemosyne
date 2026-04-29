@@ -11,6 +11,7 @@ enum NarrativeMode {
     Reader,
     Realistic,
     God,
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +56,7 @@ impl NarrativeMode {
         match label.trim().to_lowercase().as_str() {
             "realistic" => Self::Realistic,
             "god" => Self::God,
+            "custom" => Self::Custom,
             _ => Self::Reader,
         }
     }
@@ -93,7 +95,7 @@ fn template_for(tag: MockTag) -> MockTemplate {
             tag: "trust_building",
             trust_delta: 3.0,
             affection_delta: 1.0,
-            reader_line: "The promise lands softly; she seems to test whether it can hold weight.",
+            reader_line: "The promise lands softly; she tests whether it can hold weight.",
             realistic_line: "She studies the promise for a long second before letting her shoulders loosen.",
             god_line: "Trust advances, but only by a careful increment; the scene remains emotionally fragile.",
             memory_frame: "A safety promise shifted the emotional baseline",
@@ -103,7 +105,7 @@ fn template_for(tag: MockTag) -> MockTemplate {
             tag: "threat",
             trust_delta: 0.0,
             affection_delta: 0.0,
-            reader_line: "Her attention snaps sharp, every old alarm in her body waking at once.",
+            reader_line: "Her attention snaps sharp, and old alarm-patterns wake behind her eyes.",
             realistic_line: "She goes still and starts cataloging exits, distance, and anything that could become cover.",
             god_line: "Threat pressure rises; immediate survival logic begins overriding softer goals.",
             memory_frame: "A perceived danger forced a defensive read of the scene",
@@ -113,7 +115,7 @@ fn template_for(tag: MockTag) -> MockTemplate {
             tag: "bonding",
             trust_delta: 1.0,
             affection_delta: 3.0,
-            reader_line: "The shared thread of memory draws warmth into her voice before she can hide it.",
+            reader_line: "The shared thread of memory draws guarded warmth into her posture.",
             realistic_line: "She lets the memory sit between you, guarded but visibly affected by it.",
             god_line: "Bonding increases; shared memory becomes a usable emotional anchor.",
             memory_frame: "A shared memory created a warmer bond",
@@ -123,7 +125,7 @@ fn template_for(tag: MockTag) -> MockTemplate {
             tag: "orientation",
             trust_delta: 1.0,
             affection_delta: 0.5,
-            reader_line: "She follows the details carefully, building a map out of every word.",
+            reader_line: "She follows the details carefully, building a map from each concrete cue.",
             realistic_line: "She asks for specifics, anchoring herself in location, exits, and visible objects.",
             god_line: "Orientation improves; the character has more usable scene information.",
             memory_frame: "New scene information improved orientation",
@@ -133,7 +135,7 @@ fn template_for(tag: MockTag) -> MockTemplate {
             tag: "observation",
             trust_delta: 1.0,
             affection_delta: 1.0,
-            reader_line: "She listens, not fully relaxed, but present enough to answer instead of retreat.",
+            reader_line: "She listens, not fully relaxed, but present enough to stay in the exchange.",
             realistic_line: "She acknowledges the turn with measured focus and keeps the exchange grounded.",
             god_line: "A neutral exchange is recorded; no major state axis shifts dramatically.",
             memory_frame: "A neutral exchange added texture to the relationship",
@@ -153,26 +155,27 @@ fn render_visible_response(
         NarrativeMode::Reader => template.reader_line,
         NarrativeMode::Realistic => template.realistic_line,
         NarrativeMode::God => template.god_line,
+        NarrativeMode::Custom => template.reader_line,
     };
-    let answer = if user_text.ends_with('?') {
-        "I do not know the whole answer yet. But I can tell which part of it scares me."
+    let response_note = if user_text.ends_with('?') {
+        "The question narrows her attention; uncertainty stays visible, but she keeps tracking the scene."
     } else if user_text.is_empty() {
-        "Say that again, slower."
+        "The silence leaves her guarded, waiting for a clearer cue."
     } else {
-        "I heard you. That matters more than I expected."
+        "The turn lands; she absorbs it without retreating from the moment."
     };
 
     match mode {
         NarrativeMode::God => format!(
-            "{mode_line}\n\n{} steadies in the scene. Relationship read: {relationship_hint}. \"{answer}\"",
+            "{mode_line}\n\n{} steadies in the scene. Relationship read: {relationship_hint}. {response_note}",
             soul.character_name
         ),
         NarrativeMode::Realistic => format!(
-            "{mode_line}\n\n{} answers after a controlled breath. \"{answer}\"",
+            "{mode_line}\n\n{} answers only through visible restraint: a controlled breath, a lowered chin, eyes measuring the room. {response_note}",
             soul.character_name
         ),
-        NarrativeMode::Reader => format!(
-            "{mode_line}\n\n{}'s voice stays low. \"{answer}\"",
+        NarrativeMode::Reader | NarrativeMode::Custom => format!(
+            "{mode_line}\n\n{}'s awareness stays close to the surface of the scene. {response_note}",
             soul.character_name
         ),
     }
@@ -246,7 +249,25 @@ mod tests {
 
         assert!(!parsed.visible_text.starts_with("[GM]"));
         assert!(parsed.visible_text.contains("Orientation improves"));
+        assert!(!parsed.visible_text.contains("\""));
         assert_eq!(parsed.hidden_state.tag.as_deref(), Some("orientation"));
         assert!(!raw.contains("\"tag\""));
+    }
+
+    #[test]
+    fn mock_provider_uses_third_person_narration() {
+        let soul = new_default_soul("Aurora");
+        let provider = MockProvider;
+        let raw = provider.complete(
+            &soul,
+            "[CURRENT STATE]",
+            "I promise this is safe.",
+            "Reader",
+        );
+        let parsed = parse_hidden_state(&raw).expect("hidden state");
+
+        assert!(parsed.visible_text.contains("Aurora"));
+        assert!(!parsed.visible_text.contains("\"I "));
+        assert!(!parsed.visible_text.contains("I heard you"));
     }
 }
