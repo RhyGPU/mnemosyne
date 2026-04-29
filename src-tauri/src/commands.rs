@@ -15,6 +15,8 @@ use crate::{
     AppState,
 };
 
+const CONSOLIDATION_INTERVAL_TURNS: u64 = 10;
+
 #[derive(Debug, serde::Serialize)]
 pub struct TurnResult {
     pub conversation_id: String,
@@ -123,10 +125,7 @@ pub fn send_mock_turn(
     db::insert_message(&conn, &conversation_id, "assistant", &parsed.visible_text)
         .map_err(|err| err.to_string())?;
 
-    let assistant_turns =
-        db::count_assistant_messages(&conn, &conversation_id).map_err(|err| err.to_string())?;
-    let consolidation_ran =
-        (assistant_turns > 0 && assistant_turns % 10 == 0) || soul.turns_since_consolidation >= 10;
+    let consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
     if consolidation_ran {
         consolidate_soul(&mut soul);
     }

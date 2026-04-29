@@ -96,6 +96,7 @@ export type ContextPreview = {
 let browserSouls: Soul[] = [];
 let browserMessages: ChatMessage[] = [];
 let nextMessageId = 1;
+const CONSOLIDATION_INTERVAL_TURNS = 10;
 
 function hasTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -289,12 +290,7 @@ function sendPreviewTurn(
   soul.world.recent_events = soul.world.recent_events.slice(-12);
   soul.last_updated = Math.floor(Date.now() / 1000);
 
-  const assistantTurns = browserMessages.filter(
-    (message) => message.conversation_id === conversationId && message.role === "assistant",
-  ).length;
-  const consolidation_ran =
-    (assistantTurns > 0 && assistantTurns % 10 === 0) ||
-    soul.turns_since_consolidation >= 10;
+  const consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
   if (consolidation_ran) consolidatePreviewSoul(soul);
 
   return {
@@ -488,7 +484,7 @@ function renderPreviewResponse(
     : "I heard you. That matters more than I expected.";
 
   if (normalizedMode === "god") {
-    return `[GM] ${line}\n\n${soul.character_name} steadies in the scene. "${answer}"`;
+    return `${line}\n\n${soul.character_name} steadies in the scene. "${answer}"`;
   }
   if (normalizedMode === "realistic") {
     return `${line}\n\n${soul.character_name} answers after a controlled breath. "${answer}"`;

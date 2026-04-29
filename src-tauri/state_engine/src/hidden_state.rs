@@ -1,9 +1,13 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     memory::create_scored_memory,
     soul::{current_timestamp, Relationship, Soul},
 };
+
+const HIDDEN_STATE_MARKER: &str = "[HIDDEN_STATE]";
+const HIDDEN_STATE_ENCODING_PREFIX: &str = "mne1.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HiddenState {
@@ -69,20 +73,45 @@ impl HiddenState {
     }
 }
 
+pub fn encode_hidden_state(hidden_state: &HiddenState) -> String {
+    let bytes = serde_json::to_vec(hidden_state).expect("hidden state should serialize");
+    format!(
+        "{}{}",
+        HIDDEN_STATE_ENCODING_PREFIX,
+        URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
 pub fn parse_hidden_state(raw: &str) -> Result<ParsedProviderResponse, serde_json::Error> {
-    let Some(start) = raw.find("[HIDDEN_STATE]") else {
+    let Some(start) = raw.find(HIDDEN_STATE_MARKER) else {
         return Ok(ParsedProviderResponse {
             visible_text: raw.trim().to_string(),
             hidden_state: HiddenState::default(),
         });
     };
     let visible_text = raw[..start].trim().to_string();
-    let hidden_part = raw[start + "[HIDDEN_STATE]".len()..].trim();
-    let hidden_state = serde_json::from_str(hidden_part)?;
+    let hidden_part = raw[start + HIDDEN_STATE_MARKER.len()..].trim();
+    let hidden_state = decode_hidden_state(hidden_part)?;
     Ok(ParsedProviderResponse {
         visible_text,
         hidden_state,
     })
+}
+
+fn decode_hidden_state(payload: &str) -> Result<HiddenState, serde_json::Error> {
+    if let Some(encoded) = payload.strip_prefix(HIDDEN_STATE_ENCODING_PREFIX) {
+        if let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded) {
+            return serde_json::from_slice(&bytes);
+        }
+    }
+
+    if !payload.trim_start().starts_with('{') {
+        if let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload) {
+            return serde_json::from_slice(&bytes);
+        }
+    }
+
+    serde_json::from_str(payload)
 }
 
 fn default_relationship() -> Relationship {
@@ -108,16 +137,36 @@ mod tests {
     use crate::soul::new_default_soul;
 
     #[test]
-    fn strips_and_parses_hidden_state() {
+    fn strips_and_parses_encoded_hidden_state() {
+        let hidden_state = HiddenState {
+            memory: Some("A promise mattered.".into()),
+            tag: Some("trust_building".into()),
+            trust_delta: Some(3.0),
+            affection_delta: Some(2.0),
+            world_event: Some("A promise landed.".into()),
+        };
+        let raw = format!(
+            "Visible line.\n\n{HIDDEN_STATE_MARKER}\n{}",
+            encode_hidden_state(&hidden_state)
+        );
+
+        let parsed = parse_hidden_state(&raw).expect("parsed");
+        assert_eq!(parsed.visible_text, "Visible line.");
+        assert_eq!(parsed.hidden_state.tag.as_deref(), Some("trust_building"));
+        assert_eq!(parsed.hidden_state.trust_delta, Some(3.0));
+        assert!(raw.contains(HIDDEN_STATE_ENCODING_PREFIX));
+        assert!(!raw.contains("\"tag\""));
+    }
+
+    #[test]
+    fn accepts_legacy_plain_json_hidden_state() {
         let raw = r#"Visible line.
 
 [HIDDEN_STATE]
 {"memory":"A promise mattered.","tag":"trust_building","trust_delta":3,"affection_delta":2,"world_event":"A promise landed."}"#;
 
         let parsed = parse_hidden_state(raw).expect("parsed");
-        assert_eq!(parsed.visible_text, "Visible line.");
         assert_eq!(parsed.hidden_state.tag.as_deref(), Some("trust_building"));
-        assert_eq!(parsed.hidden_state.trust_delta, Some(3.0));
     }
 
     #[test]
@@ -145,4 +194,3 @@ mod tests {
         assert_eq!(soul.world.recent_events.len(), 1);
     }
 }
-

@@ -1,4 +1,7 @@
-use state_engine::soul::Soul;
+use state_engine::{
+    hidden_state::{encode_hidden_state, HiddenState},
+    soul::Soul,
+};
 
 #[derive(Debug, Default)]
 pub struct MockProvider;
@@ -32,16 +35,17 @@ impl MockProvider {
         let response = render_visible_response(soul, trimmed, mode, template, relationship_hint);
         let memory = render_memory(soul, trimmed, template, context_hint);
         let world_event = render_world_event(trimmed, template);
+        let hidden_state = HiddenState {
+            memory: Some(memory),
+            tag: Some(template.tag.into()),
+            trust_delta: Some(template.trust_delta),
+            affection_delta: Some(template.affection_delta),
+            world_event: Some(world_event),
+        };
 
         format!(
             "{response}\n\n[HIDDEN_STATE]\n{}",
-            serde_json::json!({
-                "memory": memory,
-                "tag": template.tag,
-                "trust_delta": template.trust_delta,
-                "affection_delta": template.affection_delta,
-                "world_event": world_event
-            })
+            encode_hidden_state(&hidden_state)
         )
     }
 }
@@ -160,7 +164,7 @@ fn render_visible_response(
 
     match mode {
         NarrativeMode::God => format!(
-            "[GM] {mode_line}\n\n{} steadies in the scene. Relationship read: {relationship_hint}. \"{answer}\"",
+            "{mode_line}\n\n{} steadies in the scene. Relationship read: {relationship_hint}. \"{answer}\"",
             soul.character_name
         ),
         NarrativeMode::Realistic => format!(
@@ -238,18 +242,11 @@ mod tests {
         let soul = new_default_soul("Aurora");
         let provider = MockProvider;
         let raw = provider.complete(&soul, "[CURRENT STATE]", "Where are we?", "God");
+        let parsed = parse_hidden_state(&raw).expect("hidden state");
 
-        assert!(raw.starts_with("[GM]"));
-        assert!(raw.contains("\"tag\":\"orientation\""));
-    }
-}
-
-fn reflective_line(text: &str) -> String {
-    if text.is_empty() {
-        "Say that again, slower.".into()
-    } else if text.ends_with('?') {
-        "I do not know yet, but I can feel which answer would change us.".into()
-    } else {
-        "I heard you. That matters more than I expected.".into()
+        assert!(!parsed.visible_text.starts_with("[GM]"));
+        assert!(parsed.visible_text.contains("Orientation improves"));
+        assert_eq!(parsed.hidden_state.tag.as_deref(), Some("orientation"));
+        assert!(!raw.contains("\"tag\""));
     }
 }
