@@ -61,6 +61,15 @@ pub fn get_soul(state: State<'_, AppState>, soul_id: String) -> Result<Soul, Str
 }
 
 #[tauri::command]
+pub fn list_conversation_messages(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Vec<ChatMessage>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 pub fn compile_context(
     state: State<'_, AppState>,
     soul_id: String,
@@ -88,17 +97,12 @@ pub fn run_consolidation(state: State<'_, AppState>, soul_id: String) -> Result<
 pub fn send_mock_turn(
     state: State<'_, AppState>,
     conversation_id: String,
+    soul_id: String,
     user_text: String,
+    mode: String,
 ) -> Result<TurnResult, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    let mut soul = match db::primary_soul(&conn).map_err(|err| err.to_string())? {
-        Some(soul) => soul,
-        None => {
-            let soul = new_default_soul("Aurora Schwarz");
-            db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
-            soul
-        }
-    };
+    let mut soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
 
     db::ensure_conversation(&conn, &conversation_id, &soul.character_id)
         .map_err(|err| err.to_string())?;
@@ -110,7 +114,7 @@ pub fn send_mock_turn(
     let context_preview =
         compile_context_for_messages(&soul, &messages_to_context(before_messages));
     let provider = MockProvider::default();
-    let raw_response = provider.complete(&soul, &context_preview.text, &user_text);
+    let raw_response = provider.complete(&soul, &context_preview.text, &user_text, &mode);
     let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
 
     parsed.apply_to_soul(&mut soul);

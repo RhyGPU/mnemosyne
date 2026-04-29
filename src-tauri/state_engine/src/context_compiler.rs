@@ -119,10 +119,15 @@ mod tests {
         soul.memory.core = (0..100)
             .map(|index| format!("Long memory {index} {}", "x".repeat(500)))
             .collect();
-        let preview = compile_context_for_messages(&soul, &[]);
+        let messages = (0..5)
+            .map(|index| ContextMessage {
+                role: "user".into(),
+                content: format!("Long chat turn {index} {}", "x".repeat(2_000)),
+            })
+            .collect::<Vec<_>>();
+        let preview = compile_context_for_messages(&soul, &messages);
 
-        assert!(preview.estimated_tokens <= 2_000);
+        assert!(preview.estimated_tokens <= TARGET_TOKEN_BUDGET);
         assert!(preview.truncated);
     }
 }
-

@@ -28,6 +28,7 @@ pub fn run() {
             commands::list_souls,
             commands::upsert_soul,
             commands::get_soul,
+            commands::list_conversation_messages,
             commands::send_mock_turn,
             commands::compile_context,
             commands::run_consolidation,

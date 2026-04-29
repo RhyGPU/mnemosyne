@@ -144,10 +144,18 @@ export function getSoul(soulId: string): Promise<Soul> {
 
 export function sendMockTurn(
   conversationId: string,
+  soulId: string,
   userText: string,
+  mode: string,
 ): Promise<TurnResult> {
-  return invokeOrPreview("send_mock_turn", { conversationId, userText }, () =>
-    sendPreviewTurn(conversationId, userText),
+  return invokeOrPreview("send_mock_turn", { conversationId, soulId, userText, mode }, () =>
+    sendPreviewTurn(conversationId, soulId, userText, mode),
+  );
+}
+
+export function listConversationMessages(conversationId: string): Promise<ChatMessage[]> {
+  return invokeOrPreview("list_conversation_messages", { conversationId }, () =>
+    browserMessages.filter((message) => message.conversation_id === conversationId),
   );
 }
 
@@ -246,33 +254,38 @@ function summarizeSoul(soul: Soul): SoulSummary {
   };
 }
 
-function sendPreviewTurn(conversationId: string, userText: string): TurnResult {
-  let soul = browserSouls[0];
+function sendPreviewTurn(
+  conversationId: string,
+  soulId: string,
+  userText: string,
+  mode: string,
+): TurnResult {
+  let soul = browserSouls.find((item) => item.character_id === soulId);
   if (!soul) {
     soul = makePreviewSoul("Aurora Schwarz");
     browserSouls.push(soul);
   }
 
   browserMessages.push(makePreviewMessage(conversationId, "user", userText));
-  const tag = classifyPreviewTag(userText);
-  const visibleResponse = `${soul.character_name} listens closely, letting the moment settle before answering. "I heard you. That matters more than I expected."`;
+  const template = previewTemplateFor(classifyPreviewTag(userText));
+  const visibleResponse = renderPreviewResponse(soul, userText, template, mode);
   browserMessages.push(makePreviewMessage(conversationId, "assistant", visibleResponse));
 
   const relationship = soul.relationships.user;
-  relationship.trust = Math.min(300, relationship.trust + (tag === "trust_building" ? 3 : 1));
-  relationship.affection = Math.min(300, relationship.affection + (tag === "bonding" ? 3 : 1));
+  relationship.trust = Math.min(300, relationship.trust + template.trustDelta);
+  relationship.affection = Math.min(300, relationship.affection + template.affectionDelta);
   soul.turn_counter += 1;
   soul.turns_since_consolidation += 1;
   soul.memory.recent.unshift({
     id: `mem_${crypto.randomUUID()}`,
     timestamp: Math.floor(Date.now() / 1000),
-    content: `${soul.character_name} responded to the user's turn: ${userText}`,
-    salience: tag === "trust_building" ? 73 : 55,
-    tag,
-    retrieval_strength: tag === "trust_building" ? 73 : 55,
+    content: `${template.memoryFrame} for ${soul.character_name}. User turn: ${userText}.`,
+    salience: template.salience,
+    tag: template.tag,
+    retrieval_strength: template.salience,
   });
   soul.memory.recent = soul.memory.recent.slice(0, 12);
-  soul.world.recent_events.push(`The exchange shifted around: ${userText}`);
+  soul.world.recent_events.push(`${template.worldFrame}: ${userText}`);
   soul.world.recent_events = soul.world.recent_events.slice(-12);
   soul.last_updated = Math.floor(Date.now() / 1000);
 
@@ -365,7 +378,21 @@ function estimateTokens(text: string) {
   return Math.max(1, Math.floor(text.length / 4));
 }
 
-function classifyPreviewTag(text: string) {
+type PreviewTag = "trust_building" | "threat" | "bonding" | "orientation" | "observation";
+
+type PreviewTemplate = {
+  tag: PreviewTag;
+  trustDelta: number;
+  affectionDelta: number;
+  salience: number;
+  readerLine: string;
+  realisticLine: string;
+  godLine: string;
+  memoryFrame: string;
+  worldFrame: string;
+};
+
+function classifyPreviewTag(text: string): PreviewTag {
   const lower = text.toLowerCase();
   if (lower.includes("trust") || lower.includes("promise") || lower.includes("safe")) {
     return "trust_building";
@@ -380,4 +407,91 @@ function classifyPreviewTag(text: string) {
     return "orientation";
   }
   return "observation";
+}
+
+function previewTemplateFor(tag: PreviewTag): PreviewTemplate {
+  const templates: Record<PreviewTag, PreviewTemplate> = {
+    trust_building: {
+      tag,
+      trustDelta: 3,
+      affectionDelta: 1,
+      salience: 73,
+      readerLine: "The promise lands softly; she seems to test whether it can hold weight.",
+      realisticLine: "She studies the promise for a long second before letting her shoulders loosen.",
+      godLine: "Trust advances, but only by a careful increment; the scene remains emotionally fragile.",
+      memoryFrame: "A safety promise shifted the emotional baseline",
+      worldFrame: "A small promise of safety changed the room's emotional pressure",
+    },
+    threat: {
+      tag,
+      trustDelta: 0,
+      affectionDelta: 0,
+      salience: 64,
+      readerLine: "Her attention snaps sharp, every old alarm in her body waking at once.",
+      realisticLine: "She goes still and starts cataloging exits, distance, and anything that could become cover.",
+      godLine: "Threat pressure rises; immediate survival logic begins overriding softer goals.",
+      memoryFrame: "A perceived danger forced a defensive read of the scene",
+      worldFrame: "The scene tightened around a possible danger",
+    },
+    bonding: {
+      tag,
+      trustDelta: 1,
+      affectionDelta: 3,
+      salience: 70,
+      readerLine: "The shared thread of memory draws warmth into her voice before she can hide it.",
+      realisticLine: "She lets the memory sit between you, guarded but visibly affected by it.",
+      godLine: "Bonding increases; shared memory becomes a usable emotional anchor.",
+      memoryFrame: "A shared memory created a warmer bond",
+      worldFrame: "The exchange became more intimate through remembered detail",
+    },
+    orientation: {
+      tag,
+      trustDelta: 1,
+      affectionDelta: 0.5,
+      salience: 60,
+      readerLine: "She follows the details carefully, building a map out of every word.",
+      realisticLine: "She asks for specifics, anchoring herself in location, exits, and visible objects.",
+      godLine: "Orientation improves; the character has more usable scene information.",
+      memoryFrame: "New scene information improved orientation",
+      worldFrame: "The scene gained clearer spatial definition",
+    },
+    observation: {
+      tag,
+      trustDelta: 1,
+      affectionDelta: 1,
+      salience: 55,
+      readerLine: "She listens, not fully relaxed, but present enough to answer instead of retreat.",
+      realisticLine: "She acknowledges the turn with measured focus and keeps the exchange grounded.",
+      godLine: "A neutral exchange is recorded; no major state axis shifts dramatically.",
+      memoryFrame: "A neutral exchange added texture to the relationship",
+      worldFrame: "The conversation continued without a major rupture",
+    },
+  };
+  return templates[tag];
+}
+
+function renderPreviewResponse(
+  soul: Soul,
+  userText: string,
+  template: PreviewTemplate,
+  mode: string,
+) {
+  const normalizedMode = mode.toLowerCase();
+  const line =
+    normalizedMode === "god"
+      ? template.godLine
+      : normalizedMode === "realistic"
+        ? template.realisticLine
+        : template.readerLine;
+  const answer = userText.endsWith("?")
+    ? "I do not know the whole answer yet. But I can tell which part of it scares me."
+    : "I heard you. That matters more than I expected.";
+
+  if (normalizedMode === "god") {
+    return `[GM] ${line}\n\n${soul.character_name} steadies in the scene. "${answer}"`;
+  }
+  if (normalizedMode === "realistic") {
+    return `${line}\n\n${soul.character_name} answers after a controlled breath. "${answer}"`;
+  }
+  return `${line}\n\n${soul.character_name}'s voice stays low. "${answer}"`;
 }

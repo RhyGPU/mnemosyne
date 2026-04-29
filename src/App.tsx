@@ -18,6 +18,7 @@ import {
   compileContext,
   createDefaultSoul,
   getSoul,
+  listConversationMessages,
   listSouls,
   runConsolidation,
   saveSoulFile,
@@ -38,6 +39,10 @@ export function App() {
   const [status, setStatus] = useState("Ready");
   const [busy, setBusy] = useState(false);
   const didBootstrap = useRef(false);
+  const currentConversationId = useMemo(
+    () => (soul ? conversationIdForSoul(soul.character_id) : DEFAULT_CONVERSATION_ID),
+    [soul?.character_id],
+  );
 
   useEffect(() => {
     if (didBootstrap.current) return;
@@ -47,14 +52,18 @@ export function App() {
 
   useEffect(() => {
     if (!soul) return;
-    void refreshContext(soul.character_id);
-  }, [soul?.character_id, messages.length]);
+    void refreshContext(soul.character_id, currentConversationId);
+  }, [soul?.character_id, currentConversationId, messages.length]);
 
   async function bootstrap() {
     const existing = await listSouls();
     setSouls(existing);
 
     if (existing.length > 0) {
+      const firstSoul = await getSoul(existing[0].character_id);
+      setSoul(firstSoul);
+      setCharacterName(firstSoul.character_name);
+      setMessages(await listConversationMessages(conversationIdForSoul(firstSoul.character_id)));
       setStatus("Loaded local Soul index");
       return;
     }
@@ -66,8 +75,8 @@ export function App() {
     setStatus("Created starter Soul");
   }
 
-  async function refreshContext(soulId: string) {
-    const preview = await compileContext(soulId, DEFAULT_CONVERSATION_ID);
+  async function refreshContext(soulId: string, conversationId: string) {
+    const preview = await compileContext(soulId, conversationId);
     setContext(preview);
   }
 
@@ -96,7 +105,8 @@ export function App() {
       const nextSoul = await getSoul(selected.character_id);
       setStatus(`Selected ${nextSoul.character_name}`);
       setSoul(nextSoul);
-      setMessages([]);
+      setCharacterName(nextSoul.character_name);
+      setMessages(await listConversationMessages(conversationIdForSoul(nextSoul.character_id)));
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -107,14 +117,14 @@ export function App() {
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     const text = draft.trim();
-    if (!text || busy) return;
+    if (!text || busy || !soul) return;
 
     setBusy(true);
     setDraft("");
     setStatus("Mock provider thinking");
 
     try {
-      const result = await sendMockTurn(DEFAULT_CONVERSATION_ID, text);
+      const result = await sendMockTurn(currentConversationId, soul.character_id, text, mode);
       setSoul(result.soul);
       setMessages(result.messages);
       setContext(result.context_preview);
@@ -134,6 +144,7 @@ export function App() {
       const nextSoul = await runConsolidation(soul.character_id);
       setSoul(nextSoul);
       setSouls(await listSouls());
+      setContext(await compileContext(nextSoul.character_id, currentConversationId));
       setStatus("Memory consolidated");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -198,7 +209,7 @@ export function App() {
             souls.map((item) => (
               <button
                 key={item.character_id}
-                className="soul-row"
+                className={`soul-row ${soul?.character_id === item.character_id ? "selected" : ""}`}
                 onClick={() => handleSelectSoul(item.character_id)}
               >
                 <span>{item.character_name}</span>
@@ -214,7 +225,7 @@ export function App() {
           <Stat label="Trust" value={relationship?.trust ?? 0} />
           <Stat label="Affection" value={relationship?.affection ?? 0} />
           <Stat label="Fear" value={relationship?.fear ?? 0} />
-          <Stat label="Resolve" value={soul?.global.resolve ?? 0} />
+          <Stat label="Turns" value={soul?.turn_counter ?? 0} />
         </section>
 
         <section className="memory-section">
@@ -237,7 +248,7 @@ export function App() {
       <section className="chat-panel">
         <div className="chat-header">
           <div>
-            <span className="eyebrow">Provider: Mock</span>
+            <span className="eyebrow">Provider: Mock / {mode}</span>
             <h2>Chat Window</h2>
           </div>
           <div className="token-pill">
@@ -269,7 +280,7 @@ export function App() {
             placeholder="Type message..."
             disabled={busy}
           />
-          <button aria-label="Send message" disabled={busy || !draft.trim()}>
+          <button aria-label="Send message" disabled={busy || !draft.trim() || !soul}>
             <Play size={18} />
           </button>
         </form>
@@ -341,7 +352,11 @@ function Stat({ label, value }: { label: string; value: number }) {
   return (
     <div className="stat">
       <span>{label}</span>
-      <strong>{value}</strong>
+      <strong>{Math.round(value)}</strong>
     </div>
   );
+}
+
+function conversationIdForSoul(soulId: string) {
+  return `local-mock-${soulId}`;
 }
