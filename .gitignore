@@ -1,0 +1,13 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+.DS_Store
+*.log
+*.sqlite
+*.sqlite3
+*.db
+src-tauri/state_engine/Cargo.lock
+.env
+.env.*
+!.env.example
