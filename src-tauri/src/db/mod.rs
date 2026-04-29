@@ -133,6 +133,11 @@ pub fn get_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<Soul> {
     decode_soul(&soul_json)
 }
 
+pub fn delete_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
+    let affected = conn.execute("DELETE FROM souls WHERE character_id = ?1", [soul_id])?;
+    Ok(affected > 0)
+}
+
 pub fn primary_soul(conn: &Connection) -> rusqlite::Result<Option<Soul>> {
     let soul_json: Option<String> = conn
         .query_row(
@@ -178,6 +183,11 @@ pub fn insert_message(
         params![now, conversation_id],
     )?;
     Ok(())
+}
+
+pub fn delete_conversation(conn: &Connection, conversation_id: &str) -> rusqlite::Result<bool> {
+    let affected = conn.execute("DELETE FROM conversations WHERE id = ?1", [conversation_id])?;
+    Ok(affected > 0)
 }
 
 pub fn list_messages(
@@ -248,5 +258,27 @@ mod tests {
         let messages = list_messages(&conn, "mock", 5).expect("messages");
         assert_eq!(messages.len(), 2);
         assert_eq!(count_assistant_messages(&conn, "mock").unwrap(), 1);
+    }
+
+    #[test]
+    fn deletion_cascades_souls_and_conversations() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+        ensure_conversation(&conn, "mock", &soul.character_id).expect("conversation");
+        insert_message(&conn, "mock", "user", "Hello").expect("user");
+
+        assert!(delete_conversation(&conn, "mock").expect("delete conversation"));
+        assert_eq!(list_messages(&conn, "mock", 5).expect("messages").len(), 0);
+
+        ensure_conversation(&conn, "mock", &soul.character_id).expect("conversation");
+        insert_message(&conn, "mock", "assistant", "Hi").expect("assistant");
+        assert!(delete_soul(&conn, &soul.character_id).expect("delete soul"));
+        assert!(list_souls(&conn).expect("souls").is_empty());
+
+        let message_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .expect("message count");
+        assert_eq!(message_count, 0);
     }
 }

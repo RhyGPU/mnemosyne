@@ -143,6 +143,17 @@ export function getSoul(soulId: string): Promise<Soul> {
   });
 }
 
+export function deleteSoul(soulId: string): Promise<boolean> {
+  return invokeOrPreview("delete_soul", { soulId }, () => {
+    const beforeCount = browserSouls.length;
+    browserSouls = browserSouls.filter((item) => item.character_id !== soulId);
+    browserMessages = browserMessages.filter(
+      (message) => message.conversation_id !== previewConversationIdForSoul(soulId),
+    );
+    return browserSouls.length !== beforeCount;
+  });
+}
+
 export function sendMockTurn(
   conversationId: string,
   soulId: string,
@@ -158,6 +169,16 @@ export function listConversationMessages(conversationId: string): Promise<ChatMe
   return invokeOrPreview("list_conversation_messages", { conversationId }, () =>
     browserMessages.filter((message) => message.conversation_id === conversationId),
   );
+}
+
+export function deleteConversation(conversationId: string): Promise<boolean> {
+  return invokeOrPreview("delete_conversation", { conversationId }, () => {
+    const beforeCount = browserMessages.length;
+    browserMessages = browserMessages.filter(
+      (message) => message.conversation_id !== conversationId,
+    );
+    return browserMessages.length !== beforeCount;
+  });
 }
 
 export function compileContext(
@@ -490,4 +511,8 @@ function renderPreviewResponse(
     return `${line}\n\n${soul.character_name} answers after a controlled breath. "${answer}"`;
   }
   return `${line}\n\n${soul.character_name}'s voice stays low. "${answer}"`;
+}
+
+function previewConversationIdForSoul(soulId: string) {
+  return `local-mock-${soulId}`;
 }

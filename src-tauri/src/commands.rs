@@ -63,12 +63,27 @@ pub fn get_soul(state: State<'_, AppState>, soul_id: String) -> Result<Soul, Str
 }
 
 #[tauri::command]
+pub fn delete_soul(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::delete_soul(&conn, &soul_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 pub fn list_conversation_messages(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Vec<ChatMessage>, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn delete_conversation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::delete_conversation(&conn, &conversation_id).map_err(|err| err.to_string())
 }
 
 #[tauri::command]

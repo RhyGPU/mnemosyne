@@ -4,10 +4,12 @@ import {
   FileDown,
   FileUp,
   MessageSquareText,
+  MessageSquareX,
   Play,
   RefreshCcw,
   Save,
   Sparkles,
+  Trash2,
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -17,6 +19,8 @@ import {
   SoulSummary,
   compileContext,
   createDefaultSoul,
+  deleteConversation,
+  deleteSoul,
   getSoul,
   listConversationMessages,
   listSouls,
@@ -146,6 +150,61 @@ export function App() {
       setSouls(await listSouls());
       setContext(await compileContext(nextSoul.character_id, currentConversationId));
       setStatus("Memory consolidated");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDeleteChat() {
+    if (!soul) return;
+    const confirmed = window.confirm(
+      "Delete this local chat? Messages will be removed, but Soul memory and stats will remain.",
+    );
+    if (!confirmed) return;
+
+    setBusy(true);
+    try {
+      await deleteConversation(currentConversationId);
+      setMessages([]);
+      setContext(await compileContext(soul.character_id, currentConversationId));
+      setStatus("Chat deleted; Soul memory kept");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDeleteSoul() {
+    if (!soul) return;
+    const confirmed = window.confirm(
+      `Delete ${soul.character_name} and all local chats for this Soul? This cannot be undone.`,
+    );
+    if (!confirmed) return;
+
+    setBusy(true);
+    try {
+      await deleteSoul(soul.character_id);
+      const remaining = await listSouls();
+      setSouls(remaining);
+
+      if (remaining.length === 0) {
+        setSoul(null);
+        setMessages([]);
+        setContext(null);
+        setStatus("Soul deleted");
+        return;
+      }
+
+      const nextSoul = await getSoul(remaining[0].character_id);
+      const nextConversationId = conversationIdForSoul(nextSoul.character_id);
+      setSoul(nextSoul);
+      setCharacterName(nextSoul.character_name);
+      setMessages(await listConversationMessages(nextConversationId));
+      setContext(await compileContext(nextSoul.character_id, nextConversationId));
+      setStatus("Soul deleted; selected next local Soul");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -325,6 +384,17 @@ export function App() {
           </button>
           <button title="Run consolidation" onClick={handleConsolidate} disabled={!soul || busy}>
             <RefreshCcw size={18} />
+          </button>
+          <button title="Delete current chat" onClick={handleDeleteChat} disabled={!soul || busy}>
+            <MessageSquareX size={18} />
+          </button>
+          <button
+            className="danger-button"
+            title="Delete selected Soul"
+            onClick={handleDeleteSoul}
+            disabled={!soul || busy}
+          >
+            <Trash2 size={18} />
           </button>
         </div>
 

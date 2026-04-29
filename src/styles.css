@@ -340,13 +340,17 @@ button:disabled {
 
 .button-grid {
   display: grid;
-  grid-template-columns: repeat(4, 44px);
+  grid-template-columns: repeat(3, 44px);
   gap: 10px;
 }
 
 .button-grid button {
   width: 44px;
   height: 44px;
+}
+
+.button-grid .danger-button {
+  background: #a84234;
 }
 
 .context-preview pre {
