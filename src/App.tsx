@@ -33,6 +33,7 @@ import {
 } from "./tauri";
 
 const DEFAULT_CONVERSATION_ID = "local-mock";
+const CONSOLIDATION_INTERVAL_TURNS = 10;
 type ProviderKind = "Mock" | "API";
 type NarrativeMode = "Realistic" | "Reader" | "God" | "Custom";
 type PsychePresetName =
@@ -452,6 +453,14 @@ export function App() {
   }
 
   const relationship = soul?.relationships.user;
+  const turnsSinceConsolidation = soul?.turns_since_consolidation ?? 0;
+  const turnsUntilConsolidation = soul
+    ? Math.max(0, CONSOLIDATION_INTERVAL_TURNS - turnsSinceConsolidation)
+    : CONSOLIDATION_INTERVAL_TURNS;
+  const consolidationProgress = Math.min(
+    100,
+    Math.round((turnsSinceConsolidation / CONSOLIDATION_INTERVAL_TURNS) * 100),
+  );
   const activeMessages = useMemo(
     () => messages.filter((message) => message.role !== "system"),
     [messages],
@@ -709,6 +718,8 @@ export function App() {
           <Stat label="Affection" value={relationship?.affection ?? 0} />
           <Stat label="Fear" value={relationship?.fear ?? 0} />
           <Stat label="Turns" value={soul?.turn_counter ?? 0} />
+          <Stat label="Since Sleep" value={turnsSinceConsolidation} />
+          <Stat label="Schemas" value={soul?.memory.schemas.length ?? 0} />
         </section>
 
         <section className="memory-section">
@@ -899,6 +910,37 @@ export function App() {
             <Trash2 size={18} />
           </button>
         </div>
+
+        <section className="diagnostics-section">
+          <h2>Memory Cycle</h2>
+          <div className="cycle-meter" aria-label="Consolidation progress">
+            <div>
+              <strong>{turnsSinceConsolidation}</strong>
+              <span>/ {CONSOLIDATION_INTERVAL_TURNS} turns</span>
+            </div>
+            <div className="cycle-bar">
+              <span style={{ width: `${consolidationProgress}%` }} />
+            </div>
+          </div>
+          <dl className="diagnostic-grid">
+            <div>
+              <dt>Next sleep</dt>
+              <dd>{turnsUntilConsolidation === 0 ? "Ready" : `${turnsUntilConsolidation} turns`}</dd>
+            </div>
+            <div>
+              <dt>Core</dt>
+              <dd>{soul?.memory.core.length ?? 0}</dd>
+            </div>
+            <div>
+              <dt>Recent</dt>
+              <dd>{soul?.memory.recent.length ?? 0}</dd>
+            </div>
+            <div>
+              <dt>Context</dt>
+              <dd>{context?.truncated ? "Trimmed" : "Within budget"}</dd>
+            </div>
+          </dl>
+        </section>
 
         <section className="context-preview">
           <h2>Context</h2>

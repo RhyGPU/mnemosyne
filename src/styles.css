@@ -182,6 +182,7 @@ button:disabled {
 .compact-list,
 .creator-section,
 .memory-section,
+.diagnostics-section,
 .context-preview {
   display: grid;
   gap: 10px;
@@ -190,6 +191,7 @@ button:disabled {
 .compact-list h2,
 .creator-section h2,
 .memory-section h2,
+.diagnostics-section h2,
 .context-preview h2 {
   color: #284239;
 }
@@ -413,6 +415,79 @@ button:disabled {
   border: 1px solid #d9d3c3;
   border-radius: 6px;
   background: rgba(255, 253, 248, 0.75);
+}
+
+.diagnostics-section {
+  padding: 12px;
+  border: 1px solid #d9d3c3;
+  border-radius: 6px;
+  background: rgba(255, 253, 248, 0.75);
+}
+
+.cycle-meter {
+  display: grid;
+  gap: 8px;
+}
+
+.cycle-meter div:first-child {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  color: #48584f;
+}
+
+.cycle-meter strong {
+  color: #c25340;
+  font-size: 1.3rem;
+}
+
+.cycle-meter span {
+  color: #63746d;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.cycle-bar {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e5dfd1;
+}
+
+.cycle-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #1d5e52;
+}
+
+.diagnostic-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.diagnostic-grid div {
+  min-height: 54px;
+  padding: 8px;
+  border: 1px solid #e5dfd1;
+  border-radius: 6px;
+  background: #fffdf8;
+}
+
+.diagnostic-grid dt {
+  color: #63746d;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.diagnostic-grid dd {
+  margin: 3px 0 0;
+  color: #16201c;
+  font-size: 0.92rem;
+  font-weight: 800;
 }
 
 .hidden-file {
