@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     memory::MemoryScorer,
@@ -12,14 +12,16 @@ pub fn consolidate_soul(soul: &mut Soul) {
     let memories = std::mem::take(&mut soul.memory.recent);
 
     for memory in memories {
-        if memory.retrieval_strength <= 30.0 {
-            continue;
-        }
-
         let score = scorer.score(soul, &memory);
         if score > 0.70 {
             soul.memory.core.push(summarize_core_memory(&memory));
         } else if score < 0.30 {
+            if is_schema_prone(&memory.tag) {
+                middle_by_tag
+                    .entry(memory.tag.clone())
+                    .or_default()
+                    .push(memory);
+            }
             continue;
         } else {
             middle_by_tag
@@ -30,12 +32,15 @@ pub fn consolidate_soul(soul: &mut Soul) {
         }
     }
 
+    let mut merged_tags = HashSet::new();
     for (tag, memories) in middle_by_tag {
         if memories.len() >= 3 {
             merge_schema(soul, &tag, &memories);
+            merged_tags.insert(tag);
         }
     }
 
+    retained.retain(|memory| !merged_tags.contains(&memory.tag));
     retained.sort_by(|left, right| {
         right
             .salience
@@ -46,6 +51,10 @@ pub fn consolidate_soul(soul: &mut Soul) {
     soul.memory.recent = retained;
     soul.turns_since_consolidation = 0;
     soul.last_updated = current_timestamp() as i64;
+}
+
+fn is_schema_prone(tag: &str) -> bool {
+    matches!(tag, "observation" | "orientation" | "routine" | "small_talk")
 }
 
 fn summarize_core_memory(memory: &MemoryEntry) -> String {
@@ -143,8 +152,12 @@ mod tests {
             .iter()
             .any(|schema| schema.schema_type == "routine"));
         assert!(soul.memory.recent.len() <= 4);
+        assert!(!soul
+            .memory
+            .recent
+            .iter()
+            .any(|memory| memory.tag == "routine"));
         assert!(!soul.memory.recent.iter().any(|memory| memory.id == "weak"));
         assert_eq!(soul.turns_since_consolidation, 0);
     }
 }
-

@@ -1,5 +1,6 @@
 use std::{fs, path::PathBuf};
 
+use rusqlite::Connection;
 use tauri::State;
 
 use state_engine::{
@@ -122,6 +123,16 @@ pub fn send_mock_turn(
     mode: String,
 ) -> Result<TurnResult, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    send_mock_turn_with_conn(&conn, conversation_id, soul_id, user_text, mode)
+}
+
+fn send_mock_turn_with_conn(
+    conn: &Connection,
+    conversation_id: String,
+    soul_id: String,
+    user_text: String,
+    mode: String,
+) -> Result<TurnResult, String> {
     let mut soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
 
     db::ensure_conversation(&conn, &conversation_id, &soul.character_id)
@@ -292,7 +303,7 @@ fn classify_turn_tag(text: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use state_engine::hidden_state::HiddenState;
+    use state_engine::{context_compiler::estimate_tokens, hidden_state::HiddenState};
 
     #[test]
     fn hidden_state_application_updates_soul() {
@@ -310,5 +321,61 @@ mod tests {
         assert_eq!(soul.relationships["user"].trust, 14.0);
         assert_eq!(soul.memory.recent.len(), 1);
         assert_eq!(soul.world.recent_events.len(), 1);
+    }
+
+    #[test]
+    fn ten_mock_turns_trigger_consolidation_and_keep_context_lean() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        let soul_id = soul.character_id.clone();
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+
+        let turns = [
+            "I promise this is safe.",
+            "Look at the wall and the room.",
+            "We remember childhood rain together.",
+            "There is danger near the door.",
+            "The light flickers without changing much.",
+            "A neutral breath passes in the silence.",
+            "Another quiet observation settles over the silence.",
+            "One more observation keeps the scene grounded.",
+            "Trust the route I found.",
+            "Where are we now?",
+        ];
+
+        let mut final_result = None;
+        for turn in turns {
+            final_result = Some(
+                send_mock_turn_with_conn(
+                    &conn,
+                    "acceptance".into(),
+                    soul_id.clone(),
+                    turn.into(),
+                    "Reader".into(),
+                )
+                .expect("mock turn"),
+            );
+        }
+
+        let result = final_result.expect("result");
+        assert!(result.consolidation_ran);
+        assert_eq!(result.soul.turn_counter, 10);
+        assert_eq!(result.soul.turns_since_consolidation, 0);
+        assert!(result.soul.memory.recent.len() <= 4);
+        assert!(result.soul.memory.core.len() > soul.memory.core.len());
+        assert!(result
+            .soul
+            .memory
+            .schemas
+            .iter()
+            .any(|schema| schema.schema_type == "observation"));
+        assert!(!result
+            .soul
+            .memory
+            .recent
+            .iter()
+            .any(|memory| memory.tag == "observation"));
+        assert!(result.context_preview.estimated_tokens <= 2_000);
+        assert!(estimate_tokens(&result.context_preview.text) <= 2_000);
     }
 }
