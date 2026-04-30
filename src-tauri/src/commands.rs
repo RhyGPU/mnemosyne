@@ -7,11 +7,12 @@ use state_engine::{
     consolidation::consolidate_soul,
     context_compiler::{compile_context_for_messages, ContextMessage, ContextPreview},
     hidden_state::{parse_hidden_state, HiddenState},
+    setting::{new_default_setting, SettingSoul},
     soul::{new_default_soul, Soul},
 };
 
 use crate::{
-    db::{self, ChatMessage, SoulSummary},
+    db::{self, ChatMessage, SettingSummary, SoulSummary},
     providers::{
         api::{ApiProvider, ApiProviderSettings},
         mock::MockProvider,
@@ -37,7 +38,18 @@ pub fn create_default_soul(character_name: String) -> Soul {
 }
 
 #[tauri::command]
+pub fn create_default_setting(setting_name: String) -> SettingSoul {
+    new_default_setting(&setting_name)
+}
+
+#[tauri::command]
 pub fn load_soul_file(path: String) -> Result<Soul, String> {
+    let content = fs::read_to_string(PathBuf::from(path)).map_err(|err| err.to_string())?;
+    serde_json::from_str(&content).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn load_setting_file(path: String) -> Result<SettingSoul, String> {
     let content = fs::read_to_string(PathBuf::from(path)).map_err(|err| err.to_string())?;
     serde_json::from_str(&content).map_err(|err| err.to_string())
 }
@@ -49,9 +61,21 @@ pub fn save_soul_file(path: String, soul: Soul) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn save_setting_file(path: String, setting: SettingSoul) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(&setting).map_err(|err| err.to_string())?;
+    fs::write(PathBuf::from(path), content).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 pub fn list_souls(state: State<'_, AppState>) -> Result<Vec<SoulSummary>, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::list_souls(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_settings(state: State<'_, AppState>) -> Result<Vec<SettingSummary>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_settings(&conn).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -61,15 +85,36 @@ pub fn upsert_soul(state: State<'_, AppState>, soul: Soul) -> Result<SoulSummary
 }
 
 #[tauri::command]
+pub fn upsert_setting(
+    state: State<'_, AppState>,
+    setting: SettingSoul,
+) -> Result<SettingSummary, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::upsert_setting(&conn, &setting).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 pub fn get_soul(state: State<'_, AppState>, soul_id: String) -> Result<Soul, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
+pub fn get_setting(state: State<'_, AppState>, setting_id: String) -> Result<SettingSoul, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::get_setting(&conn, &setting_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 pub fn delete_soul(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::delete_soul(&conn, &soul_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn delete_setting(state: State<'_, AppState>, setting_id: String) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::delete_setting(&conn, &setting_id).map_err(|err| err.to_string())
 }
 
 #[tauri::command]

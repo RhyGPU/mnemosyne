@@ -68,12 +68,29 @@ export type Soul = {
   };
 };
 
+export type SettingSoul = {
+  schema_version: number;
+  setting_id: string;
+  setting_name: string;
+  last_updated: number;
+  turn_counter: number;
+  world: Soul["world"];
+};
+
 export type SoulSummary = {
   character_id: string;
   character_name: string;
   last_updated: number;
   recent_count: number;
   core_count: number;
+};
+
+export type SettingSummary = {
+  setting_id: string;
+  setting_name: string;
+  last_updated: number;
+  turn_counter: number;
+  location: string;
 };
 
 export type ChatMessage = {
@@ -152,6 +169,7 @@ const MODE_PROMPTS: Record<string, string> = {
 };
 
 let browserSouls: Soul[] = [];
+let browserSettings: SettingSoul[] = [];
 let browserMessages: ChatMessage[] = [];
 let nextMessageId = 1;
 const CONSOLIDATION_INTERVAL_TURNS = 10;
@@ -177,8 +195,18 @@ export function createDefaultSoul(characterName: string): Promise<Soul> {
   );
 }
 
+export function createDefaultSetting(settingName: string): Promise<SettingSoul> {
+  return invokeOrPreview("create_default_setting", { settingName }, () =>
+    makePreviewSetting(settingName),
+  );
+}
+
 export function listSouls(): Promise<SoulSummary[]> {
   return invokeOrPreview("list_souls", {}, () => browserSouls.map(summarizeSoul));
+}
+
+export function listSettings(): Promise<SettingSummary[]> {
+  return invokeOrPreview("list_settings", {}, () => browserSettings.map(summarizeSetting));
 }
 
 export function upsertSoul(soul: Soul): Promise<SoulSummary> {
@@ -193,11 +221,31 @@ export function upsertSoul(soul: Soul): Promise<SoulSummary> {
   });
 }
 
+export function upsertSetting(setting: SettingSoul): Promise<SettingSummary> {
+  return invokeOrPreview("upsert_setting", { setting }, () => {
+    const index = browserSettings.findIndex((item) => item.setting_id === setting.setting_id);
+    if (index >= 0) {
+      browserSettings[index] = setting;
+    } else {
+      browserSettings.unshift(setting);
+    }
+    return summarizeSetting(setting);
+  });
+}
+
 export function getSoul(soulId: string): Promise<Soul> {
   return invokeOrPreview("get_soul", { soulId }, () => {
     const soul = browserSouls.find((item) => item.character_id === soulId);
     if (!soul) throw new Error("Soul not found");
     return soul;
+  });
+}
+
+export function getSetting(settingId: string): Promise<SettingSoul> {
+  return invokeOrPreview("get_setting", { settingId }, () => {
+    const setting = browserSettings.find((item) => item.setting_id === settingId);
+    if (!setting) throw new Error("Setting not found");
+    return setting;
   });
 }
 
@@ -209,6 +257,17 @@ export function deleteSoul(soulId: string): Promise<boolean> {
       (message) => message.conversation_id !== previewConversationIdForSoul(soulId),
     );
     return browserSouls.length !== beforeCount;
+  });
+}
+
+export function deleteSetting(settingId: string): Promise<boolean> {
+  return invokeOrPreview("delete_setting", { settingId }, () => {
+    const beforeCount = browserSettings.length;
+    browserSettings = browserSettings.filter((item) => item.setting_id !== settingId);
+    browserMessages = browserMessages.filter(
+      (message) => !message.conversation_id.startsWith(`local-mock-${settingId}-`),
+    );
+    return browserSettings.length !== beforeCount;
   });
 }
 
@@ -277,9 +336,25 @@ export function loadSoulFile(path: string): Promise<Soul> {
   return invoke("load_soul_file", { path });
 }
 
+export function loadSettingFile(path: string): Promise<SettingSoul> {
+  return invoke("load_setting_file", { path });
+}
+
 export function saveSoulFile(path: string, soul: Soul): Promise<void> {
   return invokeOrPreview("save_soul_file", { path, soul }, () => {
     const blob = new Blob([JSON.stringify(soul, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = path;
+    link.click();
+    URL.revokeObjectURL(url);
+  });
+}
+
+export function saveSettingFile(path: string, setting: SettingSoul): Promise<void> {
+  return invokeOrPreview("save_setting_file", { path, setting }, () => {
+    const blob = new Blob([JSON.stringify(setting, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -350,6 +425,23 @@ function makePreviewSoul(characterName: string): Soul {
   };
 }
 
+function makePreviewSetting(settingName: string): SettingSoul {
+  return {
+    schema_version: 1,
+    setting_id: crypto.randomUUID(),
+    setting_name: settingName.trim() || "Untitled Setting",
+    last_updated: Math.floor(Date.now() / 1000),
+    turn_counter: 0,
+    world: {
+      location: "Unspecified starting scene.",
+      active_plots: ["Establish the first scene"],
+      recent_events: [],
+      key_objects: [],
+      time_elapsed: "Session start",
+    },
+  };
+}
+
 function summarizeSoul(soul: Soul): SoulSummary {
   return {
     character_id: soul.character_id,
@@ -357,6 +449,16 @@ function summarizeSoul(soul: Soul): SoulSummary {
     last_updated: soul.last_updated,
     recent_count: soul.memory.recent.length,
     core_count: soul.memory.core.length,
+  };
+}
+
+function summarizeSetting(setting: SettingSoul): SettingSummary {
+  return {
+    setting_id: setting.setting_id,
+    setting_name: setting.setting_name,
+    last_updated: setting.last_updated,
+    turn_counter: setting.turn_counter,
+    location: setting.world.location,
   };
 }
 

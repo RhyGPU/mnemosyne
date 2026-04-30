@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use state_engine::soul::Soul;
+use state_engine::{setting::SettingSoul, soul::Soul};
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +12,15 @@ pub struct SoulSummary {
     pub last_updated: i64,
     pub recent_count: usize,
     pub core_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingSummary {
+    pub setting_id: String,
+    pub setting_name: String,
+    pub last_updated: i64,
+    pub turn_counter: u64,
+    pub location: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +61,13 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             character_name TEXT NOT NULL,
             last_updated INTEGER NOT NULL,
             soul_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            setting_id TEXT PRIMARY KEY,
+            setting_name TEXT NOT NULL,
+            last_updated INTEGER NOT NULL,
+            setting_json TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS conversations (
@@ -105,6 +121,58 @@ pub fn upsert_soul(conn: &Connection, soul: &Soul) -> rusqlite::Result<SoulSumma
         recent_count: soul.memory.recent.len(),
         core_count: soul.memory.core.len(),
     })
+}
+
+pub fn upsert_setting(
+    conn: &Connection,
+    setting: &SettingSoul,
+) -> rusqlite::Result<SettingSummary> {
+    let setting_json = serde_json::to_string(setting)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    conn.execute(
+        "
+        INSERT INTO settings (setting_id, setting_name, last_updated, setting_json)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(setting_id) DO UPDATE SET
+            setting_name = excluded.setting_name,
+            last_updated = excluded.last_updated,
+            setting_json = excluded.setting_json
+        ",
+        params![
+            setting.setting_id,
+            setting.setting_name,
+            setting.last_updated,
+            setting_json
+        ],
+    )?;
+
+    Ok(summarize_setting(setting))
+}
+
+pub fn list_settings(conn: &Connection) -> rusqlite::Result<Vec<SettingSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT setting_json FROM settings ORDER BY last_updated DESC, setting_name ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let setting_json: String = row.get(0)?;
+        decode_setting(&setting_json).map(|setting| summarize_setting(&setting))
+    })?;
+
+    rows.collect()
+}
+
+pub fn get_setting(conn: &Connection, setting_id: &str) -> rusqlite::Result<SettingSoul> {
+    let setting_json: String = conn.query_row(
+        "SELECT setting_json FROM settings WHERE setting_id = ?1",
+        [setting_id],
+        |row| row.get(0),
+    )?;
+    decode_setting(&setting_json)
+}
+
+pub fn delete_setting(conn: &Connection, setting_id: &str) -> rusqlite::Result<bool> {
+    let affected = conn.execute("DELETE FROM settings WHERE setting_id = ?1", [setting_id])?;
+    Ok(affected > 0)
 }
 
 pub fn list_souls(conn: &Connection) -> rusqlite::Result<Vec<SoulSummary>> {
@@ -236,9 +304,26 @@ fn decode_soul(json: &str) -> rusqlite::Result<Soul> {
     })
 }
 
+fn decode_setting(json: &str) -> rusqlite::Result<SettingSoul> {
+    serde_json::from_str(json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
+fn summarize_setting(setting: &SettingSoul) -> SettingSummary {
+    SettingSummary {
+        setting_id: setting.setting_id.clone(),
+        setting_name: setting.setting_name.clone(),
+        last_updated: setting.last_updated,
+        turn_counter: setting.turn_counter,
+        location: setting.world.location.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use state_engine::setting::new_default_setting;
     use state_engine::soul::new_default_soul;
 
     #[test]
@@ -280,5 +365,23 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .expect("message count");
         assert_eq!(message_count, 0);
+    }
+
+    #[test]
+    fn settings_persist_select_and_delete_independently() {
+        let conn = init_memory_connection().expect("db");
+        let mut setting = new_default_setting("Carver City");
+        setting.world.location = "Underground cell".into();
+        upsert_setting(&conn, &setting).expect("upsert");
+
+        let summaries = list_settings(&conn).expect("list settings");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].setting_name, "Carver City");
+        assert_eq!(summaries[0].location, "Underground cell");
+
+        let loaded = get_setting(&conn, &setting.setting_id).expect("get setting");
+        assert_eq!(loaded.world.location, "Underground cell");
+        assert!(delete_setting(&conn, &setting.setting_id).expect("delete"));
+        assert!(list_settings(&conn).expect("list settings").is_empty());
     }
 }

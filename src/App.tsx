@@ -17,19 +17,27 @@ import {
   ApiProviderSettings,
   ChatMessage,
   ContextPreview,
+  SettingSoul,
+  SettingSummary,
   Soul,
   SoulSummary,
   compileContext,
   createDefaultSoul,
+  createDefaultSetting,
   deleteConversation,
+  deleteSetting,
   deleteSoul,
+  getSetting,
   getSoul,
   listConversationMessages,
+  listSettings,
   listSouls,
   runConsolidation,
+  saveSettingFile,
   saveSoulFile,
   sendApiTurn,
   sendMockTurn,
+  upsertSetting,
   upsertSoul,
 } from "./tauri";
 
@@ -126,7 +134,9 @@ const PSYCHE_PRESETS: Record<PsychePresetName, PsycheDraft> = {
 
 export function App() {
   const [souls, setSouls] = useState<SoulSummary[]>([]);
+  const [settings, setSettings] = useState<SettingSummary[]>([]);
   const [soul, setSoul] = useState<Soul | null>(null);
+  const [setting, setSetting] = useState<SettingSoul | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [context, setContext] = useState<ContextPreview | null>(null);
   const [draft, setDraft] = useState("");
@@ -135,6 +145,7 @@ export function App() {
   const [characterAppearance, setCharacterAppearance] = useState("");
   const [characterPersonality, setCharacterPersonality] = useState("");
   const [characterScenario, setCharacterScenario] = useState("");
+  const [settingName, setSettingName] = useState("Starter Setting");
   const [worldDraft, setWorldDraft] = useState<WorldDraft>({
     location: "Unspecified starting scene.",
     activePlots: "Establish the first scene",
@@ -156,9 +167,13 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const didBootstrap = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
+  const settingImportInputRef = useRef<HTMLInputElement>(null);
   const currentConversationId = useMemo(
-    () => (soul ? conversationIdForSoul(soul.character_id) : DEFAULT_CONVERSATION_ID),
-    [soul?.character_id],
+    () =>
+      soul && setting
+        ? conversationIdForSettingAndSoul(setting.setting_id, soul.character_id)
+        : DEFAULT_CONVERSATION_ID,
+    [setting?.setting_id, soul?.character_id],
   );
 
   useEffect(() => {
@@ -178,9 +193,13 @@ export function App() {
     setCharacterAppearance(nextSoul.profile.appearance);
     setCharacterPersonality(nextSoul.profile.personality);
     setCharacterScenario(nextSoul.profile.scenario);
-    setWorldDraft(worldDraftFromSoul(nextSoul));
     setPsyche(psycheFromSoul(nextSoul));
     setPsychePreset("Custom");
+  }
+
+  function setEditorFieldsFromSetting(nextSetting: SettingSoul) {
+    setSettingName(nextSetting.setting_name);
+    setWorldDraft(worldDraftFromSetting(nextSetting));
   }
 
   function updatePsyche(update: (current: PsycheDraft) => PsycheDraft) {
@@ -272,16 +291,64 @@ export function App() {
     };
   }
 
-  async function bootstrap() {
-    const existing = await listSouls();
-    setSouls(existing);
+  function applySettingFields(nextSetting: SettingSoul) {
+    const world = normalizeWorldDraft(worldDraft);
+    return {
+      ...nextSetting,
+      setting_name: settingName.trim() || "Untitled Setting",
+      last_updated: Math.floor(Date.now() / 1000),
+      world: {
+        ...nextSetting.world,
+        location: world.location,
+        active_plots: world.activePlots,
+        key_objects: world.keyObjects,
+        time_elapsed: world.timeElapsed,
+      },
+    };
+  }
 
-    if (existing.length > 0) {
-      const firstSoul = await getSoul(existing[0].character_id);
+  function mirrorSettingIntoSoul(nextSoul: Soul, nextSetting: SettingSoul) {
+    return {
+      ...nextSoul,
+      world: nextSetting.world,
+    };
+  }
+
+  async function persistCurrentSetting() {
+    if (!setting) return null;
+    const nextSetting = applySettingFields(setting);
+    await upsertSetting(nextSetting);
+    setSetting(nextSetting);
+    setSettings(await listSettings());
+    return nextSetting;
+  }
+
+  async function bootstrap() {
+    const [existingSouls, existingSettings] = await Promise.all([listSouls(), listSettings()]);
+    setSouls(existingSouls);
+    setSettings(existingSettings);
+
+    let activeSetting: SettingSoul;
+    if (existingSettings.length > 0) {
+      activeSetting = await getSetting(existingSettings[0].setting_id);
+    } else {
+      activeSetting = await createDefaultSetting(settingName);
+      await upsertSetting(activeSetting);
+      setSettings(await listSettings());
+    }
+    setSetting(activeSetting);
+    setEditorFieldsFromSetting(activeSetting);
+
+    if (existingSouls.length > 0) {
+      const firstSoul = await getSoul(existingSouls[0].character_id);
       setSoul(firstSoul);
       setCreatorFieldsFromSoul(firstSoul);
-      setMessages(await listConversationMessages(conversationIdForSoul(firstSoul.character_id)));
-      setStatus("Loaded local Soul index");
+      setMessages(
+        await listConversationMessages(
+          conversationIdForSettingAndSoul(activeSetting.setting_id, firstSoul.character_id),
+        ),
+      );
+      setStatus("Loaded local Soul and Setting indexes");
       return;
     }
 
@@ -289,7 +356,7 @@ export function App() {
     await upsertSoul(nextSoul);
     setSoul(nextSoul);
     setSouls(await listSouls());
-    setStatus("Created starter Soul");
+    setStatus("Created starter Soul and Setting");
   }
 
   async function refreshContext(soulId: string, conversationId: string) {
@@ -325,7 +392,56 @@ export function App() {
       setStatus(`Selected ${nextSoul.character_name}`);
       setSoul(nextSoul);
       setCreatorFieldsFromSoul(nextSoul);
-      setMessages(await listConversationMessages(conversationIdForSoul(nextSoul.character_id)));
+      setMessages(
+        await listConversationMessages(
+          setting
+            ? conversationIdForSettingAndSoul(setting.setting_id, nextSoul.character_id)
+            : conversationIdForSoul(nextSoul.character_id),
+        ),
+      );
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCreateSetting() {
+    setBusy(true);
+    try {
+      const nextSetting = applySettingFields(
+        await createDefaultSetting(settingName || "Untitled Setting"),
+      );
+      await upsertSetting(nextSetting);
+      setSetting(nextSetting);
+      setEditorFieldsFromSetting(nextSetting);
+      setSettings(await listSettings());
+      setMessages([]);
+      setStatus("New Setting created");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSelectSetting(settingId: string) {
+    const selected = settings.find((item) => item.setting_id === settingId);
+    if (!selected) return;
+
+    setBusy(true);
+    try {
+      const nextSetting = await getSetting(selected.setting_id);
+      setSetting(nextSetting);
+      setEditorFieldsFromSetting(nextSetting);
+      setMessages(
+        soul
+          ? await listConversationMessages(
+              conversationIdForSettingAndSoul(nextSetting.setting_id, soul.character_id),
+            )
+          : [],
+      );
+      setStatus(`Selected ${nextSetting.setting_name}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -343,10 +459,24 @@ export function App() {
     setStatus(provider === "API" ? "API provider thinking" : "Mock provider thinking");
 
     try {
+      const activeSetting = await persistCurrentSetting();
+      const activeSoul = activeSetting ? mirrorSettingIntoSoul(soul, activeSetting) : soul;
+      await upsertSoul(activeSoul);
       const result =
         provider === "API"
-          ? await sendApiTurn(currentConversationId, soul.character_id, text, mode, apiSettings)
-          : await sendMockTurn(currentConversationId, soul.character_id, text, mode);
+          ? await sendApiTurn(currentConversationId, activeSoul.character_id, text, mode, apiSettings)
+          : await sendMockTurn(currentConversationId, activeSoul.character_id, text, mode);
+      if (activeSetting) {
+        const updatedSetting = {
+          ...activeSetting,
+          turn_counter: activeSetting.turn_counter + 1,
+          last_updated: Math.floor(Date.now() / 1000),
+          world: result.soul.world,
+        };
+        await upsertSetting(updatedSetting);
+        setSetting(updatedSetting);
+        setEditorFieldsFromSetting(updatedSetting);
+      }
       setSoul(result.soul);
       setMessages(result.messages);
       setContext(result.context_preview);
@@ -417,7 +547,9 @@ export function App() {
       }
 
       const nextSoul = await getSoul(remaining[0].character_id);
-      const nextConversationId = conversationIdForSoul(nextSoul.character_id);
+      const nextConversationId = setting
+        ? conversationIdForSettingAndSoul(setting.setting_id, nextSoul.character_id)
+        : conversationIdForSoul(nextSoul.character_id);
       setSoul(nextSoul);
       setCreatorFieldsFromSoul(nextSoul);
       setMessages(await listConversationMessages(nextConversationId));
@@ -430,16 +562,82 @@ export function App() {
     }
   }
 
+  async function handleDeleteSetting() {
+    if (!setting) return;
+    const confirmed = window.confirm(
+      `Delete ${setting.setting_name}? Local chats for this Setting remain orphaned until chat cleanup is added.`,
+    );
+    if (!confirmed) return;
+
+    setBusy(true);
+    try {
+      await deleteSetting(setting.setting_id);
+      const remaining = await listSettings();
+      setSettings(remaining);
+
+      if (remaining.length === 0) {
+        const nextSetting = await createDefaultSetting("Starter Setting");
+        await upsertSetting(nextSetting);
+        setSetting(nextSetting);
+        setEditorFieldsFromSetting(nextSetting);
+        setSettings(await listSettings());
+        setMessages([]);
+        setStatus("Setting deleted; created starter Setting");
+        return;
+      }
+
+      const nextSetting = await getSetting(remaining[0].setting_id);
+      setSetting(nextSetting);
+      setEditorFieldsFromSetting(nextSetting);
+      setMessages(
+        soul
+          ? await listConversationMessages(
+              conversationIdForSettingAndSoul(nextSetting.setting_id, soul.character_id),
+            )
+          : [],
+      );
+      setStatus("Setting deleted; selected next local Setting");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleSaveSoul() {
     if (!soul) return;
     setBusy(true);
     try {
-      const nextSoul = applyCreatorFields(soul);
+      const activeSetting = await persistCurrentSetting();
+      const nextSoul = activeSetting
+        ? mirrorSettingIntoSoul(applyCreatorFields(soul), activeSetting)
+        : applyCreatorFields(soul);
       await upsertSoul(nextSoul);
       setSoul(nextSoul);
       await saveSoulFile(`${nextSoul.character_name.replace(/\s+/g, "_")}.soul.json`, nextSoul);
       setSouls(await listSouls());
       setStatus("Soul exported beside the app working directory");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSaveSetting() {
+    if (!setting) return;
+    setBusy(true);
+    try {
+      const nextSetting = applySettingFields(setting);
+      await upsertSetting(nextSetting);
+      setSetting(nextSetting);
+      setEditorFieldsFromSetting(nextSetting);
+      await saveSettingFile(
+        `${nextSetting.setting_name.replace(/\s+/g, "_")}.setting.json`,
+        nextSetting,
+      );
+      setSettings(await listSettings());
+      setStatus("Setting exported beside the app working directory");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -459,9 +657,43 @@ export function App() {
       await upsertSoul(importedSoul);
       setSoul(importedSoul);
       setCreatorFieldsFromSoul(importedSoul);
-      setMessages(await listConversationMessages(conversationIdForSoul(importedSoul.character_id)));
+      setMessages(
+        await listConversationMessages(
+          setting
+            ? conversationIdForSettingAndSoul(setting.setting_id, importedSoul.character_id)
+            : conversationIdForSoul(importedSoul.character_id),
+        ),
+      );
       setSouls(await listSouls());
       setStatus(`Imported ${importedSoul.character_name}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleImportSettingFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    setBusy(true);
+    try {
+      const raw = JSON.parse(await file.text());
+      const importedSetting = settingFromImport(raw, file.name);
+      await upsertSetting(importedSetting);
+      setSetting(importedSetting);
+      setEditorFieldsFromSetting(importedSetting);
+      setSettings(await listSettings());
+      setMessages(
+        soul
+          ? await listConversationMessages(
+              conversationIdForSettingAndSoul(importedSetting.setting_id, soul.character_id),
+            )
+          : [],
+      );
+      setStatus(`Imported ${importedSetting.setting_name}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -899,6 +1131,14 @@ export function App() {
         <section className="setting-section">
           <h2>Setting</h2>
           <label className="field">
+            <span>Name</span>
+            <input
+              value={settingName}
+              onChange={(event) => setSettingName(event.target.value)}
+              placeholder="Setting name"
+            />
+          </label>
+          <label className="field">
             <span>Location</span>
             <textarea
               value={worldDraft.location}
@@ -940,6 +1180,71 @@ export function App() {
           </label>
         </section>
 
+        <div className="button-grid setting-actions">
+          <input
+            ref={settingImportInputRef}
+            className="hidden-file"
+            type="file"
+            accept="application/json,.json,.setting,.mne"
+            onChange={handleImportSettingFile}
+          />
+          <button
+            title="New Setting"
+            onClick={handleCreateSetting}
+            disabled={busy}
+          >
+            <Sparkles size={18} />
+          </button>
+          <button
+            title="Import Setting"
+            onClick={() => settingImportInputRef.current?.click()}
+            disabled={busy}
+          >
+            <FileUp size={18} />
+          </button>
+          <button title="Export Setting" onClick={handleSaveSetting} disabled={!setting || busy}>
+            <FileDown size={18} />
+          </button>
+          <button
+            title="Persist current Setting"
+            onClick={async () => {
+              const nextSetting = await persistCurrentSetting();
+              if (nextSetting) setStatus("Setting persisted");
+            }}
+            disabled={!setting || busy}
+          >
+            <Save size={18} />
+          </button>
+          <button
+            className="danger-button"
+            title="Delete selected Setting"
+            onClick={handleDeleteSetting}
+            disabled={!setting || busy}
+          >
+            <Trash2 size={18} />
+          </button>
+        </div>
+
+        <section className="compact-list" aria-label="Saved settings">
+          <h2>Local Settings</h2>
+          {settings.length === 0 ? (
+            <p className="muted">No saved Settings yet.</p>
+          ) : (
+            settings.map((item) => (
+              <button
+                key={item.setting_id}
+                className={`soul-row ${setting?.setting_id === item.setting_id ? "selected" : ""}`}
+                onClick={() => handleSelectSetting(item.setting_id)}
+              >
+                <span>{item.setting_name}</span>
+                <small>
+                  {item.turn_counter} turns / {item.location}
+                </small>
+              </button>
+            ))
+          )}
+        </section>
+
         <div className="button-grid">
           <input
             ref={importInputRef}
@@ -962,11 +1267,14 @@ export function App() {
             title="Persist current Soul"
             onClick={async () => {
               if (!soul) return;
-              const nextSoul = applyCreatorFields(soul);
+              const activeSetting = await persistCurrentSetting();
+              const nextSoul = activeSetting
+                ? mirrorSettingIntoSoul(applyCreatorFields(soul), activeSetting)
+                : applyCreatorFields(soul);
               await upsertSoul(nextSoul);
               setSoul(nextSoul);
               setSouls(await listSouls());
-              setStatus("Soul persisted");
+              setStatus("Soul and active Setting persisted");
             }}
             disabled={!soul || busy}
           >
@@ -1080,6 +1388,10 @@ function conversationIdForSoul(soulId: string) {
   return `local-mock-${soulId}`;
 }
 
+function conversationIdForSettingAndSoul(settingId: string, soulId: string) {
+  return `local-mock-${settingId}-${soulId}`;
+}
+
 function psycheFromSoul(soul: Soul): PsycheDraft {
   const relationship = soul.relationships.user ?? PSYCHE_PRESETS.Custom.relationship;
   return {
@@ -1122,6 +1434,15 @@ function worldDraftFromSoul(soul: Soul): WorldDraft {
     activePlots: soul.world.active_plots.join("\n") || "Establish the first scene",
     keyObjects: soul.world.key_objects.join("\n"),
     timeElapsed: soul.world.time_elapsed || "Session start",
+  };
+}
+
+function worldDraftFromSetting(setting: SettingSoul): WorldDraft {
+  return {
+    location: setting.world.location || "Unspecified starting scene.",
+    activePlots: setting.world.active_plots.join("\n") || "Establish the first scene",
+    keyObjects: setting.world.key_objects.join("\n"),
+    timeElapsed: setting.world.time_elapsed || "Session start",
   };
 }
 
@@ -1187,6 +1508,38 @@ async function soulFromImport(raw: unknown, fallbackName: string) {
         : base.world.active_plots,
     },
   } as Soul;
+}
+
+function settingFromImport(raw: unknown, fallbackName: string): SettingSoul {
+  const record = isRecord(raw) && isRecord(raw.setting) ? raw.setting : raw;
+  if (!isRecord(record)) {
+    throw new Error("Import file must be a Setting JSON object or package with a setting field");
+  }
+
+  const world = isRecord(record.world) ? record.world : record;
+  const fallbackSettingName = fallbackName.replace(/\.[^.]+$/, "");
+  return {
+    schema_version: Number(record.schema_version) || 1,
+    setting_id: stringFrom(record.setting_id) || crypto.randomUUID(),
+    setting_name:
+      stringFrom(record.setting_name) || stringFrom(record.name) || fallbackSettingName,
+    last_updated: Math.floor(Date.now() / 1000),
+    turn_counter: Number(record.turn_counter) || 0,
+    world: {
+      location:
+        stringFrom(world.location) ||
+        stringFrom(record.location) ||
+        "Unspecified starting scene.",
+      active_plots: stringArrayFrom(world.active_plots).length
+        ? stringArrayFrom(world.active_plots)
+        : stringArrayFrom(record.active_plots).length
+          ? stringArrayFrom(record.active_plots)
+          : ["Establish the first scene"],
+      recent_events: stringArrayFrom(world.recent_events),
+      key_objects: stringArrayFrom(world.key_objects),
+      time_elapsed: stringFrom(world.time_elapsed) || "Session start",
+    },
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
