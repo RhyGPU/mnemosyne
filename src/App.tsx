@@ -1,15 +1,16 @@
 import {
+  ArrowLeft,
   Brain,
   ChevronDown,
   Database,
   FileDown,
   FileUp,
   MessageSquareText,
-  MessageSquareX,
   Play,
   RefreshCcw,
   Save,
   Sparkles,
+  Square,
   Trash2,
 } from "lucide-react";
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -26,6 +27,7 @@ import {
   createDefaultSoul,
   createDefaultSetting,
   deleteConversation,
+  deleteMessage,
   deleteSetting,
   deleteSoul,
   getSetting,
@@ -46,6 +48,7 @@ const DEFAULT_CONVERSATION_ID = "local-mock";
 const CONSOLIDATION_INTERVAL_TURNS = 10;
 type ProviderKind = "Mock" | "API";
 type NarrativeMode = "Realistic" | "Reader" | "God" | "Custom";
+type AppView = "library" | "chat";
 type PsychePresetName =
   | "Stranger"
   | "Traumatized Survivor"
@@ -155,6 +158,8 @@ export function App() {
   });
   const [psychePreset, setPsychePreset] = useState<PsychePresetName>("Custom");
   const [psyche, setPsyche] = useState<PsycheDraft>(PSYCHE_PRESETS.Custom);
+  const [settingEditorOpen, setSettingEditorOpen] = useState(false);
+  const [soulEditorOpen, setSoulEditorOpen] = useState(false);
   const [psycheOpen, setPsycheOpen] = useState(false);
   const [provider, setProvider] = useState<ProviderKind>("Mock");
   const [mode, setMode] = useState<NarrativeMode>("Reader");
@@ -165,11 +170,14 @@ export function App() {
     system_prompt: "",
   });
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
+  const [view, setView] = useState<AppView>("library");
   const [status, setStatus] = useState("Ready");
   const [busy, setBusy] = useState(false);
   const didBootstrap = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const settingImportInputRef = useRef<HTMLInputElement>(null);
+  const generationAbortRef = useRef<AbortController | null>(null);
+  const generationIdRef = useRef(0);
   const currentConversationId = useMemo(
     () =>
       soul && setting
@@ -455,14 +463,14 @@ export function App() {
     }
   }
 
-  async function handleSubmit(event: FormEvent) {
-    event.preventDefault();
-    const text = draft.trim();
+  async function executeTurn(text: string, statusLabel?: string) {
     if (!text || busy || !soul) return;
-
+    const generationId = generationIdRef.current + 1;
+    generationIdRef.current = generationId;
+    const abortController = new AbortController();
+    generationAbortRef.current = abortController;
     setBusy(true);
-    setDraft("");
-    setStatus(provider === "API" ? "API provider thinking" : "Mock provider thinking");
+    setStatus(statusLabel ?? (provider === "API" ? "API provider thinking" : "Mock provider thinking"));
 
     try {
       const activeSetting = await persistCurrentSetting();
@@ -470,8 +478,18 @@ export function App() {
       await upsertSoul(activeSoul);
       const result =
         provider === "API"
-          ? await sendApiTurn(currentConversationId, activeSoul.character_id, text, mode, apiSettings)
+          ? await sendApiTurn(
+              currentConversationId,
+              activeSoul.character_id,
+              text,
+              mode,
+              apiSettings,
+              abortController.signal,
+            )
           : await sendMockTurn(currentConversationId, activeSoul.character_id, text, mode);
+      if (generationIdRef.current !== generationId || abortController.signal.aborted) {
+        return;
+      }
       if (activeSetting) {
         const updatedSetting = {
           ...activeSetting,
@@ -490,10 +508,85 @@ export function App() {
       setSouls(await listSouls());
       setStatus(result.consolidation_ran ? "Turn saved; consolidation ran" : "Turn saved");
     } catch (error) {
+      if (abortController.signal.aborted) {
+        setStatus("Generation stopped");
+      } else {
+        setStatus(error instanceof Error ? error.message : String(error));
+      }
+    } finally {
+      if (generationIdRef.current === generationId) {
+        setBusy(false);
+        generationAbortRef.current = null;
+      }
+    }
+  }
+
+  async function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    const text = draft.trim();
+    if (!text || busy || !soul) return;
+
+    setDraft("");
+    await executeTurn(text);
+  }
+
+  async function handleRegenerate() {
+    if (busy || !soul) return;
+    const lastUserMessage = [...activeMessages].reverse().find((message) => message.role === "user");
+    if (!lastUserMessage) {
+      setStatus("No user message to regenerate");
+      return;
+    }
+    await executeTurn(lastUserMessage.content, "Regenerating last turn");
+  }
+
+  async function handleRegenerateFromMessage(message: ChatMessage) {
+    if (busy || !soul || message.role !== "assistant") return;
+    const messageIndex = activeMessages.findIndex((item) => item.id === message.id);
+    const previousUserMessage = activeMessages
+      .slice(0, messageIndex)
+      .reverse()
+      .find((item) => item.role === "user");
+
+    if (!previousUserMessage) {
+      setStatus("No user prompt found for this response");
+      return;
+    }
+
+    await executeTurn(previousUserMessage.content, "Regenerating response");
+  }
+
+  async function handleDeleteChatMessage(message: ChatMessage) {
+    if (busy) return;
+    const confirmed = window.confirm(
+      message.role === "assistant"
+        ? "Delete this generated response? Soul memory is not rewound."
+        : "Delete this user message? Soul memory and later responses are not rewound.",
+    );
+    if (!confirmed) return;
+
+    setBusy(true);
+    try {
+      await deleteMessage(message.conversation_id, message.id);
+      const nextMessages = await listConversationMessages(message.conversation_id);
+      setMessages(nextMessages);
+      if (soul) {
+        setContext(await compileContext(soul.character_id, message.conversation_id));
+      }
+      setStatus(message.role === "assistant" ? "Generated response deleted" : "User message deleted");
+    } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(false);
     }
+  }
+
+  function handleStopGeneration() {
+    generationAbortRef.current?.abort();
+    generationIdRef.current += 1;
+    generationAbortRef.current = null;
+    setBusy(false);
+    setStatus("Generation stopped");
   }
 
   async function handleConsolidate() {
@@ -723,635 +816,1006 @@ export function App() {
     [messages],
   );
 
-  return (
-    <main className="app-shell">
-      <aside className="character-panel">
-        <header className="panel-header">
-          <div>
-            <span className="eyebrow">Soul</span>
-            <h1>{soul?.character_name ?? "Mnemosyne"}</h1>
-          </div>
-          <Brain aria-hidden="true" />
-        </header>
-
-        <div className="avatar" aria-hidden="true">
-          {soul?.character_name.slice(0, 1) ?? "M"}
-        </div>
-
-        <section className="creator-section">
-          <h2>Identity</h2>
-
-        <label className="field">
-          <span>Character</span>
-          <input
-            value={characterName}
-            onChange={(event) => setCharacterName(event.target.value)}
-            placeholder="Character name"
-          />
-        </label>
-
-        <label className="field">
-          <span>Appearance</span>
-          <textarea
-            value={characterAppearance}
-            onChange={(event) => setCharacterAppearance(event.target.value)}
-            placeholder="Visual details, outfit, body language"
-          />
-        </label>
-
-        <label className="field">
-          <span>Scenario Notes</span>
-          <textarea
-            value={characterScenario}
-            onChange={(event) => setCharacterScenario(event.target.value)}
-            placeholder="Character-specific role, premise, or card notes"
-          />
-        </label>
-
-        <label className="field">
-          <span>Personality</span>
-          <textarea
-            value={characterPersonality}
-            onChange={(event) => setCharacterPersonality(event.target.value)}
-            placeholder="Voice, motives, boundaries"
-          />
-        </label>
-
-        <label className="field">
-          <span>Description</span>
-          <textarea
-            value={characterDescription}
-            onChange={(event) => setCharacterDescription(event.target.value)}
-            placeholder="Backstory or character card notes"
-          />
-        </label>
-        </section>
-
-        <section className={`creator-section collapsible-section ${psycheOpen ? "open" : ""}`}>
-          <button
-            className="section-toggle"
-            type="button"
-            onClick={() => setPsycheOpen((open) => !open)}
-            aria-expanded={psycheOpen}
-          >
-            <span>
-              <span className="eyebrow">Preset: {psychePreset}</span>
-              <strong>Starting Psyche</strong>
-            </span>
-            <ChevronDown size={18} aria-hidden="true" />
+  if (view === "chat") {
+    return (
+      <main className="chat-only-shell">
+        <header className="chat-only-header">
+          <button className="ghost-action" onClick={() => setView("library")} disabled={busy}>
+            <ArrowLeft size={18} />
+            <span>Library</span>
           </button>
-
-          {psycheOpen ? (
-            <div className="collapsible-content">
-              <label className="field">
-                <span>Preset</span>
-                <select
-                  value={psychePreset}
-                  onChange={(event) => handlePresetChange(event.target.value as PsychePresetName)}
-                >
-                  {Object.keys(PSYCHE_PRESETS).map((presetName) => (
-                    <option key={presetName}>{presetName}</option>
-                  ))}
-                </select>
-              </label>
-
-              <div className="slider-group">
-                <h3>Global Traits</h3>
-                <RangeField
-                  label="Fear Baseline"
-                  value={psyche.global.fear_baseline}
-                  onChange={(value) =>
-                    updatePsyche((current) => ({
-                      ...current,
-                      global: { ...current.global, fear_baseline: value },
-                    }))
-                  }
-                />
-                <RangeField
-                  label="Resolve"
-                  value={psyche.global.resolve}
-                  onChange={(value) =>
-                    updatePsyche((current) => ({
-                      ...current,
-                      global: { ...current.global, resolve: value },
-                    }))
-                  }
-                />
-                <RangeField
-                  label="Shame"
-                  value={psyche.global.shame}
-                  onChange={(value) =>
-                    updatePsyche((current) => ({
-                      ...current,
-                      global: { ...current.global, shame: value },
-                    }))
-                  }
-                />
-                <RangeField
-                  label="Openness"
-                  value={psyche.global.openness}
-                  onChange={(value) =>
-                    updatePsyche((current) => ({
-                      ...current,
-                      global: { ...current.global, openness: value },
-                    }))
-                  }
-                />
-              </div>
-
-              <div className="slider-group">
-                <h3>Needs</h3>
-                {["Physiological", "Safety", "Belonging", "Esteem", "Actualization"].map(
-                  (label, index) => (
-                    <RangeField
-                      key={label}
-                      label={label}
-                      value={psyche.maslow[index]}
-                      onChange={(value) =>
-                        updatePsyche((current) => {
-                          const maslow = [...current.maslow] as PsycheDraft["maslow"];
-                          maslow[index] = value;
-                          return { ...current, maslow };
-                        })
-                      }
-                    />
-                  ),
-                )}
-              </div>
-
-              <div className="slider-group">
-                <h3>SDT</h3>
-                {["Autonomy", "Competence", "Relatedness"].map((label, index) => (
-                  <RangeField
-                    key={label}
-                    label={label}
-                    value={psyche.sdt[index]}
-                    onChange={(value) =>
-                      updatePsyche((current) => {
-                        const sdt = [...current.sdt] as PsycheDraft["sdt"];
-                        sdt[index] = value;
-                        return { ...current, sdt };
-                      })
-                    }
-                  />
-                ))}
-              </div>
-
-              <div className="slider-group">
-                <h3>Trauma</h3>
-                <RangeField
-                  label="Phase"
-                  min={0}
-                  max={4}
-                  value={psyche.trauma.phase}
-                  onChange={(value) =>
-                    updatePsyche((current) => ({
-                      ...current,
-                      trauma: { ...current.trauma, phase: value },
-                    }))
-                  }
-                />
-                {[
-                  ["Hypervigilance", "hypervigilance"],
-                  ["Flashbacks", "flashbacks"],
-                  ["Numbing", "numbing"],
-                  ["Avoidance", "avoidance"],
-                ].map(([label, key]) => (
-                  <RangeField
-                    key={key}
-                    label={label}
-                    value={psyche.trauma[key as keyof PsycheDraft["trauma"]]}
-                    onChange={(value) =>
-                      updatePsyche((current) => ({
-                        ...current,
-                        trauma: { ...current.trauma, [key]: value },
-                      }))
-                    }
-                  />
-                ))}
-              </div>
-
-              <div className="slider-group">
-                <h3>Relationship</h3>
-                {[
-                  ["Trust", "trust", -100, 100],
-                  ["Affection", "affection", -100, 100],
-                  ["Intimacy", "intimacy", -100, 100],
-                  ["Passion", "passion", -100, 100],
-                  ["Commitment", "commitment", -100, 100],
-                  ["Fear", "fear", 0, 100],
-                  ["Desire", "desire", -100, 100],
-                ].map(([label, key, min, max]) => (
-                  <RangeField
-                    key={key}
-                    label={String(label)}
-                    min={Number(min)}
-                    max={Number(max)}
-                    value={psyche.relationship[key as keyof PsycheDraft["relationship"]]}
-                    onChange={(value) =>
-                      updatePsyche((current) => ({
-                        ...current,
-                        relationship: { ...current.relationship, [String(key)]: value },
-                      }))
-                    }
-                  />
-                ))}
-              </div>
-            </div>
-          ) : null}
-        </section>
-
-        <button className="wide-button" onClick={handleCreateSoul} disabled={busy}>
-          <Sparkles size={18} />
-          New Soul
-        </button>
-
-        <section className="compact-list" aria-label="Saved souls">
-          <h2>Local Souls</h2>
-          {souls.length === 0 ? (
-            <p className="muted">No saved Souls yet.</p>
-          ) : (
-            souls.map((item) => (
-              <button
-                key={item.character_id}
-                className={`soul-row ${soul?.character_id === item.character_id ? "selected" : ""}`}
-                onClick={() => handleSelectSoul(item.character_id)}
-              >
-                <span>{item.character_name}</span>
-                <small>
-                  {item.core_count} core / {item.recent_count} recent
-                </small>
-              </button>
-            ))
-          )}
-        </section>
-
-        <section className="stat-grid" aria-label="Relationship stats">
-          <Stat label="Trust" value={relationship?.trust ?? 0} />
-          <Stat label="Affection" value={relationship?.affection ?? 0} />
-          <Stat label="Fear" value={relationship?.fear ?? 0} />
-          <Stat label="Turns" value={soul?.turn_counter ?? 0} />
-          <Stat label="Since Sleep" value={turnsSinceConsolidation} />
-          <Stat label="Schemas" value={soul?.memory.schemas.length ?? 0} />
-        </section>
-
-        <section className="memory-section">
-          <h2>Core Memories</h2>
-          {(soul?.memory.core ?? []).slice(0, 4).map((memory) => (
-            <p key={memory}>{memory}</p>
-          ))}
-        </section>
-
-        <section className="memory-section">
-          <h2>Schemas</h2>
-          {(soul?.memory.schemas ?? []).map((schema) => (
-            <p key={schema.schema_type}>
-              <strong>{schema.schema_type}</strong>: {schema.summary}
-            </p>
-          ))}
-        </section>
-      </aside>
-
-      <section className="chat-panel">
-        <div className="chat-header">
           <div>
-            <span className="eyebrow">Provider: {provider} / {mode}</span>
-            <h2>Chat Window</h2>
+            <span className="eyebrow">
+              {setting?.setting_name ?? "Local Setting"} / {provider} / {mode}
+            </span>
+            <h1>{soul?.character_name ?? "Mnemosyne"}</h1>
           </div>
           <div className="token-pill">
             {context?.estimated_tokens ?? 0}
             <span>tok</span>
           </div>
-        </div>
+        </header>
 
-        <div className="message-list">
+        <section className="chat-only-body">
           {activeMessages.length === 0 ? (
             <div className="empty-state">
               <MessageSquareText size={34} />
-              <p>Start a local mock turn to exercise memory, hidden state, and context compilation.</p>
+              <p>No messages yet.</p>
             </div>
           ) : (
             activeMessages.map((message) => (
               <article className={`message ${message.role}`} key={message.id}>
-                <span>{message.role === "user" ? "User" : "Narrator"}</span>
+                <div className="message-heading">
+                  <span>{message.role === "user" ? "User" : "Narrator"}</span>
+                  {message.role === "assistant" ? (
+                    <div className="message-tools">
+                      <button
+                        title="Regenerate this response"
+                        onClick={() => handleRegenerateFromMessage(message)}
+                        disabled={busy}
+                      >
+                        <RefreshCcw size={14} />
+                      </button>
+                      <button
+                        title="Delete this response"
+                        onClick={() => handleDeleteChatMessage(message)}
+                        disabled={busy}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="message-tools">
+                      <button
+                        title="Delete this message"
+                        onClick={() => handleDeleteChatMessage(message)}
+                        disabled={busy}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  )}
+                </div>
                 <p>{message.content}</p>
               </article>
             ))
           )}
-        </div>
+        </section>
 
-        <form className="composer" onSubmit={handleSubmit}>
+        <form className="chat-only-composer" onSubmit={handleSubmit}>
           <input
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             placeholder="Type message..."
             disabled={busy}
           />
-          <button aria-label="Send message" disabled={busy || !draft.trim() || !soul}>
-            <Play size={18} />
-          </button>
+          {busy ? (
+            <button type="button" aria-label="Stop generation" onClick={handleStopGeneration}>
+              <Square size={16} />
+            </button>
+          ) : (
+            <button aria-label="Send message" disabled={!draft.trim() || !soul}>
+              <Play size={18} />
+            </button>
+          )}
         </form>
-      </section>
+      </main>
+    );
+  }
 
-      <aside className="controls-panel">
-        <header className="panel-header">
-          <div>
-            <span className="eyebrow">Controls</span>
-            <h2>Session</h2>
+  return (
+    <main className="app-shell">
+      <section className="library-grid">
+        <section className="workspace-card library-card">
+          <header className="panel-header">
+            <div>
+              <span className="eyebrow">Scenes</span>
+              <h2>Local Settings</h2>
+            </div>
+            <Database aria-hidden="true" />
+          </header>
+
+          <div className="action-grid compact-actions">
+            <input
+              ref={settingImportInputRef}
+              className="hidden-file"
+              type="file"
+              accept="application/json,.json,.setting,.mne"
+              onChange={handleImportSettingFile}
+            />
+            <button title="New Setting" onClick={handleCreateSetting} disabled={busy}>
+              <Sparkles size={18} />
+              <span>New</span>
+            </button>
+            <button
+              title="Import Setting"
+              onClick={() => settingImportInputRef.current?.click()}
+              disabled={busy}
+            >
+              <FileUp size={18} />
+              <span>Import</span>
+            </button>
+            <button title="Export Setting" onClick={handleSaveSetting} disabled={!setting || busy}>
+              <FileDown size={18} />
+              <span>Export</span>
+            </button>
+            <button
+              title="Persist current Setting"
+              onClick={async () => {
+                const nextSetting = await persistCurrentSetting();
+                if (nextSetting) setStatus("Setting persisted");
+              }}
+              disabled={!setting || busy}
+            >
+              <Save size={18} />
+              <span>Save</span>
+            </button>
+            <button
+              className="danger-button"
+              title="Delete selected Setting"
+              onClick={handleDeleteSetting}
+              disabled={!setting || busy}
+            >
+              <Trash2 size={18} />
+              <span>Delete</span>
+            </button>
           </div>
-          <Database aria-hidden="true" />
-        </header>
 
-        <label className="field">
-          <span>Provider</span>
-          <select
-            value={provider}
-            onChange={(event) => setProvider(event.target.value as ProviderKind)}
-          >
-            <option>Mock</option>
-            <option>API</option>
-          </select>
-        </label>
+          <section className="compact-list library-list" aria-label="Saved settings">
+            {settings.length === 0 ? (
+              <p className="muted">No saved Settings yet.</p>
+            ) : (
+              settings.map((item) => (
+                <button
+                  key={item.setting_id}
+                  className={`soul-row ${setting?.setting_id === item.setting_id ? "selected" : ""}`}
+                  onClick={() => handleSelectSetting(item.setting_id)}
+                >
+                  <span>{item.setting_name}</span>
+                  <small>
+                    {item.turn_counter} turns / {item.location}
+                  </small>
+                </button>
+              ))
+            )}
+          </section>
 
-        {provider === "API" ? (
-          <section className="provider-settings">
-            <label className="field">
-              <span>Base URL</span>
-              <input
-                value={apiSettings.base_url}
-                onChange={(event) =>
-                  setApiSettings((current) => ({ ...current, base_url: event.target.value }))
-                }
-                placeholder="https://api.openai.com/v1"
-              />
-            </label>
-            <label className="field">
-              <span>Model</span>
-              <input
-                value={apiSettings.model}
-                onChange={(event) =>
-                  setApiSettings((current) => ({ ...current, model: event.target.value }))
-                }
-                placeholder="Model name"
-              />
-            </label>
-            <label className="field">
-              <span>API Key</span>
-              <input
-                type="password"
-                value={apiSettings.api_key}
-                onChange={(event) =>
-                  setApiSettings((current) => ({ ...current, api_key: event.target.value }))
-                }
-                placeholder="Stored only in this session"
-              />
-            </label>
-            {mode === "Custom" ? (
-              <label className="field">
-                <span>Custom Prompt</span>
-                <textarea
-                  value={apiSettings.system_prompt}
-                  onChange={(event) =>
-                    setApiSettings((current) => ({
-                      ...current,
-                      system_prompt: event.target.value,
-                    }))
-                  }
-                />
-              </label>
+          <section className={`collapsible-section ${settingEditorOpen ? "open" : ""}`}>
+            <button
+              className="section-toggle studio-toggle"
+              type="button"
+              onClick={() => setSettingEditorOpen((open) => !open)}
+              aria-expanded={settingEditorOpen}
+            >
+              <span>
+                <span className="eyebrow">World</span>
+                <strong>{setting?.setting_name ?? "Environment Creator"}</strong>
+              </span>
+              <ChevronDown size={18} aria-hidden="true" />
+            </button>
+
+            {settingEditorOpen ? (
+              <div className="collapsible-content">
+                <div className="form-grid single-column-form">
+                  <label className="field">
+                    <span>Name</span>
+                    <input
+                      value={settingName}
+                      onChange={(event) => setSettingName(event.target.value)}
+                      placeholder="Setting name"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Location</span>
+                    <textarea
+                      value={worldDraft.location}
+                      onChange={(event) =>
+                        setWorldDraft((current) => ({ ...current, location: event.target.value }))
+                      }
+                      placeholder="Shared scene location"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Active Plots</span>
+                    <textarea
+                      value={worldDraft.activePlots}
+                      onChange={(event) =>
+                        setWorldDraft((current) => ({
+                          ...current,
+                          activePlots: event.target.value,
+                        }))
+                      }
+                      placeholder="One plot per line"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Key Objects</span>
+                    <textarea
+                      value={worldDraft.keyObjects}
+                      onChange={(event) =>
+                        setWorldDraft((current) => ({
+                          ...current,
+                          keyObjects: event.target.value,
+                        }))
+                      }
+                      placeholder="One object per line"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Time</span>
+                    <input
+                      value={worldDraft.timeElapsed}
+                      onChange={(event) =>
+                        setWorldDraft((current) => ({
+                          ...current,
+                          timeElapsed: event.target.value,
+                        }))
+                      }
+                      placeholder="Session start"
+                    />
+                  </label>
+                </div>
+              </div>
             ) : null}
           </section>
-        ) : null}
-
-        <label className="field">
-          <span>Mode</span>
-          <select
-            value={mode}
-            onChange={(event) => setMode(event.target.value as NarrativeMode)}
-          >
-            <option>Realistic</option>
-            <option>Reader</option>
-            <option>God</option>
-            <option>Custom</option>
-          </select>
-        </label>
-
-        <section className="diagnostics-section api-debug-section">
-          <h2>API Debug</h2>
-          <dl className="diagnostic-grid">
-            <div>
-              <dt>Provider</dt>
-              <dd>{lastTurnDebug?.provider ?? provider}</dd>
-            </div>
-            <div>
-              <dt>Hidden</dt>
-              <dd>
-                {lastTurnDebug
-                  ? lastTurnDebug.hidden_state_found
-                    ? "Parsed"
-                    : "Missing"
-                  : "No turn"}
-              </dd>
-            </div>
-            <div>
-              <dt>Fallback</dt>
-              <dd>{lastTurnDebug?.fallback_hidden_state_generated ? "Generated" : "No"}</dd>
-            </div>
-            <div>
-              <dt>Tag</dt>
-              <dd>{lastTurnDebug?.tag ?? "-"}</dd>
-            </div>
-            <div>
-              <dt>Trust</dt>
-              <dd>{formatDebugDelta(lastTurnDebug?.trust_delta)}</dd>
-            </div>
-            <div>
-              <dt>Affection</dt>
-              <dd>{formatDebugDelta(lastTurnDebug?.affection_delta)}</dd>
-            </div>
-            <div>
-              <dt>Location</dt>
-              <dd>{lastTurnDebug?.new_location ?? "-"}</dd>
-            </div>
-            <div>
-              <dt>Present</dt>
-              <dd>{lastTurnDebug?.present_characters.join(", ") || "-"}</dd>
-            </div>
-          </dl>
         </section>
 
-        <section className="setting-section">
-          <h2>Setting</h2>
-          <label className="field">
-            <span>Name</span>
+        <section className="workspace-card library-card">
+          <header className="panel-header character-heading">
+            <div>
+              <span className="eyebrow">Characters</span>
+              <h2>Local Souls</h2>
+            </div>
+            <div className="avatar" aria-hidden="true">
+              {soul?.character_name.slice(0, 1) ?? "M"}
+            </div>
+          </header>
+
+          <div className="action-grid compact-actions">
             <input
-              value={settingName}
-              onChange={(event) => setSettingName(event.target.value)}
-              placeholder="Setting name"
+              ref={importInputRef}
+              className="hidden-file"
+              type="file"
+              accept="application/json,.json,.soul,.mne"
+              onChange={handleImportSoulFile}
             />
-          </label>
-          <label className="field">
-            <span>Location</span>
-            <textarea
-              value={worldDraft.location}
-              onChange={(event) =>
-                setWorldDraft((current) => ({ ...current, location: event.target.value }))
-              }
-              placeholder="Shared scene location"
-            />
-          </label>
-          <label className="field">
-            <span>Active Plots</span>
-            <textarea
-              value={worldDraft.activePlots}
-              onChange={(event) =>
-                setWorldDraft((current) => ({ ...current, activePlots: event.target.value }))
-              }
-              placeholder="One plot per line"
-            />
-          </label>
-          <label className="field">
-            <span>Key Objects</span>
-            <textarea
-              value={worldDraft.keyObjects}
-              onChange={(event) =>
-                setWorldDraft((current) => ({ ...current, keyObjects: event.target.value }))
-              }
-              placeholder="One object per line"
-            />
-          </label>
-          <label className="field">
-            <span>Time</span>
-            <input
-              value={worldDraft.timeElapsed}
-              onChange={(event) =>
-                setWorldDraft((current) => ({ ...current, timeElapsed: event.target.value }))
-              }
-              placeholder="Session start"
-            />
-          </label>
+            <button title="New Soul" onClick={handleCreateSoul} disabled={busy}>
+              <Sparkles size={18} />
+              <span>New</span>
+            </button>
+            <button
+              title="Import Soul"
+              onClick={() => importInputRef.current?.click()}
+              disabled={busy}
+            >
+              <FileUp size={18} />
+              <span>Import</span>
+            </button>
+            <button title="Export Soul" onClick={handleSaveSoul} disabled={!soul || busy}>
+              <FileDown size={18} />
+              <span>Export</span>
+            </button>
+            <button
+              title="Persist current Soul"
+              onClick={async () => {
+                if (!soul) return;
+                const activeSetting = await persistCurrentSetting();
+                const nextSoul = activeSetting
+                  ? mirrorSettingIntoSoul(applyCreatorFields(soul), activeSetting)
+                  : applyCreatorFields(soul);
+                await upsertSoul(nextSoul);
+                setSoul(nextSoul);
+                setSouls(await listSouls());
+                setStatus("Soul and active Setting persisted");
+              }}
+              disabled={!soul || busy}
+            >
+              <Save size={18} />
+              <span>Save</span>
+            </button>
+            <button title="Run consolidation" onClick={handleConsolidate} disabled={!soul || busy}>
+              <RefreshCcw size={18} />
+              <span>Sleep</span>
+            </button>
+            <button
+              className="danger-button"
+              title="Delete selected Soul"
+              onClick={handleDeleteSoul}
+              disabled={!soul || busy}
+            >
+              <Trash2 size={18} />
+              <span>Delete</span>
+            </button>
+          </div>
+
+          <section className="compact-list library-list" aria-label="Saved souls">
+            {souls.length === 0 ? (
+              <p className="muted">No saved Souls yet.</p>
+            ) : (
+              souls.map((item) => (
+                <button
+                  key={item.character_id}
+                  className={`soul-row ${soul?.character_id === item.character_id ? "selected" : ""}`}
+                  onClick={() => handleSelectSoul(item.character_id)}
+                >
+                  <span>{item.character_name}</span>
+                  <small>
+                    {item.core_count} core / {item.recent_count} recent
+                  </small>
+                </button>
+              ))
+            )}
+          </section>
+
+          <section className={`collapsible-section ${soulEditorOpen ? "open" : ""}`}>
+            <button
+              className="section-toggle studio-toggle"
+              type="button"
+              onClick={() => setSoulEditorOpen((open) => !open)}
+              aria-expanded={soulEditorOpen}
+            >
+              <span>
+                <span className="eyebrow">Soul</span>
+                <strong>{soul?.character_name ?? "Character Creator"}</strong>
+              </span>
+              <ChevronDown size={18} aria-hidden="true" />
+            </button>
+
+            {soulEditorOpen ? (
+              <div className="collapsible-content">
+                <div className="form-grid single-column-form">
+                  <label className="field">
+                    <span>Character</span>
+                    <input
+                      value={characterName}
+                      onChange={(event) => setCharacterName(event.target.value)}
+                      placeholder="Character name"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Appearance</span>
+                    <textarea
+                      value={characterAppearance}
+                      onChange={(event) => setCharacterAppearance(event.target.value)}
+                      placeholder="Visual details, outfit, body language"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Scenario Notes</span>
+                    <textarea
+                      value={characterScenario}
+                      onChange={(event) => setCharacterScenario(event.target.value)}
+                      placeholder="Character-specific role, premise, or card notes"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Personality</span>
+                    <textarea
+                      value={characterPersonality}
+                      onChange={(event) => setCharacterPersonality(event.target.value)}
+                      placeholder="Voice, motives, boundaries"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Description</span>
+                    <textarea
+                      value={characterDescription}
+                      onChange={(event) => setCharacterDescription(event.target.value)}
+                      placeholder="Backstory or character card notes"
+                    />
+                  </label>
+                </div>
+
+                <section className={`collapsible-section ${psycheOpen ? "open" : ""}`}>
+                  <button
+                    className="section-toggle"
+                    type="button"
+                    onClick={() => setPsycheOpen((open) => !open)}
+                    aria-expanded={psycheOpen}
+                  >
+                    <span>
+                      <span className="eyebrow">Preset: {psychePreset}</span>
+                      <strong>Starting Psyche</strong>
+                    </span>
+                    <ChevronDown size={18} aria-hidden="true" />
+                  </button>
+
+                  {psycheOpen ? (
+                    <div className="collapsible-content psyche-grid single-column-form">
+                      <label className="field wide-field">
+                        <span>Preset</span>
+                        <select
+                          value={psychePreset}
+                          onChange={(event) =>
+                            handlePresetChange(event.target.value as PsychePresetName)
+                          }
+                        >
+                          {Object.keys(PSYCHE_PRESETS).map((presetName) => (
+                            <option key={presetName}>{presetName}</option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <div className="slider-group">
+                        <h3>Global Traits</h3>
+                        <RangeField
+                          label="Fear Baseline"
+                          value={psyche.global.fear_baseline}
+                          onChange={(value) =>
+                            updatePsyche((current) => ({
+                              ...current,
+                              global: { ...current.global, fear_baseline: value },
+                            }))
+                          }
+                        />
+                        <RangeField
+                          label="Resolve"
+                          value={psyche.global.resolve}
+                          onChange={(value) =>
+                            updatePsyche((current) => ({
+                              ...current,
+                              global: { ...current.global, resolve: value },
+                            }))
+                          }
+                        />
+                        <RangeField
+                          label="Shame"
+                          value={psyche.global.shame}
+                          onChange={(value) =>
+                            updatePsyche((current) => ({
+                              ...current,
+                              global: { ...current.global, shame: value },
+                            }))
+                          }
+                        />
+                        <RangeField
+                          label="Openness"
+                          value={psyche.global.openness}
+                          onChange={(value) =>
+                            updatePsyche((current) => ({
+                              ...current,
+                              global: { ...current.global, openness: value },
+                            }))
+                          }
+                        />
+                      </div>
+
+                      <div className="slider-group">
+                        <h3>Needs</h3>
+                        {["Physiological", "Safety", "Belonging", "Esteem", "Actualization"].map(
+                          (label, index) => (
+                            <RangeField
+                              key={label}
+                              label={label}
+                              value={psyche.maslow[index]}
+                              onChange={(value) =>
+                                updatePsyche((current) => {
+                                  const maslow = [...current.maslow] as PsycheDraft["maslow"];
+                                  maslow[index] = value;
+                                  return { ...current, maslow };
+                                })
+                              }
+                            />
+                          ),
+                        )}
+                      </div>
+
+                      <div className="slider-group">
+                        <h3>SDT</h3>
+                        {["Autonomy", "Competence", "Relatedness"].map((label, index) => (
+                          <RangeField
+                            key={label}
+                            label={label}
+                            value={psyche.sdt[index]}
+                            onChange={(value) =>
+                              updatePsyche((current) => {
+                                const sdt = [...current.sdt] as PsycheDraft["sdt"];
+                                sdt[index] = value;
+                                return { ...current, sdt };
+                              })
+                            }
+                          />
+                        ))}
+                      </div>
+
+                      <div className="slider-group">
+                        <h3>Trauma</h3>
+                        <RangeField
+                          label="Phase"
+                          min={0}
+                          max={4}
+                          value={psyche.trauma.phase}
+                          onChange={(value) =>
+                            updatePsyche((current) => ({
+                              ...current,
+                              trauma: { ...current.trauma, phase: value },
+                            }))
+                          }
+                        />
+                        {[
+                          ["Hypervigilance", "hypervigilance"],
+                          ["Flashbacks", "flashbacks"],
+                          ["Numbing", "numbing"],
+                          ["Avoidance", "avoidance"],
+                        ].map(([label, key]) => (
+                          <RangeField
+                            key={key}
+                            label={label}
+                            value={psyche.trauma[key as keyof PsycheDraft["trauma"]]}
+                            onChange={(value) =>
+                              updatePsyche((current) => ({
+                                ...current,
+                                trauma: { ...current.trauma, [key]: value },
+                              }))
+                            }
+                          />
+                        ))}
+                      </div>
+
+                      <div className="slider-group">
+                        <h3>Relationship</h3>
+                        {[
+                          ["Trust", "trust", -100, 100],
+                          ["Affection", "affection", -100, 100],
+                          ["Intimacy", "intimacy", -100, 100],
+                          ["Passion", "passion", -100, 100],
+                          ["Commitment", "commitment", -100, 100],
+                          ["Fear", "fear", 0, 100],
+                          ["Desire", "desire", -100, 100],
+                        ].map(([label, key, min, max]) => (
+                          <RangeField
+                            key={key}
+                            label={String(label)}
+                            min={Number(min)}
+                            max={Number(max)}
+                            value={psyche.relationship[key as keyof PsycheDraft["relationship"]]}
+                            onChange={(value) =>
+                              updatePsyche((current) => ({
+                                ...current,
+                                relationship: { ...current.relationship, [String(key)]: value },
+                              }))
+                            }
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </section>
+              </div>
+            ) : null}
+          </section>
         </section>
+      </section>
 
-        <div className="button-grid setting-actions">
-          <input
-            ref={settingImportInputRef}
-            className="hidden-file"
-            type="file"
-            accept="application/json,.json,.setting,.mne"
-            onChange={handleImportSettingFile}
-          />
-          <button
-            title="New Setting"
-            onClick={handleCreateSetting}
-            disabled={busy}
-          >
-            <Sparkles size={18} />
-          </button>
-          <button
-            title="Import Setting"
-            onClick={() => settingImportInputRef.current?.click()}
-            disabled={busy}
-          >
-            <FileUp size={18} />
-          </button>
-          <button title="Export Setting" onClick={handleSaveSetting} disabled={!setting || busy}>
-            <FileDown size={18} />
-          </button>
-          <button
-            title="Persist current Setting"
-            onClick={async () => {
-              const nextSetting = await persistCurrentSetting();
-              if (nextSetting) setStatus("Setting persisted");
-            }}
-            disabled={!setting || busy}
-          >
-            <Save size={18} />
-          </button>
-          <button
-            className="danger-button"
-            title="Delete selected Setting"
-            onClick={handleDeleteSetting}
-            disabled={!setting || busy}
-          >
-            <Trash2 size={18} />
-          </button>
+      <section className="workspace-card provider-card">
+        <header className="panel-header">
+          <div>
+            <span className="eyebrow">Connection</span>
+            <h2>Provider Settings</h2>
+          </div>
+          <Sparkles aria-hidden="true" />
+        </header>
+
+        <div className="session-strip launcher-provider-strip">
+          <label className="field">
+            <span>Provider</span>
+            <select
+              value={provider}
+              onChange={(event) => setProvider(event.target.value as ProviderKind)}
+              disabled={busy}
+            >
+              <option>Mock</option>
+              <option>API</option>
+            </select>
+          </label>
+          <label className="field">
+            <span>Mode</span>
+            <select
+              value={mode}
+              onChange={(event) => setMode(event.target.value as NarrativeMode)}
+              disabled={busy}
+            >
+              <option>Realistic</option>
+              <option>Reader</option>
+              <option>God</option>
+              <option>Custom</option>
+            </select>
+          </label>
+          {provider === "API" ? (
+            <>
+              <label className="field">
+                <span>Base URL</span>
+                <input
+                  value={apiSettings.base_url}
+                  onChange={(event) =>
+                    setApiSettings((current) => ({ ...current, base_url: event.target.value }))
+                  }
+                  placeholder="https://api.openai.com/v1"
+                  disabled={busy}
+                />
+              </label>
+              <label className="field">
+                <span>Model</span>
+                <input
+                  value={apiSettings.model}
+                  onChange={(event) =>
+                    setApiSettings((current) => ({ ...current, model: event.target.value }))
+                  }
+                  placeholder="Model name"
+                  disabled={busy}
+                />
+              </label>
+              <label className="field">
+                <span>API Key</span>
+                <input
+                  type="password"
+                  value={apiSettings.api_key}
+                  onChange={(event) =>
+                    setApiSettings((current) => ({ ...current, api_key: event.target.value }))
+                  }
+                  placeholder="Stored only in this session"
+                  disabled={busy}
+                />
+              </label>
+              {mode === "Custom" ? (
+                <label className="field custom-prompt-field">
+                  <span>Custom Prompt</span>
+                  <textarea
+                    value={apiSettings.system_prompt}
+                    onChange={(event) =>
+                      setApiSettings((current) => ({
+                        ...current,
+                        system_prompt: event.target.value,
+                      }))
+                    }
+                    disabled={busy}
+                  />
+                </label>
+              ) : null}
+            </>
+          ) : null}
         </div>
+      </section>
 
-        <section className="compact-list" aria-label="Saved settings">
-          <h2>Local Settings</h2>
-          {settings.length === 0 ? (
-            <p className="muted">No saved Settings yet.</p>
-          ) : (
-            settings.map((item) => (
-              <button
-                key={item.setting_id}
-                className={`soul-row ${setting?.setting_id === item.setting_id ? "selected" : ""}`}
-                onClick={() => handleSelectSetting(item.setting_id)}
-              >
-                <span>{item.setting_name}</span>
-                <small>
-                  {item.turn_counter} turns / {item.location}
-                </small>
-              </button>
-            ))
-          )}
-        </section>
-
-        <div className="button-grid">
-          <input
-            ref={importInputRef}
-            className="hidden-file"
-            type="file"
-            accept="application/json,.json,.soul,.mne"
-            onChange={handleImportSoulFile}
-          />
-          <button
-            title="Import Soul"
-            onClick={() => importInputRef.current?.click()}
-            disabled={busy}
-          >
-            <FileUp size={18} />
-          </button>
-          <button title="Export Soul" onClick={handleSaveSoul} disabled={!soul || busy}>
-            <FileDown size={18} />
-          </button>
-          <button
-            title="Persist current Soul"
-            onClick={async () => {
-              if (!soul) return;
-              const activeSetting = await persistCurrentSetting();
-              const nextSoul = activeSetting
-                ? mirrorSettingIntoSoul(applyCreatorFields(soul), activeSetting)
-                : applyCreatorFields(soul);
-              await upsertSoul(nextSoul);
-              setSoul(nextSoul);
-              setSouls(await listSouls());
-              setStatus("Soul and active Setting persisted");
-            }}
-            disabled={!soul || busy}
-          >
-            <Save size={18} />
-          </button>
-          <button title="Run consolidation" onClick={handleConsolidate} disabled={!soul || busy}>
-            <RefreshCcw size={18} />
-          </button>
-          <button title="Delete current chat" onClick={handleDeleteChat} disabled={!soul || busy}>
-            <MessageSquareX size={18} />
-          </button>
-          <button
-            className="danger-button"
-            title="Delete selected Soul"
-            onClick={handleDeleteSoul}
-            disabled={!soul || busy}
-          >
-            <Trash2 size={18} />
-          </button>
+      <section className="workspace-card launch-card">
+        <div>
+          <span className="eyebrow">Ready</span>
+          <h1>
+            {soul?.character_name ?? "Choose a Soul"} in {setting?.setting_name ?? "a Setting"}
+          </h1>
         </div>
+        <button className="start-chat-button" onClick={() => setView("chat")} disabled={!soul}>
+          <MessageSquareText size={20} />
+          <span>Start Chat</span>
+        </button>
+      </section>
 
-        <section className="diagnostics-section">
-          <h2>Memory Cycle</h2>
-          <div className="cycle-meter" aria-label="Consolidation progress">
+      <section className="play-grid">
+        <aside className="studio-panel">
+          <section className="setting-section workspace-card">
+            <header className="panel-header">
+              <div>
+                <span className="eyebrow">World</span>
+                <h2>Environment</h2>
+              </div>
+              <Database aria-hidden="true" />
+            </header>
+
+            <div className="form-grid single-column-form">
+              <label className="field">
+                <span>Name</span>
+                <input
+                  value={settingName}
+                  onChange={(event) => setSettingName(event.target.value)}
+                  placeholder="Setting name"
+                />
+              </label>
+              <label className="field">
+                <span>Location</span>
+                <textarea
+                  value={worldDraft.location}
+                  onChange={(event) =>
+                    setWorldDraft((current) => ({ ...current, location: event.target.value }))
+                  }
+                  placeholder="Shared scene location"
+                />
+              </label>
+              <label className="field">
+                <span>Active Plots</span>
+                <textarea
+                  value={worldDraft.activePlots}
+                  onChange={(event) =>
+                    setWorldDraft((current) => ({ ...current, activePlots: event.target.value }))
+                  }
+                  placeholder="One plot per line"
+                />
+              </label>
+              <label className="field">
+                <span>Key Objects</span>
+                <textarea
+                  value={worldDraft.keyObjects}
+                  onChange={(event) =>
+                    setWorldDraft((current) => ({ ...current, keyObjects: event.target.value }))
+                  }
+                  placeholder="One object per line"
+                />
+              </label>
+              <label className="field">
+                <span>Time</span>
+                <input
+                  value={worldDraft.timeElapsed}
+                  onChange={(event) =>
+                    setWorldDraft((current) => ({ ...current, timeElapsed: event.target.value }))
+                  }
+                  placeholder="Session start"
+                />
+              </label>
+            </div>
+          </section>
+
+          <section className={`creator-section workspace-card collapsible-section ${soulEditorOpen ? "open" : ""}`}>
+            <button
+              className="section-toggle studio-toggle"
+              type="button"
+              onClick={() => setSoulEditorOpen((open) => !open)}
+              aria-expanded={soulEditorOpen}
+            >
+              <span>
+                <span className="eyebrow">Soul</span>
+                <strong>{soul?.character_name ?? "Character Studio"}</strong>
+              </span>
+              <ChevronDown size={18} aria-hidden="true" />
+            </button>
+
+            {soulEditorOpen ? (
+              <div className="collapsible-content">
+                <div className="form-grid single-column-form">
+                  <label className="field">
+                    <span>Character</span>
+                    <input
+                      value={characterName}
+                      onChange={(event) => setCharacterName(event.target.value)}
+                      placeholder="Character name"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Appearance</span>
+                    <textarea
+                      value={characterAppearance}
+                      onChange={(event) => setCharacterAppearance(event.target.value)}
+                      placeholder="Visual details, outfit, body language"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Scenario Notes</span>
+                    <textarea
+                      value={characterScenario}
+                      onChange={(event) => setCharacterScenario(event.target.value)}
+                      placeholder="Character-specific role, premise, or card notes"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Personality</span>
+                    <textarea
+                      value={characterPersonality}
+                      onChange={(event) => setCharacterPersonality(event.target.value)}
+                      placeholder="Voice, motives, boundaries"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Description</span>
+                    <textarea
+                      value={characterDescription}
+                      onChange={(event) => setCharacterDescription(event.target.value)}
+                      placeholder="Backstory or character card notes"
+                    />
+                  </label>
+                </div>
+
+                <section className={`collapsible-section ${psycheOpen ? "open" : ""}`}>
+                  <button
+                    className="section-toggle"
+                    type="button"
+                    onClick={() => setPsycheOpen((open) => !open)}
+                    aria-expanded={psycheOpen}
+                  >
+                    <span>
+                      <span className="eyebrow">Preset: {psychePreset}</span>
+                      <strong>Starting Psyche</strong>
+                    </span>
+                    <ChevronDown size={18} aria-hidden="true" />
+                  </button>
+
+                  {psycheOpen ? (
+                    <div className="collapsible-content psyche-grid single-column-form">
+                      <label className="field wide-field">
+                        <span>Preset</span>
+                        <select
+                          value={psychePreset}
+                          onChange={(event) =>
+                            handlePresetChange(event.target.value as PsychePresetName)
+                          }
+                        >
+                          {Object.keys(PSYCHE_PRESETS).map((presetName) => (
+                            <option key={presetName}>{presetName}</option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <div className="slider-group">
+                        <h3>Global Traits</h3>
+                        <RangeField
+                          label="Fear Baseline"
+                          value={psyche.global.fear_baseline}
+                          onChange={(value) =>
+                            updatePsyche((current) => ({
+                              ...current,
+                              global: { ...current.global, fear_baseline: value },
+                            }))
+                          }
+                        />
+                        <RangeField
+                          label="Resolve"
+                          value={psyche.global.resolve}
+                          onChange={(value) =>
+                            updatePsyche((current) => ({
+                              ...current,
+                              global: { ...current.global, resolve: value },
+                            }))
+                          }
+                        />
+                        <RangeField
+                          label="Shame"
+                          value={psyche.global.shame}
+                          onChange={(value) =>
+                            updatePsyche((current) => ({
+                              ...current,
+                              global: { ...current.global, shame: value },
+                            }))
+                          }
+                        />
+                        <RangeField
+                          label="Openness"
+                          value={psyche.global.openness}
+                          onChange={(value) =>
+                            updatePsyche((current) => ({
+                              ...current,
+                              global: { ...current.global, openness: value },
+                            }))
+                          }
+                        />
+                      </div>
+
+                      <div className="slider-group">
+                        <h3>Needs</h3>
+                        {["Physiological", "Safety", "Belonging", "Esteem", "Actualization"].map(
+                          (label, index) => (
+                            <RangeField
+                              key={label}
+                              label={label}
+                              value={psyche.maslow[index]}
+                              onChange={(value) =>
+                                updatePsyche((current) => {
+                                  const maslow = [...current.maslow] as PsycheDraft["maslow"];
+                                  maslow[index] = value;
+                                  return { ...current, maslow };
+                                })
+                              }
+                            />
+                          ),
+                        )}
+                      </div>
+
+                      <div className="slider-group">
+                        <h3>SDT</h3>
+                        {["Autonomy", "Competence", "Relatedness"].map((label, index) => (
+                          <RangeField
+                            key={label}
+                            label={label}
+                            value={psyche.sdt[index]}
+                            onChange={(value) =>
+                              updatePsyche((current) => {
+                                const sdt = [...current.sdt] as PsycheDraft["sdt"];
+                                sdt[index] = value;
+                                return { ...current, sdt };
+                              })
+                            }
+                          />
+                        ))}
+                      </div>
+
+                      <div className="slider-group">
+                        <h3>Trauma</h3>
+                        <RangeField
+                          label="Phase"
+                          min={0}
+                          max={4}
+                          value={psyche.trauma.phase}
+                          onChange={(value) =>
+                            updatePsyche((current) => ({
+                              ...current,
+                              trauma: { ...current.trauma, phase: value },
+                            }))
+                          }
+                        />
+                        {[
+                          ["Hypervigilance", "hypervigilance"],
+                          ["Flashbacks", "flashbacks"],
+                          ["Numbing", "numbing"],
+                          ["Avoidance", "avoidance"],
+                        ].map(([label, key]) => (
+                          <RangeField
+                            key={key}
+                            label={label}
+                            value={psyche.trauma[key as keyof PsycheDraft["trauma"]]}
+                            onChange={(value) =>
+                              updatePsyche((current) => ({
+                                ...current,
+                                trauma: { ...current.trauma, [key]: value },
+                              }))
+                            }
+                          />
+                        ))}
+                      </div>
+
+                      <div className="slider-group">
+                        <h3>Relationship</h3>
+                        {[
+                          ["Trust", "trust", -100, 100],
+                          ["Affection", "affection", -100, 100],
+                          ["Intimacy", "intimacy", -100, 100],
+                          ["Passion", "passion", -100, 100],
+                          ["Commitment", "commitment", -100, 100],
+                          ["Fear", "fear", 0, 100],
+                          ["Desire", "desire", -100, 100],
+                        ].map(([label, key, min, max]) => (
+                          <RangeField
+                            key={key}
+                            label={String(label)}
+                            min={Number(min)}
+                            max={Number(max)}
+                            value={psyche.relationship[key as keyof PsycheDraft["relationship"]]}
+                            onChange={(value) =>
+                              updatePsyche((current) => ({
+                                ...current,
+                                relationship: { ...current.relationship, [String(key)]: value },
+                              }))
+                            }
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </section>
+              </div>
+            ) : null}
+          </section>
+        </aside>
+      </section>
+
+      <section className="insight-grid">
+        <section className="workspace-card">
+          <header className="panel-header">
             <div>
+              <span className="eyebrow">State</span>
+              <h2>Memory</h2>
+            </div>
+            <Brain aria-hidden="true" />
+          </header>
+
+          <section className="stat-grid" aria-label="Relationship stats">
+            <Stat label="Trust" value={relationship?.trust ?? 0} />
+            <Stat label="Affection" value={relationship?.affection ?? 0} />
+            <Stat label="Fear" value={relationship?.fear ?? 0} />
+            <Stat label="Turns" value={soul?.turn_counter ?? 0} />
+            <Stat label="Since Sleep" value={turnsSinceConsolidation} />
+            <Stat label="Schemas" value={soul?.memory.schemas.length ?? 0} />
+          </section>
+
+          <section className="diagnostics-section">
+            <h2>Memory Cycle</h2>
+            <div className="cycle-meter" aria-label="Consolidation progress">
+              <div>
               <strong>{turnsSinceConsolidation}</strong>
               <span>/ {CONSOLIDATION_INTERVAL_TURNS} turns</span>
             </div>
@@ -1376,25 +1840,88 @@ export function App() {
               <dt>Context</dt>
               <dd>{context?.truncated ? "Trimmed" : "Within budget"}</dd>
             </div>
-          </dl>
+            </dl>
+          </section>
+
+          <section className="memory-section">
+            <h2>Core Memories</h2>
+            {(soul?.memory.core ?? []).slice(0, 4).map((memory) => (
+              <p key={memory}>{memory}</p>
+            ))}
+          </section>
+
+          <section className="memory-section">
+            <h2>Schemas</h2>
+            {(soul?.memory.schemas ?? []).map((schema) => (
+              <p key={schema.schema_type}>
+                <strong>{schema.schema_type}</strong>: {schema.summary}
+              </p>
+            ))}
+          </section>
+
+          <section className="memory-section">
+            <h2>Recent</h2>
+            {(soul?.memory.recent ?? []).map((memory) => (
+              <p key={memory.id}>
+                <strong>{memory.tag}</strong> / {memory.salience}: {memory.content}
+              </p>
+            ))}
+          </section>
         </section>
 
-        <section className="context-preview">
-          <h2>Context</h2>
-          <pre>{context?.text ?? "No context compiled yet."}</pre>
-        </section>
+        <section className="workspace-card">
+          <section className="diagnostics-section api-debug-section">
+            <h2>API Debug</h2>
+            <dl className="diagnostic-grid">
+              <div>
+                <dt>Provider</dt>
+                <dd>{lastTurnDebug?.provider ?? provider}</dd>
+              </div>
+              <div>
+                <dt>Hidden</dt>
+                <dd>
+                  {lastTurnDebug
+                    ? lastTurnDebug.hidden_state_found
+                      ? "Parsed"
+                      : "Missing"
+                    : "No turn"}
+                </dd>
+              </div>
+              <div>
+                <dt>Fallback</dt>
+                <dd>{lastTurnDebug?.fallback_hidden_state_generated ? "Generated" : "No"}</dd>
+              </div>
+              <div>
+                <dt>Tag</dt>
+                <dd>{lastTurnDebug?.tag ?? "-"}</dd>
+              </div>
+              <div>
+                <dt>Trust</dt>
+                <dd>{formatDebugDelta(lastTurnDebug?.trust_delta)}</dd>
+              </div>
+              <div>
+                <dt>Affection</dt>
+                <dd>{formatDebugDelta(lastTurnDebug?.affection_delta)}</dd>
+              </div>
+              <div>
+                <dt>Location</dt>
+                <dd>{lastTurnDebug?.new_location ?? "-"}</dd>
+              </div>
+              <div>
+                <dt>Present</dt>
+                <dd>{lastTurnDebug?.present_characters.join(", ") || "-"}</dd>
+              </div>
+            </dl>
+          </section>
 
-        <section className="memory-section">
-          <h2>Recent</h2>
-          {(soul?.memory.recent ?? []).map((memory) => (
-            <p key={memory.id}>
-              <strong>{memory.tag}</strong> / {memory.salience}: {memory.content}
-            </p>
-          ))}
+          <section className="context-preview">
+            <h2>Context</h2>
+            <pre>{context?.text ?? "No context compiled yet."}</pre>
+          </section>
         </section>
 
         <footer className="status-line">{status}</footer>
-      </aside>
+      </section>
     </main>
   );
 }

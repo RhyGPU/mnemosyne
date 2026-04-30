@@ -149,6 +149,16 @@ pub fn delete_conversation(
 }
 
 #[tauri::command]
+pub fn delete_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    message_id: i64,
+) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::delete_message(&conn, &conversation_id, message_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 pub fn compile_context(
     state: State<'_, AppState>,
     soul_id: String,

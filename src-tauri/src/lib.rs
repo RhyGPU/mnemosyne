@@ -39,6 +39,7 @@ pub fn run() {
             commands::delete_setting,
             commands::list_conversation_messages,
             commands::delete_conversation,
+            commands::delete_message,
             commands::send_mock_turn,
             commands::send_api_turn,
             commands::compile_context,

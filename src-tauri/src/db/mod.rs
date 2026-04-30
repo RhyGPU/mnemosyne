@@ -258,6 +258,24 @@ pub fn delete_conversation(conn: &Connection, conversation_id: &str) -> rusqlite
     Ok(affected > 0)
 }
 
+pub fn delete_message(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: i64,
+) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "DELETE FROM messages WHERE conversation_id = ?1 AND id = ?2",
+        params![conversation_id, message_id],
+    )?;
+    if affected > 0 {
+        conn.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now_ts(), conversation_id],
+        )?;
+    }
+    Ok(affected > 0)
+}
+
 pub fn list_messages(
     conn: &Connection,
     conversation_id: &str,

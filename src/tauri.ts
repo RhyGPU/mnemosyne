@@ -326,11 +326,12 @@ export function sendApiTurn(
   userText: string,
   mode: string,
   settings: ApiProviderSettings,
+  signal?: AbortSignal,
 ): Promise<TurnResult> {
   return invokeOrPreview(
     "send_api_turn",
     { conversationId, soulId, userText, mode, settings },
-    () => sendPreviewApiTurn(conversationId, soulId, userText, mode, settings),
+    () => sendPreviewApiTurn(conversationId, soulId, userText, mode, settings, signal),
   );
 }
 
@@ -345,6 +346,16 @@ export function deleteConversation(conversationId: string): Promise<boolean> {
     const beforeCount = browserMessages.length;
     browserMessages = browserMessages.filter(
       (message) => message.conversation_id !== conversationId,
+    );
+    return browserMessages.length !== beforeCount;
+  });
+}
+
+export function deleteMessage(conversationId: string, messageId: number): Promise<boolean> {
+  return invokeOrPreview("delete_message", { conversationId, messageId }, () => {
+    const beforeCount = browserMessages.length;
+    browserMessages = browserMessages.filter(
+      (message) => !(message.conversation_id === conversationId && message.id === messageId),
     );
     return browserMessages.length !== beforeCount;
   });
@@ -566,6 +577,7 @@ async function sendPreviewApiTurn(
   userText: string,
   mode: string,
   settings: ApiProviderSettings,
+  signal?: AbortSignal,
 ): Promise<TurnResult> {
   const soul = browserSouls.find((item) => item.character_id === soulId);
   if (!soul) throw new Error("Soul not found");
@@ -577,6 +589,7 @@ async function sendPreviewApiTurn(
   const context = compilePreviewContext(soul, conversationId);
   const response = await fetch(chatCompletionsUrl(settings.base_url), {
     method: "POST",
+    signal,
     headers: {
       Authorization: `Bearer ${settings.api_key.trim()}`,
       "Content-Type": "application/json",
