@@ -183,6 +183,7 @@ button:disabled {
 .creator-section,
 .memory-section,
 .diagnostics-section,
+.setting-section,
 .context-preview {
   display: grid;
   gap: 10px;
@@ -192,12 +193,54 @@ button:disabled {
 .creator-section h2,
 .memory-section h2,
 .diagnostics-section h2,
+.setting-section h2,
 .context-preview h2 {
   color: #284239;
 }
 
 .creator-section {
   padding-top: 4px;
+}
+
+.collapsible-section {
+  gap: 0;
+}
+
+.section-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #d9d3c3;
+  border-radius: 6px;
+  background: rgba(255, 253, 248, 0.75);
+  color: #16201c;
+  padding: 10px 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.section-toggle strong {
+  display: block;
+  color: #284239;
+  font-size: 1rem;
+}
+
+.section-toggle svg {
+  flex: 0 0 auto;
+  transition: transform 140ms ease;
+}
+
+.collapsible-section.open .section-toggle svg {
+  transform: rotate(180deg);
+}
+
+.collapsible-content {
+  display: grid;
+  gap: 10px;
+  padding-top: 10px;
 }
 
 .slider-group {
@@ -411,6 +454,13 @@ button:disabled {
 .provider-settings {
   display: grid;
   gap: 12px;
+  padding: 12px;
+  border: 1px solid #d9d3c3;
+  border-radius: 6px;
+  background: rgba(255, 253, 248, 0.75);
+}
+
+.setting-section {
   padding: 12px;
   border: 1px solid #d9d3c3;
   border-radius: 6px;

@@ -1,5 +1,6 @@
 import {
   Brain,
+  ChevronDown,
   Database,
   FileDown,
   FileUp,
@@ -71,6 +72,13 @@ type PsycheDraft = {
   };
 };
 
+type WorldDraft = {
+  location: string;
+  activePlots: string;
+  keyObjects: string;
+  timeElapsed: string;
+};
+
 const PSYCHE_PRESETS: Record<PsychePresetName, PsycheDraft> = {
   Stranger: {
     global: { fear_baseline: 35, resolve: 40, shame: 35, openness: 35 },
@@ -126,9 +134,16 @@ export function App() {
   const [characterDescription, setCharacterDescription] = useState("");
   const [characterAppearance, setCharacterAppearance] = useState("");
   const [characterPersonality, setCharacterPersonality] = useState("");
-  const [characterSetting, setCharacterSetting] = useState("Unspecified starting scene.");
+  const [characterScenario, setCharacterScenario] = useState("");
+  const [worldDraft, setWorldDraft] = useState<WorldDraft>({
+    location: "Unspecified starting scene.",
+    activePlots: "Establish the first scene",
+    keyObjects: "",
+    timeElapsed: "Session start",
+  });
   const [psychePreset, setPsychePreset] = useState<PsychePresetName>("Custom");
   const [psyche, setPsyche] = useState<PsycheDraft>(PSYCHE_PRESETS.Custom);
+  const [psycheOpen, setPsycheOpen] = useState(false);
   const [provider, setProvider] = useState<ProviderKind>("Mock");
   const [mode, setMode] = useState<NarrativeMode>("Reader");
   const [apiSettings, setApiSettings] = useState<ApiProviderSettings>({
@@ -162,7 +177,8 @@ export function App() {
     setCharacterDescription(nextSoul.profile.description);
     setCharacterAppearance(nextSoul.profile.appearance);
     setCharacterPersonality(nextSoul.profile.personality);
-    setCharacterSetting(nextSoul.world.location);
+    setCharacterScenario(nextSoul.profile.scenario);
+    setWorldDraft(worldDraftFromSoul(nextSoul));
     setPsyche(psycheFromSoul(nextSoul));
     setPsychePreset("Custom");
   }
@@ -182,7 +198,8 @@ export function App() {
     const description = characterDescription.trim();
     const appearance = characterAppearance.trim();
     const personality = characterPersonality.trim();
-    const setting = characterSetting.trim() || "Unspecified starting scene.";
+    const scenario = characterScenario.trim();
+    const world = normalizeWorldDraft(worldDraft);
     const core = [...nextSoul.memory.core];
     for (const memory of [
       description ? `Profile: ${description}` : "",
@@ -199,7 +216,7 @@ export function App() {
         description,
         appearance,
         personality,
-        scenario: setting,
+        scenario,
       },
       global: {
         ...nextSoul.global,
@@ -247,10 +264,10 @@ export function App() {
       },
       world: {
         ...nextSoul.world,
-        location: setting,
-        active_plots: nextSoul.world.active_plots.length
-          ? nextSoul.world.active_plots
-          : ["Establish the first scene"],
+        location: world.location,
+        active_plots: world.activePlots,
+        key_objects: world.keyObjects,
+        time_elapsed: world.timeElapsed,
       },
     };
   }
@@ -503,11 +520,11 @@ export function App() {
         </label>
 
         <label className="field">
-          <span>Setting</span>
+          <span>Scenario Notes</span>
           <textarea
-            value={characterSetting}
-            onChange={(event) => setCharacterSetting(event.target.value)}
-            placeholder="Starting location and scene"
+            value={characterScenario}
+            onChange={(event) => setCharacterScenario(event.target.value)}
+            placeholder="Character-specific role, premise, or card notes"
           />
         </label>
 
@@ -530,162 +547,178 @@ export function App() {
         </label>
         </section>
 
-        <section className="creator-section">
-          <h2>Starting Psyche</h2>
-          <label className="field">
-            <span>Preset</span>
-            <select
-              value={psychePreset}
-              onChange={(event) => handlePresetChange(event.target.value as PsychePresetName)}
-            >
-              {Object.keys(PSYCHE_PRESETS).map((presetName) => (
-                <option key={presetName}>{presetName}</option>
-              ))}
-            </select>
-          </label>
+        <section className={`creator-section collapsible-section ${psycheOpen ? "open" : ""}`}>
+          <button
+            className="section-toggle"
+            type="button"
+            onClick={() => setPsycheOpen((open) => !open)}
+            aria-expanded={psycheOpen}
+          >
+            <span>
+              <span className="eyebrow">Preset: {psychePreset}</span>
+              <strong>Starting Psyche</strong>
+            </span>
+            <ChevronDown size={18} aria-hidden="true" />
+          </button>
 
-          <div className="slider-group">
-            <h3>Global Traits</h3>
-            <RangeField
-              label="Fear Baseline"
-              value={psyche.global.fear_baseline}
-              onChange={(value) =>
-                updatePsyche((current) => ({
-                  ...current,
-                  global: { ...current.global, fear_baseline: value },
-                }))
-              }
-            />
-            <RangeField
-              label="Resolve"
-              value={psyche.global.resolve}
-              onChange={(value) =>
-                updatePsyche((current) => ({
-                  ...current,
-                  global: { ...current.global, resolve: value },
-                }))
-              }
-            />
-            <RangeField
-              label="Shame"
-              value={psyche.global.shame}
-              onChange={(value) =>
-                updatePsyche((current) => ({
-                  ...current,
-                  global: { ...current.global, shame: value },
-                }))
-              }
-            />
-            <RangeField
-              label="Openness"
-              value={psyche.global.openness}
-              onChange={(value) =>
-                updatePsyche((current) => ({
-                  ...current,
-                  global: { ...current.global, openness: value },
-                }))
-              }
-            />
-          </div>
+          {psycheOpen ? (
+            <div className="collapsible-content">
+              <label className="field">
+                <span>Preset</span>
+                <select
+                  value={psychePreset}
+                  onChange={(event) => handlePresetChange(event.target.value as PsychePresetName)}
+                >
+                  {Object.keys(PSYCHE_PRESETS).map((presetName) => (
+                    <option key={presetName}>{presetName}</option>
+                  ))}
+                </select>
+              </label>
 
-          <div className="slider-group">
-            <h3>Needs</h3>
-            {["Physiological", "Safety", "Belonging", "Esteem", "Actualization"].map(
-              (label, index) => (
+              <div className="slider-group">
+                <h3>Global Traits</h3>
                 <RangeField
-                  key={label}
-                  label={label}
-                  value={psyche.maslow[index]}
+                  label="Fear Baseline"
+                  value={psyche.global.fear_baseline}
                   onChange={(value) =>
-                    updatePsyche((current) => {
-                      const maslow = [...current.maslow] as PsycheDraft["maslow"];
-                      maslow[index] = value;
-                      return { ...current, maslow };
-                    })
+                    updatePsyche((current) => ({
+                      ...current,
+                      global: { ...current.global, fear_baseline: value },
+                    }))
                   }
                 />
-              ),
-            )}
-          </div>
+                <RangeField
+                  label="Resolve"
+                  value={psyche.global.resolve}
+                  onChange={(value) =>
+                    updatePsyche((current) => ({
+                      ...current,
+                      global: { ...current.global, resolve: value },
+                    }))
+                  }
+                />
+                <RangeField
+                  label="Shame"
+                  value={psyche.global.shame}
+                  onChange={(value) =>
+                    updatePsyche((current) => ({
+                      ...current,
+                      global: { ...current.global, shame: value },
+                    }))
+                  }
+                />
+                <RangeField
+                  label="Openness"
+                  value={psyche.global.openness}
+                  onChange={(value) =>
+                    updatePsyche((current) => ({
+                      ...current,
+                      global: { ...current.global, openness: value },
+                    }))
+                  }
+                />
+              </div>
 
-          <div className="slider-group">
-            <h3>SDT</h3>
-            {["Autonomy", "Competence", "Relatedness"].map((label, index) => (
-              <RangeField
-                key={label}
-                label={label}
-                value={psyche.sdt[index]}
-                onChange={(value) =>
-                  updatePsyche((current) => {
-                    const sdt = [...current.sdt] as PsycheDraft["sdt"];
-                    sdt[index] = value;
-                    return { ...current, sdt };
-                  })
-                }
-              />
-            ))}
-          </div>
+              <div className="slider-group">
+                <h3>Needs</h3>
+                {["Physiological", "Safety", "Belonging", "Esteem", "Actualization"].map(
+                  (label, index) => (
+                    <RangeField
+                      key={label}
+                      label={label}
+                      value={psyche.maslow[index]}
+                      onChange={(value) =>
+                        updatePsyche((current) => {
+                          const maslow = [...current.maslow] as PsycheDraft["maslow"];
+                          maslow[index] = value;
+                          return { ...current, maslow };
+                        })
+                      }
+                    />
+                  ),
+                )}
+              </div>
 
-          <div className="slider-group">
-            <h3>Trauma</h3>
-            <RangeField
-              label="Phase"
-              min={0}
-              max={4}
-              value={psyche.trauma.phase}
-              onChange={(value) =>
-                updatePsyche((current) => ({
-                  ...current,
-                  trauma: { ...current.trauma, phase: value },
-                }))
-              }
-            />
-            {[
-              ["Hypervigilance", "hypervigilance"],
-              ["Flashbacks", "flashbacks"],
-              ["Numbing", "numbing"],
-              ["Avoidance", "avoidance"],
-            ].map(([label, key]) => (
-              <RangeField
-                key={key}
-                label={label}
-                value={psyche.trauma[key as keyof PsycheDraft["trauma"]]}
-                onChange={(value) =>
-                  updatePsyche((current) => ({
-                    ...current,
-                    trauma: { ...current.trauma, [key]: value },
-                  }))
-                }
-              />
-            ))}
-          </div>
+              <div className="slider-group">
+                <h3>SDT</h3>
+                {["Autonomy", "Competence", "Relatedness"].map((label, index) => (
+                  <RangeField
+                    key={label}
+                    label={label}
+                    value={psyche.sdt[index]}
+                    onChange={(value) =>
+                      updatePsyche((current) => {
+                        const sdt = [...current.sdt] as PsycheDraft["sdt"];
+                        sdt[index] = value;
+                        return { ...current, sdt };
+                      })
+                    }
+                  />
+                ))}
+              </div>
 
-          <div className="slider-group">
-            <h3>Relationship</h3>
-            {[
-              ["Trust", "trust", -100, 100],
-              ["Affection", "affection", -100, 100],
-              ["Intimacy", "intimacy", -100, 100],
-              ["Passion", "passion", -100, 100],
-              ["Commitment", "commitment", -100, 100],
-              ["Fear", "fear", 0, 100],
-              ["Desire", "desire", -100, 100],
-            ].map(([label, key, min, max]) => (
-              <RangeField
-                key={key}
-                label={String(label)}
-                min={Number(min)}
-                max={Number(max)}
-                value={psyche.relationship[key as keyof PsycheDraft["relationship"]]}
-                onChange={(value) =>
-                  updatePsyche((current) => ({
-                    ...current,
-                    relationship: { ...current.relationship, [String(key)]: value },
-                  }))
-                }
-              />
-            ))}
-          </div>
+              <div className="slider-group">
+                <h3>Trauma</h3>
+                <RangeField
+                  label="Phase"
+                  min={0}
+                  max={4}
+                  value={psyche.trauma.phase}
+                  onChange={(value) =>
+                    updatePsyche((current) => ({
+                      ...current,
+                      trauma: { ...current.trauma, phase: value },
+                    }))
+                  }
+                />
+                {[
+                  ["Hypervigilance", "hypervigilance"],
+                  ["Flashbacks", "flashbacks"],
+                  ["Numbing", "numbing"],
+                  ["Avoidance", "avoidance"],
+                ].map(([label, key]) => (
+                  <RangeField
+                    key={key}
+                    label={label}
+                    value={psyche.trauma[key as keyof PsycheDraft["trauma"]]}
+                    onChange={(value) =>
+                      updatePsyche((current) => ({
+                        ...current,
+                        trauma: { ...current.trauma, [key]: value },
+                      }))
+                    }
+                  />
+                ))}
+              </div>
+
+              <div className="slider-group">
+                <h3>Relationship</h3>
+                {[
+                  ["Trust", "trust", -100, 100],
+                  ["Affection", "affection", -100, 100],
+                  ["Intimacy", "intimacy", -100, 100],
+                  ["Passion", "passion", -100, 100],
+                  ["Commitment", "commitment", -100, 100],
+                  ["Fear", "fear", 0, 100],
+                  ["Desire", "desire", -100, 100],
+                ].map(([label, key, min, max]) => (
+                  <RangeField
+                    key={key}
+                    label={String(label)}
+                    min={Number(min)}
+                    max={Number(max)}
+                    value={psyche.relationship[key as keyof PsycheDraft["relationship"]]}
+                    onChange={(value) =>
+                      updatePsyche((current) => ({
+                        ...current,
+                        relationship: { ...current.relationship, [String(key)]: value },
+                      }))
+                    }
+                  />
+                ))}
+              </div>
+            </div>
+          ) : null}
         </section>
 
         <button className="wide-button" onClick={handleCreateSoul} disabled={busy}>
@@ -863,6 +896,50 @@ export function App() {
           </select>
         </label>
 
+        <section className="setting-section">
+          <h2>Setting</h2>
+          <label className="field">
+            <span>Location</span>
+            <textarea
+              value={worldDraft.location}
+              onChange={(event) =>
+                setWorldDraft((current) => ({ ...current, location: event.target.value }))
+              }
+              placeholder="Shared scene location"
+            />
+          </label>
+          <label className="field">
+            <span>Active Plots</span>
+            <textarea
+              value={worldDraft.activePlots}
+              onChange={(event) =>
+                setWorldDraft((current) => ({ ...current, activePlots: event.target.value }))
+              }
+              placeholder="One plot per line"
+            />
+          </label>
+          <label className="field">
+            <span>Key Objects</span>
+            <textarea
+              value={worldDraft.keyObjects}
+              onChange={(event) =>
+                setWorldDraft((current) => ({ ...current, keyObjects: event.target.value }))
+              }
+              placeholder="One object per line"
+            />
+          </label>
+          <label className="field">
+            <span>Time</span>
+            <input
+              value={worldDraft.timeElapsed}
+              onChange={(event) =>
+                setWorldDraft((current) => ({ ...current, timeElapsed: event.target.value }))
+              }
+              placeholder="Session start"
+            />
+          </label>
+        </section>
+
         <div className="button-grid">
           <input
             ref={importInputRef}
@@ -1039,6 +1116,24 @@ function psycheFromSoul(soul: Soul): PsycheDraft {
   };
 }
 
+function worldDraftFromSoul(soul: Soul): WorldDraft {
+  return {
+    location: soul.world.location || "Unspecified starting scene.",
+    activePlots: soul.world.active_plots.join("\n") || "Establish the first scene",
+    keyObjects: soul.world.key_objects.join("\n"),
+    timeElapsed: soul.world.time_elapsed || "Session start",
+  };
+}
+
+function normalizeWorldDraft(world: WorldDraft) {
+  return {
+    location: world.location.trim() || "Unspecified starting scene.",
+    activePlots: linesFromText(world.activePlots, ["Establish the first scene"]),
+    keyObjects: linesFromText(world.keyObjects, []),
+    timeElapsed: world.timeElapsed.trim() || "Session start",
+  };
+}
+
 async function soulFromImport(raw: unknown, fallbackName: string) {
   const record = isRecord(raw) && isRecord(raw.soul) ? raw.soul : raw;
   if (!isRecord(record)) {
@@ -1106,4 +1201,12 @@ function stringArrayFrom(value: unknown) {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")
     : [];
+}
+
+function linesFromText(text: string, fallback: string[]) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length ? lines : fallback;
 }
