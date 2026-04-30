@@ -12,6 +12,16 @@ pub fn consolidate_soul(soul: &mut Soul) {
     let memories = std::mem::take(&mut soul.memory.recent);
 
     for memory in memories {
+        if memory.retrieval_strength <= 30.0 {
+            if is_schema_prone(&memory.tag) {
+                middle_by_tag
+                    .entry(memory.tag.clone())
+                    .or_default()
+                    .push(memory);
+            }
+            continue;
+        }
+
         let score = scorer.score(soul, &memory);
         if score > 0.70 {
             soul.memory.core.push(summarize_core_memory(&memory));

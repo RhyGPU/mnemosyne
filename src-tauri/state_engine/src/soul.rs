@@ -19,6 +19,7 @@ pub struct Soul {
     pub trauma: TraumaState,
     pub relationships: HashMap<String, Relationship>,
     pub memory: MemoryStore,
+    #[serde(default)]
     pub world: WorldLog,
 }
 
@@ -101,6 +102,18 @@ pub struct WorldLog {
     pub time_elapsed: String,
 }
 
+impl Default for WorldLog {
+    fn default() -> Self {
+        Self {
+            location: "Unspecified starting scene.".into(),
+            active_plots: vec!["Establish the first scene".into()],
+            recent_events: Vec::new(),
+            key_objects: Vec::new(),
+            time_elapsed: "Session start".into(),
+        }
+    }
+}
+
 impl Soul {
     pub fn default_for_character(character_name: &str) -> Self {
         let now = current_timestamp();
@@ -155,13 +168,7 @@ impl Soul {
                 recent: Vec::new(),
                 schemas: Vec::new(),
             },
-            world: WorldLog {
-                location: "Unspecified starting scene.".into(),
-                active_plots: vec!["Establish the first scene".into()],
-                recent_events: Vec::new(),
-                key_objects: Vec::new(),
-                time_elapsed: "Session start".into(),
-            },
+            world: WorldLog::default(),
         }
     }
 }
@@ -205,5 +212,27 @@ mod tests {
 
         assert_eq!(decoded.character_name, "Aurora Schwarz");
         assert_eq!(decoded.profile, CharacterProfile::default());
+    }
+
+    #[test]
+    fn character_only_soul_json_defaults_world_log() {
+        let soul = new_default_soul("Aurora Schwarz");
+        let mut value = serde_json::to_value(&soul).expect("value");
+        value.as_object_mut().expect("object").remove("world");
+        let decoded: Soul = serde_json::from_value(value).expect("deserialize");
+
+        assert_eq!(decoded.character_name, "Aurora Schwarz");
+        assert_eq!(decoded.world, WorldLog::default());
+    }
+
+    #[test]
+    fn world_log_json_roundtrip_is_independent() {
+        let mut world = WorldLog::default();
+        world.location = "Carver City service tunnel".into();
+        world.active_plots.push("Find the sealed stairwell".into());
+        let json = serde_json::to_string_pretty(&world).expect("serialize");
+        let decoded: WorldLog = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(decoded, world);
     }
 }
