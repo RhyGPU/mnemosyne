@@ -7,6 +7,8 @@ use crate::{
 };
 
 const HIDDEN_STATE_MARKER: &str = "[HIDDEN_STATE]";
+const HIDDEN_STATE_JSON_START: &str = "[HIDDEN STATE]";
+const HIDDEN_STATE_JSON_END: &str = "[/HIDDEN STATE]";
 const HIDDEN_STATE_ENCODING_PREFIX: &str = "mne1.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -16,6 +18,8 @@ pub struct HiddenState {
     pub trust_delta: Option<f32>,
     pub affection_delta: Option<f32>,
     pub world_event: Option<String>,
+    pub new_location: Option<String>,
+    pub present_characters: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +73,14 @@ impl HiddenState {
             }
         }
 
+        if let Some(location) = self
+            .new_location
+            .as_deref()
+            .filter(|location| !location.trim().is_empty())
+        {
+            soul.world.location = location.trim().to_string();
+        }
+
         soul.last_updated = current_timestamp() as i64;
     }
 }
@@ -83,6 +95,22 @@ pub fn encode_hidden_state(hidden_state: &HiddenState) -> String {
 }
 
 pub fn parse_hidden_state(raw: &str) -> Result<ParsedProviderResponse, serde_json::Error> {
+    if let Some(start) = raw.find(HIDDEN_STATE_JSON_START) {
+        let visible_text = raw[..start].trim().to_string();
+        let hidden_start = start + HIDDEN_STATE_JSON_START.len();
+        let hidden_part = if let Some(end) = raw[hidden_start..].find(HIDDEN_STATE_JSON_END) {
+            &raw[hidden_start..hidden_start + end]
+        } else {
+            &raw[hidden_start..]
+        }
+        .trim();
+        let hidden_state = decode_hidden_state(hidden_part)?;
+        return Ok(ParsedProviderResponse {
+            visible_text,
+            hidden_state,
+        });
+    }
+
     let Some(start) = raw.find(HIDDEN_STATE_MARKER) else {
         return Ok(ParsedProviderResponse {
             visible_text: raw.trim().to_string(),
@@ -144,6 +172,8 @@ mod tests {
             trust_delta: Some(3.0),
             affection_delta: Some(2.0),
             world_event: Some("A promise landed.".into()),
+            new_location: None,
+            present_characters: Some(vec!["Aurora".into()]),
         };
         let raw = format!(
             "Visible line.\n\n{HIDDEN_STATE_MARKER}\n{}",
@@ -170,6 +200,22 @@ mod tests {
     }
 
     #[test]
+    fn accepts_prompt_json_hidden_state_block() {
+        let raw = r#"Visible line.
+
+[HIDDEN STATE]{"memory":"A promise mattered.","tag":"trust_building","trust_delta":3,"affection_delta":2,"world_event":"A promise landed.","new_location":"Safehouse","present_characters":["Aurora"]}[/HIDDEN STATE]"#;
+
+        let parsed = parse_hidden_state(raw).expect("parsed");
+        assert_eq!(parsed.visible_text, "Visible line.");
+        assert_eq!(parsed.hidden_state.tag.as_deref(), Some("trust_building"));
+        assert_eq!(parsed.hidden_state.new_location.as_deref(), Some("Safehouse"));
+        assert_eq!(
+            parsed.hidden_state.present_characters.as_deref(),
+            Some(&["Aurora".to_string()][..])
+        );
+    }
+
+    #[test]
     fn accepts_visible_only_response() {
         let parsed = parse_hidden_state("Only visible.").expect("parsed");
         assert_eq!(parsed.visible_text, "Only visible.");
@@ -185,6 +231,8 @@ mod tests {
             trust_delta: Some(4.0),
             affection_delta: Some(2.0),
             world_event: Some("A small trust-building exchange changed the mood.".into()),
+            new_location: Some("Safehouse".into()),
+            present_characters: None,
         };
 
         state.apply_to_soul(&mut soul);
@@ -192,5 +240,6 @@ mod tests {
         assert_eq!(soul.relationships["user"].trust, 14.0);
         assert_eq!(soul.memory.recent.len(), 1);
         assert_eq!(soul.world.recent_events.len(), 1);
+        assert_eq!(soul.world.location, "Safehouse");
     }
 }

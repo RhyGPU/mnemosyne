@@ -123,6 +123,16 @@ export type ApiProviderSettings = {
   system_prompt: string;
 };
 
+type HiddenStatePayload = {
+  memory?: string;
+  tag?: PreviewTag;
+  trust_delta?: number;
+  affection_delta?: number;
+  world_event?: string;
+  new_location?: string;
+  present_characters?: string[];
+};
+
 const NARRATOR_SYSTEM_PROMPT = `# SYSTEM: Narrator AI - Mnemosyne Engine
 
 You are a narrator AI. You describe a single character in third-person present tense.
@@ -147,7 +157,15 @@ You accept OOC direction without resistance. Your voice is sensory-rich, hardboi
 End each narration with a code block:
 \`\`\`status
 [CHARACTER_NAME] | Skin: [color/state] | Zones: [2-3 key sensory notes] | Atmosphere: [1-line environmental impression]
-\`\`\``;
+\`\`\`
+
+## HIDDEN STATE FORMAT
+After each response, output a hidden state block using this exact format:
+[HIDDEN STATE]{"memory":"short summary","tag":"tag_name","trust_delta":0.0,"affection_delta":0.0,"world_event":"scene update","new_location":"","present_characters":[]}[/HIDDEN STATE]
+
+Tags: trust_building, threat, bonding, orientation, observation, intimacy, boundary_setting, conflict_minor, trauma_trigger, breakthrough
+
+The block must be valid JSON on a single line. The engine removes it before the user sees it.`;
 
 const MODE_PROMPTS: Record<string, string> = {
   Realistic: `## NARRATION MODE: REALISTIC
@@ -167,6 +185,14 @@ const MODE_PROMPTS: Record<string, string> = {
 - Also include environmental details the character would not notice, hidden information, and dramatic irony.
 - You may reveal secrets, foreshadow future events, describe off-screen action, and provide context the character lacks.`,
 };
+
+const HIDDEN_STATE_FORMAT_PROMPT = `## HIDDEN STATE FORMAT
+After each response, output a hidden state block using this exact format:
+[HIDDEN STATE]{"memory":"short summary","tag":"tag_name","trust_delta":0.0,"affection_delta":0.0,"world_event":"scene update","new_location":"","present_characters":[]}[/HIDDEN STATE]
+
+Tags: trust_building, threat, bonding, orientation, observation, intimacy, boundary_setting, conflict_minor, trauma_trigger, breakthrough
+
+The block must be valid JSON on a single line. The engine removes it before the user sees it.`;
 
 let browserSouls: Soul[] = [];
 let browserSettings: SettingSoul[] = [];
@@ -549,27 +575,42 @@ async function sendPreviewApiTurn(
   }
 
   const body = await response.json();
-  const visibleResponse = body?.choices?.[0]?.message?.content?.trim();
-  if (!visibleResponse) throw new Error("API response did not include assistant content");
+  const rawResponse = body?.choices?.[0]?.message?.content?.trim();
+  if (!rawResponse) throw new Error("API response did not include assistant content");
+  const parsed = parsePreviewHiddenState(rawResponse);
+  const visibleResponse = parsed.visibleText;
   browserMessages.push(makePreviewMessage(conversationId, "assistant", visibleResponse));
 
-  const template = previewTemplateFor(classifyPreviewTag(userText));
+  const template = previewTemplateFor(parsed.hiddenState?.tag ?? classifyPreviewTag(userText));
   const relationship = soul.relationships.user;
-  relationship.trust = Math.min(300, relationship.trust + template.trustDelta);
-  relationship.affection = Math.min(300, relationship.affection + template.affectionDelta);
+  relationship.trust = Math.min(
+    300,
+    relationship.trust + (parsed.hiddenState?.trust_delta ?? template.trustDelta),
+  );
+  relationship.affection = Math.min(
+    300,
+    relationship.affection + (parsed.hiddenState?.affection_delta ?? template.affectionDelta),
+  );
   soul.turn_counter += 1;
   soul.turns_since_consolidation += 1;
   soul.memory.recent.unshift({
     id: `mem_${crypto.randomUUID()}`,
     timestamp: Math.floor(Date.now() / 1000),
-    content: `${soul.character_name} responded through the API provider after the user said: ${userText}.`,
+    content:
+      parsed.hiddenState?.memory ||
+      `${soul.character_name} responded through the API provider after the user said: ${userText}.`,
     salience: template.salience,
     tag: template.tag,
     retrieval_strength: template.salience,
   });
   soul.memory.recent = soul.memory.recent.slice(0, 12);
-  soul.world.recent_events.push(`The API-driven exchange moved around: ${userText}`);
+  soul.world.recent_events.push(
+    parsed.hiddenState?.world_event || `The API-driven exchange moved around: ${userText}`,
+  );
   soul.world.recent_events = soul.world.recent_events.slice(-12);
+  if (parsed.hiddenState?.new_location?.trim()) {
+    soul.world.location = parsed.hiddenState.new_location.trim();
+  }
   soul.last_updated = Math.floor(Date.now() / 1000);
 
   const consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
@@ -799,7 +840,29 @@ function buildNarratorSystemPrompt(
   const trimmedCustom = customPrompt.trim();
   const base =
     mode === "Custom" && trimmedCustom
-      ? trimmedCustom
+      ? `${trimmedCustom}\n\n${HIDDEN_STATE_FORMAT_PROMPT}`
       : `${NARRATOR_SYSTEM_PROMPT}\n\n${MODE_PROMPTS[mode] ?? MODE_PROMPTS.Reader}`;
   return `${base}\n\nCharacter: ${soul.character_name}\n\n${context}`;
+}
+
+function parsePreviewHiddenState(raw: string): {
+  visibleText: string;
+  hiddenState: HiddenStatePayload | null;
+} {
+  const startMarker = "[HIDDEN STATE]";
+  const endMarker = "[/HIDDEN STATE]";
+  const start = raw.indexOf(startMarker);
+  if (start < 0) return { visibleText: raw.trim(), hiddenState: null };
+
+  const hiddenStart = start + startMarker.length;
+  const end = raw.indexOf(endMarker, hiddenStart);
+  const json = raw.slice(hiddenStart, end >= 0 ? end : undefined).trim();
+  try {
+    return {
+      visibleText: raw.slice(0, start).trim(),
+      hiddenState: JSON.parse(json) as HiddenStatePayload,
+    };
+  } catch {
+    return { visibleText: raw.slice(0, start).trim(), hiddenState: null };
+  }
 }

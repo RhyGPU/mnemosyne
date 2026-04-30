@@ -27,6 +27,14 @@ End each narration with a code block:
 [CHARACTER_NAME] | Skin: [color/state] | Zones: [2-3 key sensory notes] | Atmosphere: [1-line environmental impression]
 ```"#;
 
+const HIDDEN_STATE_FORMAT_PROMPT: &str = r#"## HIDDEN STATE FORMAT
+After each response, output a hidden state block using this exact format:
+[HIDDEN STATE]{"memory":"short summary","tag":"tag_name","trust_delta":0.0,"affection_delta":0.0,"world_event":"scene update","new_location":"","present_characters":[]}[/HIDDEN STATE]
+
+Tags: trust_building, threat, bonding, orientation, observation, intimacy, boundary_setting, conflict_minor, trauma_trigger, breakthrough
+
+The block must be valid JSON on a single line. The engine removes it before the user sees it."#;
+
 const REALISTIC_MODE_PROMPT: &str = r#"## NARRATION MODE: REALISTIC
 - Describe only external actions, dialogue, and physical reactions.
 - No internal monologue. No thoughts. No emotions unless visibly expressed.
@@ -167,7 +175,7 @@ fn build_system_prompt(
     context: &str,
     mode: &str,
 ) -> String {
-    let base_prompt = if mode.trim().eq_ignore_ascii_case("custom")
+    let narrator_prompt = if mode.trim().eq_ignore_ascii_case("custom")
         && !settings.system_prompt.trim().is_empty()
     {
         settings.system_prompt.trim().to_string()
@@ -176,7 +184,7 @@ fn build_system_prompt(
     };
 
     format!(
-        "{base_prompt}\n\nCharacter: {}\n\n{context}",
+        "{narrator_prompt}\n\n{HIDDEN_STATE_FORMAT_PROMPT}\n\nCharacter: {}\n\n{context}",
         soul.character_name
     )
 }
@@ -228,6 +236,8 @@ mod tests {
         assert!(prompt.contains("You are a narrator AI"));
         assert!(prompt.contains("third-person present tense"));
         assert!(prompt.contains("NARRATION MODE: READER"));
+        assert!(prompt.contains("[HIDDEN STATE]"));
+        assert!(prompt.contains("present_characters"));
         assert!(!prompt.contains("ignored unless custom"));
     }
 
@@ -244,6 +254,7 @@ mod tests {
 
         assert!(prompt.starts_with("Custom narrator law."));
         assert!(!prompt.contains("NARRATION MODE: READER"));
+        assert!(prompt.contains("HIDDEN STATE FORMAT"));
         assert!(prompt.contains("[CURRENT STATE]"));
     }
 }

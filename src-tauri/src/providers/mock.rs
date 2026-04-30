@@ -1,7 +1,4 @@
-use state_engine::{
-    hidden_state::{encode_hidden_state, HiddenState},
-    soul::Soul,
-};
+use state_engine::{hidden_state::HiddenState, soul::Soul};
 
 #[derive(Debug, Default)]
 pub struct MockProvider;
@@ -42,11 +39,13 @@ impl MockProvider {
             trust_delta: Some(template.trust_delta),
             affection_delta: Some(template.affection_delta),
             world_event: Some(world_event),
+            new_location: None,
+            present_characters: Some(vec![soul.character_name.clone()]),
         };
 
         format!(
-            "{response}\n\n[HIDDEN_STATE]\n{}",
-            encode_hidden_state(&hidden_state)
+            "{response}\n\n[HIDDEN STATE]{}[/HIDDEN STATE]",
+            serde_json::to_string(&hidden_state).expect("hidden state should serialize")
         )
     }
 }
@@ -95,9 +94,9 @@ fn template_for(tag: MockTag) -> MockTemplate {
             tag: "trust_building",
             trust_delta: 3.0,
             affection_delta: 1.0,
-            reader_line: "The promise lands softly; she tests whether it can hold weight.",
-            realistic_line: "She studies the promise for a long second before letting her shoulders loosen.",
-            god_line: "Trust advances, but only by a careful increment; the scene remains emotionally fragile.",
+            reader_line: "The promise lands softly; she tests whether it can hold weight. \"I hear you.\"",
+            realistic_line: "She studies the promise for a long second before letting her shoulders loosen. \"I hear you.\"",
+            god_line: "Trust advances, but only by a careful increment; the scene remains emotionally fragile. \"I hear you.\"",
             memory_frame: "A safety promise shifted the emotional baseline",
             world_frame: "A small promise of safety changed the room's emotional pressure",
         },
@@ -105,9 +104,9 @@ fn template_for(tag: MockTag) -> MockTemplate {
             tag: "threat",
             trust_delta: 0.0,
             affection_delta: 0.0,
-            reader_line: "Her attention snaps sharp, and old alarm-patterns wake behind her eyes.",
-            realistic_line: "She goes still and starts cataloging exits, distance, and anything that could become cover.",
-            god_line: "Threat pressure rises; immediate survival logic begins overriding softer goals.",
+            reader_line: "Her attention snaps sharp, and old alarm-patterns wake behind her eyes. \"Stay back.\"",
+            realistic_line: "She goes still and starts cataloging exits, distance, and anything that could become cover. \"Stay back.\"",
+            god_line: "Threat pressure rises; immediate survival logic begins overriding softer goals. \"Stay back.\"",
             memory_frame: "A perceived danger forced a defensive read of the scene",
             world_frame: "The scene tightened around a possible danger",
         },
@@ -115,9 +114,9 @@ fn template_for(tag: MockTag) -> MockTemplate {
             tag: "bonding",
             trust_delta: 1.0,
             affection_delta: 3.0,
-            reader_line: "The shared thread of memory draws guarded warmth into her posture.",
-            realistic_line: "She lets the memory sit between you, guarded but visibly affected by it.",
-            god_line: "Bonding increases; shared memory becomes a usable emotional anchor.",
+            reader_line: "The shared thread of memory draws guarded warmth into her posture. \"I remember that.\"",
+            realistic_line: "She lets the memory sit between you, guarded but visibly affected by it. \"I remember that.\"",
+            god_line: "Bonding increases; shared memory becomes a usable emotional anchor. \"I remember that.\"",
             memory_frame: "A shared memory created a warmer bond",
             world_frame: "The exchange became more intimate through remembered detail",
         },
@@ -125,9 +124,9 @@ fn template_for(tag: MockTag) -> MockTemplate {
             tag: "orientation",
             trust_delta: 1.0,
             affection_delta: 0.5,
-            reader_line: "She follows the details carefully, building a map from each concrete cue.",
-            realistic_line: "She asks for specifics, anchoring herself in location, exits, and visible objects.",
-            god_line: "Orientation improves; the character has more usable scene information.",
+            reader_line: "She follows the details carefully, building a map from each concrete cue. \"Tell me what you see.\"",
+            realistic_line: "She asks for specifics, anchoring herself in location, exits, and visible objects. \"Tell me what you see.\"",
+            god_line: "Orientation improves; the character has more usable scene information. \"Tell me what you see.\"",
             memory_frame: "New scene information improved orientation",
             world_frame: "The scene gained clearer spatial definition",
         },
@@ -135,9 +134,9 @@ fn template_for(tag: MockTag) -> MockTemplate {
             tag: "observation",
             trust_delta: 1.0,
             affection_delta: 1.0,
-            reader_line: "She listens, not fully relaxed, but present enough to stay in the exchange.",
-            realistic_line: "She acknowledges the turn with measured focus and keeps the exchange grounded.",
-            god_line: "A neutral exchange is recorded; no major state axis shifts dramatically.",
+            reader_line: "She listens, not fully relaxed, but present enough to stay in the exchange. \"Keep going.\"",
+            realistic_line: "She acknowledges the turn with measured focus and keeps the exchange grounded. \"Keep going.\"",
+            god_line: "A neutral exchange is recorded; no major state axis shifts dramatically. \"Keep going.\"",
             memory_frame: "A neutral exchange added texture to the relationship",
             world_frame: "The conversation continued without a major rupture",
         },
@@ -249,9 +248,9 @@ mod tests {
 
         assert!(!parsed.visible_text.starts_with("[GM]"));
         assert!(parsed.visible_text.contains("Orientation improves"));
-        assert!(!parsed.visible_text.contains("\""));
+        assert!(parsed.visible_text.contains("\"Tell me what you see.\""));
         assert_eq!(parsed.hidden_state.tag.as_deref(), Some("orientation"));
-        assert!(!raw.contains("\"tag\""));
+        assert!(raw.contains("[HIDDEN STATE]"));
     }
 
     #[test]
@@ -267,7 +266,7 @@ mod tests {
         let parsed = parse_hidden_state(&raw).expect("hidden state");
 
         assert!(parsed.visible_text.contains("Aurora"));
-        assert!(!parsed.visible_text.contains("\"I "));
+        assert!(parsed.visible_text.contains("\"I hear you.\""));
         assert!(!parsed.visible_text.contains("I heard you"));
     }
 }

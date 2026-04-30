@@ -305,6 +305,8 @@ fn hidden_state_is_empty(hidden_state: &HiddenState) -> bool {
         && hidden_state.trust_delta.is_none()
         && hidden_state.affection_delta.is_none()
         && hidden_state.world_event.is_none()
+        && hidden_state.new_location.is_none()
+        && hidden_state.present_characters.is_none()
 }
 
 fn generated_api_hidden_state(soul: &Soul, user_text: &str, visible_text: &str) -> HiddenState {
@@ -324,6 +326,8 @@ fn generated_api_hidden_state(soul: &Soul, user_text: &str, visible_text: &str) 
             "The API-driven exchange moved around: {}",
             user_text.trim()
         )),
+        new_location: None,
+        present_characters: Some(vec![soul.character_name.clone()]),
     }
 }
 
@@ -359,6 +363,8 @@ mod tests {
             trust_delta: Some(4.0),
             affection_delta: Some(2.0),
             world_event: Some("A small trust-building exchange changed the mood.".into()),
+            new_location: None,
+            present_characters: None,
         };
 
         state.apply_to_soul(&mut soul);
