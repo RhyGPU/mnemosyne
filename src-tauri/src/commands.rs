@@ -30,6 +30,19 @@ pub struct TurnResult {
     pub context_preview: ContextPreview,
     pub messages: Vec<ChatMessage>,
     pub consolidation_ran: bool,
+    pub debug: TurnDebug,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TurnDebug {
+    pub provider: String,
+    pub hidden_state_found: bool,
+    pub fallback_hidden_state_generated: bool,
+    pub tag: Option<String>,
+    pub trust_delta: Option<f32>,
+    pub affection_delta: Option<f32>,
+    pub new_location: Option<String>,
+    pub present_characters: Vec<String>,
 }
 
 #[tauri::command]
@@ -192,6 +205,7 @@ fn send_mock_turn_with_conn(
     let provider = MockProvider::default();
     let raw_response = provider.complete(&soul, &context_preview.text, &user_text, &mode);
     let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
+    let debug = debug_from_hidden_state("Mock", &parsed.hidden_state, true, false);
 
     parsed.apply_to_soul(&mut soul);
     soul.turn_counter += 1;
@@ -217,6 +231,7 @@ fn send_mock_turn_with_conn(
         context_preview,
         messages,
         consolidation_ran,
+        debug,
     })
 }
 
@@ -249,11 +264,19 @@ pub async fn send_api_turn(
         .complete(&settings, &soul, &context_preview.text, &user_text, &mode)
         .await?;
     let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
-    let hidden_state = if hidden_state_is_empty(&parsed.hidden_state) {
+    let hidden_state_found = !hidden_state_is_empty(&parsed.hidden_state);
+    let fallback_hidden_state_generated = !hidden_state_found;
+    let hidden_state = if fallback_hidden_state_generated {
         generated_api_hidden_state(&soul, &user_text, &parsed.visible_text)
     } else {
         parsed.hidden_state.clone()
     };
+    let debug = debug_from_hidden_state(
+        "API",
+        &hidden_state,
+        hidden_state_found,
+        fallback_hidden_state_generated,
+    );
 
     hidden_state.apply_to_soul(&mut soul);
     soul.turn_counter += 1;
@@ -286,6 +309,7 @@ pub async fn send_api_turn(
         context_preview,
         messages,
         consolidation_ran,
+        debug,
     })
 }
 
@@ -307,6 +331,24 @@ fn hidden_state_is_empty(hidden_state: &HiddenState) -> bool {
         && hidden_state.world_event.is_none()
         && hidden_state.new_location.is_none()
         && hidden_state.present_characters.is_none()
+}
+
+fn debug_from_hidden_state(
+    provider: &str,
+    hidden_state: &HiddenState,
+    hidden_state_found: bool,
+    fallback_hidden_state_generated: bool,
+) -> TurnDebug {
+    TurnDebug {
+        provider: provider.into(),
+        hidden_state_found,
+        fallback_hidden_state_generated,
+        tag: hidden_state.tag.clone(),
+        trust_delta: hidden_state.trust_delta,
+        affection_delta: hidden_state.affection_delta,
+        new_location: hidden_state.new_location.clone(),
+        present_characters: hidden_state.present_characters.clone().unwrap_or_default(),
+    }
 }
 
 fn generated_api_hidden_state(soul: &Soul, user_text: &str, visible_text: &str) -> HiddenState {

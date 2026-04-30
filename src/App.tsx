@@ -21,6 +21,7 @@ import {
   SettingSummary,
   Soul,
   SoulSummary,
+  TurnDebug,
   compileContext,
   createDefaultSoul,
   createDefaultSetting,
@@ -163,6 +164,7 @@ export function App() {
     model: "",
     system_prompt: "",
   });
+  const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
   const [status, setStatus] = useState("Ready");
   const [busy, setBusy] = useState(false);
   const didBootstrap = useRef(false);
@@ -373,6 +375,7 @@ export function App() {
       await upsertSoul(nextSoul);
       setSoul(nextSoul);
       setMessages([]);
+      setLastTurnDebug(null);
       setSouls(await listSouls());
       setStatus("New Soul created");
     } catch (error) {
@@ -392,6 +395,7 @@ export function App() {
       setStatus(`Selected ${nextSoul.character_name}`);
       setSoul(nextSoul);
       setCreatorFieldsFromSoul(nextSoul);
+      setLastTurnDebug(null);
       setMessages(
         await listConversationMessages(
           setting
@@ -417,6 +421,7 @@ export function App() {
       setEditorFieldsFromSetting(nextSetting);
       setSettings(await listSettings());
       setMessages([]);
+      setLastTurnDebug(null);
       setStatus("New Setting created");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -434,6 +439,7 @@ export function App() {
       const nextSetting = await getSetting(selected.setting_id);
       setSetting(nextSetting);
       setEditorFieldsFromSetting(nextSetting);
+      setLastTurnDebug(null);
       setMessages(
         soul
           ? await listConversationMessages(
@@ -480,6 +486,7 @@ export function App() {
       setSoul(result.soul);
       setMessages(result.messages);
       setContext(result.context_preview);
+      setLastTurnDebug(result.debug);
       setSouls(await listSouls());
       setStatus(result.consolidation_ran ? "Turn saved; consolidation ran" : "Turn saved");
     } catch (error) {
@@ -517,6 +524,7 @@ export function App() {
       await deleteConversation(currentConversationId);
       setMessages([]);
       setContext(await compileContext(soul.character_id, currentConversationId));
+      setLastTurnDebug(null);
       setStatus("Chat deleted; Soul memory kept");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -1128,6 +1136,50 @@ export function App() {
           </select>
         </label>
 
+        <section className="diagnostics-section api-debug-section">
+          <h2>API Debug</h2>
+          <dl className="diagnostic-grid">
+            <div>
+              <dt>Provider</dt>
+              <dd>{lastTurnDebug?.provider ?? provider}</dd>
+            </div>
+            <div>
+              <dt>Hidden</dt>
+              <dd>
+                {lastTurnDebug
+                  ? lastTurnDebug.hidden_state_found
+                    ? "Parsed"
+                    : "Missing"
+                  : "No turn"}
+              </dd>
+            </div>
+            <div>
+              <dt>Fallback</dt>
+              <dd>{lastTurnDebug?.fallback_hidden_state_generated ? "Generated" : "No"}</dd>
+            </div>
+            <div>
+              <dt>Tag</dt>
+              <dd>{lastTurnDebug?.tag ?? "-"}</dd>
+            </div>
+            <div>
+              <dt>Trust</dt>
+              <dd>{formatDebugDelta(lastTurnDebug?.trust_delta)}</dd>
+            </div>
+            <div>
+              <dt>Affection</dt>
+              <dd>{formatDebugDelta(lastTurnDebug?.affection_delta)}</dd>
+            </div>
+            <div>
+              <dt>Location</dt>
+              <dd>{lastTurnDebug?.new_location ?? "-"}</dd>
+            </div>
+            <div>
+              <dt>Present</dt>
+              <dd>{lastTurnDebug?.present_characters.join(", ") || "-"}</dd>
+            </div>
+          </dl>
+        </section>
+
         <section className="setting-section">
           <h2>Setting</h2>
           <label className="field">
@@ -1354,6 +1406,11 @@ function Stat({ label, value }: { label: string; value: number }) {
       <strong>{Math.round(value)}</strong>
     </div>
   );
+}
+
+function formatDebugDelta(value: number | null | undefined) {
+  if (value === null || value === undefined) return "-";
+  return value > 0 ? `+${value}` : String(value);
 }
 
 function RangeField({

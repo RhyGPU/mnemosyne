@@ -108,6 +108,18 @@ export type TurnResult = {
   context_preview: ContextPreview;
   messages: ChatMessage[];
   consolidation_ran: boolean;
+  debug: TurnDebug;
+};
+
+export type TurnDebug = {
+  provider: string;
+  hidden_state_found: boolean;
+  fallback_hidden_state_generated: boolean;
+  tag: string | null;
+  trust_delta: number | null;
+  affection_delta: number | null;
+  new_location: string | null;
+  present_characters: string[];
 };
 
 export type ContextPreview = {
@@ -125,7 +137,7 @@ export type ApiProviderSettings = {
 
 type HiddenStatePayload = {
   memory?: string;
-  tag?: PreviewTag;
+  tag?: string;
   trust_delta?: number;
   affection_delta?: number;
   world_event?: string;
@@ -504,6 +516,17 @@ function sendPreviewTurn(
   const template = previewTemplateFor(classifyPreviewTag(userText));
   const visibleResponse = renderPreviewResponse(soul, userText, template, mode);
   browserMessages.push(makePreviewMessage(conversationId, "assistant", visibleResponse));
+  const debug = debugFromHiddenState(
+    "Mock",
+    {
+      tag: template.tag,
+      trust_delta: template.trustDelta,
+      affection_delta: template.affectionDelta,
+      present_characters: [soul.character_name],
+    },
+    true,
+    false,
+  );
 
   const relationship = soul.relationships.user;
   relationship.trust = Math.min(300, relationship.trust + template.trustDelta);
@@ -533,6 +556,7 @@ function sendPreviewTurn(
     context_preview: compilePreviewContext(soul, conversationId),
     messages: browserMessages.filter((message) => message.conversation_id === conversationId),
     consolidation_ran,
+    debug,
   };
 }
 
@@ -578,18 +602,20 @@ async function sendPreviewApiTurn(
   const rawResponse = body?.choices?.[0]?.message?.content?.trim();
   if (!rawResponse) throw new Error("API response did not include assistant content");
   const parsed = parsePreviewHiddenState(rawResponse);
+  const hiddenStateFound = parsed.hiddenState !== null;
+  const hiddenState = parsed.hiddenState ?? generatedPreviewApiHiddenState(soul, userText, parsed.visibleText);
   const visibleResponse = parsed.visibleText;
   browserMessages.push(makePreviewMessage(conversationId, "assistant", visibleResponse));
 
-  const template = previewTemplateFor(parsed.hiddenState?.tag ?? classifyPreviewTag(userText));
+  const template = previewTemplateFor(normalizePreviewTag(hiddenState.tag, userText));
   const relationship = soul.relationships.user;
   relationship.trust = Math.min(
     300,
-    relationship.trust + (parsed.hiddenState?.trust_delta ?? template.trustDelta),
+    relationship.trust + (hiddenState.trust_delta ?? template.trustDelta),
   );
   relationship.affection = Math.min(
     300,
-    relationship.affection + (parsed.hiddenState?.affection_delta ?? template.affectionDelta),
+    relationship.affection + (hiddenState.affection_delta ?? template.affectionDelta),
   );
   soul.turn_counter += 1;
   soul.turns_since_consolidation += 1;
@@ -597,7 +623,7 @@ async function sendPreviewApiTurn(
     id: `mem_${crypto.randomUUID()}`,
     timestamp: Math.floor(Date.now() / 1000),
     content:
-      parsed.hiddenState?.memory ||
+      hiddenState.memory ||
       `${soul.character_name} responded through the API provider after the user said: ${userText}.`,
     salience: template.salience,
     tag: template.tag,
@@ -605,11 +631,11 @@ async function sendPreviewApiTurn(
   });
   soul.memory.recent = soul.memory.recent.slice(0, 12);
   soul.world.recent_events.push(
-    parsed.hiddenState?.world_event || `The API-driven exchange moved around: ${userText}`,
+    hiddenState.world_event || `The API-driven exchange moved around: ${userText}`,
   );
   soul.world.recent_events = soul.world.recent_events.slice(-12);
-  if (parsed.hiddenState?.new_location?.trim()) {
-    soul.world.location = parsed.hiddenState.new_location.trim();
+  if (hiddenState.new_location?.trim()) {
+    soul.world.location = hiddenState.new_location.trim();
   }
   soul.last_updated = Math.floor(Date.now() / 1000);
 
@@ -623,6 +649,7 @@ async function sendPreviewApiTurn(
     context_preview: compilePreviewContext(soul, conversationId),
     messages: browserMessages.filter((message) => message.conversation_id === conversationId),
     consolidation_ran,
+    debug: debugFromHiddenState("API", hiddenState, hiddenStateFound, !hiddenStateFound),
   };
 }
 
@@ -733,6 +760,59 @@ function classifyPreviewTag(text: string): PreviewTag {
     return "orientation";
   }
   return "observation";
+}
+
+function normalizePreviewTag(tag: string | undefined, fallbackText: string): PreviewTag {
+  if (
+    tag === "trust_building" ||
+    tag === "threat" ||
+    tag === "bonding" ||
+    tag === "orientation" ||
+    tag === "observation"
+  ) {
+    return tag;
+  }
+  if (tag === "intimacy") return "bonding";
+  if (tag === "boundary_setting" || tag === "conflict_minor" || tag === "trauma_trigger") {
+    return "threat";
+  }
+  if (tag === "breakthrough") return "trust_building";
+  return classifyPreviewTag(fallbackText);
+}
+
+function generatedPreviewApiHiddenState(
+  soul: Soul,
+  userText: string,
+  visibleText: string,
+): HiddenStatePayload {
+  const tag = classifyPreviewTag(userText);
+  const template = previewTemplateFor(tag);
+  return {
+    memory: `${soul.character_name} responded through the API provider after the user said: ${userText}. Assistant cue: ${visibleText.slice(0, 180).trim()}`,
+    tag,
+    trust_delta: template.trustDelta,
+    affection_delta: template.affectionDelta,
+    world_event: `The API-driven exchange moved around: ${userText}`,
+    present_characters: [soul.character_name],
+  };
+}
+
+function debugFromHiddenState(
+  provider: string,
+  hiddenState: HiddenStatePayload,
+  hiddenStateFound: boolean,
+  fallbackHiddenStateGenerated: boolean,
+): TurnDebug {
+  return {
+    provider,
+    hidden_state_found: hiddenStateFound,
+    fallback_hidden_state_generated: fallbackHiddenStateGenerated,
+    tag: hiddenState.tag ?? null,
+    trust_delta: hiddenState.trust_delta ?? null,
+    affection_delta: hiddenState.affection_delta ?? null,
+    new_location: hiddenState.new_location?.trim() || null,
+    present_characters: hiddenState.present_characters ?? [],
+  };
 }
 
 function previewTemplateFor(tag: PreviewTag): PreviewTemplate {
