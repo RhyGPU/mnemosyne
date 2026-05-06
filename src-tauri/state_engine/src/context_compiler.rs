@@ -30,6 +30,7 @@ pub struct ContextBudget {
     pub memory_tokens: usize,
     pub world_tokens: usize,
     pub relationship_tokens: usize,
+    pub immediate_continuity_tokens: usize,
     pub recent_chat_tokens: usize,
 }
 
@@ -55,7 +56,8 @@ impl Default for ContextBudget {
             memory_tokens: 650,
             world_tokens: 450,
             relationship_tokens: 250,
-            recent_chat_tokens: 750,
+            immediate_continuity_tokens: 450,
+            recent_chat_tokens: 500,
         }
     }
 }
@@ -76,6 +78,7 @@ pub fn compile_context_with_budget(
         build_world_section(soul, budget),
         build_memory_section(soul, messages, budget),
         build_relationship_section(soul, budget),
+        build_immediate_continuity_section(messages, budget),
         build_recent_chat_section(messages, budget),
     ];
 
@@ -87,16 +90,8 @@ pub fn compile_context_with_budget(
         }
     }
 
-    let mut text = sections.join("\n\n");
-    while estimate_tokens(&text) > budget.max_tokens {
-        truncated = true;
-        if let Some(last_break) = text.rfind('\n') {
-            text.truncate(last_break);
-        } else {
-            text = truncate_to_token_budget(&text, budget.max_tokens);
-            break;
-        }
-    }
+    truncated |= compact_sections_to_budget(&mut sections, budget.max_tokens);
+    let text = sections.join("\n\n");
 
     ContextPreview {
         estimated_tokens: estimate_tokens(&text),
@@ -301,8 +296,47 @@ fn build_relationship_section(soul: &Soul, budget: &ContextBudget) -> BuiltSecti
     )
 }
 
+fn build_immediate_continuity_section(
+    messages: &[ContextMessage],
+    budget: &ContextBudget,
+) -> BuiltSection {
+    let last_assistant = last_message_with_role(messages, "assistant");
+    let last_user = last_message_with_role(messages, "user");
+    if last_assistant.is_none() && last_user.is_none() {
+        return BuiltSection {
+            text: String::new(),
+            truncated: false,
+        };
+    }
+
+    let lines = vec![
+        format!(
+            "- Last narrator action: {}",
+            last_assistant
+                .map(|message| message.content.trim())
+                .unwrap_or("No prior narrator action in the available chat window.")
+        ),
+        format!(
+            "- Last user action: {}",
+            last_user
+                .map(|message| message.content.trim())
+                .unwrap_or("No prior user action in the available chat window.")
+        ),
+        "- Current scene must continue from these facts. Do not replay them unless the user explicitly asks for a rewind or retcon."
+            .into(),
+    ];
+
+    let required_tokens = estimate_tokens("[IMMEDIATE CONTINUITY]") + estimate_tokens(&lines.join("\n"));
+    let token_cap = budget
+        .immediate_continuity_tokens
+        .max(required_tokens)
+        .min(budget.max_tokens);
+
+    section_from_lines("[IMMEDIATE CONTINUITY]", lines, token_cap)
+}
+
 fn build_recent_chat_section(messages: &[ContextMessage], budget: &ContextBudget) -> BuiltSection {
-    let recent_chat = messages
+    let mut recent_chat = messages
         .iter()
         .rev()
         .take(8)
@@ -326,11 +360,22 @@ fn build_recent_chat_section(messages: &[ContextMessage], budget: &ContextBudget
         };
     }
 
-    section_from_lines(
+    let mut section = section_from_lines(
+        "[RECENT CHAT]",
+        recent_chat.clone(),
+        budget.recent_chat_tokens.min(budget.max_tokens),
+    );
+    if has_last_user_and_assistant(&section.text, messages) {
+        return section;
+    }
+
+    recent_chat = protected_recent_chat_lines(messages);
+    section = section_from_lines(
         "[RECENT CHAT]",
         recent_chat,
         budget.recent_chat_tokens.min(budget.max_tokens),
-    )
+    );
+    section
 }
 
 fn section_from_lines(header: &str, lines: Vec<String>, token_cap: usize) -> BuiltSection {
@@ -354,6 +399,62 @@ fn section_from_lines(header: &str, lines: Vec<String>, token_cap: usize) -> Bui
     }
 
     BuiltSection { text, truncated }
+}
+
+fn compact_sections_to_budget(sections: &mut Vec<String>, max_tokens: usize) -> bool {
+    let mut truncated = false;
+    let trim_order = [
+        "[RECENT CHAT]",
+        "[RELEVANT MEMORIES]",
+        "[CHARACTER SNAPSHOT]",
+        "[CURRENT STATE]",
+        "[WORLD SNAPSHOT]",
+        "[RELATIONSHIP]",
+    ];
+
+    while estimate_tokens(&sections.join("\n\n")) > max_tokens {
+        let mut trimmed = false;
+        for header in trim_order {
+            if let Some(section) = sections.iter_mut().find(|section| section.starts_with(header)) {
+                if trim_last_line(section) {
+                    truncated = true;
+                    trimmed = true;
+                    break;
+                }
+            }
+        }
+
+        if !trimmed {
+            sections.retain(|section| section.starts_with("[IMMEDIATE CONTINUITY]"));
+            if let Some(section) = sections.first_mut() {
+                let header_tokens = estimate_tokens("[IMMEDIATE CONTINUITY]");
+                let body = section
+                    .split_once('\n')
+                    .map(|(_, body)| body)
+                    .unwrap_or(section);
+                *section = format!(
+                    "[IMMEDIATE CONTINUITY]\n{}",
+                    truncate_to_token_budget(body, max_tokens.saturating_sub(header_tokens))
+                );
+            }
+            truncated = true;
+            break;
+        }
+    }
+
+    truncated
+}
+
+fn trim_last_line(section: &mut String) -> bool {
+    let Some(last_break) = section.rfind('\n') else {
+        return false;
+    };
+    let header_only = !section[..last_break].contains('\n');
+    if header_only {
+        return false;
+    }
+    section.truncate(last_break);
+    true
 }
 
 fn score_recent_memory<'a>(
@@ -381,6 +482,60 @@ fn score_recent_memory<'a>(
         score,
         repetitive,
     }
+}
+
+fn last_message_with_role<'a>(
+    messages: &'a [ContextMessage],
+    role: &str,
+) -> Option<&'a ContextMessage> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == role && !message.content.trim().is_empty())
+}
+
+fn has_last_user_and_assistant(section_text: &str, messages: &[ContextMessage]) -> bool {
+    let has_last_user = last_message_with_role(messages, "user")
+        .map(|message| section_text.contains(message.content.trim()))
+        .unwrap_or(true);
+    let has_last_assistant = last_message_with_role(messages, "assistant")
+        .map(|message| section_text.contains(message.content.trim()))
+        .unwrap_or(true);
+
+    has_last_user && has_last_assistant
+}
+
+fn protected_recent_chat_lines(messages: &[ContextMessage]) -> Vec<String> {
+    let mut protected_indexes = Vec::new();
+    if let Some(index) = last_message_index_with_role(messages, "assistant") {
+        protected_indexes.push(index);
+    }
+    if let Some(index) = last_message_index_with_role(messages, "user") {
+        protected_indexes.push(index);
+    }
+    protected_indexes.sort_unstable();
+    protected_indexes.dedup();
+
+    protected_indexes
+        .into_iter()
+        .map(|index| {
+            let message = &messages[index];
+            format!(
+                "{}: {}",
+                fallback(&message.role, "message"),
+                message.content.trim()
+            )
+        })
+        .collect()
+}
+
+fn last_message_index_with_role(messages: &[ContextMessage], role: &str) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.role == role && !message.content.trim().is_empty())
+        .map(|(index, _)| index)
 }
 
 fn is_repetitive_low_value(memory: &MemoryEntry) -> bool {
@@ -478,6 +633,7 @@ mod tests {
             memory_tokens: 120,
             world_tokens: 100,
             relationship_tokens: 80,
+            immediate_continuity_tokens: 120,
             recent_chat_tokens: 120,
         };
 
@@ -558,6 +714,84 @@ mod tests {
         assert!(preview.text.contains("locked door"));
     }
 
+    #[test]
+    fn last_assistant_message_appears_in_immediate_continuity() {
+        let soul = new_default_soul("Aurora");
+        let messages = phone_continuity_messages();
+
+        let preview = compile_context_for_messages(&soul, &messages);
+        let continuity = section_text(&preview.text, "[IMMEDIATE CONTINUITY]");
+
+        assert!(continuity.contains("took the phone, locked it, tossed it onto the couch"));
+    }
+
+    #[test]
+    fn last_user_message_appears_in_immediate_continuity() {
+        let soul = new_default_soul("Aurora");
+        let messages = phone_continuity_messages();
+
+        let preview = compile_context_for_messages(&soul, &messages);
+        let continuity = section_text(&preview.text, "[IMMEDIATE CONTINUITY]");
+
+        assert!(continuity.contains("I want pad thai too."));
+    }
+
+    #[test]
+    fn immediate_continuity_appears_before_recent_chat() {
+        let soul = new_default_soul("Aurora");
+        let messages = phone_continuity_messages();
+
+        let preview = compile_context_for_messages(&soul, &messages);
+        let continuity_index = preview
+            .text
+            .find("[IMMEDIATE CONTINUITY]")
+            .expect("continuity section");
+        let recent_chat_index = preview.text.find("[RECENT CHAT]").expect("recent chat");
+
+        assert!(continuity_index < recent_chat_index);
+    }
+
+    #[test]
+    fn budget_is_still_respected_with_immediate_continuity() {
+        let soul = new_default_soul("Aurora");
+        let messages = vec![
+            ContextMessage {
+                role: "assistant".into(),
+                content: format!("Aurora completed the prior action. {}", "a".repeat(600)),
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: format!("I move the scene forward. {}", "b".repeat(600)),
+            },
+        ];
+        let budget = ContextBudget {
+            max_tokens: 450,
+            current_state_tokens: 90,
+            profile_tokens: 70,
+            memory_tokens: 90,
+            world_tokens: 80,
+            relationship_tokens: 70,
+            immediate_continuity_tokens: 160,
+            recent_chat_tokens: 120,
+        };
+
+        let preview = compile_context_with_budget(&soul, &messages, &budget);
+
+        assert!(preview.estimated_tokens <= budget.max_tokens);
+    }
+
+    #[test]
+    fn recent_chat_appears_with_immediate_continuity() {
+        let soul = new_default_soul("Aurora");
+        let messages = phone_continuity_messages();
+
+        let preview = compile_context_for_messages(&soul, &messages);
+
+        assert!(preview.text.contains("[IMMEDIATE CONTINUITY]"));
+        assert!(preview.text.contains("[RECENT CHAT]"));
+        assert!(preview.text.contains("I want pad thai too."));
+    }
+
     fn memory(
         id: &str,
         content: &str,
@@ -574,5 +808,31 @@ mod tests {
             tag: tag.into(),
             retrieval_strength,
         }
+    }
+
+    fn phone_continuity_messages() -> Vec<ContextMessage> {
+        vec![
+            ContextMessage {
+                role: "user".into(),
+                content: "I show her the phone.".into(),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content:
+                    "Aurora saw the Tinder screenshot, took the phone, locked it, tossed it onto the couch, and moved toward the kitchen."
+                        .into(),
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "I want pad thai too.".into(),
+            },
+        ]
+    }
+
+    fn section_text<'a>(text: &'a str, header: &str) -> &'a str {
+        let start = text.find(header).expect("section header");
+        let rest = &text[start..];
+        let end = rest.find("\n\n[").unwrap_or(rest.len());
+        &rest[..end]
     }
 }
