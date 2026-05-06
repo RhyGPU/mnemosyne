@@ -32,6 +32,18 @@ pub struct ChatMessage {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderProfile {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub system_prompt: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 pub fn connection_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut dir = app.path().app_data_dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -85,6 +97,17 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             content TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS provider_profiles (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            api_key TEXT NOT NULL,
+            model TEXT NOT NULL,
+            system_prompt TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
         );
         ",
     )
@@ -253,6 +276,61 @@ pub fn insert_message(
     Ok(())
 }
 
+pub fn update_message_content(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: i64,
+    content: &str,
+) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE messages SET content = ?1 WHERE conversation_id = ?2 AND id = ?3 AND role = 'assistant'",
+        params![content, conversation_id, message_id],
+    )?;
+    if affected > 0 {
+        conn.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now_ts(), conversation_id],
+        )?;
+    }
+    Ok(affected > 0)
+}
+
+pub fn list_messages_before_id(
+    conn: &Connection,
+    conversation_id: &str,
+    before_message_id: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<ChatMessage>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT id, conversation_id, role, content, created_at
+        FROM (
+            SELECT id, conversation_id, role, content, created_at
+            FROM messages
+            WHERE conversation_id = ?1 AND id < ?2
+            ORDER BY id DESC
+            LIMIT ?3
+        )
+        ORDER BY id ASC
+        ",
+    )?;
+
+    let rows = stmt.query_map(
+        params![conversation_id, before_message_id, limit as i64],
+        |row| {
+            Ok(ChatMessage {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        },
+    )?;
+
+    rows.collect()
+}
+
 pub fn delete_conversation(conn: &Connection, conversation_id: &str) -> rusqlite::Result<bool> {
     let affected = conn.execute("DELETE FROM conversations WHERE id = ?1", [conversation_id])?;
     Ok(affected > 0)
@@ -316,6 +394,89 @@ pub fn count_assistant_messages(conn: &Connection, conversation_id: &str) -> rus
     )
 }
 
+pub fn upsert_provider_profile(
+    conn: &Connection,
+    profile: &ProviderProfile,
+) -> rusqlite::Result<ProviderProfile> {
+    let now = now_ts();
+    let created_at = if profile.created_at > 0 {
+        profile.created_at
+    } else {
+        now
+    };
+    let updated = ProviderProfile {
+        created_at,
+        updated_at: now,
+        ..profile.clone()
+    };
+    conn.execute(
+        "
+        INSERT INTO provider_profiles (id, name, base_url, api_key, model, system_prompt, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            base_url = excluded.base_url,
+            api_key = excluded.api_key,
+            model = excluded.model,
+            system_prompt = excluded.system_prompt,
+            updated_at = excluded.updated_at
+        ",
+        params![
+            updated.id,
+            updated.name,
+            updated.base_url,
+            updated.api_key,
+            updated.model,
+            updated.system_prompt,
+            updated.created_at,
+            updated.updated_at
+        ],
+    )?;
+    Ok(updated)
+}
+
+pub fn list_provider_profiles(conn: &Connection) -> rusqlite::Result<Vec<ProviderProfile>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at
+        FROM provider_profiles
+        ORDER BY updated_at DESC, name ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], provider_profile_from_row)?;
+    rows.collect()
+}
+
+pub fn get_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<ProviderProfile> {
+    conn.query_row(
+        "
+        SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at
+        FROM provider_profiles
+        WHERE id = ?1
+        ",
+        [id],
+        provider_profile_from_row,
+    )
+}
+
+pub fn delete_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let affected = conn.execute("DELETE FROM provider_profiles WHERE id = ?1", [id])?;
+    Ok(affected > 0)
+}
+
+fn provider_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderProfile> {
+    Ok(ProviderProfile {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        base_url: row.get(2)?,
+        api_key: row.get(3)?,
+        model: row.get(4)?,
+        system_prompt: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
 fn decode_soul(json: &str) -> rusqlite::Result<Soul> {
     serde_json::from_str(json).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
@@ -361,6 +522,11 @@ mod tests {
         let messages = list_messages(&conn, "mock", 5).expect("messages");
         assert_eq!(messages.len(), 2);
         assert_eq!(count_assistant_messages(&conn, "mock").unwrap(), 1);
+
+        assert!(update_message_content(&conn, "mock", messages[1].id, "Regenerated").unwrap());
+        let messages = list_messages(&conn, "mock", 5).expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "Regenerated");
     }
 
     #[test]
@@ -401,5 +567,30 @@ mod tests {
         assert_eq!(loaded.world.location, "Underground cell");
         assert!(delete_setting(&conn, &setting.setting_id).expect("delete"));
         assert!(list_settings(&conn).expect("list settings").is_empty());
+    }
+
+    #[test]
+    fn provider_profiles_crud() {
+        let conn = init_memory_connection().expect("db");
+        let profile = ProviderProfile {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "gpt".into(),
+            system_prompt: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        let saved = upsert_provider_profile(&conn, &profile).expect("upsert");
+        assert!(saved.created_at > 0);
+        assert_eq!(list_provider_profiles(&conn).expect("list").len(), 1);
+        assert_eq!(
+            get_provider_profile(&conn, "openai").expect("get").model,
+            "gpt"
+        );
+        assert!(delete_provider_profile(&conn, "openai").expect("delete"));
+        assert!(list_provider_profiles(&conn).expect("list").is_empty());
     }
 }

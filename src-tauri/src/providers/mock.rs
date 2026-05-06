@@ -41,6 +41,10 @@ impl MockProvider {
             world_event: Some(world_event),
             new_location: None,
             present_characters: Some(vec![soul.character_name.clone()]),
+            arousal_delta: None,
+            arousal_denied: None,
+            orgasm_allowed: None,
+            forced_orgasm: None,
         };
 
         format!(

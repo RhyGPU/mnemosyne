@@ -18,6 +18,7 @@ import {
   ApiProviderSettings,
   ChatMessage,
   ContextPreview,
+  ProviderProfile,
   SettingSoul,
   SettingSummary,
   Soul,
@@ -28,18 +29,22 @@ import {
   createDefaultSetting,
   deleteConversation,
   deleteMessage,
+  deleteProviderProfile,
   deleteSetting,
   deleteSoul,
   getSetting,
   getSoul,
+  listProviderProfiles,
   listConversationMessages,
   listSettings,
   listSouls,
+  listenApiStream,
   runConsolidation,
   saveSettingFile,
   saveSoulFile,
   sendApiTurn,
   sendMockTurn,
+  upsertProviderProfile,
   upsertSetting,
   upsertSoul,
 } from "./tauri";
@@ -163,6 +168,9 @@ export function App() {
   const [psycheOpen, setPsycheOpen] = useState(false);
   const [provider, setProvider] = useState<ProviderKind>("Mock");
   const [mode, setMode] = useState<NarrativeMode>("Reader");
+  const [providerProfiles, setProviderProfiles] = useState<ProviderProfile[]>([]);
+  const [providerProfileName, setProviderProfileName] = useState("Default API");
+  const [selectedProviderProfileId, setSelectedProviderProfileId] = useState("");
   const [apiSettings, setApiSettings] = useState<ApiProviderSettings>({
     base_url: "https://api.openai.com/v1",
     api_key: "",
@@ -196,6 +204,20 @@ export function App() {
     if (!soul) return;
     void refreshContext(soul.character_id, currentConversationId);
   }, [soul?.character_id, currentConversationId, messages.length]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listenApiStream((payload) => {
+      if (payload.conversation_id !== currentConversationId) return;
+      setMessages((current) => appendStreamingChunk(current, payload.conversation_id, payload.chunk));
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [currentConversationId]);
 
   function setCreatorFieldsFromSoul(nextSoul: Soul) {
     setCharacterName(nextSoul.character_name);
@@ -334,9 +356,25 @@ export function App() {
   }
 
   async function bootstrap() {
-    const [existingSouls, existingSettings] = await Promise.all([listSouls(), listSettings()]);
+    const [existingSouls, existingSettings, existingProviderProfiles] = await Promise.all([
+      listSouls(),
+      listSettings(),
+      listProviderProfiles(),
+    ]);
     setSouls(existingSouls);
     setSettings(existingSettings);
+    setProviderProfiles(existingProviderProfiles);
+    if (existingProviderProfiles.length > 0) {
+      const profile = existingProviderProfiles[0];
+      setSelectedProviderProfileId(profile.id);
+      setProviderProfileName(profile.name);
+      setApiSettings({
+        base_url: profile.base_url,
+        api_key: profile.api_key,
+        model: profile.model,
+        system_prompt: profile.system_prompt,
+      });
+    }
 
     let activeSetting: SettingSoul;
     if (existingSettings.length > 0) {
@@ -463,7 +501,7 @@ export function App() {
     }
   }
 
-  async function executeTurn(text: string, statusLabel?: string) {
+  async function executeTurn(text: string, statusLabel?: string, replacementAssistantId?: number) {
     if (!text || busy || !soul) return;
     const generationId = generationIdRef.current + 1;
     generationIdRef.current = generationId;
@@ -476,6 +514,11 @@ export function App() {
       const activeSetting = await persistCurrentSetting();
       const activeSoul = activeSetting ? mirrorSettingIntoSoul(soul, activeSetting) : soul;
       await upsertSoul(activeSoul);
+      if (provider === "API") {
+        setMessages((current) =>
+          seedStreamingTurn(current, currentConversationId, text, replacementAssistantId),
+        );
+      }
       const result =
         provider === "API"
           ? await sendApiTurn(
@@ -485,8 +528,15 @@ export function App() {
               mode,
               apiSettings,
               abortController.signal,
+              replacementAssistantId,
             )
-          : await sendMockTurn(currentConversationId, activeSoul.character_id, text, mode);
+          : await sendMockTurn(
+              currentConversationId,
+              activeSoul.character_id,
+              text,
+              mode,
+              replacementAssistantId,
+            );
       if (generationIdRef.current !== generationId || abortController.signal.aborted) {
         return;
       }
@@ -537,7 +587,14 @@ export function App() {
       setStatus("No user message to regenerate");
       return;
     }
-    await executeTurn(lastUserMessage.content, "Regenerating last turn");
+    const lastAssistantMessage = [...activeMessages]
+      .reverse()
+      .find((message) => message.role === "assistant" && message.id > lastUserMessage.id);
+    await executeTurn(
+      lastUserMessage.content,
+      "Regenerating last turn",
+      lastAssistantMessage?.id,
+    );
   }
 
   async function handleRegenerateFromMessage(message: ChatMessage) {
@@ -553,7 +610,7 @@ export function App() {
       return;
     }
 
-    await executeTurn(previousUserMessage.content, "Regenerating response");
+    await executeTurn(previousUserMessage.content, "Regenerating response", message.id);
   }
 
   async function handleDeleteChatMessage(message: ChatMessage) {
@@ -702,6 +759,57 @@ export function App() {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleSelectProviderProfile(profileId: string) {
+    setSelectedProviderProfileId(profileId);
+    const profile = providerProfiles.find((item) => item.id === profileId);
+    if (!profile) return;
+    setProviderProfileName(profile.name);
+    setApiSettings({
+      base_url: profile.base_url,
+      api_key: profile.api_key,
+      model: profile.model,
+      system_prompt: profile.system_prompt,
+    });
+    setStatus(`Loaded provider profile ${profile.name}`);
+  }
+
+  async function handleSaveProviderProfile() {
+    if (busy) return;
+    const trimmedName = providerProfileName.trim() || "API Profile";
+    const profile: ProviderProfile = {
+      id: selectedProviderProfileId || crypto.randomUUID(),
+      name: trimmedName,
+      base_url: apiSettings.base_url,
+      api_key: apiSettings.api_key,
+      model: apiSettings.model,
+      system_prompt: apiSettings.system_prompt,
+      created_at: 0,
+      updated_at: 0,
+    };
+    try {
+      const saved = await upsertProviderProfile(profile);
+      setSelectedProviderProfileId(saved.id);
+      setProviderProfileName(saved.name);
+      setProviderProfiles(await listProviderProfiles());
+      setStatus(`Saved provider profile ${saved.name}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleDeleteProviderProfile() {
+    if (busy || !selectedProviderProfileId) return;
+    try {
+      await deleteProviderProfile(selectedProviderProfileId);
+      setSelectedProviderProfileId("");
+      setProviderProfileName("Default API");
+      setProviderProfiles(await listProviderProfiles());
+      setStatus("Provider profile deleted");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -1424,6 +1532,30 @@ export function App() {
           {provider === "API" ? (
             <>
               <label className="field">
+                <span>Profile</span>
+                <select
+                  value={selectedProviderProfileId}
+                  onChange={(event) => handleSelectProviderProfile(event.target.value)}
+                  disabled={busy}
+                >
+                  <option value="">Unsaved profile</option>
+                  {providerProfiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>Profile Name</span>
+                <input
+                  value={providerProfileName}
+                  onChange={(event) => setProviderProfileName(event.target.value)}
+                  placeholder="OpenAI production"
+                  disabled={busy}
+                />
+              </label>
+              <label className="field">
                 <span>Base URL</span>
                 <input
                   value={apiSettings.base_url}
@@ -1472,6 +1604,21 @@ export function App() {
                   />
                 </label>
               ) : null}
+              <div className="button-row">
+                <button type="button" className="ghost-action" onClick={handleSaveProviderProfile} disabled={busy}>
+                  <Save size={16} />
+                  <span>Save Profile</span>
+                </button>
+                <button
+                  type="button"
+                  className="ghost-action"
+                  onClick={handleDeleteProviderProfile}
+                  disabled={busy || !selectedProviderProfileId}
+                >
+                  <Trash2 size={16} />
+                  <span>Delete Profile</span>
+                </button>
+              </div>
             </>
           ) : null}
         </div>
@@ -1938,6 +2085,73 @@ function Stat({ label, value }: { label: string; value: number }) {
 function formatDebugDelta(value: number | null | undefined) {
   if (value === null || value === undefined) return "-";
   return value > 0 ? `+${value}` : String(value);
+}
+
+function seedStreamingTurn(
+  messages: ChatMessage[],
+  conversationId: string,
+  userText: string,
+  replacementAssistantId?: number,
+) {
+  const now = Math.floor(Date.now() / 1000);
+  const seeded = replacementAssistantId
+    ? messages.map((message) =>
+        message.id === replacementAssistantId && message.role === "assistant"
+          ? { ...message, content: "" }
+          : message,
+      )
+    : [
+        ...messages,
+        {
+          id: -Date.now(),
+          conversation_id: conversationId,
+          role: "user" as const,
+          content: userText,
+          created_at: now,
+        },
+        {
+          id: -Date.now() - 1,
+          conversation_id: conversationId,
+          role: "assistant" as const,
+          content: "",
+          created_at: now,
+        },
+      ];
+
+  if (
+    replacementAssistantId &&
+    !seeded.some((message) => message.id === replacementAssistantId && message.role === "assistant")
+  ) {
+    seeded.push({
+      id: -Date.now() - 1,
+      conversation_id: conversationId,
+      role: "assistant",
+      content: "",
+      created_at: now,
+    });
+  }
+
+  return seeded;
+}
+
+function appendStreamingChunk(messages: ChatMessage[], conversationId: string, chunk: string) {
+  const next = [...messages];
+  for (let index = next.length - 1; index >= 0; index -= 1) {
+    const message = next[index];
+    if (message.conversation_id === conversationId && message.role === "assistant") {
+      next[index] = { ...message, content: `${message.content}${chunk}` };
+      return next;
+    }
+  }
+
+  next.push({
+    id: -Date.now(),
+    conversation_id: conversationId,
+    role: "assistant",
+    content: chunk,
+    created_at: Math.floor(Date.now() / 1000),
+  });
+  return next;
 }
 
 function RangeField({

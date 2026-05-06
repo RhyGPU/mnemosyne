@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 export type Relationship = {
   trust: number;
@@ -54,6 +55,16 @@ export type Soul = {
     symptoms: Record<string, number>;
   };
   relationships: Record<string, Relationship>;
+  arousal: {
+    body_sex: "Male" | "Female";
+    phase: "Neutral" | "Aware" | "Warm" | "Ready" | "Plateau" | "Peak" | "Orgasm";
+    level: number;
+    frustration: number;
+    sensitivity: number;
+    refractory_turns_remaining: number;
+    orgasm_count: number;
+    denied_peak_turns: number;
+  };
   memory: {
     core: string[];
     recent: RecentMemory[];
@@ -135,6 +146,13 @@ export type ApiProviderSettings = {
   system_prompt: string;
 };
 
+export type ProviderProfile = ApiProviderSettings & {
+  id: string;
+  name: string;
+  created_at: number;
+  updated_at: number;
+};
+
 type HiddenStatePayload = {
   memory?: string;
   tag?: string;
@@ -143,6 +161,10 @@ type HiddenStatePayload = {
   world_event?: string;
   new_location?: string;
   present_characters?: string[];
+  arousal_delta?: number;
+  arousal_denied?: boolean;
+  orgasm_allowed?: boolean;
+  forced_orgasm?: boolean;
 };
 
 const NARRATOR_SYSTEM_PROMPT = `# SYSTEM: Narrator AI - Mnemosyne Engine
@@ -177,6 +199,8 @@ After each response, output a hidden state block using this exact format:
 
 Tags: trust_building, threat, bonding, orientation, observation, intimacy, boundary_setting, conflict_minor, trauma_trigger, breakthrough
 
+Optional arousal fields: arousal_delta (-30 to 60), arousal_denied (bool), orgasm_allowed (bool), forced_orgasm (bool). Only suggest these when relevant; the Rust engine validates and caps every state change.
+
 The block must be valid JSON on a single line. The engine removes it before the user sees it.`;
 
 const MODE_PROMPTS: Record<string, string> = {
@@ -204,11 +228,14 @@ After each response, output a hidden state block using this exact format:
 
 Tags: trust_building, threat, bonding, orientation, observation, intimacy, boundary_setting, conflict_minor, trauma_trigger, breakthrough
 
+Optional arousal fields: arousal_delta (-30 to 60), arousal_denied (bool), orgasm_allowed (bool), forced_orgasm (bool). Only suggest these when relevant; the Rust engine validates and caps every state change.
+
 The block must be valid JSON on a single line. The engine removes it before the user sees it.`;
 
 let browserSouls: Soul[] = [];
 let browserSettings: SettingSoul[] = [];
 let browserMessages: ChatMessage[] = [];
+let browserProviderProfiles: ProviderProfile[] = [];
 let nextMessageId = 1;
 const CONSOLIDATION_INTERVAL_TURNS = 10;
 
@@ -314,9 +341,10 @@ export function sendMockTurn(
   soulId: string,
   userText: string,
   mode: string,
+  replacementAssistantId?: number,
 ): Promise<TurnResult> {
-  return invokeOrPreview("send_mock_turn", { conversationId, soulId, userText, mode }, () =>
-    sendPreviewTurn(conversationId, soulId, userText, mode),
+  return invokeOrPreview("send_mock_turn", { conversationId, soulId, userText, mode, replacementAssistantId: replacementAssistantId ?? null }, () =>
+    sendPreviewTurn(conversationId, soulId, userText, mode, replacementAssistantId),
   );
 }
 
@@ -327,12 +355,57 @@ export function sendApiTurn(
   mode: string,
   settings: ApiProviderSettings,
   signal?: AbortSignal,
+  replacementAssistantId?: number,
 ): Promise<TurnResult> {
   return invokeOrPreview(
     "send_api_turn",
-    { conversationId, soulId, userText, mode, settings },
-    () => sendPreviewApiTurn(conversationId, soulId, userText, mode, settings, signal),
+    { conversationId, soulId, userText, mode, settings, replacementAssistantId: replacementAssistantId ?? null },
+    () => sendPreviewApiTurn(conversationId, soulId, userText, mode, settings, signal, replacementAssistantId),
   );
+}
+
+export function listenApiStream(
+  callback: (payload: { conversation_id: string; chunk: string }) => void,
+): Promise<() => void> {
+  if (!hasTauriRuntime()) return Promise.resolve(() => undefined);
+  return listen<{ conversation_id: string; chunk: string }>(
+    "api-chunk",
+    (event) => callback(event.payload),
+  );
+}
+
+export function listProviderProfiles(): Promise<ProviderProfile[]> {
+  return invokeOrPreview("list_provider_profiles", {}, () => browserProviderProfiles);
+}
+
+export function getProviderProfile(profileId: string): Promise<ProviderProfile> {
+  return invokeOrPreview("get_provider_profile", { profileId }, () => {
+    const profile = browserProviderProfiles.find((item) => item.id === profileId);
+    if (!profile) throw new Error("Provider profile not found");
+    return profile;
+  });
+}
+
+export function upsertProviderProfile(profile: ProviderProfile): Promise<ProviderProfile> {
+  return invokeOrPreview("upsert_provider_profile", { profile }, () => {
+    const now = Math.floor(Date.now() / 1000);
+    const saved = { ...profile, created_at: profile.created_at || now, updated_at: now };
+    const index = browserProviderProfiles.findIndex((item) => item.id === profile.id);
+    if (index >= 0) {
+      browserProviderProfiles[index] = saved;
+    } else {
+      browserProviderProfiles.unshift(saved);
+    }
+    return saved;
+  });
+}
+
+export function deleteProviderProfile(profileId: string): Promise<boolean> {
+  return invokeOrPreview("delete_provider_profile", { profileId }, () => {
+    const before = browserProviderProfiles.length;
+    browserProviderProfiles = browserProviderProfiles.filter((item) => item.id !== profileId);
+    return browserProviderProfiles.length !== before;
+  });
 }
 
 export function listConversationMessages(conversationId: string): Promise<ChatMessage[]> {
@@ -447,6 +520,16 @@ function makePreviewSoul(characterName: string): Soul {
         avoidance: 10,
       },
     },
+    arousal: {
+      body_sex: "Female",
+      phase: "Neutral",
+      level: 0,
+      frustration: 0,
+      sensitivity: 1,
+      refractory_turns_remaining: 0,
+      orgasm_count: 0,
+      denied_peak_turns: 0,
+    },
     relationships: {
       user: {
         trust: 10,
@@ -516,6 +599,7 @@ function sendPreviewTurn(
   soulId: string,
   userText: string,
   mode: string,
+  replacementAssistantId?: number,
 ): TurnResult {
   let soul = browserSouls.find((item) => item.character_id === soulId);
   if (!soul) {
@@ -523,10 +607,12 @@ function sendPreviewTurn(
     browserSouls.push(soul);
   }
 
-  browserMessages.push(makePreviewMessage(conversationId, "user", userText));
+  if (!replacementAssistantId) {
+    browserMessages.push(makePreviewMessage(conversationId, "user", userText));
+  }
   const template = previewTemplateFor(classifyPreviewTag(userText));
   const visibleResponse = renderPreviewResponse(soul, userText, template, mode);
-  browserMessages.push(makePreviewMessage(conversationId, "assistant", visibleResponse));
+  upsertPreviewAssistantMessage(conversationId, visibleResponse, replacementAssistantId);
   const debug = debugFromHiddenState(
     "Mock",
     {
@@ -578,6 +664,7 @@ async function sendPreviewApiTurn(
   mode: string,
   settings: ApiProviderSettings,
   signal?: AbortSignal,
+  replacementAssistantId?: number,
 ): Promise<TurnResult> {
   const soul = browserSouls.find((item) => item.character_id === soulId);
   if (!soul) throw new Error("Soul not found");
@@ -585,7 +672,9 @@ async function sendPreviewApiTurn(
   if (!settings.model.trim()) throw new Error("Model is required for API provider mode");
   if (!settings.base_url.trim()) throw new Error("Base URL is required for API provider mode");
 
-  browserMessages.push(makePreviewMessage(conversationId, "user", userText));
+  if (!replacementAssistantId) {
+    browserMessages.push(makePreviewMessage(conversationId, "user", userText));
+  }
   const context = compilePreviewContext(soul, conversationId);
   const response = await fetch(chatCompletionsUrl(settings.base_url), {
     method: "POST",
@@ -618,7 +707,7 @@ async function sendPreviewApiTurn(
   const hiddenStateFound = parsed.hiddenState !== null;
   const hiddenState = parsed.hiddenState ?? generatedPreviewApiHiddenState(soul, userText, parsed.visibleText);
   const visibleResponse = parsed.visibleText;
-  browserMessages.push(makePreviewMessage(conversationId, "assistant", visibleResponse));
+  upsertPreviewAssistantMessage(conversationId, visibleResponse, replacementAssistantId);
 
   const template = previewTemplateFor(normalizePreviewTag(hiddenState.tag, userText));
   const relationship = soul.relationships.user;
@@ -664,6 +753,27 @@ async function sendPreviewApiTurn(
     consolidation_ran,
     debug: debugFromHiddenState("API", hiddenState, hiddenStateFound, !hiddenStateFound),
   };
+}
+
+function upsertPreviewAssistantMessage(
+  conversationId: string,
+  content: string,
+  replacementAssistantId?: number,
+) {
+  if (replacementAssistantId) {
+    const message = browserMessages.find(
+      (item) =>
+        item.conversation_id === conversationId &&
+        item.id === replacementAssistantId &&
+        item.role === "assistant",
+    );
+    if (message) {
+      message.content = content;
+      message.created_at = Math.floor(Date.now() / 1000);
+      return;
+    }
+  }
+  browserMessages.push(makePreviewMessage(conversationId, "assistant", content));
 }
 
 function makePreviewMessage(
@@ -728,6 +838,7 @@ function compilePreviewContext(soul: Soul, conversationId: string): ContextPrevi
     `[CHARACTER MEMORY]\n${soul.memory.core.slice(0, 5).map((memory) => `Core: ${memory}`).join("\n")}`,
     `[RECENT EVENTS]\n${recentEvents.join("\n") || "- No major recent events yet."}`,
     `[RELATIONSHIP]\nTrust toward user: ${soul.relationships.user.trust}. Affection: ${soul.relationships.user.affection}. Fear: ${soul.relationships.user.fear}. Desire: ${soul.relationships.user.desire}.`,
+    `[AROUSAL]\nArousal: ${soul.arousal.phase} phase, level ${Math.round(soul.arousal.level)}/100, frustration ${Math.round(soul.arousal.frustration)}/100, sensitivity ${soul.arousal.sensitivity.toFixed(2)}, refractory ${soul.arousal.refractory_turns_remaining} turns.`,
     recentChat.length ? `[RECENT CHAT]\n${recentChat.join("\n")}` : "",
   ]
     .filter(Boolean)

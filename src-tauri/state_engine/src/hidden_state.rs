@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    arousal::ArousalSignal,
     memory::create_scored_memory,
     soul::{current_timestamp, Relationship, Soul},
 };
@@ -20,6 +21,10 @@ pub struct HiddenState {
     pub world_event: Option<String>,
     pub new_location: Option<String>,
     pub present_characters: Option<Vec<String>>,
+    pub arousal_delta: Option<f32>,
+    pub arousal_denied: Option<bool>,
+    pub orgasm_allowed: Option<bool>,
+    pub forced_orgasm: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,8 +35,13 @@ pub struct ParsedProviderResponse {
 
 impl ParsedProviderResponse {
     pub fn apply_to_soul(&self, soul: &mut Soul) {
-        self.hidden_state.apply_to_soul(soul);
+        apply_hidden_state(&self.hidden_state, soul);
     }
+}
+
+/// Public wrapper that applies a parsed hidden-state payload to the soul.
+pub fn apply_hidden_state(hidden_state: &HiddenState, soul: &mut Soul) {
+    hidden_state.apply_to_soul(soul);
 }
 
 impl HiddenState {
@@ -79,6 +89,21 @@ impl HiddenState {
             .filter(|location| !location.trim().is_empty())
         {
             soul.world.location = location.trim().to_string();
+        }
+
+        if self.arousal_delta.is_some()
+            || self.arousal_denied.is_some()
+            || self.orgasm_allowed.is_some()
+            || self.forced_orgasm.is_some()
+        {
+            soul.arousal.apply_signal(ArousalSignal {
+                delta: self.arousal_delta.unwrap_or(0.0),
+                denied: self.arousal_denied.unwrap_or(false),
+                orgasm_allowed: self.orgasm_allowed.unwrap_or(false),
+                forced_orgasm: self.forced_orgasm.unwrap_or(false),
+            });
+        } else {
+            soul.arousal.decay();
         }
 
         soul.last_updated = current_timestamp() as i64;
@@ -174,6 +199,10 @@ mod tests {
             world_event: Some("A promise landed.".into()),
             new_location: None,
             present_characters: Some(vec!["Aurora".into()]),
+            arousal_delta: None,
+            arousal_denied: None,
+            orgasm_allowed: None,
+            forced_orgasm: None,
         };
         let raw = format!(
             "Visible line.\n\n{HIDDEN_STATE_MARKER}\n{}",
@@ -233,6 +262,10 @@ mod tests {
             world_event: Some("A small trust-building exchange changed the mood.".into()),
             new_location: Some("Safehouse".into()),
             present_characters: None,
+            arousal_delta: Some(25.0),
+            arousal_denied: None,
+            orgasm_allowed: None,
+            forced_orgasm: None,
         };
 
         state.apply_to_soul(&mut soul);
@@ -241,5 +274,6 @@ mod tests {
         assert_eq!(soul.memory.recent.len(), 1);
         assert_eq!(soul.world.recent_events.len(), 1);
         assert_eq!(soul.world.location, "Safehouse");
+        assert_eq!(soul.arousal.level, 25.0);
     }
 }

@@ -33,6 +33,8 @@ After each response, output a hidden state block using this exact format:
 
 Tags: trust_building, threat, bonding, orientation, observation, intimacy, boundary_setting, conflict_minor, trauma_trigger, breakthrough
 
+Optional arousal fields: arousal_delta (-30 to 60), arousal_denied (bool), orgasm_allowed (bool), forced_orgasm (bool). Only suggest these when relevant; the Rust engine validates and caps every state change.
+
 The block must be valid JSON on a single line. The engine removes it before the user sees it."#;
 
 const REALISTIC_MODE_PROMPT: &str = r#"## NARRATION MODE: REALISTIC
@@ -80,6 +82,8 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<ApiMessage>,
     temperature: f32,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +132,7 @@ impl ApiProvider {
         let request = ChatCompletionRequest {
             model: model.to_string(),
             temperature: 0.85,
+            stream: false,
             messages: vec![
                 ApiMessage {
                     role: "system",
@@ -167,9 +172,144 @@ impl ApiProvider {
             .filter(|content| !content.is_empty())
             .ok_or_else(|| "API response did not include assistant content".into())
     }
+
+    pub async fn complete_streaming<F>(
+        &self,
+        settings: &ApiProviderSettings,
+        system_prompt: &str,
+        user_text: &str,
+        mut on_chunk: F,
+    ) -> Result<String, String>
+    where
+        F: FnMut(&str) -> Result<(), String>,
+    {
+        use futures_util::StreamExt;
+
+        let api_key = settings.api_key.trim();
+        let model = settings.model.trim();
+        let base_url = settings.base_url.trim();
+        if api_key.is_empty() {
+            return Err("API key is required for API provider mode".into());
+        }
+        if model.is_empty() {
+            return Err("Model is required for API provider mode".into());
+        }
+        if base_url.is_empty() {
+            return Err("Base URL is required for API provider mode".into());
+        }
+
+        let request = ChatCompletionRequest {
+            model: model.to_string(),
+            temperature: 0.85,
+            stream: true,
+            messages: vec![
+                ApiMessage {
+                    role: "system",
+                    content: system_prompt.to_string(),
+                },
+                ApiMessage {
+                    role: "user",
+                    content: user_text.trim().to_string(),
+                },
+            ],
+        };
+
+        let response = self
+            .client
+            .post(chat_completions_url(base_url))
+            .bearer_auth(api_key)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|err| format!("API request failed: {err}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("API request failed with {status}: {body}"));
+        }
+
+        let mut full_text = String::new();
+        let mut pending = String::new();
+        let mut emitted_visible_len = 0;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|err| format!("API stream failed: {err}"))?;
+            pending.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(line_end) = pending.find('\n') {
+                let line = pending[..line_end].trim().to_string();
+                pending.drain(..=line_end);
+                if let Some(delta) = parse_sse_delta(&line)? {
+                    full_text.push_str(&delta);
+                    let visible_len = visible_stream_prefix_len(&full_text);
+                    if visible_len > emitted_visible_len {
+                        on_chunk(&full_text[emitted_visible_len..visible_len])?;
+                        emitted_visible_len = visible_len;
+                    }
+                }
+            }
+        }
+
+        if !pending.trim().is_empty() {
+            if let Some(delta) = parse_sse_delta(pending.trim())? {
+                full_text.push_str(&delta);
+                let visible_len = visible_stream_prefix_len(&full_text);
+                if visible_len > emitted_visible_len {
+                    on_chunk(&full_text[emitted_visible_len..visible_len])?;
+                }
+            }
+        }
+
+        if full_text.trim().is_empty() {
+            return Err("API stream did not include assistant content".into());
+        }
+
+        Ok(full_text.trim().to_string())
+    }
 }
 
-fn build_system_prompt(
+fn visible_stream_prefix_len(text: &str) -> usize {
+    let markers = ["[HIDDEN STATE]", "[HIDDEN_STATE]"];
+    if let Some(index) = markers.iter().filter_map(|marker| text.find(marker)).min() {
+        return index;
+    }
+
+    let max_marker_len = markers.iter().map(|marker| marker.len()).max().unwrap_or(0);
+    let holdback_limit = text.len().min(max_marker_len.saturating_sub(1));
+    for holdback in (1..=holdback_limit).rev() {
+        let suffix = &text[text.len() - holdback..];
+        if markers.iter().any(|marker| marker.starts_with(suffix)) {
+            return text.len() - holdback;
+        }
+    }
+
+    text.len()
+}
+
+fn parse_sse_delta(line: &str) -> Result<Option<String>, String> {
+    let Some(payload) = line.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let payload = payload.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return Ok(None);
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|err| format!("API stream parse failed: {err}"))?;
+    Ok(value["choices"]
+        .get(0)
+        .and_then(|choice| choice["delta"]["content"].as_str())
+        .or_else(|| {
+            value["choices"]
+                .get(0)
+                .and_then(|choice| choice["message"]["content"].as_str())
+        })
+        .map(ToOwned::to_owned))
+}
+
+pub fn build_system_prompt(
     settings: &ApiProviderSettings,
     soul: &Soul,
     context: &str,
@@ -256,5 +396,16 @@ mod tests {
         assert!(!prompt.contains("NARRATION MODE: READER"));
         assert!(prompt.contains("HIDDEN STATE FORMAT"));
         assert!(prompt.contains("[CURRENT STATE]"));
+    }
+
+    #[test]
+    fn streaming_visible_prefix_holds_back_hidden_marker() {
+        let partial = "Visible text.\n\n[HIDDEN";
+        assert_eq!(
+            visible_stream_prefix_len(partial),
+            "Visible text.\n\n".len()
+        );
+        let full = "Visible text.\n\n[HIDDEN STATE]{\"tag\":\"observation\"}";
+        assert_eq!(visible_stream_prefix_len(full), "Visible text.\n\n".len());
     }
 }

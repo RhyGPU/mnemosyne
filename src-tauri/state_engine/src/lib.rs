@@ -1,3 +1,4 @@
+pub mod arousal;
 pub mod consolidation;
 pub mod context_compiler;
 pub mod hidden_state;

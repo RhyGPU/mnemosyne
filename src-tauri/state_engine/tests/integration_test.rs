@@ -90,6 +90,10 @@ fn full_ten_turn_session_triggers_consolidation() {
             world_event: Some(event.into()),
             new_location: None,
             present_characters: Some(vec!["Aurora".into()]),
+            arousal_delta: None,
+            arousal_denied: None,
+            orgasm_allowed: None,
+            forced_orgasm: None,
         }
         .apply_to_soul(&mut soul);
         soul.turn_counter += 1;

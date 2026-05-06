@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::schema::CURRENT_SCHEMA_VERSION;
+use crate::{arousal::ArousalState, schema::CURRENT_SCHEMA_VERSION};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Soul {
@@ -18,6 +18,8 @@ pub struct Soul {
     pub global: GlobalState,
     pub trauma: TraumaState,
     pub relationships: HashMap<String, Relationship>,
+    #[serde(default)]
+    pub arousal: ArousalState,
     pub memory: MemoryStore,
     #[serde(default)]
     pub world: WorldLog,
@@ -160,6 +162,7 @@ impl Soul {
                 },
             },
             relationships,
+            arousal: ArousalState::default(),
             memory: MemoryStore {
                 core: vec![
                     "The Soul file has just been initialized; enduring identity is still forming."
@@ -223,6 +226,17 @@ mod tests {
 
         assert_eq!(decoded.character_name, "Aurora Schwarz");
         assert_eq!(decoded.world, WorldLog::default());
+    }
+
+    #[test]
+    fn legacy_soul_json_defaults_arousal() {
+        let soul = new_default_soul("Aurora Schwarz");
+        let mut value = serde_json::to_value(&soul).expect("value");
+        value.as_object_mut().expect("object").remove("arousal");
+        let decoded: Soul = serde_json::from_value(value).expect("deserialize");
+
+        assert_eq!(decoded.character_name, "Aurora Schwarz");
+        assert_eq!(decoded.arousal, ArousalState::default());
     }
 
     #[test]

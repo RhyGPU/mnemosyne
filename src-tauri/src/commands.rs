@@ -1,20 +1,20 @@
 use std::{fs, path::PathBuf};
 
 use rusqlite::Connection;
-use tauri::State;
+use tauri::{Emitter, State, Window};
 
 use state_engine::{
     consolidation::consolidate_soul,
     context_compiler::{compile_context_for_messages, ContextMessage, ContextPreview},
-    hidden_state::{parse_hidden_state, HiddenState},
+    hidden_state::{apply_hidden_state, parse_hidden_state, HiddenState},
     setting::{new_default_setting, SettingSoul},
     soul::{new_default_soul, Soul},
 };
 
 use crate::{
-    db::{self, ChatMessage, SettingSummary, SoulSummary},
+    db::{self, ChatMessage, ProviderProfile, SettingSummary, SoulSummary},
     providers::{
-        api::{ApiProvider, ApiProviderSettings},
+        api::{build_system_prompt, ApiProvider, ApiProviderSettings},
         mock::MockProvider,
     },
     AppState,
@@ -43,6 +43,12 @@ pub struct TurnDebug {
     pub affection_delta: Option<f32>,
     pub new_location: Option<String>,
     pub present_characters: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct StreamChunk {
+    pub conversation_id: String,
+    pub chunk: String,
 }
 
 #[tauri::command]
@@ -159,6 +165,39 @@ pub fn delete_message(
 }
 
 #[tauri::command]
+pub fn list_provider_profiles(state: State<'_, AppState>) -> Result<Vec<ProviderProfile>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_provider_profiles(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn get_provider_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<ProviderProfile, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::get_provider_profile(&conn, &profile_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn upsert_provider_profile(
+    state: State<'_, AppState>,
+    profile: ProviderProfile,
+) -> Result<ProviderProfile, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::upsert_provider_profile(&conn, &profile).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn delete_provider_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::delete_provider_profile(&conn, &profile_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 pub fn compile_context(
     state: State<'_, AppState>,
     soul_id: String,
@@ -189,9 +228,17 @@ pub fn send_mock_turn(
     soul_id: String,
     user_text: String,
     mode: String,
+    replacement_assistant_id: Option<i64>,
 ) -> Result<TurnResult, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    send_mock_turn_with_conn(&conn, conversation_id, soul_id, user_text, mode)
+    send_mock_turn_with_conn(
+        &conn,
+        conversation_id,
+        soul_id,
+        user_text,
+        mode,
+        replacement_assistant_id,
+    )
 }
 
 fn send_mock_turn_with_conn(
@@ -200,16 +247,22 @@ fn send_mock_turn_with_conn(
     soul_id: String,
     user_text: String,
     mode: String,
+    replacement_assistant_id: Option<i64>,
 ) -> Result<TurnResult, String> {
     let mut soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
 
     db::ensure_conversation(&conn, &conversation_id, &soul.character_id)
         .map_err(|err| err.to_string())?;
-    db::insert_message(&conn, &conversation_id, "user", &user_text)
-        .map_err(|err| err.to_string())?;
+    if replacement_assistant_id.is_none() {
+        db::insert_message(&conn, &conversation_id, "user", &user_text)
+            .map_err(|err| err.to_string())?;
+    }
 
-    let before_messages =
-        db::list_messages(&conn, &conversation_id, 5).map_err(|err| err.to_string())?;
+    let before_messages = match replacement_assistant_id {
+        Some(message_id) => db::list_messages_before_id(&conn, &conversation_id, message_id, 5),
+        None => db::list_messages(&conn, &conversation_id, 5),
+    }
+    .map_err(|err| err.to_string())?;
     let context_preview =
         compile_context_for_messages(&soul, &messages_to_context(before_messages));
     let provider = MockProvider::default();
@@ -220,8 +273,17 @@ fn send_mock_turn_with_conn(
     parsed.apply_to_soul(&mut soul);
     soul.turn_counter += 1;
     soul.turns_since_consolidation += 1;
-    db::insert_message(&conn, &conversation_id, "assistant", &parsed.visible_text)
-        .map_err(|err| err.to_string())?;
+    if let Some(message_id) = replacement_assistant_id {
+        let replaced =
+            db::update_message_content(&conn, &conversation_id, message_id, &parsed.visible_text)
+                .map_err(|err| err.to_string())?;
+        if !replaced {
+            return Err("Assistant message to regenerate was not found".into());
+        }
+    } else {
+        db::insert_message(&conn, &conversation_id, "assistant", &parsed.visible_text)
+            .map_err(|err| err.to_string())?;
+    }
 
     let consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
     if consolidation_ran {
@@ -247,31 +309,55 @@ fn send_mock_turn_with_conn(
 
 #[tauri::command]
 pub async fn send_api_turn(
+    window: Window,
     state: State<'_, AppState>,
     conversation_id: String,
     soul_id: String,
     user_text: String,
     mode: String,
     settings: ApiProviderSettings,
+    replacement_assistant_id: Option<i64>,
 ) -> Result<TurnResult, String> {
     let (mut soul, context_preview) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         let soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
         db::ensure_conversation(&conn, &conversation_id, &soul.character_id)
             .map_err(|err| err.to_string())?;
-        db::insert_message(&conn, &conversation_id, "user", &user_text)
-            .map_err(|err| err.to_string())?;
+        if replacement_assistant_id.is_none() {
+            db::insert_message(&conn, &conversation_id, "user", &user_text)
+                .map_err(|err| err.to_string())?;
+        }
 
-        let before_messages =
-            db::list_messages(&conn, &conversation_id, 5).map_err(|err| err.to_string())?;
+        let before_messages = match replacement_assistant_id {
+            Some(message_id) => db::list_messages_before_id(&conn, &conversation_id, message_id, 5),
+            None => db::list_messages(&conn, &conversation_id, 5),
+        }
+        .map_err(|err| err.to_string())?;
         let context_preview =
             compile_context_for_messages(&soul, &messages_to_context(before_messages));
         (soul, context_preview)
     };
 
+    let system_prompt = build_system_prompt(&settings, &soul, &context_preview.text, &mode);
     let provider = ApiProvider::default();
+    let stream_conversation_id = conversation_id.clone();
     let raw_response = provider
-        .complete(&settings, &soul, &context_preview.text, &user_text, &mode)
+        .complete_streaming(
+            &settings,
+            &system_prompt,
+            &user_text,
+            |chunk| {
+                window
+                    .emit(
+                        "api-chunk",
+                        StreamChunk {
+                            conversation_id: stream_conversation_id.clone(),
+                            chunk: chunk.to_string(),
+                        },
+                    )
+                    .map_err(|err| err.to_string())
+            },
+        )
         .await?;
     let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
     let hidden_state_found = !hidden_state_is_empty(&parsed.hidden_state);
@@ -288,15 +374,24 @@ pub async fn send_api_turn(
         fallback_hidden_state_generated,
     );
 
-    hidden_state.apply_to_soul(&mut soul);
+    apply_hidden_state(&hidden_state, &mut soul);
     soul.turn_counter += 1;
     soul.turns_since_consolidation += 1;
     let visible_response = parsed.visible_text;
 
     let (messages, context_preview, consolidation_ran) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
-        db::insert_message(&conn, &conversation_id, "assistant", &visible_response)
-            .map_err(|err| err.to_string())?;
+        if let Some(message_id) = replacement_assistant_id {
+            let replaced =
+                db::update_message_content(&conn, &conversation_id, message_id, &visible_response)
+                    .map_err(|err| err.to_string())?;
+            if !replaced {
+                return Err("Assistant message to regenerate was not found".into());
+            }
+        } else {
+            db::insert_message(&conn, &conversation_id, "assistant", &visible_response)
+                .map_err(|err| err.to_string())?;
+        }
 
         let consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
         if consolidation_ran {
@@ -341,6 +436,10 @@ fn hidden_state_is_empty(hidden_state: &HiddenState) -> bool {
         && hidden_state.world_event.is_none()
         && hidden_state.new_location.is_none()
         && hidden_state.present_characters.is_none()
+        && hidden_state.arousal_delta.is_none()
+        && hidden_state.arousal_denied.is_none()
+        && hidden_state.orgasm_allowed.is_none()
+        && hidden_state.forced_orgasm.is_none()
 }
 
 fn debug_from_hidden_state(
@@ -380,6 +479,10 @@ fn generated_api_hidden_state(soul: &Soul, user_text: &str, visible_text: &str) 
         )),
         new_location: None,
         present_characters: Some(vec![soul.character_name.clone()]),
+        arousal_delta: None,
+        arousal_denied: None,
+        orgasm_allowed: None,
+        forced_orgasm: None,
     }
 }
 
@@ -417,6 +520,10 @@ mod tests {
             world_event: Some("A small trust-building exchange changed the mood.".into()),
             new_location: None,
             present_characters: None,
+            arousal_delta: None,
+            arousal_denied: None,
+            orgasm_allowed: None,
+            forced_orgasm: None,
         };
 
         state.apply_to_soul(&mut soul);
@@ -455,6 +562,7 @@ mod tests {
                     soul_id.clone(),
                     turn.into(),
                     "Reader".into(),
+                    None,
                 )
                 .expect("mock turn"),
             );

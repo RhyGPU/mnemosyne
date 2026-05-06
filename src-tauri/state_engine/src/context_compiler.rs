@@ -78,6 +78,8 @@ pub fn compile_context_for_messages(soul: &Soul, messages: &[ContextMessage]) ->
         ));
     }
 
+    sections.push(format!("[AROUSAL]\n{}", soul.arousal.summary()));
+
     let recent_chat = messages
         .iter()
         .rev()
