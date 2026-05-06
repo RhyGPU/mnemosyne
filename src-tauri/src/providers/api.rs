@@ -265,7 +265,6 @@ impl ApiProvider {
                         emitted_visible_len,
                         visible_len,
                     ))?;
-                    emitted_visible_len = visible_len;
                 }
             }
         }
