@@ -189,7 +189,10 @@ mod tests {
         let parsed = parse_hidden_state(raw).expect("parsed");
         assert_eq!(parsed.visible_text, "Visible line.");
         assert_eq!(parsed.hidden_state.tag.as_deref(), Some("trust_building"));
-        assert_eq!(parsed.hidden_state.new_location.as_deref(), Some("Safehouse"));
+        assert_eq!(
+            parsed.hidden_state.new_location.as_deref(),
+            Some("Safehouse")
+        );
         assert_eq!(
             parsed.hidden_state.present_characters.as_deref(),
             Some(&["Aurora".to_string()][..])

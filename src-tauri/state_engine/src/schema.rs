@@ -16,4 +16,3 @@ pub fn validate_soul(soul: &Soul) -> Result<(), String> {
 
     Ok(())
 }
-

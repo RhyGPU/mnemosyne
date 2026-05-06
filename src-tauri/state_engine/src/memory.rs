@@ -237,4 +237,3 @@ mod tests {
         assert!(scorer.score(&soul, &duplicate) < scorer.score(&soul, &fresh));
     }
 }
-

@@ -64,7 +64,10 @@ pub fn consolidate_soul(soul: &mut Soul) {
 }
 
 fn is_schema_prone(tag: &str) -> bool {
-    matches!(tag, "observation" | "orientation" | "routine" | "small_talk")
+    matches!(
+        tag,
+        "observation" | "orientation" | "routine" | "small_talk"
+    )
 }
 
 fn summarize_core_memory(memory: &MemoryEntry) -> String {

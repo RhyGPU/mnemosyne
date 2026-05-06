@@ -9,6 +9,9 @@ use crate::{
 
 pub const PATCH_PROTOCOL_VERSION: u32 = 1;
 const MAX_RELATIONSHIP_DELTA: f32 = 10.0;
+/// Clamp each relationship scalar after deltas (matches engine defaults and leaves headroom above 100).
+const RELATIONSHIP_SCALAR_MIN: f32 = 0.0;
+const RELATIONSHIP_SCALAR_MAX: f32 = 300.0;
 const MAX_RECENT_MEMORIES: usize = 12;
 const MAX_RECENT_EVENTS: usize = 12;
 
@@ -61,23 +64,28 @@ pub struct WorldPatch {
     pub key_object_remove: Vec<String>,
 }
 
+/// Accepted for Patch Protocol V1 compatibility; arousal bridging uses the optional scalar fields only.
+/// `region_updates` / `condition_updates` are placeholders (validated JSON, ignored on apply until Body V1 lands).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct BodyPatch {
     pub activation_delta: Option<f32>,
     pub activation_blocked: Option<bool>,
     pub peak_allowed: Option<bool>,
     pub forced_peak: Option<bool>,
+    pub region_updates: Vec<serde_json::Value>,
+    pub condition_updates: Vec<serde_json::Value>,
 }
 
+/// Placeholder module: deserialization accepts narrator proposals; engine does not mutate sensory state yet.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct SensoryPatch {
     pub association_updates: Vec<SensoryAssociationPatch>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct SensoryAssociationPatch {
     pub sense: Option<String>,
     pub cue: Option<String>,
@@ -120,6 +128,8 @@ impl EnginePatch {
             report.body_updated = true;
         }
 
+        // SensoryPatch V1 proposals deserialize successfully but state application is intentionally deferred.
+
         if report.relationship_updated
             || report.memories_added > 0
             || report.world_updated
@@ -141,13 +151,8 @@ impl EnginePatch {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.soul_patch
-            .as_ref()
-            .map_or(true, SoulPatch::is_empty)
-            && self
-                .world_patch
-                .as_ref()
-                .map_or(true, WorldPatch::is_empty)
+        self.soul_patch.as_ref().map_or(true, SoulPatch::is_empty)
+            && self.world_patch.as_ref().map_or(true, WorldPatch::is_empty)
             && self.body_patch.as_ref().map_or(true, BodyPatch::is_empty)
             && self
                 .sensory_patch
@@ -156,7 +161,9 @@ impl EnginePatch {
     }
 
     fn should_decay_body(&self) -> bool {
-        self.soul_patch.as_ref().map_or(false, |patch| !patch.is_empty())
+        self.soul_patch
+            .as_ref()
+            .map_or(false, |patch| !patch.is_empty())
             || self
                 .world_patch
                 .as_ref()
@@ -187,16 +194,16 @@ impl From<&HiddenState> for EnginePatch {
             });
         }
 
-        let world_patch = if hidden_state.world_event.is_some() || hidden_state.new_location.is_some()
-        {
-            Some(WorldPatch {
-                location: hidden_state.new_location.clone(),
-                recent_event: hidden_state.world_event.clone(),
-                ..WorldPatch::default()
-            })
-        } else {
-            None
-        };
+        let world_patch =
+            if hidden_state.world_event.is_some() || hidden_state.new_location.is_some() {
+                Some(WorldPatch {
+                    location: hidden_state.new_location.clone(),
+                    recent_event: hidden_state.world_event.clone(),
+                    ..WorldPatch::default()
+                })
+            } else {
+                None
+            };
 
         let body_patch = if hidden_state.arousal_delta.is_some()
             || hidden_state.arousal_denied.is_some()
@@ -208,6 +215,7 @@ impl From<&HiddenState> for EnginePatch {
                 activation_blocked: hidden_state.arousal_denied,
                 peak_allowed: hidden_state.orgasm_allowed,
                 forced_peak: hidden_state.forced_orgasm,
+                ..BodyPatch::default()
             })
         } else {
             None
@@ -327,8 +335,14 @@ impl WorldPatch {
                 .recent_event
                 .as_deref()
                 .map_or(true, |event| event.trim().is_empty())
-            && self.recent_events.iter().all(|event| event.trim().is_empty())
-            && self.active_plot_add.iter().all(|plot| plot.trim().is_empty())
+            && self
+                .recent_events
+                .iter()
+                .all(|event| event.trim().is_empty())
+            && self
+                .active_plot_add
+                .iter()
+                .all(|plot| plot.trim().is_empty())
             && self
                 .active_plot_resolve
                 .iter()
@@ -354,12 +368,20 @@ impl WorldPatch {
             push_recent_event(soul, event);
             changed = true;
         }
-        for event in self.recent_events.iter().filter_map(|event| clean_str(event)) {
+        for event in self
+            .recent_events
+            .iter()
+            .filter_map(|event| clean_str(event))
+        {
             push_recent_event(soul, event);
             changed = true;
         }
 
-        for plot in self.active_plot_add.iter().filter_map(|plot| clean_str(plot)) {
+        for plot in self
+            .active_plot_add
+            .iter()
+            .filter_map(|plot| clean_str(plot))
+        {
             changed |= push_unique(&mut soul.world.active_plots, plot);
         }
         for plot in self
@@ -389,15 +411,21 @@ impl WorldPatch {
 }
 
 impl BodyPatch {
+    fn has_arousal_bridge(&self) -> bool {
+        self.activation_delta.is_some()
+            || self.activation_blocked.is_some()
+            || self.peak_allowed.is_some()
+            || self.forced_peak.is_some()
+    }
+
     fn is_empty(&self) -> bool {
-        self.activation_delta.is_none()
-            && self.activation_blocked.is_none()
-            && self.peak_allowed.is_none()
-            && self.forced_peak.is_none()
+        !self.has_arousal_bridge()
+            && self.region_updates.is_empty()
+            && self.condition_updates.is_empty()
     }
 
     fn apply(&self, soul: &mut Soul) -> bool {
-        if self.is_empty() {
+        if !self.has_arousal_bridge() {
             return false;
         }
         soul.arousal.apply_signal(ArousalSignal {
@@ -413,8 +441,14 @@ impl BodyPatch {
 impl SensoryPatch {
     fn is_empty(&self) -> bool {
         self.association_updates.iter().all(|update| {
-            update.sense.as_deref().map_or(true, |value| value.trim().is_empty())
-                && update.cue.as_deref().map_or(true, |value| value.trim().is_empty())
+            update
+                .sense
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+                && update
+                    .cue
+                    .as_deref()
+                    .map_or(true, |value| value.trim().is_empty())
                 && update
                     .association
                     .as_deref()
@@ -425,8 +459,13 @@ impl SensoryPatch {
 }
 
 fn apply_delta(value: &mut f32, delta: Option<f32>) {
-    *value = (*value + finite_delta(delta.unwrap_or(0.0), -MAX_RELATIONSHIP_DELTA, MAX_RELATIONSHIP_DELTA))
-        .clamp(0.0, 300.0);
+    *value = (*value
+        + finite_delta(
+            delta.unwrap_or(0.0),
+            -MAX_RELATIONSHIP_DELTA,
+            MAX_RELATIONSHIP_DELTA,
+        ))
+    .clamp(RELATIONSHIP_SCALAR_MIN, RELATIONSHIP_SCALAR_MAX);
 }
 
 fn finite_delta(value: f32, min: f32, max: f32) -> f32 {
@@ -620,5 +659,36 @@ mod tests {
             Err(PatchError::UnsupportedSchemaVersion(999))
         );
         assert_eq!(soul, original);
+    }
+
+    #[test]
+    fn body_patch_placeholders_do_not_invoke_arousal_bridge() {
+        let mut soul = new_default_soul("Aurora");
+        soul.arousal.level = 42.0;
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            body_patch: Some(BodyPatch {
+                region_updates: vec![serde_json::json!({ "region_id": "hand" })],
+                condition_updates: vec![serde_json::json!({ "id": "bruised" })],
+                ..BodyPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert_eq!(soul.arousal.level, 42.0);
+    }
+
+    #[test]
+    fn sensory_patch_deserializes_without_mutating_soul() {
+        let json = br#"{"schema_version":1,"sensory_patch":{"association_updates":[{"sense":"sound","cue":"rain","association":"comfort","strength_delta":10.0}]}}"#;
+        let patch: EnginePatch = serde_json::from_slice(json).expect("deserialize");
+        let mut soul = new_default_soul("Aurora");
+        let snapshot = soul.clone();
+
+        patch.apply_to_soul(&mut soul).expect("apply");
+
+        assert_eq!(soul, snapshot);
     }
 }

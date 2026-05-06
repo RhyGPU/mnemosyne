@@ -69,7 +69,8 @@ impl ArousalState {
 
         if signal.denied && self.level >= 90.0 && !signal.forced_orgasm {
             self.level = self.level.min(95.0);
-            self.frustration = (self.frustration + effective_delta.abs() * 0.5 + 8.0).clamp(0.0, 100.0);
+            self.frustration =
+                (self.frustration + effective_delta.abs() * 0.5 + 8.0).clamp(0.0, 100.0);
             self.sensitivity = (self.sensitivity + 0.08).clamp(0.5, 1.8);
             self.denied_peak_turns += 1;
             self.phase = ArousalPhase::Peak;
