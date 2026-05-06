@@ -1,11 +1,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    arousal::ArousalSignal,
-    memory::create_scored_memory,
-    soul::{current_timestamp, Relationship, Soul},
-};
+use crate::{patch::EnginePatch, soul::Soul};
 
 const HIDDEN_STATE_MARKER: &str = "[HIDDEN_STATE]";
 const HIDDEN_STATE_JSON_START: &str = "[HIDDEN STATE]";
@@ -31,11 +27,16 @@ pub struct HiddenState {
 pub struct ParsedProviderResponse {
     pub visible_text: String,
     pub hidden_state: HiddenState,
+    pub engine_patch: EnginePatch,
 }
 
 impl ParsedProviderResponse {
     pub fn apply_to_soul(&self, soul: &mut Soul) {
-        apply_hidden_state(&self.hidden_state, soul);
+        let _ = self.engine_patch.apply_to_soul(soul);
+    }
+
+    pub fn has_patch(&self) -> bool {
+        !self.engine_patch.is_empty()
     }
 }
 
@@ -46,67 +47,8 @@ pub fn apply_hidden_state(hidden_state: &HiddenState, soul: &mut Soul) {
 
 impl HiddenState {
     pub fn apply_to_soul(&self, soul: &mut Soul) {
-        let relationship = soul
-            .relationships
-            .entry("user".into())
-            .or_insert_with(default_relationship);
-        relationship.trust = clamp_stat(relationship.trust + self.trust_delta.unwrap_or(0.0));
-        relationship.affection =
-            clamp_stat(relationship.affection + self.affection_delta.unwrap_or(0.0));
-
-        if let Some(memory) = self
-            .memory
-            .as_deref()
-            .filter(|memory| !memory.trim().is_empty())
-        {
-            let tag = self.tag.as_deref().unwrap_or("observation");
-            let recent = create_scored_memory(soul, memory, tag);
-            soul.memory.recent.push(recent);
-            soul.memory.recent.sort_by(|left, right| {
-                right
-                    .salience
-                    .partial_cmp(&left.salience)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            soul.memory.recent.truncate(12);
-        }
-
-        if let Some(event) = self
-            .world_event
-            .as_deref()
-            .filter(|event| !event.trim().is_empty())
-        {
-            soul.world.recent_events.push(event.trim().to_string());
-            if soul.world.recent_events.len() > 12 {
-                let remove_count = soul.world.recent_events.len() - 12;
-                soul.world.recent_events.drain(0..remove_count);
-            }
-        }
-
-        if let Some(location) = self
-            .new_location
-            .as_deref()
-            .filter(|location| !location.trim().is_empty())
-        {
-            soul.world.location = location.trim().to_string();
-        }
-
-        if self.arousal_delta.is_some()
-            || self.arousal_denied.is_some()
-            || self.orgasm_allowed.is_some()
-            || self.forced_orgasm.is_some()
-        {
-            soul.arousal.apply_signal(ArousalSignal {
-                delta: self.arousal_delta.unwrap_or(0.0),
-                denied: self.arousal_denied.unwrap_or(false),
-                orgasm_allowed: self.orgasm_allowed.unwrap_or(false),
-                forced_orgasm: self.forced_orgasm.unwrap_or(false),
-            });
-        } else {
-            soul.arousal.decay();
-        }
-
-        soul.last_updated = current_timestamp() as i64;
+        let patch = EnginePatch::from(self);
+        let _ = patch.apply_to_soul(soul);
     }
 }
 
@@ -129,10 +71,11 @@ pub fn parse_hidden_state(raw: &str) -> Result<ParsedProviderResponse, serde_jso
             &raw[hidden_start..]
         }
         .trim();
-        let hidden_state = decode_hidden_state(hidden_part)?;
+        let (hidden_state, engine_patch) = decode_hidden_payload(hidden_part)?;
         return Ok(ParsedProviderResponse {
             visible_text,
             hidden_state,
+            engine_patch,
         });
     }
 
@@ -140,18 +83,32 @@ pub fn parse_hidden_state(raw: &str) -> Result<ParsedProviderResponse, serde_jso
         return Ok(ParsedProviderResponse {
             visible_text: raw.trim().to_string(),
             hidden_state: HiddenState::default(),
+            engine_patch: EnginePatch::default(),
         });
     };
     let visible_text = raw[..start].trim().to_string();
     let hidden_part = raw[start + HIDDEN_STATE_MARKER.len()..].trim();
-    let hidden_state = decode_hidden_state(hidden_part)?;
+    let (hidden_state, engine_patch) = decode_hidden_payload(hidden_part)?;
     Ok(ParsedProviderResponse {
         visible_text,
         hidden_state,
+        engine_patch,
     })
 }
 
-fn decode_hidden_state(payload: &str) -> Result<HiddenState, serde_json::Error> {
+fn decode_hidden_payload(payload: &str) -> Result<(HiddenState, EnginePatch), serde_json::Error> {
+    let value = decode_hidden_value(payload)?;
+    if looks_like_engine_patch(&value) {
+        let engine_patch = serde_json::from_value(value)?;
+        return Ok((HiddenState::default(), engine_patch));
+    }
+
+    let hidden_state: HiddenState = serde_json::from_value(value)?;
+    let engine_patch = EnginePatch::from(&hidden_state);
+    Ok((hidden_state, engine_patch))
+}
+
+fn decode_hidden_value(payload: &str) -> Result<serde_json::Value, serde_json::Error> {
     if let Some(encoded) = payload.strip_prefix(HIDDEN_STATE_ENCODING_PREFIX) {
         if let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded) {
             return serde_json::from_slice(&bytes);
@@ -167,21 +124,15 @@ fn decode_hidden_state(payload: &str) -> Result<HiddenState, serde_json::Error> 
     serde_json::from_str(payload)
 }
 
-fn default_relationship() -> Relationship {
-    Relationship {
-        trust: 0.0,
-        affection: 0.0,
-        intimacy: 0.0,
-        passion: 0.0,
-        commitment: 0.0,
-        fear: 0.0,
-        desire: 0.0,
-        love_type: String::new(),
-    }
-}
-
-fn clamp_stat(value: f32) -> f32 {
-    value.clamp(0.0, 300.0)
+fn looks_like_engine_patch(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.contains_key("schema_version")
+        || object.contains_key("soul_patch")
+        || object.contains_key("world_patch")
+        || object.contains_key("body_patch")
+        || object.contains_key("sensory_patch")
 }
 
 #[cfg(test)]
@@ -213,6 +164,7 @@ mod tests {
         assert_eq!(parsed.visible_text, "Visible line.");
         assert_eq!(parsed.hidden_state.tag.as_deref(), Some("trust_building"));
         assert_eq!(parsed.hidden_state.trust_delta, Some(3.0));
+        assert!(parsed.has_patch());
         assert!(raw.contains(HIDDEN_STATE_ENCODING_PREFIX));
         assert!(!raw.contains("\"tag\""));
     }
@@ -242,6 +194,25 @@ mod tests {
             parsed.hidden_state.present_characters.as_deref(),
             Some(&["Aurora".to_string()][..])
         );
+        assert!(parsed.has_patch());
+    }
+
+    #[test]
+    fn accepts_structured_engine_patch_block() {
+        let raw = r#"Visible line.
+
+[HIDDEN STATE]{"schema_version":1,"soul_patch":{"relationship_delta":{"trust":4},"new_memories":[{"content":"Aurora marks the stairwell.","tag":"orientation"}]},"world_patch":{"location":"Stairwell","recent_event":"Aurora found the stairwell."}}[/HIDDEN STATE]"#;
+
+        let parsed = parse_hidden_state(raw).expect("parsed");
+        let mut soul = new_default_soul("Aurora");
+        parsed.apply_to_soul(&mut soul);
+
+        assert_eq!(parsed.visible_text, "Visible line.");
+        assert!(parsed.hidden_state.memory.is_none());
+        assert!(parsed.has_patch());
+        assert_eq!(soul.relationships["user"].trust, 14.0);
+        assert_eq!(soul.memory.recent.len(), 1);
+        assert_eq!(soul.world.location, "Stairwell");
     }
 
     #[test]
@@ -249,6 +220,7 @@ mod tests {
         let parsed = parse_hidden_state("Only visible.").expect("parsed");
         assert_eq!(parsed.visible_text, "Only visible.");
         assert!(parsed.hidden_state.memory.is_none());
+        assert!(!parsed.has_patch());
     }
 
     #[test]

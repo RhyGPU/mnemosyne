@@ -3,6 +3,7 @@ pub mod consolidation;
 pub mod context_compiler;
 pub mod hidden_state;
 pub mod memory;
+pub mod patch;
 pub mod schema;
 pub mod setting;
 pub mod soul;
