@@ -244,7 +244,11 @@ impl ApiProvider {
                     full_text.push_str(&delta);
                     let visible_len = visible_stream_prefix_len(&full_text);
                     if visible_len > emitted_visible_len {
-                        on_chunk(&full_text[emitted_visible_len..visible_len])?;
+                        on_chunk(slice_at_char_boundaries(
+                            &full_text,
+                            emitted_visible_len,
+                            visible_len,
+                        ))?;
                         emitted_visible_len = visible_len;
                     }
                 }
@@ -256,7 +260,11 @@ impl ApiProvider {
                 full_text.push_str(&delta);
                 let visible_len = visible_stream_prefix_len(&full_text);
                 if visible_len > emitted_visible_len {
-                    on_chunk(&full_text[emitted_visible_len..visible_len])?;
+                    on_chunk(slice_at_char_boundaries(
+                        &full_text,
+                        emitted_visible_len,
+                        visible_len,
+                    ))?;
                 }
             }
         }
@@ -272,19 +280,37 @@ impl ApiProvider {
 fn visible_stream_prefix_len(text: &str) -> usize {
     let markers = ["[HIDDEN STATE]", "[HIDDEN_STATE]"];
     if let Some(index) = markers.iter().filter_map(|marker| text.find(marker)).min() {
-        return index;
+        return floor_char_boundary(text, index);
     }
 
     let max_marker_len = markers.iter().map(|marker| marker.len()).max().unwrap_or(0);
     let holdback_limit = text.len().min(max_marker_len.saturating_sub(1));
     for holdback in (1..=holdback_limit).rev() {
-        let suffix = &text[text.len() - holdback..];
+        let start = floor_char_boundary(text, text.len() - holdback);
+        let suffix = &text[start..];
         if markers.iter().any(|marker| marker.starts_with(suffix)) {
-            return text.len() - holdback;
+            return start;
         }
     }
 
     text.len()
+}
+
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut safe_index = index.min(text.len());
+    while safe_index > 0 && !text.is_char_boundary(safe_index) {
+        safe_index -= 1;
+    }
+    safe_index
+}
+
+fn slice_at_char_boundaries(text: &str, start: usize, end: usize) -> &str {
+    let safe_start = floor_char_boundary(text, start);
+    let mut safe_end = floor_char_boundary(text, end);
+    if safe_end < safe_start {
+        safe_end = safe_start;
+    }
+    &text[safe_start..safe_end]
 }
 
 fn parse_sse_delta(line: &str) -> Result<Option<String>, String> {
@@ -407,5 +433,52 @@ mod tests {
         );
         let full = "Visible text.\n\n[HIDDEN STATE]{\"tag\":\"observation\"}";
         assert_eq!(visible_stream_prefix_len(full), "Visible text.\n\n".len());
+    }
+
+    #[test]
+    fn streaming_visible_prefix_handles_em_dash_utf8() {
+        let text = "Visible — text [HIDDEN";
+        let visible_len = visible_stream_prefix_len(text);
+        let chunk = slice_at_char_boundaries(text, 0, visible_len);
+        assert_eq!(chunk, "Visible — text ");
+    }
+
+    #[test]
+    fn streaming_visible_prefix_handles_korean_utf8() {
+        let text = "장면이 조용하다 [HIDDEN";
+        let visible_len = visible_stream_prefix_len(text);
+        let chunk = slice_at_char_boundaries(text, 0, visible_len);
+        assert_eq!(chunk, "장면이 조용하다 ");
+    }
+
+    #[test]
+    fn streaming_visible_prefix_handles_emoji_utf8() {
+        let text = "She smiles 🙂 [HIDDEN";
+        let visible_len = visible_stream_prefix_len(text);
+        let chunk = slice_at_char_boundaries(text, 0, visible_len);
+        assert_eq!(chunk, "She smiles 🙂 ");
+    }
+
+    #[test]
+    fn streaming_partial_hidden_marker_after_multibyte_text() {
+        let mut emitted_visible_len = 0;
+        let mut full_text = String::new();
+
+        full_text.push_str("숨이 멎는 듯한 — pause 🙂 ");
+        let visible_len = visible_stream_prefix_len(&full_text);
+        let first_chunk = slice_at_char_boundaries(&full_text, emitted_visible_len, visible_len);
+        assert_eq!(first_chunk, "숨이 멎는 듯한 — pause 🙂 ");
+        emitted_visible_len = visible_len;
+
+        full_text.push_str("[HID");
+        let visible_len = visible_stream_prefix_len(&full_text);
+        let second_chunk = slice_at_char_boundaries(&full_text, emitted_visible_len, visible_len);
+        assert_eq!(second_chunk, "");
+        emitted_visible_len = visible_len;
+
+        full_text.push_str("DEN STATE]{\"tag\":\"observation\"}");
+        let visible_len = visible_stream_prefix_len(&full_text);
+        let third_chunk = slice_at_char_boundaries(&full_text, emitted_visible_len, visible_len);
+        assert_eq!(third_chunk, "");
     }
 }

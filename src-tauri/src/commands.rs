@@ -6,7 +6,8 @@ use tauri::{Emitter, State, Window};
 use state_engine::{
     consolidation::consolidate_soul,
     context_compiler::{compile_context_for_messages, ContextMessage, ContextPreview},
-    hidden_state::{apply_hidden_state, parse_hidden_state, HiddenState},
+    hidden_state::{parse_hidden_state, HiddenState},
+    patch::EnginePatch,
     setting::{new_default_setting, SettingSoul},
     soul::{new_default_soul, Soul},
 };
@@ -342,30 +343,27 @@ pub async fn send_api_turn(
     let provider = ApiProvider::default();
     let stream_conversation_id = conversation_id.clone();
     let raw_response = provider
-        .complete_streaming(
-            &settings,
-            &system_prompt,
-            &user_text,
-            |chunk| {
-                window
-                    .emit(
-                        "api-chunk",
-                        StreamChunk {
-                            conversation_id: stream_conversation_id.clone(),
-                            chunk: chunk.to_string(),
-                        },
-                    )
-                    .map_err(|err| err.to_string())
-            },
-        )
+        .complete_streaming(&settings, &system_prompt, &user_text, |chunk| {
+            window
+                .emit(
+                    "api-chunk",
+                    StreamChunk {
+                        conversation_id: stream_conversation_id.clone(),
+                        chunk: chunk.to_string(),
+                    },
+                )
+                .map_err(|err| err.to_string())
+        })
         .await?;
     let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
-    let hidden_state_found = !hidden_state_is_empty(&parsed.hidden_state);
+    let hidden_state_found = parsed.has_patch();
     let fallback_hidden_state_generated = !hidden_state_found;
-    let hidden_state = if fallback_hidden_state_generated {
-        generated_api_hidden_state(&soul, &user_text, &parsed.visible_text)
+    let (hidden_state, engine_patch) = if fallback_hidden_state_generated {
+        let hidden_state = generated_api_hidden_state(&soul, &user_text, &parsed.visible_text);
+        let engine_patch = EnginePatch::from(&hidden_state);
+        (hidden_state, engine_patch)
     } else {
-        parsed.hidden_state.clone()
+        (parsed.hidden_state.clone(), parsed.engine_patch.clone())
     };
     let debug = debug_from_hidden_state(
         "API",
@@ -374,7 +372,7 @@ pub async fn send_api_turn(
         fallback_hidden_state_generated,
     );
 
-    apply_hidden_state(&hidden_state, &mut soul);
+    let _ = engine_patch.apply_to_soul(&mut soul);
     soul.turn_counter += 1;
     soul.turns_since_consolidation += 1;
     let visible_response = parsed.visible_text;
@@ -426,20 +424,6 @@ fn messages_to_context(messages: Vec<ChatMessage>) -> Vec<ContextMessage> {
             content: message.content,
         })
         .collect()
-}
-
-fn hidden_state_is_empty(hidden_state: &HiddenState) -> bool {
-    hidden_state.memory.is_none()
-        && hidden_state.tag.is_none()
-        && hidden_state.trust_delta.is_none()
-        && hidden_state.affection_delta.is_none()
-        && hidden_state.world_event.is_none()
-        && hidden_state.new_location.is_none()
-        && hidden_state.present_characters.is_none()
-        && hidden_state.arousal_delta.is_none()
-        && hidden_state.arousal_denied.is_none()
-        && hidden_state.orgasm_allowed.is_none()
-        && hidden_state.forced_orgasm.is_none()
 }
 
 fn debug_from_hidden_state(

@@ -984,7 +984,13 @@ export function App() {
                     </div>
                   )}
                 </div>
-                <p>{message.content}</p>
+                {message.role === "assistant" ? (
+                  <pre style={{ whiteSpace: "pre-wrap", margin: 0, fontFamily: "inherit" }}>
+                    {normalizeAssistantDisplay(message.content)}
+                  </pre>
+                ) : (
+                  <p>{message.content}</p>
+                )}
               </article>
             ))
           )}
@@ -2152,6 +2158,29 @@ function appendStreamingChunk(messages: ChatMessage[], conversationId: string, c
     created_at: Math.floor(Date.now() / 1000),
   });
   return next;
+}
+
+function normalizeAssistantDisplay(content: string) {
+  const withoutHidden = stripHiddenStateBlocks(content);
+  return normalizeTrailingStatusBlock(withoutHidden);
+}
+
+function stripHiddenStateBlocks(content: string) {
+  let cleaned = content;
+  cleaned = cleaned.replace(/\[HIDDEN STATE\][\s\S]*?(?:\[\/HIDDEN STATE\]|$)/g, "");
+  cleaned = cleaned.replace(/\[HIDDEN_STATE\][\s\S]*$/g, "");
+  return cleaned.trimEnd();
+}
+
+function normalizeTrailingStatusBlock(content: string) {
+  const statusMatch = content.match(/```status[\s\S]*?```[\t ]*$/);
+  if (!statusMatch || statusMatch.index === undefined) {
+    return content;
+  }
+  const start = statusMatch.index;
+  const body = content.slice(0, start).trimEnd();
+  const status = statusMatch[0].trim();
+  return body ? `${body}\n\n${status}` : status;
 }
 
 function RangeField({
