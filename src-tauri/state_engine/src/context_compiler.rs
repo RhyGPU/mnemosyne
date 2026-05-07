@@ -8,6 +8,20 @@ use crate::soul::{MemoryEntry, Soul};
 const DEFAULT_TOKEN_BUDGET: usize = 2_500;
 const MIN_RECENT_MEMORY_SALIENCE: f32 = 65.0;
 const MIN_RELEVANT_MEMORY_SALIENCE: f32 = 45.0;
+const ASSISTANT_RECENT_CHAT_CHARS: usize = 350;
+const ASSISTANT_RECENT_CHAT_HEAD_CHARS: usize = 120;
+const ASSISTANT_RECENT_CHAT_TAIL_CHARS: usize = 220;
+const USER_RECENT_CHAT_CHARS: usize = 500;
+const LATEST_ASSISTANT_EXCHANGE_CHARS: usize = 1_200;
+const LATEST_USER_EXCHANGE_CHARS: usize = 1_000;
+const LATEST_EXCHANGE_INSTRUCTION: &str = "Continue from this section first. If older context conflicts with this section, ignore older context. Continue from the final state of the last narrator response and the latest user input. Do not replay earlier beats.";
+const CURRENT_USER_FOLLOWS_LINE: &str = "The current user message follows as the next user message.";
+const FILLER_MEMORY_PHRASES: &[&str] = &[
+    "neutral exchange added texture",
+    "context cue",
+    "recent chat is available",
+    "fresh scene context",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextMessage {
@@ -30,8 +44,11 @@ pub struct ContextBudget {
     pub memory_tokens: usize,
     pub world_tokens: usize,
     pub relationship_tokens: usize,
-    pub immediate_continuity_tokens: usize,
+    pub context_priority_tokens: usize,
+    pub scene_state_tokens: usize,
+    pub do_not_replay_tokens: usize,
     pub recent_chat_tokens: usize,
+    pub latest_exchange_tokens: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -56,8 +73,11 @@ impl Default for ContextBudget {
             memory_tokens: 650,
             world_tokens: 450,
             relationship_tokens: 250,
-            immediate_continuity_tokens: 450,
+            context_priority_tokens: 150,
+            scene_state_tokens: 350,
+            do_not_replay_tokens: 180,
             recent_chat_tokens: 500,
+            latest_exchange_tokens: 700,
         }
     }
 }
@@ -66,20 +86,35 @@ pub fn compile_context_for_messages(soul: &Soul, messages: &[ContextMessage]) ->
     compile_context_with_budget(soul, messages, &ContextBudget::default())
 }
 
+pub fn compile_context_for_separate_user_message(
+    soul: &Soul,
+    messages: &[ContextMessage],
+) -> ContextPreview {
+    compile_context_with_budget_and_options(soul, messages, &ContextBudget::default(), true)
+}
+
 pub fn compile_context_with_budget(
     soul: &Soul,
     messages: &[ContextMessage],
     budget: &ContextBudget,
 ) -> ContextPreview {
+    compile_context_with_budget_and_options(soul, messages, budget, false)
+}
+
+fn compile_context_with_budget_and_options(
+    soul: &Soul,
+    messages: &[ContextMessage],
+    budget: &ContextBudget,
+    separate_user_message_follows: bool,
+) -> ContextPreview {
     let mut truncated = false;
     let section_builders = [
-        build_current_state_section(soul, budget),
-        build_profile_section(soul, budget),
         build_world_section(soul, budget),
+        build_profile_section(soul, budget),
         build_memory_section(soul, messages, budget),
         build_relationship_section(soul, budget),
-        build_immediate_continuity_section(messages, budget),
         build_recent_chat_section(messages, budget),
+        build_latest_exchange_section(messages, budget, separate_user_message_follows),
     ];
 
     let mut sections = Vec::new();
@@ -100,8 +135,8 @@ pub fn compile_context_with_budget(
     }
 }
 
-fn build_current_state_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
-    let lines = vec![
+fn build_profile_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
+    let mut lines = vec![
         format!("Character: {}", fallback(&soul.character_name, "Unnamed Character")),
         format!("Turn: {}", soul.turn_counter),
         format!(
@@ -131,31 +166,15 @@ fn build_current_state_section(soul: &Soul, budget: &ContextBudget) -> BuiltSect
         ),
         format!("Body/arousal continuity: {}", soul.arousal.summary()),
     ];
-
-    section_from_lines(
-        "[CURRENT STATE]",
-        lines,
-        budget.current_state_tokens.min(budget.max_tokens),
-    )
-}
-
-fn build_profile_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
-    let mut lines = Vec::new();
-    push_if_present(
-        &mut lines,
-        "Description",
-        soul.profile.description.trim(),
-    );
+    push_if_present(&mut lines, "Description", soul.profile.description.trim());
     push_if_present(&mut lines, "Appearance", soul.profile.appearance.trim());
-    push_if_present(
-        &mut lines,
-        "Personality",
-        soul.profile.personality.trim(),
-    );
+    push_if_present(&mut lines, "Personality", soul.profile.personality.trim());
     push_if_present(&mut lines, "Scenario seed", soul.profile.scenario.trim());
 
     if lines.is_empty() {
-        lines.push("Profile is still sparse; rely on current state, memory, and scene continuity.".into());
+        lines.push(
+            "Profile is still sparse; rely on current state, memory, and scene continuity.".into(),
+        );
     }
 
     section_from_lines(
@@ -171,11 +190,22 @@ fn build_memory_section(
     budget: &ContextBudget,
 ) -> BuiltSection {
     let mut lines = Vec::new();
-    for memory in soul.memory.core.iter().filter_map(|memory| clean(memory)) {
+    for memory in soul
+        .memory
+        .core
+        .iter()
+        .filter_map(|memory| clean(memory))
+        .filter(|memory| !is_generic_filler_text(memory))
+    {
         lines.push(format!("Core: {memory}"));
     }
     for schema in &soul.memory.schemas {
         if let Some(summary) = clean(&schema.summary) {
+            if is_generic_filler_text(summary)
+                || is_near_empty_generic_schema(&schema.schema_type, summary)
+            {
+                continue;
+            }
             lines.push(format!(
                 "Schema: {} (seen {}x): {}",
                 fallback(&schema.schema_type, "pattern"),
@@ -190,6 +220,7 @@ fn build_memory_section(
         .memory
         .recent
         .iter()
+        .filter(|memory| !is_generic_filler_memory(memory))
         .map(|memory| score_recent_memory(memory, &query_terms, soul.turn_counter))
         .filter(|memory| {
             memory.memory.salience >= MIN_RECENT_MEMORY_SALIENCE
@@ -227,10 +258,13 @@ fn build_memory_section(
 
 fn build_world_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
     let mut lines = vec![
-        format!("Location: {}", fallback(&soul.world.location, "Unspecified")),
+        format!(
+            "Location: {}",
+            fallback(&soul.world.location, "Unspecified")
+        ),
         format!(
             "Time elapsed: {}",
-            fallback(&soul.world.time_elapsed, "Unknown")
+            normalize_time_elapsed_display(fallback(&soul.world.time_elapsed, "Unknown"))
         ),
     ];
 
@@ -296,61 +330,20 @@ fn build_relationship_section(soul: &Soul, budget: &ContextBudget) -> BuiltSecti
     )
 }
 
-fn build_immediate_continuity_section(
-    messages: &[ContextMessage],
-    budget: &ContextBudget,
-) -> BuiltSection {
-    let last_assistant = last_message_with_role(messages, "assistant");
-    let last_user = last_message_with_role(messages, "user");
-    if last_assistant.is_none() && last_user.is_none() {
-        return BuiltSection {
-            text: String::new(),
-            truncated: false,
-        };
-    }
-
-    let lines = vec![
-        format!(
-            "- Last narrator action: {}",
-            last_assistant
-                .map(|message| message.content.trim())
-                .unwrap_or("No prior narrator action in the available chat window.")
-        ),
-        format!(
-            "- Last user action: {}",
-            last_user
-                .map(|message| message.content.trim())
-                .unwrap_or("No prior user action in the available chat window.")
-        ),
-        "- Current scene must continue from these facts. Do not replay them unless the user explicitly asks for a rewind or retcon."
-            .into(),
-    ];
-
-    let required_tokens = estimate_tokens("[IMMEDIATE CONTINUITY]") + estimate_tokens(&lines.join("\n"));
-    let token_cap = budget
-        .immediate_continuity_tokens
-        .max(required_tokens)
-        .min(budget.max_tokens);
-
-    section_from_lines("[IMMEDIATE CONTINUITY]", lines, token_cap)
-}
-
 fn build_recent_chat_section(messages: &[ContextMessage], budget: &ContextBudget) -> BuiltSection {
+    let message_count = if budget.recent_chat_tokens < 400 {
+        4
+    } else {
+        6
+    };
+    let skip_indices = latest_exchange_message_indices(messages);
     let mut recent_chat = messages
         .iter()
+        .enumerate()
         .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .filter(|message| !message.content.trim().is_empty())
-        .map(|message| {
-            format!(
-                "{}: {}",
-                fallback(&message.role, "message"),
-                message.content.trim()
-            )
-        })
+        .filter(|(index, _)| !skip_indices.contains(index))
+        .filter_map(|(_, message)| recent_chat_line(message))
+        .take(message_count)
         .collect::<Vec<_>>();
 
     if recent_chat.is_empty() {
@@ -360,22 +353,53 @@ fn build_recent_chat_section(messages: &[ContextMessage], budget: &ContextBudget
         };
     }
 
-    let mut section = section_from_lines(
-        "[RECENT CHAT]",
-        recent_chat.clone(),
-        budget.recent_chat_tokens.min(budget.max_tokens),
-    );
-    if has_last_user_and_assistant(&section.text, messages) {
-        return section;
-    }
-
-    recent_chat = protected_recent_chat_lines(messages);
-    section = section_from_lines(
-        "[RECENT CHAT]",
+    recent_chat.reverse();
+    section_from_lines(
+        "[RECENT CHAT, LOWER PRIORITY]",
         recent_chat,
         budget.recent_chat_tokens.min(budget.max_tokens),
-    );
-    section
+    )
+}
+
+fn build_latest_exchange_section(
+    messages: &[ContextMessage],
+    budget: &ContextBudget,
+    separate_user_message_follows: bool,
+) -> BuiltSection {
+    let last_assistant = last_message_with_role(messages, "assistant")
+        .map(|message| {
+            tail_excerpt(
+                &sanitize_assistant_context(&message.content),
+                LATEST_ASSISTANT_EXCHANGE_CHARS,
+            )
+        })
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| "No prior narrator response in available context.".into());
+
+    let mut lines = vec![
+        LATEST_EXCHANGE_INSTRUCTION.into(),
+        format!("Last narrator response: {last_assistant}"),
+    ];
+    if separate_user_message_follows {
+        lines.push(CURRENT_USER_FOLLOWS_LINE.into());
+    } else {
+        let latest_user = last_message_with_role(messages, "user")
+            .map(|message| {
+                excerpt(
+                    &sanitize_message_content(&message.content),
+                    LATEST_USER_EXCHANGE_CHARS,
+                )
+            })
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| "No latest user input in available context.".into());
+        lines.push(format!("Latest user input: {latest_user}"));
+    }
+
+    section_from_lines(
+        "[LATEST EXCHANGE, HIGH PRIORITY]",
+        lines,
+        budget.latest_exchange_tokens.min(budget.max_tokens),
+    )
 }
 
 fn section_from_lines(header: &str, lines: Vec<String>, token_cap: usize) -> BuiltSection {
@@ -391,7 +415,10 @@ fn section_from_lines(header: &str, lines: Vec<String>, token_cap: usize) -> Bui
             if text == header {
                 text = format!(
                     "{header}\n{}",
-                    truncate_to_token_budget(&line, token_cap.saturating_sub(estimate_tokens(header)))
+                    truncate_to_token_budget(
+                        &line,
+                        token_cap.saturating_sub(estimate_tokens(header))
+                    )
                 );
             }
             break;
@@ -404,18 +431,21 @@ fn section_from_lines(header: &str, lines: Vec<String>, token_cap: usize) -> Bui
 fn compact_sections_to_budget(sections: &mut Vec<String>, max_tokens: usize) -> bool {
     let mut truncated = false;
     let trim_order = [
-        "[RECENT CHAT]",
+        "[RECENT CHAT, LOWER PRIORITY]",
         "[RELEVANT MEMORIES]",
         "[CHARACTER SNAPSHOT]",
-        "[CURRENT STATE]",
         "[WORLD SNAPSHOT]",
         "[RELATIONSHIP]",
+        "[LATEST EXCHANGE, HIGH PRIORITY]",
     ];
 
     while estimate_tokens(&sections.join("\n\n")) > max_tokens {
         let mut trimmed = false;
         for header in trim_order {
-            if let Some(section) = sections.iter_mut().find(|section| section.starts_with(header)) {
+            if let Some(section) = sections
+                .iter_mut()
+                .find(|section| section.starts_with(header))
+            {
                 if trim_last_line(section) {
                     truncated = true;
                     trimmed = true;
@@ -425,18 +455,7 @@ fn compact_sections_to_budget(sections: &mut Vec<String>, max_tokens: usize) -> 
         }
 
         if !trimmed {
-            sections.retain(|section| section.starts_with("[IMMEDIATE CONTINUITY]"));
-            if let Some(section) = sections.first_mut() {
-                let header_tokens = estimate_tokens("[IMMEDIATE CONTINUITY]");
-                let body = section
-                    .split_once('\n')
-                    .map(|(_, body)| body)
-                    .unwrap_or(section);
-                *section = format!(
-                    "[IMMEDIATE CONTINUITY]\n{}",
-                    truncate_to_token_budget(body, max_tokens.saturating_sub(header_tokens))
-                );
-            }
+            trim_to_priority_minimum(sections, max_tokens);
             truncated = true;
             break;
         }
@@ -457,6 +476,32 @@ fn trim_last_line(section: &mut String) -> bool {
     true
 }
 
+fn trim_to_priority_minimum(sections: &mut Vec<String>, max_tokens: usize) {
+    sections.retain(|section| section.starts_with("[LATEST EXCHANGE, HIGH PRIORITY]"));
+
+    while estimate_tokens(&sections.join("\n\n")) > max_tokens {
+        if sections.iter_mut().rev().any(trim_last_line) {
+            continue;
+        }
+
+        if let Some(section) = sections.first_mut() {
+            let header = section
+                .lines()
+                .next()
+                .unwrap_or("[LATEST EXCHANGE, HIGH PRIORITY]");
+            let body = section
+                .split_once('\n')
+                .map(|(_, body)| body)
+                .unwrap_or(section);
+            *section = format!(
+                "{header}\n{}",
+                truncate_to_token_budget(body, max_tokens.saturating_sub(estimate_tokens(header)))
+            );
+        }
+        break;
+    }
+}
+
 fn score_recent_memory<'a>(
     memory: &'a MemoryEntry,
     query_terms: &HashSet<String>,
@@ -469,7 +514,15 @@ fn score_recent_memory<'a>(
         .count() as f32;
     let recency_bonus = current_turn
         .checked_sub(memory.timestamp)
-        .map(|age| if age <= 3 { 12.0 } else if age <= 10 { 6.0 } else { 0.0 })
+        .map(|age| {
+            if age <= 3 {
+                12.0
+            } else if age <= 10 {
+                6.0
+            } else {
+                0.0
+            }
+        })
         .unwrap_or(3.0);
     let repetitive = is_repetitive_low_value(memory);
     let repetition_penalty = if repetitive { 25.0 } else { 0.0 };
@@ -494,48 +547,105 @@ fn last_message_with_role<'a>(
         .find(|message| message.role == role && !message.content.trim().is_empty())
 }
 
-fn has_last_user_and_assistant(section_text: &str, messages: &[ContextMessage]) -> bool {
-    let has_last_user = last_message_with_role(messages, "user")
-        .map(|message| section_text.contains(message.content.trim()))
-        .unwrap_or(true);
-    let has_last_assistant = last_message_with_role(messages, "assistant")
-        .map(|message| section_text.contains(message.content.trim()))
-        .unwrap_or(true);
-
-    has_last_user && has_last_assistant
-}
-
-fn protected_recent_chat_lines(messages: &[ContextMessage]) -> Vec<String> {
-    let mut protected_indexes = Vec::new();
-    if let Some(index) = last_message_index_with_role(messages, "assistant") {
-        protected_indexes.push(index);
-    }
-    if let Some(index) = last_message_index_with_role(messages, "user") {
-        protected_indexes.push(index);
-    }
-    protected_indexes.sort_unstable();
-    protected_indexes.dedup();
-
-    protected_indexes
-        .into_iter()
-        .map(|index| {
-            let message = &messages[index];
-            format!(
-                "{}: {}",
-                fallback(&message.role, "message"),
-                message.content.trim()
-            )
-        })
-        .collect()
-}
-
-fn last_message_index_with_role(messages: &[ContextMessage], role: &str) -> Option<usize> {
-    messages
+fn latest_exchange_message_indices(messages: &[ContextMessage]) -> HashSet<usize> {
+    let mut skip = HashSet::new();
+    if let Some((index, _)) = messages
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, message)| message.role == role && !message.content.trim().is_empty())
-        .map(|(index, _)| index)
+        .find(|(_, message)| message.role == "assistant" && !message.content.trim().is_empty())
+    {
+        skip.insert(index);
+    }
+    if let Some((index, _)) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.role == "user" && !message.content.trim().is_empty())
+    {
+        skip.insert(index);
+    }
+    skip
+}
+
+fn recent_chat_line(message: &ContextMessage) -> Option<String> {
+    let cleaned = match message.role.as_str() {
+        "assistant" => sanitize_assistant_context(&message.content),
+        _ => sanitize_message_content(&message.content),
+    };
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let content = match message.role.as_str() {
+        "assistant" => assistant_recent_chat_excerpt(&cleaned),
+        "user" => excerpt(&cleaned, USER_RECENT_CHAT_CHARS),
+        _ => excerpt(&cleaned, ASSISTANT_RECENT_CHAT_CHARS),
+    };
+
+    Some(format!(
+        "{}: {}",
+        fallback(&message.role, "message"),
+        content
+    ))
+}
+
+fn assistant_recent_chat_excerpt(text: &str) -> String {
+    head_tail_excerpt(
+        text,
+        ASSISTANT_RECENT_CHAT_HEAD_CHARS,
+        ASSISTANT_RECENT_CHAT_TAIL_CHARS,
+        ASSISTANT_RECENT_CHAT_CHARS,
+    )
+}
+
+fn sanitize_message_content(content: &str) -> String {
+    strip_hidden_state_blocks(content).trim().to_string()
+}
+
+fn sanitize_assistant_context(content: &str) -> String {
+    strip_status_blocks(&strip_hidden_state_blocks(content))
+        .trim()
+        .to_string()
+}
+
+fn strip_hidden_state_blocks(content: &str) -> String {
+    let mut cleaned = content.to_string();
+    loop {
+        let Some(start) = cleaned.find("[HIDDEN STATE]") else {
+            break;
+        };
+        if let Some(relative_end) = cleaned[start..].find("[/HIDDEN STATE]") {
+            let end = start + relative_end + "[/HIDDEN STATE]".len();
+            cleaned.replace_range(start..end, "");
+        } else {
+            cleaned.truncate(start);
+            break;
+        }
+    }
+
+    if let Some(start) = cleaned.find("[HIDDEN_STATE]") {
+        cleaned.truncate(start);
+    }
+    cleaned
+}
+
+fn strip_status_blocks(content: &str) -> String {
+    let mut cleaned = content.to_string();
+    loop {
+        let Some(start) = cleaned.find("```status") else {
+            break;
+        };
+        let after_marker = start + "```status".len();
+        if let Some(relative_end) = cleaned[after_marker..].find("```") {
+            let end = after_marker + relative_end + "```".len();
+            cleaned.replace_range(start..end, "");
+        } else {
+            cleaned.truncate(start);
+            break;
+        }
+    }
+    cleaned
 }
 
 fn is_repetitive_low_value(memory: &MemoryEntry) -> bool {
@@ -544,6 +654,33 @@ fn is_repetitive_low_value(memory: &MemoryEntry) -> bool {
             memory.tag.as_str(),
             "routine" | "small_talk" | "observation" | "minor_observation"
         )
+}
+
+fn is_generic_filler_memory(memory: &MemoryEntry) -> bool {
+    is_generic_filler_text(&memory.content)
+        || is_near_empty_generic_schema(&memory.tag, &memory.content)
+}
+
+fn is_generic_filler_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    FILLER_MEMORY_PHRASES
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+}
+
+fn is_near_empty_generic_schema(kind: &str, summary: &str) -> bool {
+    let kind = kind.to_lowercase();
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return true;
+    }
+
+    let tokens = token_set(summary);
+    let generic_kind = matches!(
+        kind.as_str(),
+        "observation" | "minor_observation" | "routine" | "small_talk" | "pattern"
+    );
+    generic_kind && (tokens.len() <= 4 || summary.to_lowercase().contains("recurring pattern"))
 }
 
 fn recent_chat_terms(messages: &[ContextMessage]) -> HashSet<String> {
@@ -563,7 +700,10 @@ fn token_set(text: &str) -> HashSet<String> {
 }
 
 fn format_list(label: &str, values: &[String], fallback_text: &str) -> String {
-    let values = values.iter().filter_map(|value| clean(value)).collect::<Vec<_>>();
+    let values = values
+        .iter()
+        .filter_map(|value| clean(value))
+        .collect::<Vec<_>>();
     if values.is_empty() {
         format!("{label}: {fallback_text}")
     } else {
@@ -586,6 +726,88 @@ fn fallback<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     clean(value).unwrap_or(fallback)
 }
 
+fn excerpt(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let take_chars = max_chars.saturating_sub(3);
+    format!("{}...", text.chars().take(take_chars).collect::<String>())
+}
+
+fn tail_excerpt(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let ellipsis = "...";
+    let tail_len = max_chars.saturating_sub(ellipsis.chars().count());
+    let drop = char_count.saturating_sub(tail_len);
+    let tail = text.chars().skip(drop).collect::<String>();
+    format!("{ellipsis}{tail}")
+}
+
+fn head_tail_excerpt(text: &str, head_chars: usize, tail_chars: usize, max_chars: usize) -> String {
+    let text = text.trim();
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    let separator = " ... ";
+    let separator_len = separator.chars().count();
+    let available = max_chars.saturating_sub(separator_len);
+    let head_len = head_chars.min(available);
+    let tail_len = tail_chars.min(available.saturating_sub(head_len));
+    if head_len == 0 || tail_len == 0 {
+        return tail_excerpt(text, max_chars);
+    }
+
+    let head = text.chars().take(head_len).collect::<String>();
+    let tail_start = char_count.saturating_sub(tail_len);
+    let tail = text.chars().skip(tail_start).collect::<String>();
+    format!("{head}{separator}{tail}")
+}
+
+fn normalize_time_elapsed_display(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "Unknown".into();
+    }
+
+    const PREFIX: &str = "Session start";
+    let Some(found) = trimmed.find(PREFIX) else {
+        return trimmed.to_string();
+    };
+    let after_prefix = found + PREFIX.len();
+    let Some(rest) = trimmed.get(after_prefix..) else {
+        return trimmed.to_string();
+    };
+    let Some(next) = rest.chars().next() else {
+        return trimmed.to_string();
+    };
+    let needs_boundary = !next.is_whitespace() && !matches!(next, '.' | ',' | ';' | ':');
+    let looks_glued_continuation =
+        needs_boundary && (next.is_ascii_uppercase() || next.is_ascii_digit());
+
+    if !looks_glued_continuation {
+        return trimmed.to_string();
+    }
+
+    let mut out = String::with_capacity(trimmed.len().saturating_add(2));
+    out.push_str(&trimmed[..after_prefix]);
+    out.push_str(". ");
+    out.push_str(rest);
+    out
+}
+
 fn truncate_to_token_budget(text: &str, token_cap: usize) -> String {
     if token_cap == 0 {
         return String::new();
@@ -600,18 +822,305 @@ pub fn estimate_tokens(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::soul::{new_default_soul, MemoryEntry};
+    use crate::soul::{new_default_soul, MemoryEntry, SchemaEntry};
 
     #[test]
     fn context_contains_required_sections() {
         let soul = new_default_soul("Aurora");
         let preview = compile_context_for_messages(&soul, &[]);
 
-        assert!(preview.text.contains("[CURRENT STATE]"));
-        assert!(preview.text.contains("[CHARACTER SNAPSHOT]"));
         assert!(preview.text.contains("[WORLD SNAPSHOT]"));
+        assert!(preview.text.contains("[CHARACTER SNAPSHOT]"));
         assert!(preview.text.contains("[RELEVANT MEMORIES]"));
         assert!(preview.text.contains("[RELATIONSHIP]"));
+        assert!(preview.text.contains("[LATEST EXCHANGE, HIGH PRIORITY]"));
+    }
+
+    #[test]
+    fn world_snapshot_appears_before_character_snapshot() {
+        let soul = soul_with_phone_scene();
+        let preview = compile_context_for_messages(&soul, &phone_continuity_messages());
+
+        assert_order(&preview.text, "[WORLD SNAPSHOT]", "[CHARACTER SNAPSHOT]");
+    }
+
+    #[test]
+    fn latest_exchange_appears_after_lower_priority_recent_chat() {
+        let soul = soul_with_phone_scene();
+        let preview = compile_context_for_messages(&soul, &phone_continuity_messages());
+
+        assert_order(
+            &preview.text,
+            "[RECENT CHAT, LOWER PRIORITY]",
+            "[LATEST EXCHANGE, HIGH PRIORITY]",
+        );
+    }
+
+    #[test]
+    fn latest_exchange_contains_conflict_override_instruction() {
+        let soul = soul_with_phone_scene();
+        let preview = compile_context_for_messages(&soul, &phone_continuity_messages());
+        let latest_exchange = section_text(&preview.text, "[LATEST EXCHANGE, HIGH PRIORITY]");
+        let recent_chat = section_text(&preview.text, "[RECENT CHAT, LOWER PRIORITY]");
+
+        assert!(latest_exchange.contains("Continue from this section first."));
+        assert!(latest_exchange.contains("ignore older context"));
+        assert!(latest_exchange.contains("Do not replay earlier beats."));
+        assert!(latest_exchange.contains("tossed it onto the couch"));
+        assert!(latest_exchange.contains("lonely too"));
+        assert!(
+            recent_chat.contains("phone"),
+            "expected older-turn recent chat excerpt, got: {recent_chat}"
+        );
+        assert!(
+            !recent_chat.contains("lonely too"),
+            "recent chat must not duplicate the latest user message"
+        );
+        assert!(
+            !recent_chat.contains("tossed it onto"),
+            "recent chat must not duplicate the latest assistant excerpt"
+        );
+    }
+
+    #[test]
+    fn latest_exchange_omits_current_user_when_separate_message_follows() {
+        let soul = soul_with_phone_scene();
+        let preview =
+            compile_context_for_separate_user_message(&soul, &phone_continuity_messages());
+        let latest_exchange = section_text(&preview.text, "[LATEST EXCHANGE, HIGH PRIORITY]");
+
+        assert!(latest_exchange.contains("tossed it onto the couch"));
+        assert!(latest_exchange.contains(CURRENT_USER_FOLLOWS_LINE));
+        assert!(latest_exchange.contains("Do not replay earlier beats."));
+        assert!(
+            !latest_exchange.contains("lonely too"),
+            "latest exchange should not repeat the separate user message: {latest_exchange}"
+        );
+    }
+
+    #[test]
+    fn latest_exchange_prefers_tail_of_long_assistant() {
+        let soul = new_default_soul("Aurora");
+        let long_opening = (0..120)
+            .map(|beat| format!("Beat {beat}: the radiator ticks while the kettle waits. "))
+            .collect::<String>();
+        let closing =
+            "Aurora set the phone on the couch, crossed to the kitchen, and reached for the takeout containers.";
+        let messages = vec![
+            ContextMessage {
+                role: "user".into(),
+                content: "Open the fridge.".into(),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: format!("{long_opening}{closing}"),
+            },
+        ];
+
+        let preview = compile_context_for_messages(&soul, &messages);
+        let latest_exchange = section_text(&preview.text, "[LATEST EXCHANGE, HIGH PRIORITY]");
+
+        assert!(
+            latest_exchange.contains("takeout containers"),
+            "latest narrator excerpt should preserve the ending: {latest_exchange}"
+        );
+        assert!(
+            !latest_exchange.contains("Beat 000:"),
+            "latest narrator excerpt must not anchor on the opening beats: {latest_exchange}"
+        );
+    }
+
+    #[test]
+    fn latest_exchange_tail_strips_assistant_status() {
+        let soul = new_default_soul("Aurora");
+        let pad = format!("{}. ", "Echo");
+        let body = pad.repeat(500);
+        let tail = "Aurora left the handset on the table and drifted toward the kitchen.";
+        let messages = vec![ContextMessage {
+            role: "assistant".into(),
+            content: format!("{body}{tail}\n```status\nAurora | Skin: flushed | Zones: hands\n```"),
+        }];
+
+        let preview = compile_context_for_messages(&soul, &messages);
+        let latest_exchange = section_text(&preview.text, "[LATEST EXCHANGE, HIGH PRIORITY]");
+
+        assert!(latest_exchange.contains("kitchen."));
+        assert!(!latest_exchange.contains("```status"));
+        assert!(!latest_exchange.contains("Skin: flushed"));
+    }
+
+    #[test]
+    fn tail_excerpt_prefix_ellipsis_is_utf8_safe() {
+        let opening = format!("{}. ", "x".repeat(200));
+        let tail = format!("{}Closer — 안녕 🙂", "→".repeat(400));
+        let text = format!("{opening}{tail}");
+        let trimmed = tail_excerpt(&text, 140);
+
+        assert!(trimmed.starts_with("..."));
+        assert!(trimmed.is_char_boundary(trimmed.len()));
+        assert!(trimmed.contains('—'));
+        assert!(trimmed.contains("안녕"));
+        assert!(trimmed.contains('🙂'));
+        assert!(trimmed.contains('→'));
+    }
+
+    #[test]
+    fn time_elapsed_fixes_glued_session_start() {
+        let mut soul = soul_with_phone_scene();
+        soul.world.time_elapsed = "Session startLate evening, just after midnight.".into();
+
+        let preview = compile_context_for_messages(&soul, &[]);
+
+        assert!(
+            preview.text.contains("Session start. Late evening"),
+            "world snapshot malformed time string: {}",
+            preview.text
+        );
+        assert!(!preview.text.contains("Session startLate"));
+    }
+
+    #[test]
+    fn assistant_status_blocks_are_stripped_from_recent_chat_context() {
+        let soul = new_default_soul("Aurora");
+        let messages = vec![
+            ContextMessage {
+                role: "user".into(),
+                content: "What changed?".into(),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "Aurora sets the phone down.\n```status\nAurora | Skin: pale | Zones: hands | Atmosphere: tense\n```".into(),
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "Latest user.".into(),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "Later beat.".into(),
+            },
+        ];
+
+        let preview = compile_context_for_messages(&soul, &messages);
+        let recent_chat = section_text(&preview.text, "[RECENT CHAT, LOWER PRIORITY]");
+
+        assert!(recent_chat.contains("Aurora sets the phone down."));
+        assert!(!recent_chat.contains("```status"));
+        assert!(!recent_chat.contains("Skin: pale"));
+    }
+
+    #[test]
+    fn assistant_messages_are_compacted() {
+        let soul = new_default_soul("Aurora");
+        let final_state = "Final state: Aurora has moved to the kitchen doorway.";
+        let messages = vec![
+            ContextMessage {
+                role: "user".into(),
+                content: "First user turn.".into(),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: format!("Aurora continues. {} {final_state}", "a".repeat(900)),
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "Latest user.".into(),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "Short latest.".into(),
+            },
+        ];
+
+        let preview = compile_context_for_messages(&soul, &messages);
+        let recent_chat = section_text(&preview.text, "[RECENT CHAT, LOWER PRIORITY]");
+
+        assert!(recent_chat.contains("..."));
+        assert!(recent_chat.contains(final_state));
+        assert!(!recent_chat.contains(&"a".repeat(500)));
+    }
+
+    #[test]
+    fn user_messages_are_preserved_with_higher_cap() {
+        let soul = new_default_soul("Aurora");
+        let user_content = format!("I explain the lonely confession. {}", "u".repeat(460));
+        let assistant_content = format!("Aurora listens. {}", "a".repeat(460));
+        let messages = vec![
+            ContextMessage {
+                role: "assistant".into(),
+                content: "Aurora taps her fingers once.".into(),
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: user_content.clone(),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: assistant_content,
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "Latest beat.".into(),
+            },
+        ];
+
+        let preview = compile_context_for_messages(&soul, &messages);
+        let recent_chat = section_text(&preview.text, "[RECENT CHAT, LOWER PRIORITY]");
+
+        assert!(recent_chat.contains(&"u".repeat(430)));
+        assert!(!recent_chat.contains(&"a".repeat(430)));
+    }
+
+    #[test]
+    fn recent_chat_cannot_exceed_per_message_caps() {
+        let soul = new_default_soul("Aurora");
+        let messages = vec![
+            ContextMessage {
+                role: "assistant".into(),
+                content: format!("Assistant {}", "a".repeat(1_000)),
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: format!("User {}", "u".repeat(1_000)),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "Latest narrator.".into(),
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "Latest.".into(),
+            },
+        ];
+
+        let preview = compile_context_for_messages(&soul, &messages);
+        let recent_chat = section_text(&preview.text, "[RECENT CHAT, LOWER PRIORITY]");
+        let assistant_line = recent_chat
+            .lines()
+            .find(|line| line.starts_with("assistant:"))
+            .unwrap();
+        let user_line = recent_chat
+            .lines()
+            .find(|line| line.starts_with("user:"))
+            .unwrap();
+
+        assert!(
+            assistant_line.chars().count()
+                <= "assistant: ".chars().count() + ASSISTANT_RECENT_CHAT_CHARS
+        );
+        assert!(user_line.chars().count() <= "user: ".chars().count() + USER_RECENT_CHAT_CHARS);
+    }
+
+    #[test]
+    fn utf8_truncation_is_safe_with_em_dash_korean_and_emoji() {
+        let text = format!("Start — 안녕 🙂 {}", "x".repeat(600));
+        let excerpted = excerpt(&text, 24);
+
+        assert!(excerpted.is_char_boundary(excerpted.len()));
+        assert!(excerpted.contains('—'));
+        assert!(excerpted.contains("안녕"));
+        assert!(excerpted.contains('🙂'));
+        assert!(excerpted.ends_with("..."));
     }
 
     #[test]
@@ -622,7 +1131,7 @@ mod tests {
             .collect();
         let messages = (0..10)
             .map(|index| ContextMessage {
-                role: "user".into(),
+                role: if index % 2 == 0 { "user" } else { "assistant" }.into(),
                 content: format!("Long chat turn {index} {}", "x".repeat(2_000)),
             })
             .collect::<Vec<_>>();
@@ -633,8 +1142,11 @@ mod tests {
             memory_tokens: 120,
             world_tokens: 100,
             relationship_tokens: 80,
-            immediate_continuity_tokens: 120,
+            context_priority_tokens: 120,
+            scene_state_tokens: 120,
+            do_not_replay_tokens: 80,
             recent_chat_tokens: 120,
+            latest_exchange_tokens: 120,
         };
 
         let preview = compile_context_with_budget(&soul, &messages, &budget);
@@ -678,18 +1190,51 @@ mod tests {
     }
 
     #[test]
-    fn key_objects_and_active_plots_appear_in_world_section() {
+    fn generic_filler_memories_are_filtered() {
         let mut soul = new_default_soul("Aurora");
-        soul.world.location = "Carver City service tunnel".into();
-        soul.world.active_plots = vec!["Open the locked gate".into(), "Avoid the patrol".into()];
-        soul.world.key_objects = vec!["Rusty key".into(), "Signal lantern".into()];
-        soul.world.recent_events = vec!["The gate mechanism clicked once.".into()];
-        soul.world.time_elapsed = "Night 1, forty minutes after entry".into();
+        soul.memory.core = vec![
+            "A neutral exchange added texture to the relationship".into(),
+            "Aurora keeps the brass key in her coat pocket.".into(),
+        ];
+        soul.memory.schemas.push(SchemaEntry {
+            schema_type: "observation".into(),
+            summary: "observation recurring pattern across 3 memories.".into(),
+            count: 3,
+        });
+        soul.memory.recent.push(memory(
+            "filler",
+            "Context cue: recent chat is available.",
+            "observation",
+            99.0,
+            99.0,
+            1,
+        ));
+        soul.memory.recent.push(memory(
+            "real",
+            "Aurora found a brass key hidden under the chapel stone.",
+            "orientation",
+            92.0,
+            80.0,
+            1,
+        ));
+
+        let preview = compile_context_for_messages(&soul, &[]);
+        let memories = section_text(&preview.text, "[RELEVANT MEMORIES]");
+
+        assert!(memories.contains("brass key"));
+        assert!(!memories.contains("neutral exchange added texture"));
+        assert!(!memories.contains("Context cue"));
+        assert!(!memories.contains("recurring pattern"));
+    }
+
+    #[test]
+    fn key_objects_and_active_plots_appear_in_world_section() {
+        let soul = soul_with_phone_scene();
 
         let preview = compile_context_for_messages(&soul, &[]);
 
-        assert!(preview.text.contains("Open the locked gate"));
-        assert!(preview.text.contains("Rusty key"));
+        assert!(preview.text.contains("Get pad thai from the kitchen"));
+        assert!(preview.text.contains("phone on couch"));
         assert!(preview.text.contains("Night 1"));
     }
 
@@ -697,6 +1242,14 @@ mod tests {
     fn recent_chat_is_still_included() {
         let soul = new_default_soul("Aurora");
         let messages = vec![
+            ContextMessage {
+                role: "user".into(),
+                content: "We should keep moving.".into(),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "Aurora nods slowly.".into(),
+            },
             ContextMessage {
                 role: "user".into(),
                 content: "Do you remember the stairwell?".into(),
@@ -708,88 +1261,15 @@ mod tests {
         ];
 
         let preview = compile_context_for_messages(&soul, &messages);
+        let recent_chat = section_text(&preview.text, "[RECENT CHAT, LOWER PRIORITY]");
 
-        assert!(preview.text.contains("[RECENT CHAT]"));
+        assert!(preview.text.contains("[RECENT CHAT, LOWER PRIORITY]"));
         assert!(preview.text.contains("stairwell"));
         assert!(preview.text.contains("locked door"));
-    }
-
-    #[test]
-    fn last_assistant_message_appears_in_immediate_continuity() {
-        let soul = new_default_soul("Aurora");
-        let messages = phone_continuity_messages();
-
-        let preview = compile_context_for_messages(&soul, &messages);
-        let continuity = section_text(&preview.text, "[IMMEDIATE CONTINUITY]");
-
-        assert!(continuity.contains("took the phone, locked it, tossed it onto the couch"));
-    }
-
-    #[test]
-    fn last_user_message_appears_in_immediate_continuity() {
-        let soul = new_default_soul("Aurora");
-        let messages = phone_continuity_messages();
-
-        let preview = compile_context_for_messages(&soul, &messages);
-        let continuity = section_text(&preview.text, "[IMMEDIATE CONTINUITY]");
-
-        assert!(continuity.contains("I want pad thai too."));
-    }
-
-    #[test]
-    fn immediate_continuity_appears_before_recent_chat() {
-        let soul = new_default_soul("Aurora");
-        let messages = phone_continuity_messages();
-
-        let preview = compile_context_for_messages(&soul, &messages);
-        let continuity_index = preview
-            .text
-            .find("[IMMEDIATE CONTINUITY]")
-            .expect("continuity section");
-        let recent_chat_index = preview.text.find("[RECENT CHAT]").expect("recent chat");
-
-        assert!(continuity_index < recent_chat_index);
-    }
-
-    #[test]
-    fn budget_is_still_respected_with_immediate_continuity() {
-        let soul = new_default_soul("Aurora");
-        let messages = vec![
-            ContextMessage {
-                role: "assistant".into(),
-                content: format!("Aurora completed the prior action. {}", "a".repeat(600)),
-            },
-            ContextMessage {
-                role: "user".into(),
-                content: format!("I move the scene forward. {}", "b".repeat(600)),
-            },
-        ];
-        let budget = ContextBudget {
-            max_tokens: 450,
-            current_state_tokens: 90,
-            profile_tokens: 70,
-            memory_tokens: 90,
-            world_tokens: 80,
-            relationship_tokens: 70,
-            immediate_continuity_tokens: 160,
-            recent_chat_tokens: 120,
-        };
-
-        let preview = compile_context_with_budget(&soul, &messages, &budget);
-
-        assert!(preview.estimated_tokens <= budget.max_tokens);
-    }
-
-    #[test]
-    fn recent_chat_appears_with_immediate_continuity() {
-        let soul = new_default_soul("Aurora");
-        let messages = phone_continuity_messages();
-
-        let preview = compile_context_for_messages(&soul, &messages);
-
-        assert!(preview.text.contains("[IMMEDIATE CONTINUITY]"));
-        assert!(preview.text.contains("[RECENT CHAT]"));
-        assert!(preview.text.contains("I want pad thai too."));
+        assert!(
+            recent_chat.contains("moving") || recent_chat.contains("slowly"),
+            "expected older recent chat excerpt, got: {recent_chat}"
+        );
     }
 
     fn memory(
@@ -810,6 +1290,18 @@ mod tests {
         }
     }
 
+    fn soul_with_phone_scene() -> Soul {
+        let mut soul = new_default_soul("Aurora");
+        soul.world.location = "Apartment kitchen threshold".into();
+        soul.world.active_plots = vec!["Get pad thai from the kitchen".into()];
+        soul.world.key_objects = vec!["phone on couch".into(), "pad thai in kitchen".into()];
+        soul.world.recent_events = vec![
+            "Phone reveal completed: Aurora saw the user's phone/Tinder post, reacted with embarrassment, tossed the phone onto the couch, and moved to the kitchen to get pad thai.".into(),
+        ];
+        soul.world.time_elapsed = "Night 1".into();
+        soul
+    }
+
     fn phone_continuity_messages() -> Vec<ContextMessage> {
         vec![
             ContextMessage {
@@ -819,14 +1311,20 @@ mod tests {
             ContextMessage {
                 role: "assistant".into(),
                 content:
-                    "Aurora saw the Tinder screenshot, took the phone, locked it, tossed it onto the couch, and moved toward the kitchen."
+                    "Aurora saw the Tinder screenshot, took the phone, locked it, tossed it onto the couch, and moved toward the kitchen.\n```status\nAurora | Skin: flushed | Zones: hand, couch | Atmosphere: awkward\n```"
                         .into(),
             },
             ContextMessage {
                 role: "user".into(),
-                content: "I want pad thai too.".into(),
+                content: "I accept pad thai and admit I'm lonely too.".into(),
             },
         ]
+    }
+
+    fn assert_order(text: &str, first: &str, second: &str) {
+        let first_index = text.find(first).expect("first section");
+        let second_index = text.find(second).expect("second section");
+        assert!(first_index < second_index);
     }
 
     fn section_text<'a>(text: &'a str, header: &str) -> &'a str {

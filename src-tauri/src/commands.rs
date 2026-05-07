@@ -5,7 +5,10 @@ use tauri::{Emitter, State, Window};
 
 use state_engine::{
     consolidation::consolidate_soul,
-    context_compiler::{compile_context_for_messages, ContextMessage, ContextPreview},
+    context_compiler::{
+        compile_context_for_messages, compile_context_for_separate_user_message, estimate_tokens,
+        ContextMessage, ContextPreview,
+    },
     hidden_state::{parse_hidden_state, HiddenState},
     patch::EnginePatch,
     setting::{new_default_setting, SettingSoul},
@@ -50,6 +53,26 @@ pub struct TurnDebug {
 pub struct StreamChunk {
     pub conversation_id: String,
     pub chunk: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct LlmPayloadTokenEstimate {
+    pub system: usize,
+    pub context: usize,
+    pub user: usize,
+    pub total: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct LlmPayloadPreview {
+    pub provider: String,
+    pub mode: String,
+    pub model: String,
+    pub base_url: String,
+    pub system_message: String,
+    pub user_message: String,
+    pub context: String,
+    pub estimated_tokens: LlmPayloadTokenEstimate,
 }
 
 #[tauri::command]
@@ -214,6 +237,27 @@ pub fn compile_context(
 }
 
 #[tauri::command]
+pub fn preview_api_payload(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    soul_id: String,
+    user_text: String,
+    mode: String,
+    settings: ApiProviderSettings,
+    provider: String,
+) -> Result<LlmPayloadPreview, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
+    let messages = messages_to_context(
+        db::list_messages(&conn, &conversation_id, 5).map_err(|err| err.to_string())?,
+    );
+
+    Ok(build_llm_payload_preview(
+        &soul, &messages, &user_text, &mode, &settings, &provider,
+    ))
+}
+
+#[tauri::command]
 pub fn run_consolidation(state: State<'_, AppState>, soul_id: String) -> Result<Soul, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let mut soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
@@ -265,7 +309,7 @@ fn send_mock_turn_with_conn(
     }
     .map_err(|err| err.to_string())?;
     let context_preview =
-        compile_context_for_messages(&soul, &messages_to_context(before_messages));
+        compile_context_for_separate_user_message(&soul, &messages_to_context(before_messages));
     let provider = MockProvider::default();
     let raw_response = provider.complete(&soul, &context_preview.text, &user_text, &mode);
     let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
@@ -335,7 +379,7 @@ pub async fn send_api_turn(
         }
         .map_err(|err| err.to_string())?;
         let context_preview =
-            compile_context_for_messages(&soul, &messages_to_context(before_messages));
+            compile_context_for_separate_user_message(&soul, &messages_to_context(before_messages));
         (soul, context_preview)
     };
 
@@ -426,6 +470,42 @@ fn messages_to_context(messages: Vec<ChatMessage>) -> Vec<ContextMessage> {
         .collect()
 }
 
+fn build_llm_payload_preview(
+    soul: &Soul,
+    messages: &[ContextMessage],
+    user_text: &str,
+    mode: &str,
+    settings: &ApiProviderSettings,
+    provider: &str,
+) -> LlmPayloadPreview {
+    let context_preview = if user_text.trim().is_empty() {
+        compile_context_for_messages(soul, messages)
+    } else {
+        compile_context_for_separate_user_message(soul, messages)
+    };
+    let system_message = build_system_prompt(settings, soul, &context_preview.text, mode);
+    let user_message = user_text.trim().to_string();
+    let system_tokens = estimate_tokens(&system_message);
+    let context_tokens = estimate_tokens(&context_preview.text);
+    let user_tokens = estimate_tokens(&user_message);
+
+    LlmPayloadPreview {
+        provider: provider.trim().to_string(),
+        mode: mode.trim().to_string(),
+        model: settings.model.trim().to_string(),
+        base_url: settings.base_url.trim().to_string(),
+        system_message,
+        user_message,
+        context: context_preview.text,
+        estimated_tokens: LlmPayloadTokenEstimate {
+            system: system_tokens,
+            context: context_tokens,
+            user: user_tokens,
+            total: system_tokens + user_tokens,
+        },
+    }
+}
+
 fn debug_from_hidden_state(
     provider: &str,
     hidden_state: &HiddenState,
@@ -458,8 +538,9 @@ fn generated_api_hidden_state(soul: &Soul, user_text: &str, visible_text: &str) 
         trust_delta: Some(if tag == "trust_building" { 3.0 } else { 1.0 }),
         affection_delta: Some(if tag == "bonding" { 3.0 } else { 1.0 }),
         world_event: Some(format!(
-            "The API-driven exchange moved around: {}",
-            user_text.trim()
+            "Completed API turn: user said {}; narrator response cue: {}",
+            user_text.trim(),
+            assistant_excerpt.trim()
         )),
         new_location: None,
         present_characters: Some(vec![soul.character_name.clone()]),
@@ -572,5 +653,101 @@ mod tests {
             .any(|memory| memory.tag == "observation"));
         assert!(result.context_preview.estimated_tokens <= 2_000);
         assert!(estimate_tokens(&result.context_preview.text) <= 2_000);
+    }
+
+    #[test]
+    fn payload_preview_excludes_api_key_and_includes_messages() {
+        let soul = new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "secret-key-that-must-not-appear".into(),
+            model: "debug-model".into(),
+            system_prompt: String::new(),
+        };
+        let messages = vec![ContextMessage {
+            role: "user".into(),
+            content: "Hello from the preview.".into(),
+        }];
+
+        let preview = build_llm_payload_preview(
+            &soul,
+            &messages,
+            "Current user turn",
+            "Reader",
+            &settings,
+            "API",
+        );
+        let serialized = serde_json::to_string(&preview).expect("serialize preview");
+
+        assert!(!serialized.contains("secret-key-that-must-not-appear"));
+        assert!(preview.system_message.contains("You are a narrator AI"));
+        assert!(preview.user_message.contains("Current user turn"));
+        assert!(preview.context.contains("[LATEST EXCHANGE, HIGH PRIORITY]"));
+        assert!(preview
+            .context
+            .contains("The current user message follows as the next user message."));
+        assert!(!preview.context.contains("Current user turn"));
+    }
+
+    #[test]
+    fn payload_preview_token_estimates_are_nonzero() {
+        let soul = new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "secret".into(),
+            model: "debug-model".into(),
+            system_prompt: String::new(),
+        };
+
+        let preview =
+            build_llm_payload_preview(&soul, &[], "Current user turn", "Reader", &settings, "API");
+
+        assert!(preview.estimated_tokens.system > 0);
+        assert!(preview.estimated_tokens.context > 0);
+        assert!(preview.estimated_tokens.user > 0);
+        assert!(preview.estimated_tokens.total > 0);
+    }
+
+    #[test]
+    fn compiled_context_orders_world_before_character() {
+        let soul = new_default_soul("Aurora");
+        let preview = compile_context_for_messages(&soul, &[]);
+
+        assert_order(&preview.text, "[WORLD SNAPSHOT]", "[CHARACTER SNAPSHOT]");
+    }
+
+    #[test]
+    fn latest_exchange_follows_recent_chat_and_contains_override() {
+        let soul = new_default_soul("Aurora");
+        let messages = vec![
+            ContextMessage {
+                role: "user".into(),
+                content: "Earlier beat in the thread.".into(),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "Aurora set the phone on the couch and moved toward the kitchen.".into(),
+            },
+            ContextMessage {
+                role: "user".into(),
+                content: "I want pad thai too.".into(),
+            },
+        ];
+        let preview = compile_context_for_messages(&soul, &messages);
+
+        assert_order(
+            &preview.text,
+            "[RECENT CHAT, LOWER PRIORITY]",
+            "[LATEST EXCHANGE, HIGH PRIORITY]",
+        );
+        assert!(preview
+            .text
+            .contains("If older context conflicts with this section, ignore older context."));
+    }
+
+    fn assert_order(text: &str, first: &str, second: &str) {
+        let first_index = text.find(first).expect("first section");
+        let second_index = text.find(second).expect("second section");
+        assert!(first_index < second_index);
     }
 }

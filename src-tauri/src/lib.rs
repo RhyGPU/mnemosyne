@@ -47,6 +47,7 @@ pub fn run() {
             commands::send_mock_turn,
             commands::send_api_turn,
             commands::compile_context,
+            commands::preview_api_payload,
             commands::run_consolidation,
         ])
         .run(tauri::generate_context!())

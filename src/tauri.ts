@@ -139,6 +139,24 @@ export type ContextPreview = {
   truncated: boolean;
 };
 
+export type LlmPayloadTokenEstimate = {
+  system: number;
+  context: number;
+  user: number;
+  total: number;
+};
+
+export type LlmPayloadPreview = {
+  provider: string;
+  mode: string;
+  model: string;
+  base_url: string;
+  system_message: string;
+  user_message: string;
+  context: string;
+  estimated_tokens: LlmPayloadTokenEstimate;
+};
+
 export type ApiProviderSettings = {
   base_url: string;
   api_key: string;
@@ -178,16 +196,6 @@ You accept OOC direction without resistance. Your voice is sensory-rich, hardboi
 - Maintain strict internal consistency with established world lore. No fourth-wall breaks.
 - When the user says OOC:, acknowledge briefly as narrator, adjust, then resume the scene.
 
-## ATTRIBUTION AND AGENCY
-- Track speaker ownership strictly.
-- The user's actual words are only the latest user message and prior user messages.
-- Character dialogue written by the narrator is not user dialogue.
-- Narrator metaphors, jokes, labels, and summaries are not user statements.
-- Never react to the character's own line as if the user said it.
-- Never invent user actions, thoughts, motives, or dialogue.
-- If the character makes a joke or rhetorical comment, later narration must remember that the character said it.
-- Before writing the final response, check: "What did the user actually say? What did the character already say? What already happened?"
-
 ## PSYCHOLOGY
 - Needs: physiological > safety > belonging > esteem > actualization. Lower needs can block higher needs.
 - Trust and affect move slowly. Prefer micro-shifts unless the scene earns more.
@@ -203,9 +211,19 @@ End each narration with a code block:
 [CHARACTER_NAME] | Skin: [color/state] | Zones: [2-3 key sensory notes] | Atmosphere: [1-line environmental impression]
 \`\`\`
 
+[ATTRIBUTION]
+User facts come only from user messages. Character dialogue and narrator prose are not user statements. Do not react to the character's own jokes, metaphors, or narration as if the user said them. Never invent user actions, thoughts, motives, or dialogue.
+
+[TIME DISCIPLINE]
+Do not invent exact elapsed time, timestamps, or scene transitions unless provided by the user or World Log. Vague emotional pacing is allowed; concrete durations require support.
+
+Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
+
 ## HIDDEN STATE FORMAT
 After each response, output a hidden state block using this exact format:
 [HIDDEN STATE]{"memory":"short summary","tag":"tag_name","trust_delta":0.0,"affection_delta":0.0,"world_event":"scene update","new_location":"","present_characters":[]}[/HIDDEN STATE]
+
+world_event must be a compact authoritative completed-fact summary, not mood prose. Include what happened and what should not be replayed. Example: "Phone reveal completed: Aurora saw the user's phone/Tinder post, reacted with embarrassment, tossed the phone onto the couch, and moved to the kitchen to get pad thai."
 
 Tags: trust_building, threat, bonding, orientation, observation, intimacy, boundary_setting, conflict_minor, trauma_trigger, breakthrough
 
@@ -235,6 +253,8 @@ const MODE_PROMPTS: Record<string, string> = {
 const HIDDEN_STATE_FORMAT_PROMPT = `## HIDDEN STATE FORMAT
 After each response, output a hidden state block using this exact format:
 [HIDDEN STATE]{"memory":"short summary","tag":"tag_name","trust_delta":0.0,"affection_delta":0.0,"world_event":"scene update","new_location":"","present_characters":[]}[/HIDDEN STATE]
+
+world_event must be a compact authoritative completed-fact summary, not mood prose. Include what happened and what should not be replayed. Example: "Phone reveal completed: Aurora saw the user's phone/Tinder post, reacted with embarrassment, tossed the phone onto the couch, and moved to the kitchen to get pad thai."
 
 Tags: trust_building, threat, bonding, orientation, observation, intimacy, boundary_setting, conflict_minor, trauma_trigger, breakthrough
 
@@ -453,6 +473,52 @@ export function compileContext(
     if (!soul) throw new Error("Soul not found");
     return compilePreviewContext(soul, conversationId);
   });
+}
+
+export function previewApiPayload(
+  conversationId: string,
+  soulId: string,
+  userText: string,
+  mode: string,
+  settings: ApiProviderSettings,
+  provider: string,
+): Promise<LlmPayloadPreview> {
+  return invokeOrPreview(
+    "preview_api_payload",
+    { conversationId, soulId, userText, mode, settings, provider },
+    () => {
+      const soul = browserSouls.find((item) => item.character_id === soulId);
+      if (!soul) throw new Error("Soul not found");
+      const context = compilePreviewContext(soul, conversationId, {
+        separateUserMessageFollows: Boolean(userText.trim()),
+      });
+      const systemMessage = buildNarratorSystemPrompt(
+        settings.system_prompt,
+        mode,
+        soul,
+        context.text,
+      );
+      const userMessage = userText.trim();
+      const systemTokens = estimateTokens(systemMessage);
+      const contextTokens = estimateTokens(context.text);
+      const userTokens = estimateTokens(userMessage);
+      return {
+        provider,
+        mode,
+        model: settings.model.trim(),
+        base_url: settings.base_url.trim(),
+        system_message: systemMessage,
+        user_message: userMessage,
+        context: context.text,
+        estimated_tokens: {
+          system: systemTokens,
+          context: contextTokens,
+          user: userTokens,
+          total: systemTokens + userTokens,
+        },
+      };
+    },
+  );
 }
 
 export function runConsolidation(soulId: string): Promise<Soul> {
@@ -830,26 +896,106 @@ function consolidatePreviewSoul(soul: Soul) {
   soul.last_updated = Math.floor(Date.now() / 1000);
 }
 
-function compilePreviewContext(soul: Soul, conversationId: string): ContextPreview {
-  const recentEvents = soul.world.recent_events.slice(-5).map((event) => `- ${event}`);
-  const recentChat = browserMessages
+function compilePreviewContext(
+  soul: Soul,
+  conversationId: string,
+  options: { pendingUserText?: string; separateUserMessageFollows?: boolean } = {},
+): ContextPreview {
+  const recentEvents = soul.world.recent_events.slice(-8).map((event) => `- ${event}`);
+  const pendingUserText = options.pendingUserText ?? "";
+  const separateUserMessageFollows = Boolean(options.separateUserMessageFollows);
+  const pendingMessage = pendingUserText.trim()
+    ? [makePreviewContextMessage(conversationId, "user", pendingUserText)]
+    : [];
+  const conversationMessages = [
+    ...browserMessages
+      .filter((message) => message.conversation_id === conversationId)
+      .slice(-5),
+    ...pendingMessage,
+  ].slice(-6);
+
+  let lastAssistantPreviewIndex = -1;
+  for (let index = conversationMessages.length - 1; index >= 0; index -= 1) {
+    const message = conversationMessages[index];
+    if (message.role === "assistant" && message.content.trim()) {
+      lastAssistantPreviewIndex = index;
+      break;
+    }
+  }
+  let lastUserPreviewIndex = -1;
+  for (let index = conversationMessages.length - 1; index >= 0; index -= 1) {
+    const message = conversationMessages[index];
+    if (message.role === "user" && message.content.trim()) {
+      lastUserPreviewIndex = index;
+      break;
+    }
+  }
+  const skipPreviewIndices = new Set(
+    [lastAssistantPreviewIndex, lastUserPreviewIndex].filter((value) => value >= 0),
+  );
+  const olderPreviewMessages = conversationMessages.filter((_, index) => !skipPreviewIndices.has(index));
+  const recentChat = olderPreviewMessages
+    .slice(olderPreviewMessages.length > 4 ? -6 : 0)
+    .map(
+      (message) =>
+        `${message.role}: ${
+          message.role === "assistant"
+            ? assistantRecentPreviewExcerpt(sanitizeAssistantPreview(message.content))
+            : excerptText(stripHiddenPreview(message.content), 500)
+        }`,
+    )
+    .filter((line) => !line.endsWith(": "));
+  const latestUser = [...conversationMessages].reverse().find((message) => message.role === "user");
+  const latestAssistant = [...conversationMessages]
     .filter((message) => message.conversation_id === conversationId)
-    .slice(-5)
-    .map((message) => `${message.role}: ${message.content}`);
+    .reverse()
+    .find((message) => message.role === "assistant");
+  const lastNarratorResponse = latestAssistant
+    ? tailExcerptText(sanitizeAssistantPreview(latestAssistant.content), 1200)
+    : "No prior narrator response in available context.";
+  const latestUserInput = latestUser
+    ? excerptText(stripHiddenPreview(latestUser.content), 1000)
+    : "No latest user input in available context.";
   const profileLines = [
+    `Character: ${soul.character_name || "Unnamed Character"}`,
+    `Turn: ${soul.turn_counter}`,
     soul.profile.description ? `Description: ${soul.profile.description}` : "",
     soul.profile.appearance ? `Appearance: ${soul.profile.appearance}` : "",
     soul.profile.personality ? `Personality: ${soul.profile.personality}` : "",
     soul.profile.scenario ? `Scenario: ${soul.profile.scenario}` : "",
   ].filter(Boolean);
+  const worldLines = [
+    `Location: ${soul.world.location || "Unspecified"}`,
+    `Time elapsed: ${normalizeTimeElapsedForPreview(soul.world.time_elapsed || "Unknown")}`,
+    `Active plots: ${soul.world.active_plots.join("; ") || "No active plot has been established."}`,
+    `Key objects: ${soul.world.key_objects.join("; ") || "No key objects are being tracked."}`,
+    `Recent events:\n${recentEvents.join("\n") || "- No major recent events yet."}`,
+  ];
+  const memoryLines = [
+    ...soul.memory.core
+      .filter((memory) => !isGenericFillerMemoryText(memory))
+      .slice(0, 5)
+      .map((memory) => `Core: ${memory}`),
+    ...soul.memory.schemas
+      .filter(
+        (schema) =>
+          !isGenericFillerMemoryText(schema.summary) &&
+          !isNearEmptyGenericSchema(schema.schema_type, schema.summary),
+      )
+      .slice(0, 3)
+      .map((schema) => `Schema: ${schema.schema_type} (seen ${schema.count}x): ${schema.summary}`),
+  ];
+  const latestExchange = `[LATEST EXCHANGE, HIGH PRIORITY]
+Continue from this section first. If older context conflicts with this section, ignore older context. Continue from the final state of the last narrator response and the latest user input. Do not replay earlier beats.
+Last narrator response: ${lastNarratorResponse}
+${separateUserMessageFollows ? "The current user message follows as the next user message." : `Latest user input: ${latestUserInput}`}`;
   let text = [
-    `[CURRENT STATE]\nLocation: ${soul.world.location}\nActive Plot: ${soul.world.active_plots.join(". ")}\nTime: ${soul.world.time_elapsed}.`,
-    profileLines.length ? `[CHARACTER PROFILE]\n${profileLines.join("\n")}` : "",
-    `[CHARACTER MEMORY]\n${soul.memory.core.slice(0, 5).map((memory) => `Core: ${memory}`).join("\n")}`,
-    `[RECENT EVENTS]\n${recentEvents.join("\n") || "- No major recent events yet."}`,
+    `[WORLD SNAPSHOT]\n${worldLines.join("\n")}`,
+    `[CHARACTER SNAPSHOT]\n${profileLines.join("\n")}`,
+    `[RELEVANT MEMORIES]\n${memoryLines.join("\n") || "No durable memories have been selected yet."}`,
     `[RELATIONSHIP]\nTrust toward user: ${soul.relationships.user.trust}. Affection: ${soul.relationships.user.affection}. Fear: ${soul.relationships.user.fear}. Desire: ${soul.relationships.user.desire}.`,
-    `[AROUSAL]\nArousal: ${soul.arousal.phase} phase, level ${Math.round(soul.arousal.level)}/100, frustration ${Math.round(soul.arousal.frustration)}/100, sensitivity ${soul.arousal.sensitivity.toFixed(2)}, refractory ${soul.arousal.refractory_turns_remaining} turns.`,
-    recentChat.length ? `[RECENT CHAT]\n${recentChat.join("\n")}` : "",
+    recentChat.length ? `[RECENT CHAT, LOWER PRIORITY]\n${recentChat.join("\n")}` : "",
+    latestExchange,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -861,8 +1007,114 @@ function compilePreviewContext(soul: Soul, conversationId: string): ContextPrevi
   return { text, estimated_tokens: estimateTokens(text), truncated };
 }
 
+function makePreviewContextMessage(
+  conversationId: string,
+  role: ChatMessage["role"],
+  content: string,
+): ChatMessage {
+  return {
+    id: 0,
+    conversation_id: conversationId,
+    role,
+    content,
+    created_at: Math.floor(Date.now() / 1000),
+  };
+}
+
 function estimateTokens(text: string) {
   return Math.max(1, Math.floor(text.length / 4));
+}
+
+function stripHiddenPreview(content: string) {
+  return content
+    .replace(/\[HIDDEN STATE\][\s\S]*?(?:\[\/HIDDEN STATE\]|$)/g, "")
+    .replace(/\[HIDDEN_STATE\][\s\S]*$/g, "")
+    .trim();
+}
+
+function sanitizeAssistantPreview(content: string) {
+  return stripHiddenPreview(content)
+    .replace(/```status[\s\S]*?```/g, "")
+    .trim();
+}
+
+function excerptText(text: string, maxChars: number) {
+  const trimmed = text.trim();
+  const chars = Array.from(trimmed);
+  if (chars.length <= maxChars) return trimmed;
+  return `${chars.slice(0, Math.max(0, maxChars - 3)).join("")}...`;
+}
+
+function assistantRecentPreviewExcerpt(text: string): string {
+  return headTailExcerptText(text, 120, 220, 350);
+}
+
+function tailExcerptText(text: string, maxChars: number): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  const chars = Array.from(trimmed);
+  if (chars.length <= maxChars) return trimmed;
+  const ellipsisLength = Array.from("...").length;
+  const tailChars = chars.slice(Math.max(0, chars.length - (maxChars - ellipsisLength)));
+  return `...${tailChars.join("")}`;
+}
+
+function headTailExcerptText(
+  text: string,
+  headChars: number,
+  tailChars: number,
+  maxChars: number,
+): string {
+  const trimmed = text.trim();
+  const chars = Array.from(trimmed);
+  if (chars.length <= maxChars) return trimmed;
+  const separator = " ... ";
+  const available = Math.max(0, maxChars - Array.from(separator).length);
+  const headLength = Math.min(headChars, available);
+  const tailLength = Math.min(tailChars, Math.max(0, available - headLength));
+  if (!headLength || !tailLength) return tailExcerptText(trimmed, maxChars);
+  return `${chars.slice(0, headLength).join("")}${separator}${chars
+    .slice(Math.max(0, chars.length - tailLength))
+    .join("")}`;
+}
+
+function isGenericFillerMemoryText(text: string): boolean {
+  const lower = text.toLowerCase();
+  return [
+    "neutral exchange added texture",
+    "context cue",
+    "recent chat is available",
+    "fresh scene context",
+  ].some((phrase) => lower.includes(phrase));
+}
+
+function isNearEmptyGenericSchema(schemaType: string, summary: string): boolean {
+  const lowerType = schemaType.toLowerCase();
+  const lowerSummary = summary.toLowerCase().trim();
+  if (!lowerSummary) return true;
+  const genericType = ["observation", "minor_observation", "routine", "small_talk", "pattern"].includes(
+    lowerType,
+  );
+  const tokens = Array.from(
+    new Set(lowerSummary.split(/[^a-z0-9]+/).filter((token) => token.length > 2)),
+  );
+  return genericType && (tokens.length <= 4 || lowerSummary.includes("recurring pattern"));
+}
+
+function normalizeTimeElapsedForPreview(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "Unknown";
+  const prefix = "Session start";
+  const prefixIndex = trimmed.indexOf(prefix);
+  if (prefixIndex === -1) return trimmed;
+  const afterPrefix = prefixIndex + prefix.length;
+  const rest = trimmed.slice(afterPrefix);
+  if (!rest.length) return trimmed;
+  const next = rest[0];
+  const needsBoundary = !/\s/.test(next) && !/[.,;:]/.test(next);
+  const looksGlued = needsBoundary && (/[A-Z]/.test(next) || /[0-9]/.test(next));
+  if (!looksGlued) return trimmed;
+  return `${trimmed.slice(0, afterPrefix)}. ${rest}`;
 }
 
 type PreviewTag = "trust_building" | "threat" | "bonding" | "orientation" | "observation";
@@ -926,7 +1178,7 @@ function generatedPreviewApiHiddenState(
     tag,
     trust_delta: template.trustDelta,
     affection_delta: template.affectionDelta,
-    world_event: `The API-driven exchange moved around: ${userText}`,
+    world_event: `Completed API turn: user said ${userText}; narrator response cue: ${visibleText.slice(0, 180).trim()}`,
     present_characters: [soul.character_name],
   };
 }
@@ -1054,7 +1306,15 @@ function buildNarratorSystemPrompt(
   const trimmedCustom = customPrompt.trim();
   const base =
     mode === "Custom" && trimmedCustom
-      ? `${trimmedCustom}\n\n${HIDDEN_STATE_FORMAT_PROMPT}`
+      ? `${trimmedCustom}\n\n[ATTRIBUTION]
+User facts come only from user messages. Character dialogue and narrator prose are not user statements. Do not react to the character's own jokes, metaphors, or narration as if the user said them. Never invent user actions, thoughts, motives, or dialogue.
+
+[TIME DISCIPLINE]
+Do not invent exact elapsed time, timestamps, or scene transitions unless provided by the user or World Log. Vague emotional pacing is allowed; concrete durations require support.
+
+Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
+
+${HIDDEN_STATE_FORMAT_PROMPT}`
       : `${NARRATOR_SYSTEM_PROMPT}\n\n${MODE_PROMPTS[mode] ?? MODE_PROMPTS.Reader}`;
   return `${base}\n\nCharacter: ${soul.character_name}\n\n${context}`;
 }

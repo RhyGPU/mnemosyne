@@ -2,6 +2,7 @@ import {
   ArrowLeft,
   Brain,
   ChevronDown,
+  Clipboard,
   Database,
   FileDown,
   FileUp,
@@ -18,6 +19,7 @@ import {
   ApiProviderSettings,
   ChatMessage,
   ContextPreview,
+  LlmPayloadPreview,
   ProviderProfile,
   SettingSoul,
   SettingSummary,
@@ -39,6 +41,7 @@ import {
   listSettings,
   listSouls,
   listenApiStream,
+  previewApiPayload,
   runConsolidation,
   saveSettingFile,
   saveSoulFile,
@@ -148,6 +151,7 @@ export function App() {
   const [setting, setSetting] = useState<SettingSoul | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [context, setContext] = useState<ContextPreview | null>(null);
+  const [llmPayload, setLlmPayload] = useState<LlmPayloadPreview | null>(null);
   const [draft, setDraft] = useState("");
   const [characterName, setCharacterName] = useState("Aurora Schwarz");
   const [characterDescription, setCharacterDescription] = useState("");
@@ -204,6 +208,26 @@ export function App() {
     if (!soul) return;
     void refreshContext(soul.character_id, currentConversationId);
   }, [soul?.character_id, currentConversationId, messages.length]);
+
+  useEffect(() => {
+    if (!soul) {
+      setLlmPayload(null);
+      return;
+    }
+    const payloadUserText =
+      draft.trim() || [...messages].reverse().find((message) => message.role === "user")?.content || "";
+    void refreshLlmPayload(soul.character_id, currentConversationId, payloadUserText);
+  }, [
+    soul?.character_id,
+    currentConversationId,
+    messages.length,
+    draft,
+    provider,
+    mode,
+    apiSettings.base_url,
+    apiSettings.model,
+    apiSettings.system_prompt,
+  ]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -412,6 +436,22 @@ export function App() {
     setContext(preview);
   }
 
+  async function refreshLlmPayload(soulId: string, conversationId: string, userText: string) {
+    try {
+      const preview = await previewApiPayload(
+        conversationId,
+        soulId,
+        userText,
+        mode,
+        apiSettings,
+        provider,
+      );
+      setLlmPayload(preview);
+    } catch {
+      setLlmPayload(null);
+    }
+  }
+
   async function handleCreateSoul() {
     setBusy(true);
     try {
@@ -578,6 +618,12 @@ export function App() {
 
     setDraft("");
     await executeTurn(text);
+  }
+
+  async function handleCopyLlmPayload() {
+    if (!llmPayload) return;
+    await navigator.clipboard.writeText(formatLlmPayloadDebugBlock(llmPayload));
+    setStatus("LLM payload copied");
   }
 
   async function handleRegenerate() {
@@ -2067,6 +2113,61 @@ export function App() {
             </dl>
           </section>
 
+          <section className="context-preview payload-inspector">
+            <div className="payload-header">
+              <h2>LLM Payload Inspector</h2>
+              <button
+                className="ghost-action"
+                title="Copy LLM Payload"
+                onClick={handleCopyLlmPayload}
+                disabled={!llmPayload}
+              >
+                <Clipboard size={16} />
+                <span>Copy LLM Payload</span>
+              </button>
+            </div>
+            <dl className="diagnostic-grid payload-grid">
+              <div>
+                <dt>Provider</dt>
+                <dd>{llmPayload?.provider ?? provider}</dd>
+              </div>
+              <div>
+                <dt>Mode</dt>
+                <dd>{llmPayload?.mode ?? mode}</dd>
+              </div>
+              <div>
+                <dt>Model</dt>
+                <dd>{llmPayload?.model || "-"}</dd>
+              </div>
+              <div>
+                <dt>Base URL</dt>
+                <dd>{llmPayload?.base_url || "-"}</dd>
+              </div>
+              <div>
+                <dt>System Tokens</dt>
+                <dd>{llmPayload?.estimated_tokens.system ?? 0}</dd>
+              </div>
+              <div>
+                <dt>Context Tokens</dt>
+                <dd>{llmPayload?.estimated_tokens.context ?? 0}</dd>
+              </div>
+              <div>
+                <dt>User Tokens</dt>
+                <dd>{llmPayload?.estimated_tokens.user ?? 0}</dd>
+              </div>
+              <div>
+                <dt>Total Tokens</dt>
+                <dd>{llmPayload?.estimated_tokens.total ?? 0}</dd>
+              </div>
+            </dl>
+            <h3>System Message</h3>
+            <pre>{llmPayload?.system_message ?? "No LLM payload compiled yet."}</pre>
+            <h3>Context, already included inside System Message</h3>
+            <pre>{llmPayload?.context ?? "No context compiled yet."}</pre>
+            <h3>Current User Message</h3>
+            <pre>{llmPayload?.user_message || "No current user message."}</pre>
+          </section>
+
           <section className="context-preview">
             <h2>Context</h2>
             <pre>{context?.text ?? "No context compiled yet."}</pre>
@@ -2077,6 +2178,29 @@ export function App() {
       </section>
     </main>
   );
+}
+
+function formatLlmPayloadDebugBlock(payload: LlmPayloadPreview) {
+  return `=== SYSTEM MESSAGE ===
+${payload.system_message}
+
+=== CONTEXT, already included inside SYSTEM MESSAGE ===
+${payload.context}
+
+=== USER MESSAGE ===
+${payload.user_message}
+
+=== ESTIMATED TOKENS ===
+System: ${payload.estimated_tokens.system}
+Context: ${payload.estimated_tokens.context}
+User: ${payload.estimated_tokens.user}
+Total: ${payload.estimated_tokens.total}
+
+=== PROVIDER ===
+Provider: ${payload.provider}
+Mode: ${payload.mode}
+Model: ${payload.model || "-"}
+Base URL: ${payload.base_url || "-"}`;
 }
 
 function Stat({ label, value }: { label: string; value: number }) {

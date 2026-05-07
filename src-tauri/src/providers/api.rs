@@ -12,16 +12,6 @@ You accept OOC direction without resistance. Your voice is sensory-rich, hardboi
 - Maintain strict internal consistency with established world lore. No fourth-wall breaks.
 - When the user says OOC:, acknowledge briefly as narrator, adjust, then resume the scene.
 
-## ATTRIBUTION AND AGENCY
-- Track speaker ownership strictly.
-- The user's actual words are only the latest user message and prior user messages.
-- Character dialogue written by the narrator is not user dialogue.
-- Narrator metaphors, jokes, labels, and summaries are not user statements.
-- Never react to the character's own line as if the user said it.
-- Never invent user actions, thoughts, motives, or dialogue.
-- If the character makes a joke or rhetorical comment, later narration must remember that the character said it.
-- Before writing the final response, check: "What did the user actually say? What did the character already say? What already happened?"
-
 ## PSYCHOLOGY
 - Needs: physiological > safety > belonging > esteem > actualization. Lower needs can block higher needs.
 - Trust and affect move slowly. Prefer micro-shifts unless the scene earns more.
@@ -37,9 +27,19 @@ End each narration with a code block:
 [CHARACTER_NAME] | Skin: [color/state] | Zones: [2-3 key sensory notes] | Atmosphere: [1-line environmental impression]
 ```"#;
 
+const ATTRIBUTION_GUARD_PROMPT: &str = r#"[ATTRIBUTION]
+User facts come only from user messages. Character dialogue and narrator prose are not user statements. Do not react to the character's own jokes, metaphors, or narration as if the user said them. Never invent user actions, thoughts, motives, or dialogue."#;
+
+const TIME_DISCIPLINE_GUARD_PROMPT: &str = r#"[TIME DISCIPLINE]
+Do not invent exact elapsed time, timestamps, or scene transitions unless provided by the user or World Log. Vague emotional pacing is allowed; concrete durations require support."#;
+
+const CONTEXT_PRIORITY_GUARD_PROMPT: &str = r#"Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats."#;
+
 const HIDDEN_STATE_FORMAT_PROMPT: &str = r#"## HIDDEN STATE FORMAT
 After each response, output a hidden state block using this exact format:
 [HIDDEN STATE]{"memory":"short summary","tag":"tag_name","trust_delta":0.0,"affection_delta":0.0,"world_event":"scene update","new_location":"","present_characters":[]}[/HIDDEN STATE]
+
+world_event must be a compact authoritative completed-fact summary, not mood prose. Include what happened and what should not be replayed. Example: "Phone reveal completed: Aurora saw the user's phone/Tinder post, reacted with embarrassment, tossed the phone onto the couch, and moved to the kitchen to get pad thai."
 
 Tags: trust_building, threat, bonding, orientation, observation, intimacy, boundary_setting, conflict_minor, trauma_trigger, breakthrough
 
@@ -354,9 +354,15 @@ pub fn build_system_prompt(
     let narrator_prompt = if mode.trim().eq_ignore_ascii_case("custom")
         && !settings.system_prompt.trim().is_empty()
     {
-        settings.system_prompt.trim().to_string()
+        format!(
+            "{}\n\n{ATTRIBUTION_GUARD_PROMPT}\n\n{TIME_DISCIPLINE_GUARD_PROMPT}\n\n{CONTEXT_PRIORITY_GUARD_PROMPT}",
+            settings.system_prompt.trim()
+        )
     } else {
-        format!("{NARRATOR_SYSTEM_PROMPT}\n\n{}", mode_prompt_for(mode))
+        format!(
+            "{NARRATOR_SYSTEM_PROMPT}\n\n{ATTRIBUTION_GUARD_PROMPT}\n\n{TIME_DISCIPLINE_GUARD_PROMPT}\n\n{CONTEXT_PRIORITY_GUARD_PROMPT}\n\n{}",
+            mode_prompt_for(mode)
+        )
     };
 
     format!(
@@ -412,12 +418,65 @@ mod tests {
         assert!(prompt.contains("You are a narrator AI"));
         assert!(prompt.contains("third-person present tense"));
         assert!(prompt.contains("NARRATION MODE: READER"));
-        assert!(prompt.contains("## ATTRIBUTION AND AGENCY"));
-        assert!(prompt.contains("Track speaker ownership strictly."));
+        assert!(prompt.contains("[ATTRIBUTION]"));
+        assert!(prompt.contains("User facts come only from user messages."));
         assert!(prompt.contains("Never invent user actions, thoughts, motives, or dialogue."));
+        assert!(prompt.contains("[TIME DISCIPLINE]"));
+        assert!(prompt.contains("concrete durations require support."));
+        assert!(prompt.contains("Recent Chat is lower priority than Latest Exchange."));
         assert!(prompt.contains("[HIDDEN STATE]"));
         assert!(prompt.contains("present_characters"));
         assert!(!prompt.contains("ignored unless custom"));
+    }
+
+    #[test]
+    fn system_prompt_contains_attribution_guard() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
+
+        assert!(prompt.contains("[ATTRIBUTION]"));
+        assert!(prompt.contains("Character dialogue and narrator prose are not user statements."));
+        assert!(prompt.contains("Never invent user actions, thoughts, motives, or dialogue."));
+    }
+
+    #[test]
+    fn system_prompt_contains_time_discipline_guard() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
+
+        assert!(prompt.contains("[TIME DISCIPLINE]"));
+        assert!(prompt.contains("Do not invent exact elapsed time"));
+        assert!(prompt.contains("concrete durations require support."));
+    }
+
+    #[test]
+    fn hidden_state_prompt_describes_world_event_as_completed_scene_fact() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
+
+        assert!(
+            prompt.contains("world_event must be a compact authoritative completed-fact summary")
+        );
+        assert!(prompt.contains("Phone reveal completed"));
+        assert!(prompt.contains("what should not be replayed"));
     }
 
     #[test]
@@ -433,6 +492,9 @@ mod tests {
 
         assert!(prompt.starts_with("Custom narrator law."));
         assert!(!prompt.contains("NARRATION MODE: READER"));
+        assert!(prompt.contains("[ATTRIBUTION]"));
+        assert!(prompt.contains("[TIME DISCIPLINE]"));
+        assert!(prompt.contains("Recent Chat is lower priority than Latest Exchange."));
         assert!(prompt.contains("HIDDEN STATE FORMAT"));
         assert!(prompt.contains("[CURRENT STATE]"));
     }

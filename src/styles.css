@@ -344,6 +344,25 @@ button:disabled {
   color: #284239;
 }
 
+.payload-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.payload-inspector h3 {
+  margin: 6px 0 0;
+  color: #48584f;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.payload-grid dd {
+  overflow-wrap: anywhere;
+}
+
 .session-strip {
   display: grid;
   grid-template-columns: repeat(2, minmax(150px, 1fr));
@@ -833,6 +852,10 @@ button:disabled {
   white-space: pre-wrap;
   font-size: 0.78rem;
   line-height: 1.45;
+}
+
+.payload-inspector pre {
+  max-height: 260px;
 }
 
 .status-line {
