@@ -184,6 +184,7 @@ export function App() {
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
   const [view, setView] = useState<AppView>("library");
   const [status, setStatus] = useState("Ready");
+  const [payloadCopied, setPayloadCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const didBootstrap = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
@@ -623,7 +624,9 @@ export function App() {
   async function handleCopyLlmPayload() {
     if (!llmPayload) return;
     await navigator.clipboard.writeText(formatLlmPayloadDebugBlock(llmPayload));
+    setPayloadCopied(true);
     setStatus("LLM payload copied");
+    window.setTimeout(() => setPayloadCopied(false), 1800);
   }
 
   async function handleRegenerate() {
@@ -2116,15 +2119,18 @@ export function App() {
           <section className="context-preview payload-inspector">
             <div className="payload-header">
               <h2>LLM Payload Inspector</h2>
-              <button
-                className="ghost-action"
-                title="Copy LLM Payload"
-                onClick={handleCopyLlmPayload}
-                disabled={!llmPayload}
-              >
-                <Clipboard size={16} />
-                <span>Copy LLM Payload</span>
-              </button>
+              <div className="payload-actions">
+                {payloadCopied ? <span className="copy-feedback">Payload copied</span> : null}
+                <button
+                  className="ghost-action"
+                  title="Copy LLM Payload"
+                  onClick={handleCopyLlmPayload}
+                  disabled={!llmPayload}
+                >
+                  <Clipboard size={16} />
+                  <span>{payloadCopied ? "Copied!" : "Copy LLM Payload"}</span>
+                </button>
+              </div>
             </div>
             <dl className="diagnostic-grid payload-grid">
               <div>

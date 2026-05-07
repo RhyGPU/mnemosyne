@@ -125,6 +125,9 @@ button {
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 16px;
   align-items: center;
+  position: sticky;
+  top: 0;
+  z-index: 20;
   border-bottom: 1px solid #d9d3c3;
   background: #fffdf8;
   padding: 14px 18px;
@@ -349,6 +352,18 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.payload-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.copy-feedback {
+  color: #1d5e52;
+  font-size: 0.78rem;
+  font-weight: 800;
 }
 
 .payload-inspector h3 {
