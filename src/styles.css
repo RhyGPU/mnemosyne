@@ -103,6 +103,34 @@ button {
   font-weight: 900;
 }
 
+.chat-start-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.chat-start-options label {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid #d9d3c3;
+  border-radius: 8px;
+  background: #fffdf8;
+  color: #28342f;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.session-state-label {
+  margin: 8px 0 0;
+  color: #5b665f;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
 .ghost-action {
   min-height: 40px;
   gap: 8px;
@@ -356,7 +384,9 @@ button:disabled {
 
 .payload-actions {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 10px;
 }
 
@@ -364,6 +394,14 @@ button:disabled {
   color: #1d5e52;
   font-size: 0.78rem;
   font-weight: 800;
+}
+
+.export-feedback {
+  max-width: 100%;
+  color: #1d5e52;
+  font-size: 0.78rem;
+  font-weight: 800;
+  overflow-wrap: anywhere;
 }
 
 .payload-inspector h3 {
@@ -640,6 +678,7 @@ button:disabled {
 
 .message-tools {
   display: inline-flex;
+  flex-wrap: wrap;
   gap: 6px;
   opacity: 0;
   transition: opacity 140ms ease;
@@ -661,6 +700,46 @@ button:disabled {
   background: #fffdf8;
   color: #48584f;
   cursor: pointer;
+}
+
+.message-tools .message-tool-action {
+  width: auto;
+  min-width: 28px;
+  padding: 0 8px;
+  gap: 6px;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.variant-switcher {
+  display: inline-flex;
+  height: 28px;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid #d9d3c3;
+  border-radius: 8px;
+  background: #fffaf0;
+}
+
+.variant-switcher button {
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.variant-switcher span {
+  min-width: 42px;
+  padding: 0 6px;
+  color: #584f42;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+.next-variant-icon {
+  transform: rotate(180deg);
 }
 
 .message-tools button:hover {

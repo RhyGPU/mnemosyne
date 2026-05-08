@@ -112,6 +112,24 @@ export type ChatMessage = {
   created_at: number;
 };
 
+export type AssistantMessageVariant = {
+  id: number | null;
+  message_id: number;
+  conversation_id: string;
+  content: string;
+  created_at: number;
+  label: string | null;
+  source: string | null;
+  is_selected: boolean;
+  soul_snapshot_json: string | null;
+  debug_json: string | null;
+};
+
+export type VariantSelectionResult = {
+  variants: AssistantMessageVariant[];
+  messages: ChatMessage[];
+};
+
 export type TurnResult = {
   conversation_id: string;
   soul: Soul;
@@ -155,6 +173,28 @@ export type LlmPayloadPreview = {
   user_message: string;
   context: string;
   estimated_tokens: LlmPayloadTokenEstimate;
+};
+
+export type LlmPayloadLog = {
+  id: number;
+  conversation_id: string;
+  message_id: number | null;
+  provider: string;
+  mode: string;
+  model: string;
+  base_url: string;
+  system_message: string;
+  user_message: string;
+  context_text: string;
+  estimated_system_tokens: number;
+  estimated_user_tokens: number;
+  estimated_total_tokens: number;
+  created_at: number;
+};
+
+export type ExportResult = {
+  path: string;
+  message: string;
 };
 
 export type ApiProviderSettings = {
@@ -214,6 +254,9 @@ End each narration with a code block:
 [ATTRIBUTION]
 User facts come only from user messages. Character dialogue and narrator prose are not user statements. Do not react to the character's own jokes, metaphors, or narration as if the user said them. Never invent user actions, thoughts, motives, or dialogue.
 
+[DEVICE AND PROP AGENCY]
+Do not make the character take, pull, angle, unlock, search, or operate the user's device unless the user explicitly offers or hands it over.
+
 [TIME DISCIPLINE]
 Do not invent exact elapsed time, timestamps, or scene transitions unless provided by the user or World Log. Vague emotional pacing is allowed; concrete durations require support.
 
@@ -265,8 +308,13 @@ The block must be valid JSON on a single line. The engine removes it before the 
 let browserSouls: Soul[] = [];
 let browserSettings: SettingSoul[] = [];
 let browserMessages: ChatMessage[] = [];
+let browserAssistantVariants: AssistantMessageVariant[] = [];
+let browserPayloadLogs: LlmPayloadLog[] = [];
 let browserProviderProfiles: ProviderProfile[] = [];
+const previewTurnSnapshots = new Map<string, { soul: Soul; userText: string }>();
 let nextMessageId = 1;
+let nextVariantId = 1;
+let nextPayloadLogId = 1;
 const CONSOLIDATION_INTERVAL_TURNS = 10;
 
 function hasTauriRuntime() {
@@ -287,6 +335,26 @@ async function invokeOrPreview<T>(
 export function createDefaultSoul(characterName: string): Promise<Soul> {
   return invokeOrPreview("create_default_soul", { characterName }, () =>
     makePreviewSoul(characterName),
+  );
+}
+
+export function createFreshScenarioSoul(
+  soulId: string,
+  settingId?: string,
+): Promise<Soul> {
+  return invokeOrPreview(
+    "create_fresh_scenario_soul",
+    { soulId, settingId: settingId ?? null },
+    () => {
+      const base = browserSouls.find((item) => item.character_id === soulId);
+      if (!base) throw new Error("Soul not found");
+      const setting = settingId
+        ? browserSettings.find((item) => item.setting_id === settingId)
+        : undefined;
+      const fresh = makeFreshPreviewSoul(base, setting?.world);
+      browserSouls.unshift(fresh);
+      return fresh;
+    },
   );
 }
 
@@ -351,6 +419,12 @@ export function deleteSoul(soulId: string): Promise<boolean> {
     browserMessages = browserMessages.filter(
       (message) => message.conversation_id !== previewConversationIdForSoul(soulId),
     );
+    browserAssistantVariants = browserAssistantVariants.filter(
+      (variant) => variant.conversation_id !== previewConversationIdForSoul(soulId),
+    );
+    browserPayloadLogs = browserPayloadLogs.filter(
+      (log) => log.conversation_id !== previewConversationIdForSoul(soulId),
+    );
     return browserSouls.length !== beforeCount;
   });
 }
@@ -372,9 +446,10 @@ export function sendMockTurn(
   userText: string,
   mode: string,
   replacementAssistantId?: number,
+  correctionInstruction?: string,
 ): Promise<TurnResult> {
-  return invokeOrPreview("send_mock_turn", { conversationId, soulId, userText, mode, replacementAssistantId: replacementAssistantId ?? null }, () =>
-    sendPreviewTurn(conversationId, soulId, userText, mode, replacementAssistantId),
+  return invokeOrPreview("send_mock_turn", { conversationId, soulId, userText, mode, replacementAssistantId: replacementAssistantId ?? null, correctionInstruction: correctionInstruction ?? null }, () =>
+    sendPreviewTurn(conversationId, soulId, userText, mode, replacementAssistantId, correctionInstruction),
   );
 }
 
@@ -386,11 +461,12 @@ export function sendApiTurn(
   settings: ApiProviderSettings,
   signal?: AbortSignal,
   replacementAssistantId?: number,
+  correctionInstruction?: string,
 ): Promise<TurnResult> {
   return invokeOrPreview(
     "send_api_turn",
-    { conversationId, soulId, userText, mode, settings, replacementAssistantId: replacementAssistantId ?? null },
-    () => sendPreviewApiTurn(conversationId, soulId, userText, mode, settings, signal, replacementAssistantId),
+    { conversationId, soulId, userText, mode, settings, replacementAssistantId: replacementAssistantId ?? null, correctionInstruction: correctionInstruction ?? null },
+    () => sendPreviewApiTurn(conversationId, soulId, userText, mode, settings, signal, replacementAssistantId, correctionInstruction),
   );
 }
 
@@ -450,6 +526,10 @@ export function deleteConversation(conversationId: string): Promise<boolean> {
     browserMessages = browserMessages.filter(
       (message) => message.conversation_id !== conversationId,
     );
+    browserAssistantVariants = browserAssistantVariants.filter(
+      (variant) => variant.conversation_id !== conversationId,
+    );
+    browserPayloadLogs = browserPayloadLogs.filter((log) => log.conversation_id !== conversationId);
     return browserMessages.length !== beforeCount;
   });
 }
@@ -460,7 +540,82 @@ export function deleteMessage(conversationId: string, messageId: number): Promis
     browserMessages = browserMessages.filter(
       (message) => !(message.conversation_id === conversationId && message.id === messageId),
     );
+    browserAssistantVariants = browserAssistantVariants.filter(
+      (variant) => !(variant.conversation_id === conversationId && variant.message_id === messageId),
+    );
     return browserMessages.length !== beforeCount;
+  });
+}
+
+export function listAssistantMessageVariants(
+  conversationId: string,
+  messageId: number,
+): Promise<AssistantMessageVariant[]> {
+  return invokeOrPreview("list_assistant_message_variants", { conversationId, messageId }, () =>
+    listPreviewAssistantVariants(conversationId, messageId),
+  );
+}
+
+export function selectAssistantMessageVariant(
+  conversationId: string,
+  messageId: number,
+  variantId: number,
+): Promise<VariantSelectionResult> {
+  return invokeOrPreview(
+    "select_assistant_message_variant",
+    { conversationId, messageId, variantId },
+    () => selectPreviewAssistantVariant(conversationId, messageId, variantId),
+  );
+}
+
+export function deleteAssistantMessageVariant(
+  conversationId: string,
+  messageId: number,
+  variantId: number,
+): Promise<VariantSelectionResult> {
+  return invokeOrPreview(
+    "delete_assistant_message_variant",
+    { conversationId, messageId, variantId },
+    () => deletePreviewAssistantVariant(conversationId, messageId, variantId),
+  );
+}
+
+export function listLlmPayloadLogs(conversationId: string): Promise<LlmPayloadLog[]> {
+  return invokeOrPreview("list_llm_payload_logs", { conversationId }, () =>
+    browserPayloadLogs.filter((log) => log.conversation_id === conversationId),
+  );
+}
+
+export function getLlmPayloadLog(logId: number): Promise<LlmPayloadLog> {
+  return invokeOrPreview("get_llm_payload_log", { logId }, () => {
+    const log = browserPayloadLogs.find((item) => item.id === logId);
+    if (!log) throw new Error("LLM payload log not found");
+    return log;
+  });
+}
+
+export function exportVisibleChatLog(conversationId: string): Promise<ExportResult> {
+  return invokeOrPreview("export_visible_chat_log", { conversationId }, () => {
+    const content = renderPreviewVisibleChatLog(
+      browserMessages.filter((message) => message.conversation_id === conversationId),
+    );
+    downloadPreviewExport(`mnemosyne-${conversationId}-visible-chat-log.md`, content);
+    return { path: "browser-downloads", message: "Visible chat log exported." };
+  });
+}
+
+export function exportLlmPayloadHistory(conversationId: string): Promise<ExportResult> {
+  return invokeOrPreview("export_llm_payload_history", { conversationId }, () => {
+    const content = renderPreviewPayloadHistory(
+      browserPayloadLogs.filter((log) => log.conversation_id === conversationId),
+    );
+    downloadPreviewExport(`mnemosyne-${conversationId}-llm-payload-history.md`, content);
+    return {
+      path: "browser-downloads",
+      message: browserPayloadLogs.some((log) => log.conversation_id === conversationId)
+        ? "LLM payload history exported."
+        : "No LLM payload logs found for this conversation.",
+    };
   });
 }
 
@@ -650,6 +805,37 @@ function makePreviewSetting(settingName: string): SettingSoul {
   };
 }
 
+function makeFreshPreviewSoul(base: Soul, scenarioWorld?: Soul["world"]): Soul {
+  const defaultSoul = makePreviewSoul(base.character_name);
+  return {
+    ...deepClone(base),
+    character_id: crypto.randomUUID(),
+    last_updated: Math.floor(Date.now() / 1000),
+    turn_counter: 0,
+    turns_since_consolidation: 0,
+    arousal: defaultSoul.arousal,
+    world: scenarioWorld ? deepClone(scenarioWorld) : defaultSoul.world,
+    relationships: {
+      ...deepClone(base.relationships),
+      user: {
+        trust: 10,
+        affection: 20,
+        intimacy: 10,
+        passion: 10,
+        commitment: 10,
+        fear: 10,
+        desire: 20,
+        love_type: "",
+      },
+    },
+    memory: {
+      core: [...base.memory.core],
+      recent: [],
+      schemas: [],
+    },
+  };
+}
+
 function summarizeSoul(soul: Soul): SoulSummary {
   return {
     character_id: soul.character_id,
@@ -676,6 +862,7 @@ function sendPreviewTurn(
   userText: string,
   mode: string,
   replacementAssistantId?: number,
+  correctionInstruction?: string,
 ): TurnResult {
   let soul = browserSouls.find((item) => item.character_id === soulId);
   if (!soul) {
@@ -683,12 +870,21 @@ function sendPreviewTurn(
     browserSouls.push(soul);
   }
 
-  if (!replacementAssistantId) {
+  const snapshotKey = replacementAssistantId
+    ? `${conversationId}:${replacementAssistantId}`
+    : undefined;
+  const snapshot = snapshotKey ? previewTurnSnapshots.get(snapshotKey) : undefined;
+  if (snapshot) {
+    soul = deepClone(snapshot.soul);
+    const soulIndex = browserSouls.findIndex((item) => item.character_id === soulId);
+    if (soulIndex >= 0) browserSouls[soulIndex] = soul;
+    userText = snapshot.userText;
+  } else if (!replacementAssistantId) {
     browserMessages.push(makePreviewMessage(conversationId, "user", userText));
   }
+  const preTurnSoul = deepClone(soul);
   const template = previewTemplateFor(classifyPreviewTag(userText));
   const visibleResponse = renderPreviewResponse(soul, userText, template, mode);
-  upsertPreviewAssistantMessage(conversationId, visibleResponse, replacementAssistantId);
   const debug = debugFromHiddenState(
     "Mock",
     {
@@ -699,6 +895,14 @@ function sendPreviewTurn(
     },
     true,
     false,
+  );
+  const assistantMessageId = upsertPreviewAssistantMessage(
+    conversationId,
+    visibleResponse,
+    replacementAssistantId,
+    correctionInstruction?.trim() ? "fix" : replacementAssistantId ? "regenerate" : "original",
+    preTurnSoul,
+    debug,
   );
 
   const relationship = soul.relationships.user;
@@ -722,6 +926,12 @@ function sendPreviewTurn(
   const consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
   if (consolidation_ran) consolidatePreviewSoul(soul);
 
+  if (!replacementAssistantId) {
+    previewTurnSnapshots.set(`${conversationId}:${assistantMessageId}`, {
+      soul: preTurnSoul,
+      userText,
+    });
+  }
   return {
     conversation_id: conversationId,
     soul,
@@ -741,6 +951,7 @@ async function sendPreviewApiTurn(
   settings: ApiProviderSettings,
   signal?: AbortSignal,
   replacementAssistantId?: number,
+  correctionInstruction?: string,
 ): Promise<TurnResult> {
   const soul = browserSouls.find((item) => item.character_id === soulId);
   if (!soul) throw new Error("Soul not found");
@@ -748,10 +959,43 @@ async function sendPreviewApiTurn(
   if (!settings.model.trim()) throw new Error("Model is required for API provider mode");
   if (!settings.base_url.trim()) throw new Error("Base URL is required for API provider mode");
 
-  if (!replacementAssistantId) {
+  const snapshotKey = replacementAssistantId
+    ? `${conversationId}:${replacementAssistantId}`
+    : undefined;
+  const snapshot = snapshotKey ? previewTurnSnapshots.get(snapshotKey) : undefined;
+  if (snapshot) {
+    const restoredSoul = deepClone(snapshot.soul);
+    const soulIndex = browserSouls.findIndex((item) => item.character_id === soulId);
+    if (soulIndex >= 0) browserSouls[soulIndex] = restoredSoul;
+    Object.assign(soul, restoredSoul);
+    userText = snapshot.userText;
+  } else if (!replacementAssistantId) {
     browserMessages.push(makePreviewMessage(conversationId, "user", userText));
   }
-  const context = compilePreviewContext(soul, conversationId);
+  const preTurnSoul = deepClone(soul);
+  const effectiveUserText = buildUserTextWithCorrection(userText, correctionInstruction);
+  const context = compilePreviewContext(soul, conversationId, {
+    separateUserMessageFollows: true,
+    temporaryInstruction: correctionInstruction,
+  });
+  const systemMessage = buildNarratorSystemPrompt(settings.system_prompt, mode, soul, context.text);
+  const payloadLogId = nextPayloadLogId++;
+  browserPayloadLogs.push({
+    id: payloadLogId,
+    conversation_id: conversationId,
+    message_id: replacementAssistantId ?? null,
+    provider: "API",
+    mode,
+    model: settings.model.trim(),
+    base_url: settings.base_url.trim(),
+    system_message: systemMessage,
+    user_message: effectiveUserText.trim(),
+    context_text: context.text,
+    estimated_system_tokens: estimateTokens(systemMessage),
+    estimated_user_tokens: estimateTokens(effectiveUserText),
+    estimated_total_tokens: estimateTokens(systemMessage) + estimateTokens(effectiveUserText),
+    created_at: Math.floor(Date.now() / 1000),
+  });
   const response = await fetch(chatCompletionsUrl(settings.base_url), {
     method: "POST",
     signal,
@@ -765,9 +1009,9 @@ async function sendPreviewApiTurn(
       messages: [
         {
           role: "system",
-          content: buildNarratorSystemPrompt(settings.system_prompt, mode, soul, context.text),
+          content: systemMessage,
         },
-        { role: "user", content: userText },
+        { role: "user", content: effectiveUserText },
       ],
     }),
   });
@@ -783,9 +1027,18 @@ async function sendPreviewApiTurn(
   const hiddenStateFound = parsed.hiddenState !== null;
   const hiddenState = parsed.hiddenState ?? generatedPreviewApiHiddenState(soul, userText, parsed.visibleText);
   const visibleResponse = parsed.visibleText;
-  upsertPreviewAssistantMessage(conversationId, visibleResponse, replacementAssistantId);
+  const assistantMessageId = upsertPreviewAssistantMessage(
+    conversationId,
+    visibleResponse,
+    replacementAssistantId,
+    correctionInstruction?.trim() ? "fix" : replacementAssistantId ? "regenerate" : "original",
+    preTurnSoul,
+    debugFromHiddenState("API", hiddenState, hiddenStateFound, !hiddenStateFound),
+  );
+  const payloadLog = browserPayloadLogs.find((log) => log.id === payloadLogId);
+  if (payloadLog) payloadLog.message_id = assistantMessageId;
 
-  const template = previewTemplateFor(normalizePreviewTag(hiddenState.tag, userText));
+  const template = previewTemplateFor(normalizePreviewTag(hiddenState.tag, effectiveUserText));
   const relationship = soul.relationships.user;
   relationship.trust = Math.min(
     300,
@@ -820,6 +1073,12 @@ async function sendPreviewApiTurn(
   const consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
   if (consolidation_ran) consolidatePreviewSoul(soul);
 
+  if (!replacementAssistantId) {
+    previewTurnSnapshots.set(`${conversationId}:${assistantMessageId}`, {
+      soul: preTurnSoul,
+      userText,
+    });
+  }
   return {
     conversation_id: conversationId,
     soul,
@@ -835,7 +1094,10 @@ function upsertPreviewAssistantMessage(
   conversationId: string,
   content: string,
   replacementAssistantId?: number,
-) {
+  source = "original",
+  soulSnapshot?: Soul,
+  debug?: TurnDebug,
+): number {
   if (replacementAssistantId) {
     const message = browserMessages.find(
       (item) =>
@@ -844,12 +1106,188 @@ function upsertPreviewAssistantMessage(
         item.role === "assistant",
     );
     if (message) {
+      ensurePreviewBaseVariant(message);
+      for (const variant of browserAssistantVariants.filter((item) => item.message_id === message.id)) {
+        variant.is_selected = false;
+      }
+      browserAssistantVariants.push(makePreviewVariant(message, content, source, true, soulSnapshot, debug));
       message.content = content;
       message.created_at = Math.floor(Date.now() / 1000);
-      return;
+      return message.id;
     }
   }
-  browserMessages.push(makePreviewMessage(conversationId, "assistant", content));
+  const created = makePreviewMessage(conversationId, "assistant", content);
+  browserMessages.push(created);
+  browserAssistantVariants.push(makePreviewVariant(created, content, source, true, soulSnapshot, debug));
+  return created.id;
+}
+
+function listPreviewAssistantVariants(
+  conversationId: string,
+  messageId: number,
+): AssistantMessageVariant[] {
+  const message = browserMessages.find(
+    (item) => item.conversation_id === conversationId && item.id === messageId && item.role === "assistant",
+  );
+  if (!message) return [];
+  const variants = browserAssistantVariants
+    .filter((variant) => variant.conversation_id === conversationId && variant.message_id === messageId)
+    .sort((left, right) => (left.id ?? 0) - (right.id ?? 0));
+  if (variants.length) return variants.map((variant) => ({ ...variant }));
+  return [
+    {
+      id: null,
+      message_id: message.id,
+      conversation_id: message.conversation_id,
+      content: message.content,
+      created_at: message.created_at,
+      label: "Variant 1",
+      source: "legacy",
+      is_selected: true,
+      soul_snapshot_json: null,
+      debug_json: null,
+    },
+  ];
+}
+
+function selectPreviewAssistantVariant(
+  conversationId: string,
+  messageId: number,
+  variantId: number,
+): VariantSelectionResult {
+  const variant = browserAssistantVariants.find(
+    (item) => item.conversation_id === conversationId && item.message_id === messageId && item.id === variantId,
+  );
+  const message = browserMessages.find(
+    (item) => item.conversation_id === conversationId && item.id === messageId && item.role === "assistant",
+  );
+  if (!variant || !message) throw new Error("Variant not found");
+  for (const sibling of browserAssistantVariants.filter((item) => item.message_id === messageId)) {
+    sibling.is_selected = sibling.id === variantId;
+  }
+  message.content = variant.content;
+  return {
+    variants: listPreviewAssistantVariants(conversationId, messageId),
+    messages: browserMessages.filter((item) => item.conversation_id === conversationId),
+  };
+}
+
+function deletePreviewAssistantVariant(
+  conversationId: string,
+  messageId: number,
+  variantId: number,
+): VariantSelectionResult {
+  const siblings = browserAssistantVariants.filter(
+    (item) => item.conversation_id === conversationId && item.message_id === messageId,
+  );
+  if (siblings.length <= 1) {
+    return {
+      variants: listPreviewAssistantVariants(conversationId, messageId),
+      messages: browserMessages.filter((item) => item.conversation_id === conversationId),
+    };
+  }
+  const deleted = siblings.find((variant) => variant.id === variantId);
+  browserAssistantVariants = browserAssistantVariants.filter((variant) => variant.id !== variantId);
+  if (deleted?.is_selected) {
+    const next = browserAssistantVariants.find(
+      (variant) => variant.conversation_id === conversationId && variant.message_id === messageId,
+    );
+    if (next?.id) return selectPreviewAssistantVariant(conversationId, messageId, next.id);
+  }
+  return {
+    variants: listPreviewAssistantVariants(conversationId, messageId),
+    messages: browserMessages.filter((item) => item.conversation_id === conversationId),
+  };
+}
+
+function ensurePreviewBaseVariant(message: ChatMessage) {
+  if (browserAssistantVariants.some((variant) => variant.message_id === message.id)) return;
+  browserAssistantVariants.push(makePreviewVariant(message, message.content, "original", true));
+}
+
+function makePreviewVariant(
+  message: ChatMessage,
+  content: string,
+  source: string,
+  selected: boolean,
+  soulSnapshot?: Soul,
+  debug?: TurnDebug,
+): AssistantMessageVariant {
+  return {
+    id: nextVariantId++,
+    message_id: message.id,
+    conversation_id: message.conversation_id,
+    content,
+    created_at: Math.floor(Date.now() / 1000),
+    label: null,
+    source,
+    is_selected: selected,
+    soul_snapshot_json: soulSnapshot ? JSON.stringify(soulSnapshot) : null,
+    debug_json: debug ? JSON.stringify(debug) : null,
+  };
+}
+
+function renderPreviewVisibleChatLog(messages: ChatMessage[]): string {
+  const lines = ["# Mnemosyne Chat Log"];
+  for (const message of messages.filter((item) => item.role !== "system")) {
+    lines.push("");
+    lines.push(`## ${message.role === "assistant" ? "Narrator" : "User"}`);
+    lines.push(`Created: ${message.created_at}`);
+    lines.push("");
+    lines.push(
+      message.role === "assistant" ? normalizeAssistantDisplayForExport(message.content) : message.content,
+    );
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+function renderPreviewPayloadHistory(logs: LlmPayloadLog[]): string {
+  const lines = ["# Mnemosyne LLM Payload History"];
+  if (!logs.length) {
+    lines.push("");
+    lines.push("No LLM payload logs found for this conversation.");
+    lines.push("Payload history is recorded for API provider turns. Mock conversations do not send LLM payloads.");
+    lines.push("");
+    return lines.join("\n");
+  }
+  logs.forEach((log, index) => {
+    lines.push("");
+    lines.push(`## Payload ${index + 1}`);
+    lines.push(`Created: ${log.created_at}`);
+    lines.push(`Provider: ${log.provider}`);
+    lines.push(`Model: ${log.model}`);
+    lines.push(`Mode: ${log.mode}`);
+    lines.push(`Base URL: ${log.base_url}`);
+    lines.push(
+      `Estimated tokens: system ${log.estimated_system_tokens}, user ${log.estimated_user_tokens}, total ${log.estimated_total_tokens}`,
+    );
+    lines.push("");
+    lines.push("### SYSTEM MESSAGE");
+    lines.push(log.system_message);
+    lines.push("");
+    lines.push("### USER MESSAGE");
+    lines.push(log.user_message);
+    lines.push("");
+    lines.push("### CONTEXT");
+    lines.push(log.context_text);
+  });
+  lines.push("");
+  return lines.join("\n");
+}
+
+function downloadPreviewExport(filename: string, content: string) {
+  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename.replace(/[^a-z0-9._-]+/gi, "-");
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function normalizeAssistantDisplayForExport(content: string) {
+  return stripHiddenPreview(content).trimEnd();
 }
 
 function makePreviewMessage(
@@ -899,11 +1337,16 @@ function consolidatePreviewSoul(soul: Soul) {
 function compilePreviewContext(
   soul: Soul,
   conversationId: string,
-  options: { pendingUserText?: string; separateUserMessageFollows?: boolean } = {},
+  options: {
+    pendingUserText?: string;
+    separateUserMessageFollows?: boolean;
+    temporaryInstruction?: string;
+  } = {},
 ): ContextPreview {
   const recentEvents = soul.world.recent_events.slice(-8).map((event) => `- ${event}`);
   const pendingUserText = options.pendingUserText ?? "";
   const separateUserMessageFollows = Boolean(options.separateUserMessageFollows);
+  const temporaryInstruction = options.temporaryInstruction?.trim() || "";
   const pendingMessage = pendingUserText.trim()
     ? [makePreviewContextMessage(conversationId, "user", pendingUserText)]
     : [];
@@ -990,6 +1433,11 @@ Continue from this section first. If older context conflicts with this section, 
 Last narrator response: ${lastNarratorResponse}
 ${separateUserMessageFollows ? "The current user message follows as the next user message." : `Latest user input: ${latestUserInput}`}`;
   let text = [
+    temporaryInstruction
+      ? `[FIX INSTRUCTION, TEMPORARY HIGH PRIORITY]
+Apply this only while generating the next narrator response. Do not store it as memory.
+Instruction: ${temporaryInstruction}`
+      : "",
     `[WORLD SNAPSHOT]\n${worldLines.join("\n")}`,
     `[CHARACTER SNAPSHOT]\n${profileLines.join("\n")}`,
     `[RELEVANT MEMORIES]\n${memoryLines.join("\n") || "No durable memories have been selected yet."}`,
@@ -1005,6 +1453,10 @@ ${separateUserMessageFollows ? "The current user message follows as the next use
     text = text.slice(0, text.lastIndexOf("\n"));
   }
   return { text, estimated_tokens: estimateTokens(text), truncated };
+}
+
+function deepClone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function makePreviewContextMessage(
@@ -1297,6 +1749,12 @@ function chatCompletionsUrl(baseUrl: string) {
   return trimmed.endsWith("/chat/completions") ? trimmed : `${trimmed}/chat/completions`;
 }
 
+function buildUserTextWithCorrection(userText: string, correctionInstruction?: string) {
+  const instruction = correctionInstruction?.trim();
+  if (!instruction) return userText;
+  return `${userText}\n\n[FIX INSTRUCTION - APPLY TO THIS RESPONSE ONLY]\n${instruction}`;
+}
+
 function buildNarratorSystemPrompt(
   customPrompt: string,
   mode: string,
@@ -1308,6 +1766,9 @@ function buildNarratorSystemPrompt(
     mode === "Custom" && trimmedCustom
       ? `${trimmedCustom}\n\n[ATTRIBUTION]
 User facts come only from user messages. Character dialogue and narrator prose are not user statements. Do not react to the character's own jokes, metaphors, or narration as if the user said them. Never invent user actions, thoughts, motives, or dialogue.
+
+[DEVICE AND PROP AGENCY]
+Do not make the character take, pull, angle, unlock, search, or operate the user's device unless the user explicitly offers or hands it over.
 
 [TIME DISCIPLINE]
 Do not invent exact elapsed time, timestamps, or scene transitions unless provided by the user or World Log. Vague emotional pacing is allowed; concrete durations require support.

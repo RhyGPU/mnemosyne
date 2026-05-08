@@ -30,6 +30,9 @@ End each narration with a code block:
 const ATTRIBUTION_GUARD_PROMPT: &str = r#"[ATTRIBUTION]
 User facts come only from user messages. Character dialogue and narrator prose are not user statements. Do not react to the character's own jokes, metaphors, or narration as if the user said them. Never invent user actions, thoughts, motives, or dialogue."#;
 
+const DEVICE_PROP_AGENCY_GUARD_PROMPT: &str = r#"[DEVICE AND PROP AGENCY]
+Do not make the character take, pull, angle, unlock, search, or operate the user's device unless the user explicitly offers or hands it over."#;
+
 const TIME_DISCIPLINE_GUARD_PROMPT: &str = r#"[TIME DISCIPLINE]
 Do not invent exact elapsed time, timestamps, or scene transitions unless provided by the user or World Log. Vague emotional pacing is allowed; concrete durations require support."#;
 
@@ -355,12 +358,12 @@ pub fn build_system_prompt(
         && !settings.system_prompt.trim().is_empty()
     {
         format!(
-            "{}\n\n{ATTRIBUTION_GUARD_PROMPT}\n\n{TIME_DISCIPLINE_GUARD_PROMPT}\n\n{CONTEXT_PRIORITY_GUARD_PROMPT}",
+            "{}\n\n{ATTRIBUTION_GUARD_PROMPT}\n\n{DEVICE_PROP_AGENCY_GUARD_PROMPT}\n\n{TIME_DISCIPLINE_GUARD_PROMPT}\n\n{CONTEXT_PRIORITY_GUARD_PROMPT}",
             settings.system_prompt.trim()
         )
     } else {
         format!(
-            "{NARRATOR_SYSTEM_PROMPT}\n\n{ATTRIBUTION_GUARD_PROMPT}\n\n{TIME_DISCIPLINE_GUARD_PROMPT}\n\n{CONTEXT_PRIORITY_GUARD_PROMPT}\n\n{}",
+            "{NARRATOR_SYSTEM_PROMPT}\n\n{ATTRIBUTION_GUARD_PROMPT}\n\n{DEVICE_PROP_AGENCY_GUARD_PROMPT}\n\n{TIME_DISCIPLINE_GUARD_PROMPT}\n\n{CONTEXT_PRIORITY_GUARD_PROMPT}\n\n{}",
             mode_prompt_for(mode)
         )
     };
@@ -421,6 +424,8 @@ mod tests {
         assert!(prompt.contains("[ATTRIBUTION]"));
         assert!(prompt.contains("User facts come only from user messages."));
         assert!(prompt.contains("Never invent user actions, thoughts, motives, or dialogue."));
+        assert!(prompt.contains("[DEVICE AND PROP AGENCY]"));
+        assert!(prompt.contains("unless the user explicitly offers or hands it over"));
         assert!(prompt.contains("[TIME DISCIPLINE]"));
         assert!(prompt.contains("concrete durations require support."));
         assert!(prompt.contains("Recent Chat is lower priority than Latest Exchange."));
@@ -462,6 +467,20 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_contains_device_prop_agency_guard() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
+
+        assert!(prompt.contains("Do not make the character take, pull, angle, unlock, search, or operate the user's device unless the user explicitly offers or hands it over."));
+    }
+
+    #[test]
     fn hidden_state_prompt_describes_world_event_as_completed_scene_fact() {
         let soul = state_engine::soul::new_default_soul("Aurora");
         let settings = ApiProviderSettings {
@@ -493,6 +512,7 @@ mod tests {
         assert!(prompt.starts_with("Custom narrator law."));
         assert!(!prompt.contains("NARRATION MODE: READER"));
         assert!(prompt.contains("[ATTRIBUTION]"));
+        assert!(prompt.contains("[DEVICE AND PROP AGENCY]"));
         assert!(prompt.contains("[TIME DISCIPLINE]"));
         assert!(prompt.contains("Recent Chat is lower priority than Latest Exchange."));
         assert!(prompt.contains("HIDDEN STATE FORMAT"));

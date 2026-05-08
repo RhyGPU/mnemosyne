@@ -186,6 +186,34 @@ pub fn new_default_soul(character_name: &str) -> Soul {
     Soul::default_for_character(character_name)
 }
 
+pub fn fresh_scenario_soul(base: &Soul, scenario_world: Option<WorldLog>) -> Soul {
+    let now = current_timestamp();
+    let mut fresh = base.clone();
+    fresh.character_id = Uuid::new_v4().to_string();
+    fresh.last_updated = now as i64;
+    fresh.turn_counter = 0;
+    fresh.turns_since_consolidation = 0;
+    fresh.world = scenario_world.unwrap_or_default();
+    fresh.memory.recent.clear();
+    fresh.memory.schemas.clear();
+    fresh.relationships.insert("user".into(), neutral_user_relationship());
+    fresh.arousal = ArousalState::default();
+    fresh
+}
+
+pub fn neutral_user_relationship() -> Relationship {
+    Relationship {
+        trust: 10.0,
+        affection: 20.0,
+        intimacy: 10.0,
+        passion: 10.0,
+        commitment: 10.0,
+        fear: 10.0,
+        desire: 20.0,
+        love_type: String::new(),
+    }
+}
+
 pub fn current_timestamp() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
@@ -248,5 +276,39 @@ mod tests {
         let decoded: WorldLog = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(decoded, world);
+    }
+
+    #[test]
+    fn fresh_scenario_resets_volatile_state() {
+        let mut soul = new_default_soul("Aurora Schwarz");
+        soul.world.location = "Aurora's kitchen counter.".into();
+        soul.world.recent_events = vec!["Romantic kitchen scene resolved.".into()];
+        soul.memory.recent.push(MemoryEntry {
+            id: "recent".into(),
+            timestamp: 1,
+            content: "Aurora warmed to the user.".into(),
+            salience: 90.0,
+            tag: "bonding".into(),
+            retrieval_strength: 90.0,
+        });
+        soul.relationships.get_mut("user").unwrap().trust = 130.0;
+        soul.relationships.get_mut("user").unwrap().affection = 126.0;
+        let scenario_world = WorldLog {
+            location: "Debt collector office threshold.".into(),
+            active_plots: vec!["Collect the overdue payment".into()],
+            recent_events: Vec::new(),
+            key_objects: Vec::new(),
+            time_elapsed: "Session start".into(),
+        };
+
+        let fresh = fresh_scenario_soul(&soul, Some(scenario_world.clone()));
+
+        assert_ne!(fresh.character_id, soul.character_id);
+        assert_eq!(fresh.world, scenario_world);
+        assert!(fresh.memory.recent.is_empty());
+        assert!(fresh.memory.schemas.is_empty());
+        assert_eq!(fresh.relationships["user"], neutral_user_relationship());
+        assert_eq!(soul.world.location, "Aurora's kitchen counter.");
+        assert_eq!(soul.relationships["user"].trust, 130.0);
     }
 }

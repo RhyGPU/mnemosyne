@@ -24,6 +24,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::create_default_soul,
+            commands::create_fresh_scenario_soul,
             commands::create_default_setting,
             commands::load_soul_file,
             commands::load_setting_file,
@@ -40,6 +41,13 @@ pub fn run() {
             commands::list_conversation_messages,
             commands::delete_conversation,
             commands::delete_message,
+            commands::list_assistant_message_variants,
+            commands::select_assistant_message_variant,
+            commands::delete_assistant_message_variant,
+            commands::list_llm_payload_logs,
+            commands::get_llm_payload_log,
+            commands::export_visible_chat_log,
+            commands::export_llm_payload_history,
             commands::list_provider_profiles,
             commands::get_provider_profile,
             commands::upsert_provider_profile,

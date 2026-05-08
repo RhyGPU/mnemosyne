@@ -17,6 +17,7 @@ import {
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiProviderSettings,
+  AssistantMessageVariant,
   ChatMessage,
   ContextPreview,
   LlmPayloadPreview,
@@ -28,15 +29,19 @@ import {
   TurnDebug,
   compileContext,
   createDefaultSoul,
+  createFreshScenarioSoul,
   createDefaultSetting,
   deleteConversation,
   deleteMessage,
   deleteProviderProfile,
   deleteSetting,
   deleteSoul,
+  exportLlmPayloadHistory,
+  exportVisibleChatLog,
   getSetting,
   getSoul,
   listProviderProfiles,
+  listAssistantMessageVariants,
   listConversationMessages,
   listSettings,
   listSouls,
@@ -45,6 +50,7 @@ import {
   runConsolidation,
   saveSettingFile,
   saveSoulFile,
+  selectAssistantMessageVariant,
   sendApiTurn,
   sendMockTurn,
   upsertProviderProfile,
@@ -57,6 +63,7 @@ const CONSOLIDATION_INTERVAL_TURNS = 10;
 type ProviderKind = "Mock" | "API";
 type NarrativeMode = "Realistic" | "Reader" | "God" | "Custom";
 type AppView = "library" | "chat";
+type ChatStartMode = "continue" | "fresh";
 type PsychePresetName =
   | "Stranger"
   | "Traumatized Survivor"
@@ -150,6 +157,7 @@ export function App() {
   const [soul, setSoul] = useState<Soul | null>(null);
   const [setting, setSetting] = useState<SettingSoul | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [variantsByMessage, setVariantsByMessage] = useState<Record<number, AssistantMessageVariant[]>>({});
   const [context, setContext] = useState<ContextPreview | null>(null);
   const [llmPayload, setLlmPayload] = useState<LlmPayloadPreview | null>(null);
   const [draft, setDraft] = useState("");
@@ -183,8 +191,11 @@ export function App() {
   });
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
   const [view, setView] = useState<AppView>("library");
+  const [chatStartMode, setChatStartMode] = useState<ChatStartMode>("continue");
+  const [sessionContinuityLabel, setSessionContinuityLabel] = useState("Using persistent Soul continuity");
   const [status, setStatus] = useState("Ready");
   const [payloadCopied, setPayloadCopied] = useState(false);
+  const [exportFeedback, setExportFeedback] = useState("");
   const [busy, setBusy] = useState(false);
   const didBootstrap = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
@@ -209,6 +220,10 @@ export function App() {
     if (!soul) return;
     void refreshContext(soul.character_id, currentConversationId);
   }, [soul?.character_id, currentConversationId, messages.length]);
+
+  useEffect(() => {
+    void refreshAssistantVariants(currentConversationId, messages);
+  }, [currentConversationId, messages]);
 
   useEffect(() => {
     if (!soul) {
@@ -437,6 +452,25 @@ export function App() {
     setContext(preview);
   }
 
+  async function refreshAssistantVariants(conversationId: string, nextMessages = messages) {
+    const assistantMessages = nextMessages.filter((message) => message.role === "assistant");
+    if (!assistantMessages.length) {
+      setVariantsByMessage({});
+      return;
+    }
+    try {
+      const entries = await Promise.all(
+        assistantMessages.map(async (message) => [
+          message.id,
+          await listAssistantMessageVariants(conversationId, message.id),
+        ] as const),
+      );
+      setVariantsByMessage(Object.fromEntries(entries));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async function refreshLlmPayload(soulId: string, conversationId: string, userText: string) {
     try {
       const preview = await previewApiPayload(
@@ -542,7 +576,12 @@ export function App() {
     }
   }
 
-  async function executeTurn(text: string, statusLabel?: string, replacementAssistantId?: number) {
+  async function executeTurn(
+    text: string,
+    statusLabel?: string,
+    replacementAssistantId?: number,
+    correctionInstruction?: string,
+  ) {
     if (!text || busy || !soul) return;
     const generationId = generationIdRef.current + 1;
     generationIdRef.current = generationId;
@@ -570,6 +609,7 @@ export function App() {
               apiSettings,
               abortController.signal,
               replacementAssistantId,
+              correctionInstruction,
             )
           : await sendMockTurn(
               currentConversationId,
@@ -577,6 +617,7 @@ export function App() {
               text,
               mode,
               replacementAssistantId,
+              correctionInstruction,
             );
       if (generationIdRef.current !== generationId || abortController.signal.aborted) {
         return;
@@ -629,6 +670,70 @@ export function App() {
     window.setTimeout(() => setPayloadCopied(false), 1800);
   }
 
+  async function handleExportVisibleChatLog() {
+    if (!currentConversationId) return;
+    setBusy(true);
+    try {
+      const result = await exportVisibleChatLog(currentConversationId);
+      const message = `${result.message} ${result.path}`;
+      setExportFeedback(message);
+      setStatus(message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setExportFeedback(message);
+      setStatus(message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleExportLlmPayloadHistory() {
+    if (!currentConversationId) return;
+    setBusy(true);
+    try {
+      const result = await exportLlmPayloadHistory(currentConversationId);
+      const message = `${result.message} ${result.path}`;
+      setExportFeedback(message);
+      setStatus(message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setExportFeedback(message);
+      setStatus(message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleStartChat() {
+    if (!soul || busy) return;
+    if (chatStartMode === "continue") {
+      setSessionContinuityLabel("Using persistent Soul continuity");
+      setView("chat");
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const freshSoul = await createFreshScenarioSoul(soul.character_id, setting?.setting_id);
+      const nextConversationId = setting
+        ? conversationIdForSettingAndSoul(setting.setting_id, freshSoul.character_id)
+        : conversationIdForSoul(freshSoul.character_id);
+      setSoul(freshSoul);
+      setCreatorFieldsFromSoul(freshSoul);
+      setMessages(await listConversationMessages(nextConversationId));
+      setContext(await compileContext(freshSoul.character_id, nextConversationId));
+      setSouls(await listSouls());
+      setLastTurnDebug(null);
+      setSessionContinuityLabel("Fresh scenario state");
+      setStatus("Started fresh scenario state; original Soul continuity was preserved.");
+      setView("chat");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleRegenerate() {
     if (busy || !soul) return;
     const lastUserMessage = [...activeMessages].reverse().find((message) => message.role === "user");
@@ -648,6 +753,10 @@ export function App() {
 
   async function handleRegenerateFromMessage(message: ChatMessage) {
     if (busy || !soul || message.role !== "assistant") return;
+    if (message.id !== latestAssistantMessageId) {
+      setStatus("Regenerating older messages requires branch rewind and will be added later.");
+      return;
+    }
     const messageIndex = activeMessages.findIndex((item) => item.id === message.id);
     const previousUserMessage = activeMessages
       .slice(0, messageIndex)
@@ -660,6 +769,31 @@ export function App() {
     }
 
     await executeTurn(previousUserMessage.content, "Regenerating response", message.id);
+  }
+
+  async function handleFixWithInstruction(message: ChatMessage) {
+    if (busy || !soul || message.role !== "assistant") return;
+    if (message.id !== latestAssistantMessageId) {
+      setStatus("Regenerating older messages requires branch rewind and will be added later.");
+      return;
+    }
+    const messageIndex = activeMessages.findIndex((item) => item.id === message.id);
+    const previousUserMessage = activeMessages
+      .slice(0, messageIndex)
+      .reverse()
+      .find((item) => item.role === "user");
+    if (!previousUserMessage) {
+      setStatus("No user prompt found for this response");
+      return;
+    }
+    const instruction = window
+      .prompt(
+        "Correction instruction for next response:",
+        "Continue from the kitchen. Do not replay the phone reveal.",
+      )
+      ?.trim();
+    if (!instruction) return;
+    await executeTurn(previousUserMessage.content, "Applying fix instruction", message.id, instruction);
   }
 
   async function handleDeleteChatMessage(message: ChatMessage) {
@@ -680,6 +814,35 @@ export function App() {
         setContext(await compileContext(soul.character_id, message.conversation_id));
       }
       setStatus(message.role === "assistant" ? "Generated response deleted" : "User message deleted");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSelectVariant(message: ChatMessage, direction: -1 | 1) {
+    if (busy || message.role !== "assistant") return;
+    const variants = variantsByMessage[message.id] ?? [];
+    if (variants.length <= 1) return;
+    const selectedIndex = selectedVariantIndex(variants);
+    const nextIndex = selectedIndex + direction;
+    const nextVariant = variants[nextIndex];
+    if (!nextVariant?.id) return;
+
+    setBusy(true);
+    try {
+      const result = await selectAssistantMessageVariant(
+        message.conversation_id,
+        message.id,
+        nextVariant.id,
+      );
+      setMessages(result.messages);
+      setVariantsByMessage((current) => ({ ...current, [message.id]: result.variants }));
+      if (soul) {
+        setContext(await compileContext(soul.character_id, message.conversation_id));
+      }
+      setStatus(`Selected response variant ${nextIndex + 1} / ${variants.length}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -972,6 +1135,11 @@ export function App() {
     () => messages.filter((message) => message.role !== "system"),
     [messages],
   );
+  const latestAssistantMessageId = useMemo(
+    () =>
+      [...activeMessages].reverse().find((message) => message.role === "assistant")?.id ?? null,
+    [activeMessages],
+  );
 
   if (view === "chat") {
     return (
@@ -986,6 +1154,7 @@ export function App() {
               {setting?.setting_name ?? "Local Setting"} / {provider} / {mode}
             </span>
             <h1>{soul?.character_name ?? "Mnemosyne"}</h1>
+            <p className="session-state-label">{sessionContinuityLabel}</p>
           </div>
           <div className="token-pill">
             {context?.estimated_tokens ?? 0}
@@ -1000,48 +1169,87 @@ export function App() {
               <p>No messages yet.</p>
             </div>
           ) : (
-            activeMessages.map((message) => (
-              <article className={`message ${message.role}`} key={message.id}>
-                <div className="message-heading">
-                  <span>{message.role === "user" ? "User" : "Narrator"}</span>
+            activeMessages.map((message) => {
+              const variants = variantsByMessage[message.id] ?? [];
+              const selectedIndex = selectedVariantIndex(variants);
+              const canGenerate = message.id === latestAssistantMessageId;
+              const olderGenerationTitle =
+                "Regenerating older messages requires branch rewind and will be added later.";
+
+              return (
+                <article className={`message ${message.role}`} key={message.id}>
+                  <div className="message-heading">
+                    <span>{message.role === "user" ? "User" : "Narrator"}</span>
+                    {message.role === "assistant" ? (
+                      <div className="message-tools">
+                        <button
+                          className="message-tool-action"
+                          title={canGenerate ? "Regenerate response" : olderGenerationTitle}
+                          onClick={() => handleRegenerateFromMessage(message)}
+                          disabled={busy || !canGenerate}
+                        >
+                          <RefreshCcw size={14} />
+                          <span>Regenerate</span>
+                        </button>
+                        <button
+                          className="message-tool-action"
+                          title={canGenerate ? "Fix response with instruction" : olderGenerationTitle}
+                          onClick={() => handleFixWithInstruction(message)}
+                          disabled={busy || !canGenerate}
+                        >
+                          <span>Fix</span>
+                        </button>
+                        <div className="variant-switcher" aria-label="Response variants">
+                          <button
+                            title="Previous variant"
+                            onClick={() => handleSelectVariant(message, -1)}
+                            disabled={busy || variants.length <= 1 || selectedIndex <= 0}
+                          >
+                            <ArrowLeft size={13} />
+                          </button>
+                          <span>
+                            {variants.length ? selectedIndex + 1 : 1} / {Math.max(variants.length, 1)}
+                          </span>
+                          <button
+                            title="Next variant"
+                            onClick={() => handleSelectVariant(message, 1)}
+                            disabled={
+                              busy || variants.length <= 1 || selectedIndex >= variants.length - 1
+                            }
+                          >
+                            <ArrowLeft size={13} className="next-variant-icon" />
+                          </button>
+                        </div>
+                        <button
+                          title="Delete this response"
+                          onClick={() => handleDeleteChatMessage(message)}
+                          disabled={busy}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="message-tools">
+                        <button
+                          title="Delete this message"
+                          onClick={() => handleDeleteChatMessage(message)}
+                          disabled={busy}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
                   {message.role === "assistant" ? (
-                    <div className="message-tools">
-                      <button
-                        title="Regenerate this response"
-                        onClick={() => handleRegenerateFromMessage(message)}
-                        disabled={busy}
-                      >
-                        <RefreshCcw size={14} />
-                      </button>
-                      <button
-                        title="Delete this response"
-                        onClick={() => handleDeleteChatMessage(message)}
-                        disabled={busy}
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
+                    <pre style={{ whiteSpace: "pre-wrap", margin: 0, fontFamily: "inherit" }}>
+                      {normalizeAssistantDisplay(message.content)}
+                    </pre>
                   ) : (
-                    <div className="message-tools">
-                      <button
-                        title="Delete this message"
-                        onClick={() => handleDeleteChatMessage(message)}
-                        disabled={busy}
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
+                    <p>{message.content}</p>
                   )}
-                </div>
-                {message.role === "assistant" ? (
-                  <pre style={{ whiteSpace: "pre-wrap", margin: 0, fontFamily: "inherit" }}>
-                    {normalizeAssistantDisplay(message.content)}
-                  </pre>
-                ) : (
-                  <p>{message.content}</p>
-                )}
-              </article>
-            ))
+                </article>
+              );
+            })
           )}
         </section>
 
@@ -1685,8 +1893,37 @@ export function App() {
           <h1>
             {soul?.character_name ?? "Choose a Soul"} in {setting?.setting_name ?? "a Setting"}
           </h1>
+          <div className="chat-start-options" role="radiogroup" aria-label="Chat start mode">
+            <label>
+              <input
+                type="radio"
+                name="chat-start-mode"
+                value="continue"
+                checked={chatStartMode === "continue"}
+                onChange={() => setChatStartMode("continue")}
+                disabled={busy}
+              />
+              <span>Continue Soul continuity</span>
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="chat-start-mode"
+                value="fresh"
+                checked={chatStartMode === "fresh"}
+                onChange={() => setChatStartMode("fresh")}
+                disabled={busy}
+              />
+              <span>Start fresh scenario state</span>
+            </label>
+          </div>
+          <p className="session-state-label">
+            {chatStartMode === "fresh"
+              ? "Fresh scenario state resets world, recent memories, and relationship for this new session."
+              : "Using persistent Soul continuity"}
+          </p>
         </div>
-        <button className="start-chat-button" onClick={() => setView("chat")} disabled={!soul}>
+        <button className="start-chat-button" onClick={handleStartChat} disabled={!soul || busy}>
           <MessageSquareText size={20} />
           <span>Start Chat</span>
         </button>
@@ -2121,6 +2358,7 @@ export function App() {
               <h2>LLM Payload Inspector</h2>
               <div className="payload-actions">
                 {payloadCopied ? <span className="copy-feedback">Payload copied</span> : null}
+                {exportFeedback ? <span className="export-feedback">{exportFeedback}</span> : null}
                 <button
                   className="ghost-action"
                   title="Copy LLM Payload"
@@ -2129,6 +2367,24 @@ export function App() {
                 >
                   <Clipboard size={16} />
                   <span>{payloadCopied ? "Copied!" : "Copy LLM Payload"}</span>
+                </button>
+                <button
+                  className="ghost-action"
+                  title="Export Visible Chat Log"
+                  onClick={handleExportVisibleChatLog}
+                  disabled={busy || activeMessages.length === 0}
+                >
+                  <FileDown size={16} />
+                  <span>Export Visible Chat Log</span>
+                </button>
+                <button
+                  className="ghost-action"
+                  title="Export LLM Payload History"
+                  onClick={handleExportLlmPayloadHistory}
+                  disabled={busy}
+                >
+                  <FileDown size={16} />
+                  <span>Export LLM Payload History</span>
                 </button>
               </div>
             </div>
@@ -2207,6 +2463,11 @@ Provider: ${payload.provider}
 Mode: ${payload.mode}
 Model: ${payload.model || "-"}
 Base URL: ${payload.base_url || "-"}`;
+}
+
+function selectedVariantIndex(variants: AssistantMessageVariant[]) {
+  const index = variants.findIndex((variant) => variant.is_selected);
+  return index >= 0 ? index : 0;
 }
 
 function Stat({ label, value }: { label: string; value: number }) {
@@ -2298,7 +2559,12 @@ function normalizeAssistantDisplay(content: string) {
 function stripHiddenStateBlocks(content: string) {
   let cleaned = content;
   cleaned = cleaned.replace(/\[HIDDEN STATE\][\s\S]*?(?:\[\/HIDDEN STATE\]|$)/g, "");
+  cleaned = cleaned.replace(/\[HIDDEN STATE[\s\S]*$/g, "");
   cleaned = cleaned.replace(/\[HIDDEN_STATE\][\s\S]*$/g, "");
+  cleaned = cleaned.replace(/\[HIDDEN_STATE[\s\S]*$/g, "");
+  cleaned = cleaned.replace(/\[\/HIDDEN STATE[\s\S]*$/g, "");
+  cleaned = cleaned.replace(/\[\/HIDDEN_STATE[\s\S]*$/g, "");
+  cleaned = cleaned.replace(/\[\s*$/g, "");
   return cleaned.trimEnd();
 }
 
