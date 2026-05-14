@@ -41,6 +41,7 @@ pub fn run() {
             commands::list_conversation_messages,
             commands::delete_conversation,
             commands::delete_message,
+            commands::update_user_message,
             commands::list_assistant_message_variants,
             commands::select_assistant_message_variant,
             commands::delete_assistant_message_variant,

@@ -56,6 +56,7 @@ pub struct MemoryPatch {
 #[serde(default, deny_unknown_fields)]
 pub struct WorldPatch {
     pub location: Option<String>,
+    pub time_elapsed: Option<String>,
     pub recent_event: Option<String>,
     pub recent_events: Vec<String>,
     pub active_plot_add: Vec<String>,
@@ -327,10 +328,18 @@ impl MemoryPatch {
 }
 
 impl WorldPatch {
+    pub fn is_empty_for_commands(&self) -> bool {
+        self.is_empty()
+    }
+
     fn is_empty(&self) -> bool {
         self.location
             .as_deref()
             .map_or(true, |location| location.trim().is_empty())
+            && self
+                .time_elapsed
+                .as_deref()
+                .map_or(true, |time| time.trim().is_empty())
             && self
                 .recent_event
                 .as_deref()
@@ -361,6 +370,10 @@ impl WorldPatch {
         let mut changed = false;
         if let Some(location) = cleaned(&self.location) {
             soul.world.location = location.to_string();
+            changed = true;
+        }
+        if let Some(time_elapsed) = cleaned(&self.time_elapsed) {
+            soul.world.time_elapsed = normalize_time_elapsed(time_elapsed);
             changed = true;
         }
 
@@ -411,6 +424,10 @@ impl WorldPatch {
 }
 
 impl BodyPatch {
+    pub fn is_empty_for_commands(&self) -> bool {
+        self.is_empty()
+    }
+
     fn has_arousal_bridge(&self) -> bool {
         self.activation_delta.is_some()
             || self.activation_blocked.is_some()
@@ -520,6 +537,22 @@ fn remove_value(values: &mut Vec<String>, value: &str) -> bool {
     values.len() != before
 }
 
+fn normalize_time_elapsed(raw: &str) -> String {
+    let trimmed = raw.trim();
+    const PREFIX: &str = "Session start";
+    let Some(found) = trimmed.find(PREFIX) else {
+        return trimmed.to_string();
+    };
+    let suffix = trimmed[found + PREFIX.len()..]
+        .trim_start_matches(['.', ' ', '-', ':'])
+        .trim();
+    if suffix.is_empty() {
+        PREFIX.into()
+    } else {
+        suffix.into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +617,41 @@ mod tests {
         assert_eq!(soul.relationships["user"].trust, 20.0);
         assert_eq!(soul.relationships["user"].affection, 190.0);
         assert_eq!(soul.relationships["user"].fear, 10.0);
+    }
+
+    #[test]
+    fn explicit_world_time_patch_applies() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            world_patch: Some(WorldPatch {
+                time_elapsed: Some("Ten minutes later".into()),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        let report = patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert!(report.world_updated);
+        assert_eq!(soul.world.time_elapsed, "Ten minutes later");
+    }
+
+    #[test]
+    fn malformed_session_start_time_is_normalized_on_apply() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            world_patch: Some(WorldPatch {
+                time_elapsed: Some("Session startLate evening, just after midnight.".into()),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert_eq!(soul.world.time_elapsed, "Late evening, just after midnight.");
     }
 
     #[test]

@@ -21,7 +21,10 @@ use crate::{
         SoulSummary,
     },
     providers::{
-        api::{build_system_prompt, ApiProvider, ApiProviderSettings},
+        api::{
+            build_narrator_system_prompt, build_state_updater_prompt, ApiMessage, ApiProvider,
+            ApiProviderSettings, PreparedApiPayload,
+        },
         mock::MockProvider,
     },
     AppState,
@@ -29,6 +32,7 @@ use crate::{
 
 const CONSOLIDATION_INTERVAL_TURNS: u64 = 10;
 const NO_LLM_PAYLOAD_LOGS_MESSAGE: &str = "No LLM payload logs found for this conversation.";
+const FULL_CHAT_TOKEN_BUDGET: usize = 6_000;
 
 #[derive(Debug, serde::Serialize)]
 pub struct TurnResult {
@@ -46,6 +50,10 @@ pub struct TurnDebug {
     pub provider: String,
     pub hidden_state_found: bool,
     pub fallback_hidden_state_generated: bool,
+    pub narrator_response_saved: bool,
+    pub assistant_message_id: Option<i64>,
+    pub selected_variant_id: Option<i64>,
+    pub state_updater_status: String,
     pub tag: Option<String>,
     pub trust_delta: Option<f32>,
     pub affection_delta: Option<f32>,
@@ -57,6 +65,12 @@ pub struct TurnDebug {
 pub struct StreamChunk {
     pub conversation_id: String,
     pub chunk: String,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct SavedChatMessageEvent {
+    pub conversation_id: String,
+    pub message: ChatMessage,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -71,12 +85,42 @@ pub struct LlmPayloadTokenEstimate {
 pub struct LlmPayloadPreview {
     pub provider: String,
     pub mode: String,
+    pub context_mode: String,
     pub model: String,
     pub base_url: String,
     pub system_message: String,
     pub user_message: String,
     pub context: String,
+    pub messages: Vec<ApiMessage>,
+    pub truncated: bool,
     pub estimated_tokens: LlmPayloadTokenEstimate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextMode {
+    Brief,
+    FullChat,
+}
+
+impl ContextMode {
+    fn from_label(value: Option<&str>) -> Self {
+        match value
+            .map(str::trim)
+            .unwrap_or("brief")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "full_chat" | "full chat" | "full-chat" => Self::FullChat,
+            _ => Self::Brief,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Brief => "brief",
+            Self::FullChat => "full_chat",
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -221,6 +265,26 @@ pub fn delete_message(
 ) -> Result<bool, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::delete_message(&conn, &conversation_id, message_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn update_user_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    message_id: i64,
+    content: String,
+) -> Result<Vec<ChatMessage>, String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("User message cannot be empty".into());
+    }
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let updated = db::update_user_message_content(&conn, &conversation_id, message_id, trimmed)
+        .map_err(|err| err.to_string())?;
+    if !updated {
+        return Err("User message not found".into());
+    }
+    db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -383,6 +447,7 @@ pub fn preview_api_payload(
     mode: String,
     settings: ApiProviderSettings,
     provider: String,
+    context_mode: Option<String>,
 ) -> Result<LlmPayloadPreview, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
@@ -391,7 +456,13 @@ pub fn preview_api_payload(
     );
 
     Ok(build_llm_payload_preview(
-        &soul, &messages, &user_text, &mode, &settings, &provider,
+        &soul,
+        &messages,
+        &user_text,
+        &mode,
+        &settings,
+        &provider,
+        ContextMode::from_label(context_mode.as_deref()),
     ))
 }
 
@@ -562,11 +633,14 @@ pub async fn send_api_turn(
     soul_id: String,
     user_text: String,
     mode: String,
-    settings: ApiProviderSettings,
+    narrator_settings: ApiProviderSettings,
+    state_updater_settings: ApiProviderSettings,
     replacement_assistant_id: Option<i64>,
     correction_instruction: Option<String>,
+    context_mode: Option<String>,
 ) -> Result<TurnResult, String> {
-    let (mut soul, context_preview, snapshot_user_text, pre_turn_soul_json) = {
+    let context_mode = ContextMode::from_label(context_mode.as_deref());
+    let (mut soul, context_messages, context_preview, snapshot_user_text, pre_turn_soul_json) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         let (soul, snapshot_user_text) = if let Some(message_id) = replacement_assistant_id {
             let snapshot = db::get_turn_snapshot(&conn, &conversation_id, message_id)
@@ -588,30 +662,47 @@ pub async fn send_api_turn(
                 .map_err(|err| err.to_string())?;
         }
 
+        let history_limit = if context_mode == ContextMode::FullChat {
+            100
+        } else {
+            5
+        };
         let before_messages = match replacement_assistant_id {
-            Some(message_id) => db::list_messages_before_id(&conn, &conversation_id, message_id, 5),
-            None => db::list_messages(&conn, &conversation_id, 5),
+            Some(message_id) => {
+                db::list_messages_before_id(&conn, &conversation_id, message_id, history_limit)
+            }
+            None => db::list_messages(&conn, &conversation_id, history_limit),
         }
         .map_err(|err| err.to_string())?;
+        let context_messages = messages_to_context(before_messages);
         let context_preview = compile_context_with_correction(
             &soul,
-            &messages_to_context(before_messages),
+            &context_messages,
             correction_instruction.as_deref(),
         );
         let pre_turn_soul_json = serde_json::to_string(&soul).map_err(|err| err.to_string())?;
         (
             soul,
+            context_messages,
             context_preview,
             snapshot_user_text,
             pre_turn_soul_json,
         )
     };
 
-    let system_prompt = build_system_prompt(&settings, &soul, &context_preview.text, &mode);
-    let provider = ApiProvider::default();
-    let stream_conversation_id = conversation_id.clone();
     let effective_user_text =
         build_user_text_with_correction(&snapshot_user_text, correction_instruction.as_deref());
+    let narrator_payload = prepare_narrator_payload(
+        &narrator_settings,
+        &soul,
+        &context_messages,
+        &context_preview,
+        &effective_user_text,
+        &mode,
+        context_mode,
+    );
+    let provider = ApiProvider::default();
+    let stream_conversation_id = conversation_id.clone();
     let payload_log_id = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         db::insert_llm_payload_log(
@@ -620,118 +711,191 @@ pub async fn send_api_turn(
                 id: 0,
                 conversation_id: conversation_id.clone(),
                 message_id: replacement_assistant_id,
-                provider: "API".into(),
+                provider: format!("narrator_{}", context_mode.label()),
                 mode: mode.trim().to_string(),
-                model: settings.model.trim().to_string(),
-                base_url: settings.base_url.trim().to_string(),
-                system_message: system_prompt.clone(),
-                user_message: effective_user_text.trim().to_string(),
-                context_text: context_preview.text.clone(),
-                estimated_system_tokens: estimate_tokens(&system_prompt),
+                context_mode: context_mode.label().into(),
+                model: narrator_settings.model.trim().to_string(),
+                base_url: narrator_settings.base_url.trim().to_string(),
+                system_message: narrator_payload
+                    .messages
+                    .first()
+                    .map(|message| message.content.clone())
+                    .unwrap_or_default(),
+                user_message: narrator_payload.user_message.clone(),
+                context_text: narrator_payload.context_text.clone(),
+                estimated_system_tokens: estimate_tokens(
+                    narrator_payload
+                        .messages
+                        .first()
+                        .map(|message| message.content.as_str())
+                        .unwrap_or_default(),
+                ),
                 estimated_user_tokens: estimate_tokens(&effective_user_text),
-                estimated_total_tokens: estimate_tokens(&system_prompt)
-                    + estimate_tokens(&effective_user_text),
+                estimated_total_tokens: estimate_tokens(&serialize_api_messages(
+                    &narrator_payload.messages,
+                )),
+                truncated: narrator_payload.truncated,
                 created_at: db::now_ts(),
             },
         )
         .map_err(|err| err.to_string())?
     };
     let raw_response = provider
-        .complete_streaming(&settings, &system_prompt, &effective_user_text, |chunk| {
-            window
-                .emit(
-                    "api-chunk",
-                    StreamChunk {
-                        conversation_id: stream_conversation_id.clone(),
-                        chunk: chunk.to_string(),
-                    },
-                )
-                .map_err(|err| err.to_string())
-        })
+        .complete_streaming_messages(
+            &narrator_settings,
+            narrator_payload.messages.clone(),
+            |chunk| {
+                window
+                    .emit(
+                        "api-chunk",
+                        StreamChunk {
+                            conversation_id: stream_conversation_id.clone(),
+                            chunk: chunk.to_string(),
+                        },
+                    )
+                    .map_err(|err| err.to_string())
+            },
+        )
         .await?;
     let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
-    let hidden_state_found = parsed.has_patch();
-    let fallback_hidden_state_generated = !hidden_state_found;
-    let (hidden_state, engine_patch) = if fallback_hidden_state_generated {
-        let hidden_state =
-            generated_api_hidden_state(&soul, &snapshot_user_text, &parsed.visible_text);
-        let engine_patch = EnginePatch::from(&hidden_state);
-        (hidden_state, engine_patch)
-    } else {
-        (parsed.hidden_state.clone(), parsed.engine_patch.clone())
+    let visible_response = parsed.visible_text.clone();
+    if visible_response.trim().is_empty() {
+        return Err("Narrator provider returned an empty visible response".into());
+    }
+
+    let (assistant_message_id, selected_variant_id) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        save_visible_narrator_response(
+            &conn,
+            &conversation_id,
+            &visible_response,
+            replacement_assistant_id,
+            correction_instruction.as_deref(),
+            &pre_turn_soul_json,
+            &snapshot_user_text,
+            payload_log_id,
+        )?
     };
-    let debug = debug_from_hidden_state(
+    {
+        let saved_message = state
+            .conn
+            .lock()
+            .map_err(|err| err.to_string())
+            .and_then(|conn| {
+                db::get_message(&conn, &conversation_id, assistant_message_id)
+                    .map_err(|err| err.to_string())
+            });
+        match saved_message {
+            Ok(message) => {
+                if let Err(err) = window.emit(
+                    "chat-message-saved",
+                    SavedChatMessageEvent {
+                        conversation_id: conversation_id.clone(),
+                        message,
+                    },
+                ) {
+                    eprintln!("Saved narrator message event failed: {err}");
+                }
+            }
+            Err(err) => eprintln!("Saved narrator message reload failed: {err}"),
+        }
+    }
+
+    let updater_system_prompt = build_state_updater_prompt(&soul);
+    let updater_user_message =
+        build_state_updater_user_message(&snapshot_user_text, &visible_response);
+    let updater_log_id = match state
+        .conn
+        .lock()
+        .map_err(|err| err.to_string())
+        .and_then(|conn| {
+            db::insert_llm_payload_log(
+                &conn,
+                &LlmPayloadLog {
+                    id: 0,
+                    conversation_id: conversation_id.clone(),
+                    message_id: Some(assistant_message_id),
+                    provider: "state_updater".into(),
+                    mode: "state_updater".into(),
+                    context_mode: context_mode.label().into(),
+                    model: state_updater_settings.model.trim().to_string(),
+                    base_url: state_updater_settings.base_url.trim().to_string(),
+                    system_message: updater_system_prompt.clone(),
+                    user_message: updater_user_message.clone(),
+                    context_text: updater_system_prompt.clone(),
+                    estimated_system_tokens: estimate_tokens(&updater_system_prompt),
+                    estimated_user_tokens: estimate_tokens(&updater_user_message),
+                    estimated_total_tokens: estimate_tokens(&updater_system_prompt)
+                        + estimate_tokens(&updater_user_message),
+                    truncated: false,
+                    created_at: db::now_ts(),
+                },
+            )
+            .map_err(|err| err.to_string())
+        }) {
+        Ok(log_id) => Some(log_id),
+        Err(err) => {
+            eprintln!(
+                "State updater payload logging failed; narration saved without updater log: {err}"
+            );
+            None
+        }
+    };
+    let updater_result = provider
+        .complete_prompt(
+            &state_updater_settings,
+            &updater_system_prompt,
+            &updater_user_message,
+            0.0,
+        )
+        .await
+        .and_then(|updater_response| parse_engine_patch_json(&updater_response));
+    let (hidden_state, engine_patch, state_updater_status, hidden_state_found) =
+        match updater_result {
+            Ok(patch) => {
+                let engine_patch = sanitize_state_updater_patch(
+                    patch,
+                    &soul,
+                    &snapshot_user_text,
+                    &visible_response,
+                );
+                let hidden_state = hidden_state_from_engine_patch(&engine_patch);
+                (hidden_state, engine_patch, "success".to_string(), true)
+            }
+            Err(err) => {
+                eprintln!("State updater failed; narration saved without state update: {err}");
+                (
+                    HiddenState::default(),
+                    EnginePatch::default(),
+                    format!("failed: {err}"),
+                    false,
+                )
+            }
+        };
+    let fallback_hidden_state_generated = false;
+    let mut debug = debug_from_hidden_state(
         "API",
         &hidden_state,
         hidden_state_found,
         fallback_hidden_state_generated,
     );
-    let debug_json = serde_json::to_string(&debug).map_err(|err| err.to_string())?;
+    debug.narrator_response_saved = true;
+    debug.assistant_message_id = Some(assistant_message_id);
+    debug.selected_variant_id = selected_variant_id;
+    debug.state_updater_status = state_updater_status;
 
     let _ = engine_patch.apply_to_soul(&mut soul);
     soul.turn_counter += 1;
     soul.turns_since_consolidation += 1;
-    let visible_response = parsed.visible_text;
 
     let (messages, context_preview, consolidation_ran) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
-        let assistant_message_id = if let Some(message_id) = replacement_assistant_id {
-            message_id
-        } else {
-            db::insert_message_and_get_id(&conn, &conversation_id, "assistant", &visible_response)
-                .map_err(|err| err.to_string())?
-        };
-        db::set_llm_payload_log_message_id(&conn, payload_log_id, assistant_message_id)
-            .map_err(|err| err.to_string())?;
-
-        if replacement_assistant_id.is_some() {
-            db::create_assistant_message_variant(
-                &conn,
-                &conversation_id,
-                assistant_message_id,
-                &visible_response,
-                None,
-                Some(
-                    if correction_instruction
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|instruction| !instruction.is_empty())
-                        .is_some()
-                    {
-                        "fix"
-                    } else {
-                        "regenerate"
-                    },
-                ),
-                true,
-                Some(&pre_turn_soul_json),
-                Some(&debug_json),
-            )
-            .map_err(|err| err.to_string())?;
-        } else {
-            db::seed_initial_assistant_message_variant(
-                &conn,
-                &conversation_id,
-                assistant_message_id,
-                &visible_response,
-                Some("original"),
-                Some(&pre_turn_soul_json),
-                Some(&debug_json),
-            )
-            .map_err(|err| err.to_string())?;
-        }
-
-        if replacement_assistant_id.is_none() {
-            db::upsert_turn_snapshot(
-                &conn,
-                &db::TurnSnapshot {
-                    conversation_id: conversation_id.clone(),
-                    assistant_message_id,
-                    user_text: snapshot_user_text.clone(),
-                    soul_json: pre_turn_soul_json.clone(),
-                },
-            )
-            .map_err(|err| err.to_string())?;
+        if let Some(updater_log_id) = updater_log_id {
+            if let Err(err) =
+                db::set_llm_payload_log_message_id(&conn, updater_log_id, assistant_message_id)
+            {
+                eprintln!("State updater payload log link failed; narration remains saved: {err}");
+            }
         }
 
         let consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
@@ -757,6 +921,94 @@ pub async fn send_api_turn(
         consolidation_ran,
         debug,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_visible_narrator_response(
+    conn: &Connection,
+    conversation_id: &str,
+    visible_response: &str,
+    replacement_assistant_id: Option<i64>,
+    correction_instruction: Option<&str>,
+    pre_turn_soul_json: &str,
+    snapshot_user_text: &str,
+    payload_log_id: i64,
+) -> Result<(i64, Option<i64>), String> {
+    let assistant_message_id = if let Some(message_id) = replacement_assistant_id {
+        message_id
+    } else {
+        db::insert_message_and_get_id(conn, conversation_id, "assistant", visible_response)
+            .map_err(|err| err.to_string())?
+    };
+    db::set_llm_payload_log_message_id(conn, payload_log_id, assistant_message_id)
+        .map_err(|err| err.to_string())?;
+
+    let pending_debug = TurnDebug {
+        provider: "API".into(),
+        hidden_state_found: false,
+        fallback_hidden_state_generated: false,
+        narrator_response_saved: true,
+        assistant_message_id: Some(assistant_message_id),
+        selected_variant_id: None,
+        state_updater_status: "pending".into(),
+        tag: None,
+        trust_delta: None,
+        affection_delta: None,
+        new_location: None,
+        present_characters: Vec::new(),
+    };
+    let pending_debug_json =
+        serde_json::to_string(&pending_debug).map_err(|err| err.to_string())?;
+    let variant = if replacement_assistant_id.is_some() {
+        db::create_assistant_message_variant(
+            conn,
+            conversation_id,
+            assistant_message_id,
+            visible_response,
+            None,
+            Some(
+                if correction_instruction
+                    .map(str::trim)
+                    .filter(|instruction| !instruction.is_empty())
+                    .is_some()
+                {
+                    "fix"
+                } else {
+                    "regenerate"
+                },
+            ),
+            true,
+            Some(pre_turn_soul_json),
+            Some(&pending_debug_json),
+        )
+        .map_err(|err| err.to_string())?
+    } else {
+        db::seed_initial_assistant_message_variant(
+            conn,
+            conversation_id,
+            assistant_message_id,
+            visible_response,
+            Some("original"),
+            Some(pre_turn_soul_json),
+            Some(&pending_debug_json),
+        )
+        .map_err(|err| err.to_string())?
+    };
+
+    if replacement_assistant_id.is_none() {
+        db::upsert_turn_snapshot(
+            conn,
+            &db::TurnSnapshot {
+                conversation_id: conversation_id.to_string(),
+                assistant_message_id,
+                user_text: snapshot_user_text.to_string(),
+                soul_json: pre_turn_soul_json.to_string(),
+            },
+        )
+        .map_err(|err| err.to_string())?;
+    }
+
+    Ok((assistant_message_id, variant.id))
 }
 
 fn messages_to_context(messages: Vec<ChatMessage>) -> Vec<ContextMessage> {
@@ -803,6 +1055,286 @@ fn build_user_text_with_correction(
     }
 }
 
+fn build_state_updater_user_message(user_text: &str, narrator_response: &str) -> String {
+    format!(
+        "[LATEST USER MESSAGE]\n{}\n\n[NARRATOR RESPONSE]\n{}",
+        user_text.trim(),
+        strip_hidden_state_blocks(narrator_response).trim()
+    )
+}
+
+#[cfg(test)]
+fn build_compact_updater_payload_for_test(
+    soul: &Soul,
+    user_text: &str,
+    narrator_response: &str,
+) -> String {
+    format!(
+        "{}\n\n{}",
+        build_state_updater_prompt(soul),
+        build_state_updater_user_message(user_text, narrator_response)
+    )
+}
+
+fn parse_engine_patch_json(raw: &str) -> Result<EnginePatch, String> {
+    let trimmed = raw.trim();
+    let json = if let Some(stripped) = trimmed.strip_prefix("```json") {
+        stripped.trim_end_matches("```").trim()
+    } else if let Some(stripped) = trimmed.strip_prefix("```") {
+        stripped.trim_end_matches("```").trim()
+    } else {
+        trimmed
+    };
+    serde_json::from_str::<EnginePatch>(json)
+        .map_err(|err| format!("State updater returned invalid EnginePatch JSON: {err}"))
+}
+
+fn hidden_state_from_engine_patch(patch: &EnginePatch) -> HiddenState {
+    let relationship = patch
+        .soul_patch
+        .as_ref()
+        .and_then(|patch| patch.relationship_delta.as_ref());
+    let memory = patch.soul_patch.as_ref().and_then(|patch| {
+        patch
+            .new_memories
+            .iter()
+            .find(|memory| !memory.content.trim().is_empty())
+    });
+    let world = patch.world_patch.as_ref();
+    let body = patch.body_patch.as_ref();
+    HiddenState {
+        memory: memory.map(|memory| memory.content.clone()),
+        tag: memory.and_then(|memory| memory.tag.clone()),
+        trust_delta: relationship.and_then(|delta| delta.trust),
+        affection_delta: relationship.and_then(|delta| delta.affection),
+        world_event: world.and_then(|patch| {
+            patch.recent_event.clone().or_else(|| {
+                patch
+                    .recent_events
+                    .iter()
+                    .find(|event| !event.trim().is_empty())
+                    .cloned()
+            })
+        }),
+        new_location: world.and_then(|patch| patch.location.clone()),
+        present_characters: None,
+        arousal_delta: body.and_then(|patch| patch.activation_delta),
+        arousal_denied: body.and_then(|patch| patch.activation_blocked),
+        orgasm_allowed: body.and_then(|patch| patch.peak_allowed),
+        forced_orgasm: body.and_then(|patch| patch.forced_peak),
+    }
+}
+
+fn sanitize_state_updater_patch(
+    mut patch: EnginePatch,
+    soul: &Soul,
+    user_text: &str,
+    narrator_response: &str,
+) -> EnginePatch {
+    let turn_text = format!("{user_text}\n{narrator_response}");
+    let threat_scene = is_threat_or_emergency(&turn_text) || latest_world_event_is_threat(soul);
+    let explicit_intimacy = explicitly_intimate(user_text);
+    if let Some(body_patch) = patch.body_patch.as_mut() {
+        if threat_scene && !explicit_intimacy {
+            if body_patch.activation_delta.unwrap_or(0.0) > 0.0 {
+                body_patch.activation_delta = Some(0.0);
+            }
+            body_patch.peak_allowed = Some(false);
+            body_patch.forced_peak = Some(false);
+        }
+    }
+    if patch
+        .body_patch
+        .as_ref()
+        .map_or(false, |body| body.is_empty_for_commands())
+    {
+        patch.body_patch = None;
+    }
+
+    if let Some(world_patch) = patch.world_patch.as_mut() {
+        if let Some(time) = world_patch.time_elapsed.as_mut() {
+            *time = normalize_time_for_updater(time);
+        }
+        if world_patch.time_elapsed.is_some() && !user_text_has_explicit_time(user_text) {
+            world_patch.time_elapsed = None;
+        }
+        if should_replace_default_plot(soul, world_patch, &turn_text) {
+            if let Some(plot) = infer_active_plot(&turn_text) {
+                world_patch
+                    .active_plot_resolve
+                    .push("Establish the first scene".into());
+                world_patch
+                    .active_plot_resolve
+                    .push("Establish the first scene – Aurora is alone, expecting company, or has just let someone in.".into());
+                world_patch.active_plot_add.push(plot.into());
+            }
+        }
+        if world_patch.is_empty_for_commands() {
+            patch.world_patch = None;
+        }
+    }
+
+    patch
+}
+
+fn normalize_time_for_updater(raw: &str) -> String {
+    let trimmed = raw.trim();
+    const PREFIX: &str = "Session start";
+    let Some(found) = trimmed.find(PREFIX) else {
+        return trimmed.to_string();
+    };
+    let suffix = trimmed[found + PREFIX.len()..]
+        .trim_start_matches(['.', ' ', '-', ':'])
+        .trim();
+    if suffix.is_empty() {
+        PREFIX.into()
+    } else {
+        suffix.into()
+    }
+}
+
+fn latest_world_event_is_threat(soul: &Soul) -> bool {
+    soul.world
+        .recent_events
+        .last()
+        .map(|event| is_threat_or_emergency(event))
+        .unwrap_or(false)
+}
+
+fn is_threat_or_emergency(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "threat",
+        "trauma",
+        "injury",
+        "emergency",
+        "armed raid",
+        "raid",
+        "restraint",
+        "restrained",
+        "explosion",
+        "evacuation",
+        "fear",
+        "danger",
+        "gun",
+        "warrant",
+        "police",
+        "federal",
+        "hazard",
+        "blood",
+        "shot",
+        "shooter",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn explicitly_intimate(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "consensual",
+        "intimate",
+        "kiss",
+        "romantic",
+        "erotic",
+        "aroused",
+        "desire",
+        "make love",
+        "touch her gently",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn should_replace_default_plot(
+    soul: &Soul,
+    world_patch: &state_engine::patch::WorldPatch,
+    turn_text: &str,
+) -> bool {
+    let has_default_plot = soul.world.active_plots.iter().any(|plot| {
+        plot.to_ascii_lowercase()
+            .contains("establish the first scene")
+    });
+    has_default_plot
+        && (world_patch
+            .recent_event
+            .as_deref()
+            .map(is_major_plot_shift)
+            .unwrap_or(false)
+            || is_major_plot_shift(turn_text))
+}
+
+fn is_major_plot_shift(text: &str) -> bool {
+    infer_active_plot(text).is_some()
+}
+
+fn infer_active_plot(text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    if [
+        "forced entry",
+        "cop",
+        "police",
+        "warrant",
+        "hazard suit",
+        "hazmat",
+        "raid",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        Some("Forced-entry police operation at Aurora's apartment")
+    } else if [
+        "explosion",
+        "federal",
+        "evacuation",
+        "multi-agency",
+        "agency",
+        "evacuate",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        Some("Emergency evacuation during multi-agency crisis")
+    } else if ["confession", "romantic", "intimacy", "kiss", "late-night"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        Some("Late-night intimacy and emotional negotiation")
+    } else {
+        None
+    }
+}
+
+fn user_text_has_explicit_time(user_text: &str) -> bool {
+    let lower = user_text.to_ascii_lowercase();
+    let time_words = [
+        "minute",
+        "minutes",
+        "hour",
+        "hours",
+        "day",
+        "days",
+        "week",
+        "weeks",
+        "month",
+        "months",
+        "year",
+        "years",
+        "tonight",
+        "tomorrow",
+        "yesterday",
+        "morning",
+        "afternoon",
+        "evening",
+        "midnight",
+        "noon",
+        "wait",
+        "later",
+    ];
+    lower.chars().any(|ch| ch.is_ascii_digit())
+        || time_words.iter().any(|word| lower.contains(word))
+}
+
 fn build_llm_payload_preview(
     soul: &Soul,
     messages: &[ContextMessage],
@@ -810,33 +1342,163 @@ fn build_llm_payload_preview(
     mode: &str,
     settings: &ApiProviderSettings,
     provider: &str,
+    context_mode: ContextMode,
 ) -> LlmPayloadPreview {
     let context_preview = if user_text.trim().is_empty() {
         compile_context_for_messages(soul, messages)
     } else {
         compile_context_for_separate_user_message(soul, messages)
     };
-    let system_message = build_system_prompt(settings, soul, &context_preview.text, mode);
+    let prepared = prepare_narrator_payload(
+        settings,
+        soul,
+        messages,
+        &context_preview,
+        user_text,
+        mode,
+        context_mode,
+    );
+    let system_message = prepared
+        .messages
+        .first()
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
     let user_message = user_text.trim().to_string();
     let system_tokens = estimate_tokens(&system_message);
-    let context_tokens = estimate_tokens(&context_preview.text);
+    let context_tokens = estimate_tokens(&prepared.context_text);
     let user_tokens = estimate_tokens(&user_message);
 
     LlmPayloadPreview {
         provider: provider.trim().to_string(),
         mode: mode.trim().to_string(),
+        context_mode: context_mode.label().into(),
         model: settings.model.trim().to_string(),
         base_url: settings.base_url.trim().to_string(),
         system_message,
         user_message,
-        context: context_preview.text,
+        context: prepared.context_text,
+        messages: prepared.messages,
+        truncated: prepared.truncated,
         estimated_tokens: LlmPayloadTokenEstimate {
             system: system_tokens,
             context: context_tokens,
             user: user_tokens,
-            total: system_tokens + user_tokens,
+            total: system_tokens + user_tokens + context_tokens,
         },
     }
+}
+
+fn prepare_narrator_payload(
+    settings: &ApiProviderSettings,
+    soul: &Soul,
+    messages: &[ContextMessage],
+    context_preview: &ContextPreview,
+    user_text: &str,
+    mode: &str,
+    context_mode: ContextMode,
+) -> PreparedApiPayload {
+    match context_mode {
+        ContextMode::Brief => {
+            let system_message =
+                build_narrator_system_prompt(settings, soul, &context_preview.text, mode, false);
+            PreparedApiPayload {
+                messages: vec![
+                    ApiMessage::system(system_message),
+                    ApiMessage::user(user_text.trim().to_string()),
+                ],
+                context_text: context_preview.text.clone(),
+                user_message: user_text.trim().to_string(),
+                truncated: context_preview.truncated,
+            }
+        }
+        ContextMode::FullChat => {
+            prepare_full_chat_payload(settings, soul, messages, user_text, mode)
+        }
+    }
+}
+
+fn prepare_full_chat_payload(
+    settings: &ApiProviderSettings,
+    soul: &Soul,
+    messages: &[ContextMessage],
+    user_text: &str,
+    mode: &str,
+) -> PreparedApiPayload {
+    let system_message =
+        build_narrator_system_prompt(settings, soul, &full_chat_setup(soul), mode, false);
+    let mut api_messages = vec![ApiMessage::system(system_message)];
+    for message in messages {
+        match message.role.as_str() {
+            "assistant" => api_messages.push(ApiMessage::assistant(sanitize_visible_chat_content(
+                &message.content,
+            ))),
+            "user" => api_messages.push(ApiMessage::user(message.content.trim().to_string())),
+            _ => {}
+        }
+    }
+    if user_text.trim().len() > 0
+        && !api_messages
+            .last()
+            .map(|message| message.role == "user" && message.content.trim() == user_text.trim())
+            .unwrap_or(false)
+    {
+        api_messages.push(ApiMessage::user(user_text.trim().to_string()));
+    }
+
+    let mut truncated = false;
+    while estimate_tokens(&serialize_api_messages(&api_messages)) > FULL_CHAT_TOKEN_BUDGET
+        && api_messages.len() > 3
+    {
+        api_messages.remove(1);
+        truncated = true;
+    }
+    let context_text = format!(
+        "Context mode: full_chat\nTruncated: {}\n\n{}",
+        truncated,
+        serialize_api_messages(&api_messages)
+    );
+    PreparedApiPayload {
+        user_message: user_text.trim().to_string(),
+        messages: api_messages,
+        context_text,
+        truncated,
+    }
+}
+
+fn full_chat_setup(soul: &Soul) -> String {
+    format!(
+        "[CHARACTER SETUP]\nName: {}\nDescription: {}\nAppearance: {}\nPersonality: {}\nScenario: {}\nWorld location: {}\nWorld time: {}",
+        soul.character_name,
+        empty_as_unspecified(&soul.profile.description),
+        empty_as_unspecified(&soul.profile.appearance),
+        empty_as_unspecified(&soul.profile.personality),
+        empty_as_unspecified(&soul.profile.scenario),
+        empty_as_unspecified(&soul.world.location),
+        empty_as_unspecified(&soul.world.time_elapsed)
+    )
+}
+
+fn empty_as_unspecified(value: &str) -> &str {
+    let value = value.trim();
+    if value.is_empty() {
+        "Unspecified"
+    } else {
+        value
+    }
+}
+
+fn sanitize_visible_chat_content(content: &str) -> String {
+    strip_status_blocks_for_export(&strip_hidden_state_blocks(content))
+        .trim()
+        .to_string()
+}
+
+fn serialize_api_messages(messages: &[ApiMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| format!("{}: {}", message.role, message.content.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn render_visible_chat_log(messages: &[ChatMessage]) -> String {
@@ -878,7 +1540,9 @@ fn render_llm_payload_history(logs: &[LlmPayloadLog]) -> String {
         lines.push(format!("Provider: {}", log.provider));
         lines.push(format!("Model: {}", log.model));
         lines.push(format!("Mode: {}", log.mode));
+        lines.push(format!("Context mode: {}", log.context_mode));
         lines.push(format!("Base URL: {}", log.base_url));
+        lines.push(format!("Truncated: {}", log.truncated));
         lines.push(format!(
             "Estimated tokens: system {}, user {}, total {}",
             log.estimated_system_tokens, log.estimated_user_tokens, log.estimated_total_tokens
@@ -976,6 +1640,27 @@ fn strip_hidden_state_blocks(content: &str) -> String {
     cleaned.trim_end().to_string()
 }
 
+fn strip_status_blocks_for_export(content: &str) -> String {
+    let mut cleaned = String::new();
+    let mut in_status = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("```status") {
+            in_status = true;
+            continue;
+        }
+        if in_status {
+            if trimmed == "```" {
+                in_status = false;
+            }
+            continue;
+        }
+        cleaned.push_str(line);
+        cleaned.push('\n');
+    }
+    cleaned.trim_end().to_string()
+}
+
 fn debug_from_hidden_state(
     provider: &str,
     hidden_state: &HiddenState,
@@ -986,56 +1671,15 @@ fn debug_from_hidden_state(
         provider: provider.into(),
         hidden_state_found,
         fallback_hidden_state_generated,
+        narrator_response_saved: false,
+        assistant_message_id: None,
+        selected_variant_id: None,
+        state_updater_status: "legacy_hidden_state".into(),
         tag: hidden_state.tag.clone(),
         trust_delta: hidden_state.trust_delta,
         affection_delta: hidden_state.affection_delta,
         new_location: hidden_state.new_location.clone(),
         present_characters: hidden_state.present_characters.clone().unwrap_or_default(),
-    }
-}
-
-fn generated_api_hidden_state(soul: &Soul, user_text: &str, visible_text: &str) -> HiddenState {
-    let tag = classify_turn_tag(user_text);
-    let assistant_excerpt = visible_text.chars().take(180).collect::<String>();
-    HiddenState {
-        memory: Some(format!(
-            "{} responded through the API provider after the user said: {} Assistant cue: {}",
-            soul.character_name,
-            user_text.trim(),
-            assistant_excerpt.trim()
-        )),
-        tag: Some(tag.into()),
-        trust_delta: Some(if tag == "trust_building" { 3.0 } else { 1.0 }),
-        affection_delta: Some(if tag == "bonding" { 3.0 } else { 1.0 }),
-        world_event: Some(format!(
-            "Completed API turn: user said {}; narrator response cue: {}",
-            user_text.trim(),
-            assistant_excerpt.trim()
-        )),
-        new_location: None,
-        present_characters: Some(vec![soul.character_name.clone()]),
-        arousal_delta: None,
-        arousal_denied: None,
-        orgasm_allowed: None,
-        forced_orgasm: None,
-    }
-}
-
-fn classify_turn_tag(text: &str) -> &'static str {
-    let lower = text.to_lowercase();
-    if lower.contains("trust") || lower.contains("promise") || lower.contains("safe") {
-        "trust_building"
-    } else if lower.contains("hurt") || lower.contains("blood") || lower.contains("danger") {
-        "threat"
-    } else if lower.contains("remember")
-        || lower.contains("childhood")
-        || lower.contains("together")
-    {
-        "bonding"
-    } else if lower.contains("where") || lower.contains("look") || lower.contains("room") {
-        "orientation"
-    } else {
-        "observation"
     }
 }
 
@@ -1147,6 +1791,7 @@ mod tests {
             "Reader",
             &settings,
             "API",
+            ContextMode::Brief,
         );
         let serialized = serde_json::to_string(&preview).expect("serialize preview");
 
@@ -1170,13 +1815,279 @@ mod tests {
             system_prompt: String::new(),
         };
 
-        let preview =
-            build_llm_payload_preview(&soul, &[], "Current user turn", "Reader", &settings, "API");
+        let preview = build_llm_payload_preview(
+            &soul,
+            &[],
+            "Current user turn",
+            "Reader",
+            &settings,
+            "API",
+            ContextMode::Brief,
+        );
 
         assert!(preview.estimated_tokens.system > 0);
         assert!(preview.estimated_tokens.context > 0);
         assert!(preview.estimated_tokens.user > 0);
         assert!(preview.estimated_tokens.total > 0);
+    }
+
+    #[test]
+    fn brief_context_mode_compiles_existing_sections() {
+        let soul = new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "secret".into(),
+            model: "debug-model".into(),
+            system_prompt: String::new(),
+        };
+        let preview = build_llm_payload_preview(
+            &soul,
+            &[],
+            "Current user turn",
+            "Reader",
+            &settings,
+            "API",
+            ContextMode::Brief,
+        );
+
+        assert_eq!(preview.context_mode, "brief");
+        assert!(preview.context.contains("[WORLD SNAPSHOT]"));
+        assert!(preview.context.contains("[LATEST EXCHANGE, HIGH PRIORITY]"));
+    }
+
+    #[test]
+    fn full_chat_mode_sends_visible_history_instead_of_brief_sections() {
+        let soul = new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "secret".into(),
+            model: "debug-model".into(),
+            system_prompt: String::new(),
+        };
+        let messages = vec![
+            ContextMessage {
+                role: "user".into(),
+                content: "Hello.".into(),
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "Visible text.\n```status\nAurora | Skin: calm | Zones: room | Atmosphere: still\n```\n[HIDDEN STATE]{\"tag\":\"observation\"}[/HIDDEN STATE]".into(),
+            },
+        ];
+
+        let preview = build_llm_payload_preview(
+            &soul,
+            &messages,
+            "Current user turn",
+            "Reader",
+            &settings,
+            "API",
+            ContextMode::FullChat,
+        );
+
+        assert_eq!(preview.context_mode, "full_chat");
+        assert!(!preview.context.contains("[WORLD SNAPSHOT]"));
+        assert!(!preview.context.contains("[LATEST EXCHANGE, HIGH PRIORITY]"));
+        assert!(preview.context.contains("user: Hello."));
+        assert!(preview.context.contains("assistant: Visible text."));
+        assert!(!preview.context.contains("[HIDDEN STATE]"));
+        assert!(!preview.messages[2].content.contains("```status"));
+        assert_eq!(preview.messages[1].role, "user");
+        assert_eq!(preview.messages[2].role, "assistant");
+    }
+
+    #[test]
+    fn full_chat_mode_trims_oldest_messages_when_over_budget() {
+        let soul = new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "secret".into(),
+            model: "debug-model".into(),
+            system_prompt: String::new(),
+        };
+        let huge = "old ".repeat(8_000);
+        let messages = vec![
+            ContextMessage {
+                role: "user".into(),
+                content: huge,
+            },
+            ContextMessage {
+                role: "assistant".into(),
+                content: "Latest narrator tail.".into(),
+            },
+        ];
+
+        let preview = build_llm_payload_preview(
+            &soul,
+            &messages,
+            "Current user turn",
+            "Reader",
+            &settings,
+            "API",
+            ContextMode::FullChat,
+        );
+
+        assert!(preview.truncated);
+        assert!(preview.context.contains("Latest narrator tail."));
+        assert!(preview.context.contains("Current user turn"));
+    }
+
+    #[test]
+    fn state_updater_patch_applies_through_engine_validation() {
+        let mut soul = new_default_soul("Aurora");
+        let raw = r#"{"schema_version":1,"soul_patch":{"relationship_delta":{"target":"user","trust":2.0},"new_memories":[{"content":"Aurora noticed the user's steady answer.","tag":"observation"}]},"world_patch":{"recent_event":"Aurora challenged the user and waited for an answer."}}"#;
+
+        let patch = parse_engine_patch_json(raw).expect("valid patch");
+        let report = patch.apply_to_soul(&mut soul).expect("engine validation");
+
+        assert!(report.relationship_updated);
+        assert_eq!(report.memories_added, 1);
+        assert!(report.world_updated);
+        assert_eq!(soul.relationships["user"].trust, 12.0);
+    }
+
+    #[test]
+    fn unsupported_state_updater_time_jump_is_ignored() {
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"world_patch":{"time_elapsed":"Three days later","recent_event":"Aurora spoke."}}"#,
+        )
+        .expect("valid patch");
+
+        let soul = new_default_soul("Aurora");
+        let filtered =
+            sanitize_state_updater_patch(patch, &soul, "I tell her the truth.", "Aurora spoke.");
+
+        assert_eq!(
+            filtered
+                .world_patch
+                .as_ref()
+                .and_then(|patch| patch.time_elapsed.as_deref()),
+            None
+        );
+        assert_eq!(
+            filtered
+                .world_patch
+                .as_ref()
+                .and_then(|patch| patch.recent_event.as_deref()),
+            Some("Aurora spoke.")
+        );
+    }
+
+    #[test]
+    fn explicit_user_time_update_is_accepted() {
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"world_patch":{"time_elapsed":"Ten minutes later"}}"#,
+        )
+        .expect("valid patch");
+
+        let soul = new_default_soul("Aurora");
+        let filtered =
+            sanitize_state_updater_patch(patch, &soul, "I wait ten minutes.", "Aurora waits.");
+
+        assert_eq!(
+            filtered
+                .world_patch
+                .as_ref()
+                .and_then(|patch| patch.time_elapsed.as_deref()),
+            Some("Ten minutes later")
+        );
+    }
+
+    #[test]
+    fn state_updater_payload_is_compact_and_excludes_compiled_context() {
+        let mut soul = new_default_soul("Aurora");
+        soul.world.location = "Apartment hallway".into();
+        soul.world.time_elapsed = "Session startLate evening, just after midnight.".into();
+        soul.world.active_plots = vec!["Establish the first scene".into()];
+        soul.world.recent_events = vec![
+            "Old unrelated cohabitation discussion from another session.".into(),
+            "Forced entry began at Aurora's apartment door.".into(),
+        ];
+        let payload = build_compact_updater_payload_for_test(
+            &soul,
+            "Police force the door with a warrant.",
+            "Aurora backs away from the forced entry.",
+        );
+
+        assert!(payload.contains("[CURRENT STATE]"));
+        assert!(payload.contains("[LATEST USER MESSAGE]"));
+        assert!(payload.contains("[NARRATOR RESPONSE]"));
+        assert!(payload.contains("Patch schema"));
+        assert!(!payload.contains("[COMPILED CONTEXT]"));
+        assert!(!payload.contains("[WORLD SNAPSHOT]"));
+        assert!(!payload.contains("Old unrelated cohabitation"));
+        assert!(estimate_tokens(&payload) < 1_200);
+        assert!(payload.contains("Time: Late evening, just after midnight."));
+    }
+
+    #[test]
+    fn threat_emergency_scene_suppresses_arousal_increase() {
+        let soul = new_default_soul("Aurora");
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"body_patch":{"activation_delta":25.0,"peak_allowed":true}}"#,
+        )
+        .expect("valid patch");
+
+        let filtered = sanitize_state_updater_patch(
+            patch,
+            &soul,
+            "An armed raid hits the apartment.",
+            "Aurora is restrained while an explosion shakes the hallway.",
+        );
+
+        let body = filtered.body_patch.expect("body patch remains");
+        assert_eq!(body.activation_delta, Some(0.0));
+        assert_eq!(body.peak_allowed, Some(false));
+    }
+
+    #[test]
+    fn explicit_non_threat_intimacy_allows_arousal_update() {
+        let soul = new_default_soul("Aurora");
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"body_patch":{"activation_delta":12.0}}"#,
+        )
+        .expect("valid patch");
+
+        let filtered = sanitize_state_updater_patch(
+            patch,
+            &soul,
+            "In a consensual intimate moment, I kiss her gently.",
+            "Aurora leans into the kiss.",
+        );
+
+        assert_eq!(
+            filtered
+                .body_patch
+                .as_ref()
+                .and_then(|body| body.activation_delta),
+            Some(12.0)
+        );
+    }
+
+    #[test]
+    fn active_plot_replaces_default_after_major_shift() {
+        let mut soul = new_default_soul("Aurora");
+        soul.world.active_plots = vec!["Establish the first scene".into()];
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"world_patch":{"recent_event":"Police forced entry with a warrant."}}"#,
+        )
+        .expect("valid patch");
+
+        let filtered = sanitize_state_updater_patch(
+            patch,
+            &soul,
+            "Police force the door with a warrant.",
+            "Aurora retreats from the raid.",
+        );
+
+        let world = filtered.world_patch.expect("world patch");
+        assert!(world
+            .active_plot_add
+            .contains(&"Forced-entry police operation at Aurora's apartment".into()));
+        assert!(world
+            .active_plot_resolve
+            .iter()
+            .any(|plot| plot.contains("Establish the first scene")));
     }
 
     #[test]
@@ -1337,6 +2248,87 @@ mod tests {
     }
 
     #[test]
+    fn narrator_response_is_persisted_before_state_updater_result() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "dual-pass", &soul.character_id).expect("conversation");
+        db::insert_message_and_get_id(&conn, "dual-pass", "user", "The siren starts.")
+            .expect("user message");
+        let payload_log_id = db::insert_llm_payload_log(
+            &conn,
+            &LlmPayloadLog {
+                id: 0,
+                conversation_id: "dual-pass".into(),
+                message_id: None,
+                provider: "narrator_brief".into(),
+                mode: "Reader".into(),
+                context_mode: "brief".into(),
+                model: "narrator-model".into(),
+                base_url: "https://api.example/v1".into(),
+                system_message: "Narrator system".into(),
+                user_message: "The siren starts.".into(),
+                context_text: "Brief context".into(),
+                estimated_system_tokens: 3,
+                estimated_user_tokens: 3,
+                estimated_total_tokens: 6,
+                truncated: false,
+                created_at: 100,
+            },
+        )
+        .expect("payload log");
+
+        let (assistant_message_id, selected_variant_id) = save_visible_narrator_response(
+            &conn,
+            "dual-pass",
+            "Aurora snaps toward the window as the siren climbs.",
+            None,
+            None,
+            &serde_json::to_string(&soul).expect("soul json"),
+            "The siren starts.",
+            payload_log_id,
+        )
+        .expect("save narrator");
+        assert!(parse_engine_patch_json("not json").is_err());
+
+        let messages = db::list_messages(&conn, "dual-pass", 100).expect("messages");
+        let assistant = messages
+            .iter()
+            .find(|message| message.id == assistant_message_id)
+            .expect("assistant persisted");
+        assert_eq!(assistant.role, "assistant");
+        assert_eq!(
+            assistant.content,
+            "Aurora snaps toward the window as the siren climbs."
+        );
+        let exported = render_visible_chat_log(&messages);
+        assert!(exported.contains("## Narrator"));
+        assert!(exported.contains("Aurora snaps toward the window"));
+
+        let variants =
+            db::list_assistant_message_variants(&conn, "dual-pass", assistant_message_id)
+                .expect("variants");
+        assert_eq!(
+            variants
+                .iter()
+                .filter(|variant| variant.is_selected)
+                .count(),
+            1
+        );
+        assert_eq!(
+            variants
+                .iter()
+                .find(|variant| variant.is_selected)
+                .unwrap()
+                .id,
+            selected_variant_id
+        );
+
+        let logs = db::list_llm_payload_logs(&conn, "dual-pass").expect("logs");
+        assert_eq!(logs[0].message_id, Some(assistant_message_id));
+    }
+
+    #[test]
     fn visible_chat_export_strips_hidden_state() {
         let messages = vec![
             ChatMessage {
@@ -1376,6 +2368,7 @@ mod tests {
                 message_id: Some(10),
                 provider: "API".into(),
                 mode: "Reader".into(),
+                context_mode: "brief".into(),
                 model: "model-a".into(),
                 base_url: "https://api.example/v1".into(),
                 system_message: "System A with clothing context".into(),
@@ -1384,6 +2377,7 @@ mod tests {
                 estimated_system_tokens: 10,
                 estimated_user_tokens: 2,
                 estimated_total_tokens: 12,
+                truncated: false,
                 created_at: 100,
             },
             LlmPayloadLog {
@@ -1392,6 +2386,7 @@ mod tests {
                 message_id: Some(11),
                 provider: "API".into(),
                 mode: "God".into(),
+                context_mode: "brief".into(),
                 model: "model-b".into(),
                 base_url: "https://api.example/v1".into(),
                 system_message: "System B".into(),
@@ -1400,6 +2395,7 @@ mod tests {
                 estimated_system_tokens: 11,
                 estimated_user_tokens: 3,
                 estimated_total_tokens: 14,
+                truncated: false,
                 created_at: 101,
             },
         ];
@@ -1415,6 +2411,54 @@ mod tests {
         assert!(exported.contains("Context B"));
         assert!(!exported.contains("api_key"));
         assert!(!exported.contains("secret"));
+    }
+
+    #[test]
+    fn payload_history_labels_narrator_and_state_updater_sources() {
+        let logs = vec![
+            LlmPayloadLog {
+                id: 1,
+                conversation_id: "history".into(),
+                message_id: Some(10),
+                provider: "narrator_brief".into(),
+                mode: "Reader".into(),
+                context_mode: "brief".into(),
+                model: "model".into(),
+                base_url: "https://api.example/v1".into(),
+                system_message: "Narrator system".into(),
+                user_message: "User".into(),
+                context_text: "Context".into(),
+                estimated_system_tokens: 1,
+                estimated_user_tokens: 1,
+                estimated_total_tokens: 2,
+                truncated: false,
+                created_at: 100,
+            },
+            LlmPayloadLog {
+                id: 2,
+                conversation_id: "history".into(),
+                message_id: Some(10),
+                provider: "state_updater".into(),
+                mode: "state_updater".into(),
+                context_mode: "brief".into(),
+                model: "model".into(),
+                base_url: "https://api.example/v1".into(),
+                system_message: "Updater system".into(),
+                user_message: "Latest turn".into(),
+                context_text: "Context".into(),
+                estimated_system_tokens: 1,
+                estimated_user_tokens: 1,
+                estimated_total_tokens: 2,
+                truncated: false,
+                created_at: 101,
+            },
+        ];
+
+        let exported = render_llm_payload_history(&logs);
+
+        assert!(exported.contains("Provider: narrator_brief"));
+        assert!(exported.contains("Provider: state_updater"));
+        assert!(exported.contains("Context mode: brief"));
     }
 
     #[test]

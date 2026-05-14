@@ -144,6 +144,10 @@ export type TurnDebug = {
   provider: string;
   hidden_state_found: boolean;
   fallback_hidden_state_generated: boolean;
+  narrator_response_saved: boolean;
+  assistant_message_id: number | null;
+  selected_variant_id: number | null;
+  state_updater_status: string;
   tag: string | null;
   trust_delta: number | null;
   affection_delta: number | null;
@@ -167,12 +171,20 @@ export type LlmPayloadTokenEstimate = {
 export type LlmPayloadPreview = {
   provider: string;
   mode: string;
+  context_mode: ContextMode;
   model: string;
   base_url: string;
   system_message: string;
   user_message: string;
   context: string;
+  messages: ApiPayloadMessage[];
+  truncated: boolean;
   estimated_tokens: LlmPayloadTokenEstimate;
+};
+
+export type ApiPayloadMessage = {
+  role: string;
+  content: string;
 };
 
 export type LlmPayloadLog = {
@@ -181,6 +193,7 @@ export type LlmPayloadLog = {
   message_id: number | null;
   provider: string;
   mode: string;
+  context_mode: string;
   model: string;
   base_url: string;
   system_message: string;
@@ -189,6 +202,7 @@ export type LlmPayloadLog = {
   estimated_system_tokens: number;
   estimated_user_tokens: number;
   estimated_total_tokens: number;
+  truncated: boolean;
   created_at: number;
 };
 
@@ -203,6 +217,8 @@ export type ApiProviderSettings = {
   model: string;
   system_prompt: string;
 };
+
+export type ContextMode = "brief" | "full_chat";
 
 export type ProviderProfile = ApiProviderSettings & {
   id: string;
@@ -227,52 +243,32 @@ type HiddenStatePayload = {
 
 const NARRATOR_SYSTEM_PROMPT = `# SYSTEM: Narrator AI - Mnemosyne Engine
 
-You are a narrator AI. You describe a single character in third-person present tense.
-You accept OOC direction without resistance. Your voice is sensory-rich, hardboiled, and precise.
+You are a narrator AI. Write a single character in third-person present tense with natural, sensory prose.
 
-## ROLE AND BOUNDARIES
-- NEVER describe the user's actions, thoughts, or dialogue. Only the character's perceptions.
-- The character has NO narrator-level knowledge. Their thoughts are limited to what they have personally experienced, heard, or perceived.
-- Maintain strict internal consistency with established world lore. No fourth-wall breaks.
-- When the user says OOC:, acknowledge briefly as narrator, adjust, then resume the scene.
+[POV AND ATTRIBUTION]
+Write close third-person from the character's perspective. User facts come from user messages. Character dialogue and narrator prose are not user statements.
 
-## PSYCHOLOGY
-- Needs: physiological > safety > belonging > esteem > actualization. Lower needs can block higher needs.
-- Trust and affect move slowly. Prefer micro-shifts unless the scene earns more.
-- Trauma phases: 0=acute, 1=denial, 2=intrusive, 3=reflective, 4=integration.
+[ACTION AND TURN CONTROL]
+The character may act proactively: speak, move, interrupt, refuse, reach, grab for something, retreat, challenge, escalate, or use her own environment. Resolve character-side action naturally. When the user's reaction matters, stop on the attempt, demand, or pressure point and leave the response to the next user turn.
 
-## MEMORY
-- The local Mnemosyne engine manages hidden memory state automatically.
-- Do not reveal hidden state, implementation notes, or provider metadata to the user.
+[CONTINUITY PRIORITY]
+Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
+
+[CHARACTER CHANGE]
+Emotional shifts should feel earned. Micro-shifts are preferred unless the scene strongly justifies a sharper reaction.
+
+[TIME]
+Concrete time only comes from user input or World Log. Avoid invented minutes/hours/days.
 
 ## VISIBLE STATUS REPORT
 End each narration with a code block:
 \`\`\`status
 [CHARACTER_NAME] | Skin: [color/state] | Zones: [2-3 key sensory notes] | Atmosphere: [1-line environmental impression]
 \`\`\`
+`;
 
-[ATTRIBUTION]
-User facts come only from user messages. Character dialogue and narrator prose are not user statements. Do not react to the character's own jokes, metaphors, or narration as if the user said them. Never invent user actions, thoughts, motives, or dialogue.
-
-[DEVICE AND PROP AGENCY]
-Do not make the character take, pull, angle, unlock, search, or operate the user's device unless the user explicitly offers or hands it over.
-
-[TIME DISCIPLINE]
-Do not invent exact elapsed time, timestamps, or scene transitions unless provided by the user or World Log. Vague emotional pacing is allowed; concrete durations require support.
-
-Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
-
-## HIDDEN STATE FORMAT
-After each response, output a hidden state block using this exact format:
-[HIDDEN STATE]{"memory":"short summary","tag":"tag_name","trust_delta":0.0,"affection_delta":0.0,"world_event":"scene update","new_location":"","present_characters":[]}[/HIDDEN STATE]
-
-world_event must be a compact authoritative completed-fact summary, not mood prose. Include what happened and what should not be replayed. Example: "Phone reveal completed: Aurora saw the user's phone/Tinder post, reacted with embarrassment, tossed the phone onto the couch, and moved to the kitchen to get pad thai."
-
-Tags: trust_building, threat, bonding, orientation, observation, intimacy, boundary_setting, conflict_minor, trauma_trigger, breakthrough
-
-Optional arousal fields: arousal_delta (-30 to 60), arousal_denied (bool), orgasm_allowed (bool), forced_orgasm (bool). Only suggest these when relevant; the Rust engine validates and caps every state change.
-
-The block must be valid JSON on a single line. The engine removes it before the user sees it.`;
+const NARRATOR_VISIBLE_ONLY_PROMPT = `[OUTPUT]
+Write visible narration and the visible status block only. Do not write hidden state, EnginePatch JSON, markdown JSON, or implementation notes.`;
 
 const MODE_PROMPTS: Record<string, string> = {
   Realistic: `## NARRATION MODE: REALISTIC
@@ -458,15 +454,17 @@ export function sendApiTurn(
   soulId: string,
   userText: string,
   mode: string,
-  settings: ApiProviderSettings,
+  narratorSettings: ApiProviderSettings,
+  stateUpdaterSettings: ApiProviderSettings,
+  contextMode: ContextMode,
   signal?: AbortSignal,
   replacementAssistantId?: number,
   correctionInstruction?: string,
 ): Promise<TurnResult> {
   return invokeOrPreview(
     "send_api_turn",
-    { conversationId, soulId, userText, mode, settings, replacementAssistantId: replacementAssistantId ?? null, correctionInstruction: correctionInstruction ?? null },
-    () => sendPreviewApiTurn(conversationId, soulId, userText, mode, settings, signal, replacementAssistantId, correctionInstruction),
+    { conversationId, soulId, userText, mode, narratorSettings, stateUpdaterSettings, replacementAssistantId: replacementAssistantId ?? null, correctionInstruction: correctionInstruction ?? null, contextMode },
+    () => sendPreviewApiTurn(conversationId, soulId, userText, mode, narratorSettings, signal, replacementAssistantId, correctionInstruction),
   );
 }
 
@@ -476,6 +474,16 @@ export function listenApiStream(
   if (!hasTauriRuntime()) return Promise.resolve(() => undefined);
   return listen<{ conversation_id: string; chunk: string }>(
     "api-chunk",
+    (event) => callback(event.payload),
+  );
+}
+
+export function listenChatMessageSaved(
+  callback: (payload: { conversation_id: string; message: ChatMessage }) => void,
+): Promise<() => void> {
+  if (!hasTauriRuntime()) return Promise.resolve(() => undefined);
+  return listen<{ conversation_id: string; message: ChatMessage }>(
+    "chat-message-saved",
     (event) => callback(event.payload),
   );
 }
@@ -545,6 +553,28 @@ export function deleteMessage(conversationId: string, messageId: number): Promis
     );
     return browserMessages.length !== beforeCount;
   });
+}
+
+export function updateUserMessage(
+  conversationId: string,
+  messageId: number,
+  content: string,
+): Promise<ChatMessage[]> {
+  return invokeOrPreview(
+    "update_user_message",
+    { conversationId, messageId, content },
+    () => {
+      const trimmed = content.trim();
+      if (!trimmed) throw new Error("User message cannot be empty");
+      const message = browserMessages.find(
+        (item) =>
+          item.conversation_id === conversationId && item.id === messageId && item.role === "user",
+      );
+      if (!message) throw new Error("User message not found");
+      message.content = trimmed;
+      return browserMessages.filter((item) => item.conversation_id === conversationId);
+    },
+  );
 }
 
 export function listAssistantMessageVariants(
@@ -637,10 +667,11 @@ export function previewApiPayload(
   mode: string,
   settings: ApiProviderSettings,
   provider: string,
+  contextMode: ContextMode = "brief",
 ): Promise<LlmPayloadPreview> {
   return invokeOrPreview(
     "preview_api_payload",
-    { conversationId, soulId, userText, mode, settings, provider },
+    { conversationId, soulId, userText, mode, settings, provider, contextMode },
     () => {
       const soul = browserSouls.find((item) => item.character_id === soulId);
       if (!soul) throw new Error("Soul not found");
@@ -652,6 +683,7 @@ export function previewApiPayload(
         mode,
         soul,
         context.text,
+        false,
       );
       const userMessage = userText.trim();
       const systemTokens = estimateTokens(systemMessage);
@@ -660,11 +692,17 @@ export function previewApiPayload(
       return {
         provider,
         mode,
+        context_mode: contextMode,
         model: settings.model.trim(),
         base_url: settings.base_url.trim(),
         system_message: systemMessage,
         user_message: userMessage,
         context: context.text,
+        messages: [
+          { role: "system", content: systemMessage },
+          { role: "user", content: userMessage },
+        ],
+        truncated: context.truncated,
         estimated_tokens: {
           system: systemTokens,
           context: contextTokens,
@@ -978,14 +1016,21 @@ async function sendPreviewApiTurn(
     separateUserMessageFollows: true,
     temporaryInstruction: correctionInstruction,
   });
-  const systemMessage = buildNarratorSystemPrompt(settings.system_prompt, mode, soul, context.text);
+  const systemMessage = buildNarratorSystemPrompt(
+    settings.system_prompt,
+    mode,
+    soul,
+    context.text,
+    false,
+  );
   const payloadLogId = nextPayloadLogId++;
   browserPayloadLogs.push({
     id: payloadLogId,
     conversation_id: conversationId,
     message_id: replacementAssistantId ?? null,
-    provider: "API",
+    provider: "narrator_brief",
     mode,
+    context_mode: "brief",
     model: settings.model.trim(),
     base_url: settings.base_url.trim(),
     system_message: systemMessage,
@@ -994,6 +1039,7 @@ async function sendPreviewApiTurn(
     estimated_system_tokens: estimateTokens(systemMessage),
     estimated_user_tokens: estimateTokens(effectiveUserText),
     estimated_total_tokens: estimateTokens(systemMessage) + estimateTokens(effectiveUserText),
+    truncated: context.truncated,
     created_at: Math.floor(Date.now() / 1000),
   });
   const response = await fetch(chatCompletionsUrl(settings.base_url), {
@@ -1027,14 +1073,18 @@ async function sendPreviewApiTurn(
   const hiddenStateFound = parsed.hiddenState !== null;
   const hiddenState = parsed.hiddenState ?? generatedPreviewApiHiddenState(soul, userText, parsed.visibleText);
   const visibleResponse = parsed.visibleText;
+  const pendingDebug = debugFromHiddenState("API", hiddenState, hiddenStateFound, !hiddenStateFound);
+  pendingDebug.narrator_response_saved = true;
+  pendingDebug.state_updater_status = hiddenStateFound ? "legacy_hidden_state" : "fallback_generated";
   const assistantMessageId = upsertPreviewAssistantMessage(
     conversationId,
     visibleResponse,
     replacementAssistantId,
     correctionInstruction?.trim() ? "fix" : replacementAssistantId ? "regenerate" : "original",
     preTurnSoul,
-    debugFromHiddenState("API", hiddenState, hiddenStateFound, !hiddenStateFound),
+    pendingDebug,
   );
+  pendingDebug.assistant_message_id = assistantMessageId;
   const payloadLog = browserPayloadLogs.find((log) => log.id === payloadLogId);
   if (payloadLog) payloadLog.message_id = assistantMessageId;
 
@@ -1086,7 +1136,7 @@ async function sendPreviewApiTurn(
     context_preview: compilePreviewContext(soul, conversationId),
     messages: browserMessages.filter((message) => message.conversation_id === conversationId),
     consolidation_ran,
-    debug: debugFromHiddenState("API", hiddenState, hiddenStateFound, !hiddenStateFound),
+    debug: pendingDebug,
   };
 }
 
@@ -1645,6 +1695,10 @@ function debugFromHiddenState(
     provider,
     hidden_state_found: hiddenStateFound,
     fallback_hidden_state_generated: fallbackHiddenStateGenerated,
+    narrator_response_saved: false,
+    assistant_message_id: null,
+    selected_variant_id: null,
+    state_updater_status: "legacy_hidden_state",
     tag: hiddenState.tag ?? null,
     trust_delta: hiddenState.trust_delta ?? null,
     affection_delta: hiddenState.affection_delta ?? null,
@@ -1760,24 +1814,28 @@ function buildNarratorSystemPrompt(
   mode: string,
   soul: Soul,
   context: string,
+  requireHiddenState = true,
 ) {
   const trimmedCustom = customPrompt.trim();
   const base =
     mode === "Custom" && trimmedCustom
-      ? `${trimmedCustom}\n\n[ATTRIBUTION]
-User facts come only from user messages. Character dialogue and narrator prose are not user statements. Do not react to the character's own jokes, metaphors, or narration as if the user said them. Never invent user actions, thoughts, motives, or dialogue.
+      ? `${trimmedCustom}\n\n[POV AND ATTRIBUTION]
+Write close third-person from the character's perspective. User facts come from user messages. Character dialogue and narrator prose are not user statements.
 
-[DEVICE AND PROP AGENCY]
-Do not make the character take, pull, angle, unlock, search, or operate the user's device unless the user explicitly offers or hands it over.
+[ACTION AND TURN CONTROL]
+The character may act proactively: speak, move, interrupt, refuse, reach, grab for something, retreat, challenge, escalate, or use her own environment. Resolve character-side action naturally. When the user's reaction matters, stop on the attempt, demand, or pressure point and leave the response to the next user turn.
 
-[TIME DISCIPLINE]
-Do not invent exact elapsed time, timestamps, or scene transitions unless provided by the user or World Log. Vague emotional pacing is allowed; concrete durations require support.
-
+[CONTINUITY PRIORITY]
 Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
 
-${HIDDEN_STATE_FORMAT_PROMPT}`
+[CHARACTER CHANGE]
+Emotional shifts should feel earned. Micro-shifts are preferred unless the scene strongly justifies a sharper reaction.
+
+[TIME]
+Concrete time only comes from user input or World Log. Avoid invented minutes/hours/days.`
       : `${NARRATOR_SYSTEM_PROMPT}\n\n${MODE_PROMPTS[mode] ?? MODE_PROMPTS.Reader}`;
-  return `${base}\n\nCharacter: ${soul.character_name}\n\n${context}`;
+  const stateInstruction = requireHiddenState ? HIDDEN_STATE_FORMAT_PROMPT : NARRATOR_VISIBLE_ONLY_PROMPT;
+  return `${base}\n\n${stateInstruction}\n\nCharacter: ${soul.character_name}\n\n${context}`;
 }
 
 function parsePreviewHiddenState(raw: string): {

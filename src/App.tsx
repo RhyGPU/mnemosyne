@@ -7,6 +7,7 @@ import {
   FileDown,
   FileUp,
   MessageSquareText,
+  Pencil,
   Play,
   RefreshCcw,
   Save,
@@ -27,6 +28,7 @@ import {
   Soul,
   SoulSummary,
   TurnDebug,
+  ContextMode,
   compileContext,
   createDefaultSoul,
   createFreshScenarioSoul,
@@ -46,6 +48,7 @@ import {
   listSettings,
   listSouls,
   listenApiStream,
+  listenChatMessageSaved,
   previewApiPayload,
   runConsolidation,
   saveSettingFile,
@@ -53,6 +56,7 @@ import {
   selectAssistantMessageVariant,
   sendApiTurn,
   sendMockTurn,
+  updateUserMessage,
   upsertProviderProfile,
   upsertSetting,
   upsertSoul,
@@ -60,6 +64,9 @@ import {
 
 const DEFAULT_CONVERSATION_ID = "local-mock";
 const CONSOLIDATION_INTERVAL_TURNS = 10;
+const NARRATOR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:narrator_provider_profile_id";
+const UPDATER_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:state_updater_provider_profile_id";
+const USE_NARRATOR_FOR_UPDATER_STORAGE_KEY = "mnemosyne:use_narrator_provider_for_updater";
 type ProviderKind = "Mock" | "API";
 type NarrativeMode = "Realistic" | "Reader" | "God" | "Custom";
 type AppView = "library" | "chat";
@@ -180,10 +187,26 @@ export function App() {
   const [psycheOpen, setPsycheOpen] = useState(false);
   const [provider, setProvider] = useState<ProviderKind>("Mock");
   const [mode, setMode] = useState<NarrativeMode>("Reader");
+  const [contextMode, setContextMode] = useState<ContextMode>("brief");
   const [providerProfiles, setProviderProfiles] = useState<ProviderProfile[]>([]);
-  const [providerProfileName, setProviderProfileName] = useState("Default API");
-  const [selectedProviderProfileId, setSelectedProviderProfileId] = useState("");
+  const [narratorProviderProfileName, setNarratorProviderProfileName] = useState("Narrator API");
+  const [updaterProviderProfileName, setUpdaterProviderProfileName] = useState("Updater API");
+  const [selectedProviderProfileId, setSelectedProviderProfileId] = useState(() =>
+    localStorage.getItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY) ?? "",
+  );
+  const [selectedStateUpdaterProfileId, setSelectedStateUpdaterProfileId] = useState(() =>
+    localStorage.getItem(UPDATER_PROVIDER_PROFILE_STORAGE_KEY) ?? "",
+  );
+  const [useNarratorProviderForUpdater, setUseNarratorProviderForUpdater] = useState(
+    () => localStorage.getItem(USE_NARRATOR_FOR_UPDATER_STORAGE_KEY) !== "false",
+  );
   const [apiSettings, setApiSettings] = useState<ApiProviderSettings>({
+    base_url: "https://api.openai.com/v1",
+    api_key: "",
+    model: "",
+    system_prompt: "",
+  });
+  const [stateUpdaterSettings, setStateUpdaterSettings] = useState<ApiProviderSettings>({
     base_url: "https://api.openai.com/v1",
     api_key: "",
     model: "",
@@ -217,6 +240,21 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    localStorage.setItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY, selectedProviderProfileId);
+  }, [selectedProviderProfileId]);
+
+  useEffect(() => {
+    localStorage.setItem(UPDATER_PROVIDER_PROFILE_STORAGE_KEY, selectedStateUpdaterProfileId);
+  }, [selectedStateUpdaterProfileId]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      USE_NARRATOR_FOR_UPDATER_STORAGE_KEY,
+      useNarratorProviderForUpdater ? "true" : "false",
+    );
+  }, [useNarratorProviderForUpdater]);
+
+  useEffect(() => {
     if (!soul) return;
     void refreshContext(soul.character_id, currentConversationId);
   }, [soul?.character_id, currentConversationId, messages.length]);
@@ -243,6 +281,9 @@ export function App() {
     apiSettings.base_url,
     apiSettings.model,
     apiSettings.system_prompt,
+    stateUpdaterSettings.base_url,
+    stateUpdaterSettings.model,
+    contextMode,
   ]);
 
   useEffect(() => {
@@ -250,6 +291,21 @@ export function App() {
     void listenApiStream((payload) => {
       if (payload.conversation_id !== currentConversationId) return;
       setMessages((current) => appendStreamingChunk(current, payload.conversation_id, payload.chunk));
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [currentConversationId]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listenChatMessageSaved((payload) => {
+      if (payload.conversation_id !== currentConversationId) return;
+      setMessages((current) => upsertSavedChatMessage(current, payload.message));
+      setStatus("Narrator response saved; updating state");
     }).then((cleanup) => {
       unlisten = cleanup;
     });
@@ -277,6 +333,26 @@ export function App() {
   function updatePsyche(update: (current: PsycheDraft) => PsycheDraft) {
     setPsychePreset("Custom");
     setPsyche((current) => update(current));
+  }
+
+  function applyNarratorProviderProfile(profile: ProviderProfile) {
+    setNarratorProviderProfileName(profile.name);
+    setApiSettings({
+      base_url: profile.base_url,
+      api_key: profile.api_key,
+      model: profile.model,
+      system_prompt: profile.system_prompt,
+    });
+  }
+
+  function applyStateUpdaterProviderProfile(profile: ProviderProfile) {
+    setUpdaterProviderProfileName(profile.name);
+    setStateUpdaterSettings({
+      base_url: profile.base_url,
+      api_key: profile.api_key,
+      model: profile.model,
+      system_prompt: profile.system_prompt,
+    });
   }
 
   function handlePresetChange(nextPreset: PsychePresetName) {
@@ -405,15 +481,18 @@ export function App() {
     setSettings(existingSettings);
     setProviderProfiles(existingProviderProfiles);
     if (existingProviderProfiles.length > 0) {
-      const profile = existingProviderProfiles[0];
-      setSelectedProviderProfileId(profile.id);
-      setProviderProfileName(profile.name);
-      setApiSettings({
-        base_url: profile.base_url,
-        api_key: profile.api_key,
-        model: profile.model,
-        system_prompt: profile.system_prompt,
-      });
+      const savedNarratorId = localStorage.getItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY) ?? "";
+      const savedUpdaterId = localStorage.getItem(UPDATER_PROVIDER_PROFILE_STORAGE_KEY) ?? "";
+      const narratorProfile =
+        existingProviderProfiles.find((profile) => profile.id === savedNarratorId) ??
+        existingProviderProfiles[0];
+      const updaterProfile = existingProviderProfiles.find((profile) => profile.id === savedUpdaterId);
+      setSelectedProviderProfileId(narratorProfile.id);
+      applyNarratorProviderProfile(narratorProfile);
+      if (updaterProfile) {
+        setSelectedStateUpdaterProfileId(updaterProfile.id);
+        applyStateUpdaterProviderProfile(updaterProfile);
+      }
     }
 
     let activeSetting: SettingSoul;
@@ -480,6 +559,7 @@ export function App() {
         mode,
         apiSettings,
         provider,
+        contextMode,
       );
       setLlmPayload(preview);
     } catch {
@@ -607,6 +687,8 @@ export function App() {
               text,
               mode,
               apiSettings,
+              useNarratorProviderForUpdater ? apiSettings : stateUpdaterSettings,
+              contextMode,
               abortController.signal,
               replacementAssistantId,
               correctionInstruction,
@@ -821,6 +903,31 @@ export function App() {
     }
   }
 
+  async function handleEditUserMessage(message: ChatMessage) {
+    if (busy || message.role !== "user") return;
+    const nextContent = window.prompt(
+      "Edit user message. Soul memory and later responses are not rewound.",
+      message.content,
+    );
+    if (nextContent === null) return;
+    const trimmed = nextContent.trim();
+    if (!trimmed || trimmed === message.content) return;
+
+    setBusy(true);
+    try {
+      const nextMessages = await updateUserMessage(message.conversation_id, message.id, trimmed);
+      setMessages(nextMessages);
+      if (soul) {
+        setContext(await compileContext(soul.character_id, message.conversation_id));
+      }
+      setStatus("User message edited");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleSelectVariant(message: ChatMessage, direction: -1 | 1) {
     if (busy || message.role !== "assistant") return;
     const variants = variantsByMessage[message.id] ?? [];
@@ -978,19 +1085,21 @@ export function App() {
     setSelectedProviderProfileId(profileId);
     const profile = providerProfiles.find((item) => item.id === profileId);
     if (!profile) return;
-    setProviderProfileName(profile.name);
-    setApiSettings({
-      base_url: profile.base_url,
-      api_key: profile.api_key,
-      model: profile.model,
-      system_prompt: profile.system_prompt,
-    });
-    setStatus(`Loaded provider profile ${profile.name}`);
+    applyNarratorProviderProfile(profile);
+    setStatus(`Loaded narrator profile ${profile.name}`);
   }
 
-  async function handleSaveProviderProfile() {
+  async function handleSelectStateUpdaterProfile(profileId: string) {
+    setSelectedStateUpdaterProfileId(profileId);
+    const profile = providerProfiles.find((item) => item.id === profileId);
+    if (!profile) return;
+    applyStateUpdaterProviderProfile(profile);
+    setStatus(`Loaded state updater profile ${profile.name}`);
+  }
+
+  async function handleSaveNarratorProviderProfile() {
     if (busy) return;
-    const trimmedName = providerProfileName.trim() || "API Profile";
+    const trimmedName = narratorProviderProfileName.trim() || "Narrator API";
     const profile: ProviderProfile = {
       id: selectedProviderProfileId || crypto.randomUUID(),
       name: trimmedName,
@@ -1004,22 +1113,59 @@ export function App() {
     try {
       const saved = await upsertProviderProfile(profile);
       setSelectedProviderProfileId(saved.id);
-      setProviderProfileName(saved.name);
+      setNarratorProviderProfileName(saved.name);
       setProviderProfiles(await listProviderProfiles());
-      setStatus(`Saved provider profile ${saved.name}`);
+      setStatus(`Saved narrator profile ${saved.name}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     }
   }
 
-  async function handleDeleteProviderProfile() {
+  async function handleSaveStateUpdaterProviderProfile() {
+    if (busy) return;
+    const trimmedName = updaterProviderProfileName.trim() || "Updater API";
+    const profile: ProviderProfile = {
+      id: selectedStateUpdaterProfileId || crypto.randomUUID(),
+      name: trimmedName,
+      base_url: stateUpdaterSettings.base_url,
+      api_key: stateUpdaterSettings.api_key,
+      model: stateUpdaterSettings.model,
+      system_prompt: stateUpdaterSettings.system_prompt,
+      created_at: 0,
+      updated_at: 0,
+    };
+    try {
+      const saved = await upsertProviderProfile(profile);
+      setSelectedStateUpdaterProfileId(saved.id);
+      setUpdaterProviderProfileName(saved.name);
+      setProviderProfiles(await listProviderProfiles());
+      setStatus(`Saved state updater profile ${saved.name}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleDeleteNarratorProviderProfile() {
     if (busy || !selectedProviderProfileId) return;
     try {
       await deleteProviderProfile(selectedProviderProfileId);
       setSelectedProviderProfileId("");
-      setProviderProfileName("Default API");
+      setNarratorProviderProfileName("Narrator API");
       setProviderProfiles(await listProviderProfiles());
-      setStatus("Provider profile deleted");
+      setStatus("Narrator profile deleted");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleDeleteStateUpdaterProviderProfile() {
+    if (busy || !selectedStateUpdaterProfileId) return;
+    try {
+      await deleteProviderProfile(selectedStateUpdaterProfileId);
+      setSelectedStateUpdaterProfileId("");
+      setUpdaterProviderProfileName("Updater API");
+      setProviderProfiles(await listProviderProfiles());
+      setStatus("State updater profile deleted");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     }
@@ -1145,7 +1291,7 @@ export function App() {
     return (
       <main className="chat-only-shell">
         <header className="chat-only-header">
-          <button className="ghost-action" onClick={() => setView("library")} disabled={busy}>
+          <button className="ghost-action" onClick={() => setView("library")}>
             <ArrowLeft size={18} />
             <span>Library</span>
           </button>
@@ -1230,6 +1376,13 @@ export function App() {
                       </div>
                     ) : (
                       <div className="message-tools">
+                        <button
+                          title="Edit this message"
+                          onClick={() => handleEditUserMessage(message)}
+                          disabled={busy}
+                        >
+                          <Pencil size={14} />
+                        </button>
                         <button
                           title="Delete this message"
                           onClick={() => handleDeleteChatMessage(message)}
@@ -1792,95 +1945,242 @@ export function App() {
               <option>Custom</option>
             </select>
           </label>
+          <label className="field">
+            <span>Context Mode</span>
+            <select
+              value={contextMode}
+              onChange={(event) => setContextMode(event.target.value as ContextMode)}
+              disabled={busy || provider !== "API"}
+            >
+              <option value="brief">Mnemosyne Brief</option>
+              <option value="full_chat">Full Chat</option>
+            </select>
+          </label>
           {provider === "API" ? (
             <>
-              <label className="field">
-                <span>Profile</span>
-                <select
-                  value={selectedProviderProfileId}
-                  onChange={(event) => handleSelectProviderProfile(event.target.value)}
-                  disabled={busy}
-                >
-                  <option value="">Unsaved profile</option>
-                  {providerProfiles.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="field">
-                <span>Profile Name</span>
-                <input
-                  value={providerProfileName}
-                  onChange={(event) => setProviderProfileName(event.target.value)}
-                  placeholder="OpenAI production"
-                  disabled={busy}
-                />
-              </label>
-              <label className="field">
-                <span>Base URL</span>
-                <input
-                  value={apiSettings.base_url}
-                  onChange={(event) =>
-                    setApiSettings((current) => ({ ...current, base_url: event.target.value }))
-                  }
-                  placeholder="https://api.openai.com/v1"
-                  disabled={busy}
-                />
-              </label>
-              <label className="field">
-                <span>Model</span>
-                <input
-                  value={apiSettings.model}
-                  onChange={(event) =>
-                    setApiSettings((current) => ({ ...current, model: event.target.value }))
-                  }
-                  placeholder="Model name"
-                  disabled={busy}
-                />
-              </label>
-              <label className="field">
-                <span>API Key</span>
-                <input
-                  type="password"
-                  value={apiSettings.api_key}
-                  onChange={(event) =>
-                    setApiSettings((current) => ({ ...current, api_key: event.target.value }))
-                  }
-                  placeholder="Stored only in this session"
-                  disabled={busy}
-                />
-              </label>
-              {mode === "Custom" ? (
-                <label className="field custom-prompt-field">
-                  <span>Custom Prompt</span>
-                  <textarea
-                    value={apiSettings.system_prompt}
-                    onChange={(event) =>
-                      setApiSettings((current) => ({
-                        ...current,
-                        system_prompt: event.target.value,
-                      }))
-                    }
+              <div className="provider-pass-card">
+                <div className="provider-pass-heading">
+                  <div>
+                    <h3>Narrator Provider</h3>
+                    <p>Narrator pass: writes visible RP response.</p>
+                  </div>
+                  <span className="provider-status-pill">{apiSettings.model || "No model"}</span>
+                </div>
+                <div className="provider-pass-grid">
+                  <label className="field">
+                    <span>Narrator Provider</span>
+                    <select
+                      value={selectedProviderProfileId}
+                      onChange={(event) => handleSelectProviderProfile(event.target.value)}
+                      disabled={busy}
+                    >
+                      <option value="">Unsaved narrator profile</option>
+                      {providerProfiles.map((profile) => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>Profile Name</span>
+                    <input
+                      value={narratorProviderProfileName}
+                      onChange={(event) => setNarratorProviderProfileName(event.target.value)}
+                      placeholder="Narrator API"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Base URL</span>
+                    <input
+                      value={apiSettings.base_url}
+                      onChange={(event) =>
+                        setApiSettings((current) => ({ ...current, base_url: event.target.value }))
+                      }
+                      placeholder="https://api.openai.com/v1"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Model</span>
+                    <input
+                      value={apiSettings.model}
+                      onChange={(event) =>
+                        setApiSettings((current) => ({ ...current, model: event.target.value }))
+                      }
+                      placeholder="Model name"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>API Key</span>
+                    <input
+                      type="password"
+                      value={apiSettings.api_key}
+                      onChange={(event) =>
+                        setApiSettings((current) => ({ ...current, api_key: event.target.value }))
+                      }
+                      placeholder="Stored locally with profile"
+                      disabled={busy}
+                    />
+                  </label>
+                  {mode === "Custom" ? (
+                    <label className="field custom-prompt-field">
+                      <span>Custom Prompt</span>
+                      <textarea
+                        value={apiSettings.system_prompt}
+                        onChange={(event) =>
+                          setApiSettings((current) => ({
+                            ...current,
+                            system_prompt: event.target.value,
+                          }))
+                        }
+                        disabled={busy}
+                      />
+                    </label>
+                  ) : null}
+                </div>
+                <div className="button-row">
+                  <button
+                    type="button"
+                    className="ghost-action"
+                    onClick={handleSaveNarratorProviderProfile}
+                    disabled={busy}
+                  >
+                    <Save size={16} />
+                    <span>Save Narrator Profile</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-action"
+                    onClick={handleDeleteNarratorProviderProfile}
+                    disabled={busy || !selectedProviderProfileId}
+                  >
+                    <Trash2 size={16} />
+                    <span>Delete</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="provider-pass-card">
+                <div className="provider-pass-heading">
+                  <div>
+                    <h3>State Updater Provider</h3>
+                    <p>State updater pass: updates Soul/World/Memory.</p>
+                  </div>
+                  <span className="provider-status-pill">
+                    {useNarratorProviderForUpdater
+                      ? "Using narrator provider"
+                      : stateUpdaterSettings.model || "No model"}
+                  </span>
+                </div>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={useNarratorProviderForUpdater}
+                    onChange={(event) => setUseNarratorProviderForUpdater(event.target.checked)}
                     disabled={busy}
                   />
+                  <span>Use narrator provider for state updater</span>
                 </label>
-              ) : null}
-              <div className="button-row">
-                <button type="button" className="ghost-action" onClick={handleSaveProviderProfile} disabled={busy}>
-                  <Save size={16} />
-                  <span>Save Profile</span>
-                </button>
-                <button
-                  type="button"
-                  className="ghost-action"
-                  onClick={handleDeleteProviderProfile}
-                  disabled={busy || !selectedProviderProfileId}
-                >
-                  <Trash2 size={16} />
-                  <span>Delete Profile</span>
-                </button>
+                {useNarratorProviderForUpdater ? (
+                  <p className="provider-note">
+                    Using narrator provider: {apiSettings.base_url || "No base URL"} / {apiSettings.model || "No model"}
+                  </p>
+                ) : (
+                  <>
+                    <div className="provider-pass-grid">
+                      <label className="field">
+                        <span>State Updater Provider</span>
+                        <select
+                          value={selectedStateUpdaterProfileId}
+                          onChange={(event) => handleSelectStateUpdaterProfile(event.target.value)}
+                          disabled={busy}
+                        >
+                          <option value="">Unsaved updater profile</option>
+                          {providerProfiles.map((profile) => (
+                            <option key={profile.id} value={profile.id}>
+                              {profile.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="field">
+                        <span>Profile Name</span>
+                        <input
+                          value={updaterProviderProfileName}
+                          onChange={(event) => setUpdaterProviderProfileName(event.target.value)}
+                          placeholder="Updater API"
+                          disabled={busy}
+                        />
+                      </label>
+                      <label className="field">
+                        <span>Base URL</span>
+                        <input
+                          value={stateUpdaterSettings.base_url}
+                          onChange={(event) =>
+                            setStateUpdaterSettings((current) => ({
+                              ...current,
+                              base_url: event.target.value,
+                            }))
+                          }
+                          placeholder="http://localhost:11434/v1"
+                          disabled={busy}
+                        />
+                      </label>
+                      <label className="field">
+                        <span>Model</span>
+                        <input
+                          value={stateUpdaterSettings.model}
+                          onChange={(event) =>
+                            setStateUpdaterSettings((current) => ({
+                              ...current,
+                              model: event.target.value,
+                            }))
+                          }
+                          placeholder="Cheaper/local model"
+                          disabled={busy}
+                        />
+                      </label>
+                      <label className="field">
+                        <span>API Key</span>
+                        <input
+                          type="password"
+                          value={stateUpdaterSettings.api_key}
+                          onChange={(event) =>
+                            setStateUpdaterSettings((current) => ({
+                              ...current,
+                              api_key: event.target.value,
+                            }))
+                          }
+                          placeholder="Stored locally with profile"
+                          disabled={busy}
+                        />
+                      </label>
+                    </div>
+                    <div className="button-row">
+                      <button
+                        type="button"
+                        className="ghost-action"
+                        onClick={handleSaveStateUpdaterProviderProfile}
+                        disabled={busy}
+                      >
+                        <Save size={16} />
+                        <span>Save Updater Profile</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-action"
+                        onClick={handleDeleteStateUpdaterProviderProfile}
+                        disabled={busy || !selectedStateUpdaterProfileId}
+                      >
+                        <Trash2 size={16} />
+                        <span>Delete</span>
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
             </>
           ) : null}
@@ -2331,6 +2631,14 @@ export function App() {
                 <dd>{lastTurnDebug?.fallback_hidden_state_generated ? "Generated" : "No"}</dd>
               </div>
               <div>
+                <dt>Narration</dt>
+                <dd>{lastTurnDebug?.narrator_response_saved ? "Saved" : "No turn"}</dd>
+              </div>
+              <div>
+                <dt>Updater</dt>
+                <dd>{lastTurnDebug?.state_updater_status ?? "-"}</dd>
+              </div>
+              <div>
                 <dt>Tag</dt>
                 <dd>{lastTurnDebug?.tag ?? "-"}</dd>
               </div>
@@ -2398,6 +2706,14 @@ export function App() {
                 <dd>{llmPayload?.mode ?? mode}</dd>
               </div>
               <div>
+                <dt>Context Mode</dt>
+                <dd>{llmPayload?.context_mode === "full_chat" ? "Full Chat" : "Mnemosyne Brief"}</dd>
+              </div>
+              <div>
+                <dt>Payload Trim</dt>
+                <dd>{llmPayload?.truncated ? "Trimmed" : "Within budget"}</dd>
+              </div>
+              <div>
                 <dt>Model</dt>
                 <dd>{llmPayload?.model || "-"}</dd>
               </div>
@@ -2426,6 +2742,12 @@ export function App() {
             <pre>{llmPayload?.system_message ?? "No LLM payload compiled yet."}</pre>
             <h3>Context, already included inside System Message</h3>
             <pre>{llmPayload?.context ?? "No context compiled yet."}</pre>
+            {llmPayload?.context_mode === "full_chat" ? (
+              <>
+                <h3>Full Chat Messages Sent</h3>
+                <pre>{llmPayload.messages.map((message) => `${message.role}: ${message.content}`).join("\n\n")}</pre>
+              </>
+            ) : null}
             <h3>Current User Message</h3>
             <pre>{llmPayload?.user_message || "No current user message."}</pre>
           </section>
@@ -2443,11 +2765,18 @@ export function App() {
 }
 
 function formatLlmPayloadDebugBlock(payload: LlmPayloadPreview) {
+  const chatMessages =
+    payload.context_mode === "full_chat"
+      ? `\n\n=== FULL CHAT MESSAGES SENT ===\n${payload.messages
+          .map((message) => `${message.role}: ${message.content}`)
+          .join("\n\n")}`
+      : "";
   return `=== SYSTEM MESSAGE ===
 ${payload.system_message}
 
 === CONTEXT, already included inside SYSTEM MESSAGE ===
 ${payload.context}
+${chatMessages}
 
 === USER MESSAGE ===
 ${payload.user_message}
@@ -2461,6 +2790,8 @@ Total: ${payload.estimated_tokens.total}
 === PROVIDER ===
 Provider: ${payload.provider}
 Mode: ${payload.mode}
+Context Mode: ${payload.context_mode}
+Truncated: ${payload.truncated}
 Model: ${payload.model || "-"}
 Base URL: ${payload.base_url || "-"}`;
 }
@@ -2549,6 +2880,35 @@ function appendStreamingChunk(messages: ChatMessage[], conversationId: string, c
     created_at: Math.floor(Date.now() / 1000),
   });
   return next;
+}
+
+function upsertSavedChatMessage(messages: ChatMessage[], savedMessage: ChatMessage) {
+  const existingIndex = messages.findIndex(
+    (message) =>
+      message.conversation_id === savedMessage.conversation_id && message.id === savedMessage.id,
+  );
+  if (existingIndex >= 0) {
+    const next = [...messages];
+    next[existingIndex] = savedMessage;
+    return next;
+  }
+
+  if (savedMessage.role === "assistant") {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (
+        message.conversation_id === savedMessage.conversation_id &&
+        message.role === "assistant" &&
+        message.id < 0
+      ) {
+        const next = [...messages];
+        next[index] = savedMessage;
+        return next;
+      }
+    }
+  }
+
+  return [...messages, savedMessage].sort((left, right) => left.id - right.id);
 }
 
 function normalizeAssistantDisplay(content: string) {

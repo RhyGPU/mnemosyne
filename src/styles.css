@@ -430,10 +430,74 @@ button:disabled {
 }
 
 .launcher-provider-strip {
-  grid-template-columns: repeat(5, minmax(140px, 1fr));
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
   border: 0;
   background: transparent;
   padding: 0;
+}
+
+.provider-pass-card {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid #e1dacb;
+  border-radius: 8px;
+  background: #fbf8ef;
+}
+
+.provider-pass-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.provider-pass-heading h3 {
+  margin: 0 0 4px;
+  font-size: 0.98rem;
+}
+
+.provider-pass-heading p,
+.provider-note {
+  margin: 0;
+  color: #66746b;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.provider-pass-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.provider-status-pill {
+  max-width: 220px;
+  padding: 5px 8px;
+  border: 1px solid #cfc6b6;
+  border-radius: 999px;
+  color: #33413a;
+  background: #fffdf8;
+  font-size: 0.76rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: #33413a;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.toggle-row input {
+  width: 16px;
+  height: 16px;
+  accent-color: #1d5e52;
 }
 
 .chat-panel:has(.session-strip .custom-prompt-field),
@@ -974,7 +1038,8 @@ button:disabled {
   }
 
   .form-grid,
-  .psyche-grid {
+  .psyche-grid,
+  .provider-pass-grid {
     grid-template-columns: 1fr;
   }
 

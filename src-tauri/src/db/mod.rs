@@ -53,6 +53,7 @@ pub struct LlmPayloadLog {
     pub message_id: Option<i64>,
     pub provider: String,
     pub mode: String,
+    pub context_mode: String,
     pub model: String,
     pub base_url: String,
     pub system_message: String,
@@ -61,6 +62,7 @@ pub struct LlmPayloadLog {
     pub estimated_system_tokens: usize,
     pub estimated_user_tokens: usize,
     pub estimated_total_tokens: usize,
+    pub truncated: bool,
     pub created_at: i64,
 }
 
@@ -182,6 +184,7 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             message_id INTEGER,
             provider TEXT NOT NULL,
             mode TEXT NOT NULL,
+            context_mode TEXT NOT NULL DEFAULT '',
             model TEXT NOT NULL,
             base_url TEXT NOT NULL,
             system_message TEXT NOT NULL,
@@ -190,12 +193,45 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             estimated_system_tokens INTEGER NOT NULL,
             estimated_user_tokens INTEGER NOT NULL,
             estimated_total_tokens INTEGER NOT NULL,
+            truncated INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
             FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
         );
         ",
-    )
+    )?;
+    add_column_if_missing(
+        conn,
+        "llm_payload_logs",
+        "context_mode",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "llm_payload_logs",
+        "truncated",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 pub fn now_ts() -> i64 {
@@ -389,6 +425,25 @@ pub fn update_message_content(
 ) -> rusqlite::Result<bool> {
     let affected = conn.execute(
         "UPDATE messages SET content = ?1 WHERE conversation_id = ?2 AND id = ?3 AND role = 'assistant'",
+        params![content, conversation_id, message_id],
+    )?;
+    if affected > 0 {
+        conn.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now_ts(), conversation_id],
+        )?;
+    }
+    Ok(affected > 0)
+}
+
+pub fn update_user_message_content(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: i64,
+    content: &str,
+) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE messages SET content = ?1 WHERE conversation_id = ?2 AND id = ?3 AND role = 'user'",
         params![content, conversation_id, message_id],
     )?;
     if affected > 0 {
@@ -601,14 +656,15 @@ pub fn insert_llm_payload_log(conn: &Connection, log: &LlmPayloadLog) -> rusqlit
     conn.execute(
         "
         INSERT INTO llm_payload_logs
-            (conversation_id, message_id, provider, mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            (conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         ",
         params![
             log.conversation_id,
             log.message_id,
             log.provider,
             log.mode,
+            log.context_mode,
             log.model,
             log.base_url,
             log.system_message,
@@ -617,6 +673,7 @@ pub fn insert_llm_payload_log(conn: &Connection, log: &LlmPayloadLog) -> rusqlit
             log.estimated_system_tokens as i64,
             log.estimated_user_tokens as i64,
             log.estimated_total_tokens as i64,
+            if log.truncated { 1 } else { 0 },
             log.created_at,
         ],
     )?;
@@ -641,7 +698,7 @@ pub fn list_llm_payload_logs(
 ) -> rusqlite::Result<Vec<LlmPayloadLog>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, message_id, provider, mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, created_at
+        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at
         FROM llm_payload_logs
         WHERE conversation_id = ?1
         ORDER BY id ASC
@@ -654,7 +711,7 @@ pub fn list_llm_payload_logs(
 pub fn get_llm_payload_log(conn: &Connection, log_id: i64) -> rusqlite::Result<LlmPayloadLog> {
     conn.query_row(
         "
-        SELECT id, conversation_id, message_id, provider, mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, created_at
+        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at
         FROM llm_payload_logs
         WHERE id = ?1
         ",
@@ -754,7 +811,7 @@ pub fn list_messages(
     rows.collect()
 }
 
-fn get_message(
+pub fn get_message(
     conn: &Connection,
     conversation_id: &str,
     message_id: i64,
@@ -838,24 +895,27 @@ fn variant_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssistantMessag
 }
 
 fn llm_payload_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmPayloadLog> {
-    let estimated_system_tokens: i64 = row.get(10)?;
-    let estimated_user_tokens: i64 = row.get(11)?;
-    let estimated_total_tokens: i64 = row.get(12)?;
+    let estimated_system_tokens: i64 = row.get(11)?;
+    let estimated_user_tokens: i64 = row.get(12)?;
+    let estimated_total_tokens: i64 = row.get(13)?;
+    let truncated: i64 = row.get(14)?;
     Ok(LlmPayloadLog {
         id: row.get(0)?,
         conversation_id: row.get(1)?,
         message_id: row.get(2)?,
         provider: row.get(3)?,
         mode: row.get(4)?,
-        model: row.get(5)?,
-        base_url: row.get(6)?,
-        system_message: row.get(7)?,
-        user_message: row.get(8)?,
-        context_text: row.get(9)?,
+        context_mode: row.get(5)?,
+        model: row.get(6)?,
+        base_url: row.get(7)?,
+        system_message: row.get(8)?,
+        user_message: row.get(9)?,
+        context_text: row.get(10)?,
         estimated_system_tokens: estimated_system_tokens.max(0) as usize,
         estimated_user_tokens: estimated_user_tokens.max(0) as usize,
         estimated_total_tokens: estimated_total_tokens.max(0) as usize,
-        created_at: row.get(13)?,
+        truncated: truncated != 0,
+        created_at: row.get(15)?,
     })
 }
 
@@ -1048,6 +1108,32 @@ mod tests {
     }
 
     #[test]
+    fn user_message_update_edits_user_rows_only() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+        ensure_conversation(&conn, "edit-user", &soul.character_id).expect("conversation");
+        let user_id = insert_message_and_get_id(&conn, "edit-user", "user", "Original user text")
+            .expect("user");
+        let assistant_id =
+            insert_message_and_get_id(&conn, "edit-user", "assistant", "Assistant text")
+                .expect("assistant");
+
+        assert!(
+            update_user_message_content(&conn, "edit-user", user_id, "Edited user text")
+                .expect("edit user")
+        );
+        assert!(
+            !update_user_message_content(&conn, "edit-user", assistant_id, "Wrong row")
+                .expect("ignore assistant")
+        );
+
+        let messages = list_messages(&conn, "edit-user", 10).expect("messages");
+        assert_eq!(messages[0].content, "Edited user text");
+        assert_eq!(messages[1].content, "Assistant text");
+    }
+
+    #[test]
     fn migration_creates_assistant_variants_table() {
         let conn = init_memory_connection().expect("db");
         let exists: i64 = conn
@@ -1092,6 +1178,7 @@ mod tests {
                 message_id: None,
                 provider: "API".into(),
                 mode: "Reader".into(),
+                context_mode: "brief".into(),
                 model: "debug-model".into(),
                 base_url: "https://api.example/v1".into(),
                 system_message: "System with context".into(),
@@ -1100,6 +1187,7 @@ mod tests {
                 estimated_system_tokens: 4,
                 estimated_user_tokens: 2,
                 estimated_total_tokens: 6,
+                truncated: false,
                 created_at: now_ts(),
             },
         )
