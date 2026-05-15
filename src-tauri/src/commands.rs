@@ -1,4 +1,11 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use rusqlite::Connection;
 use tauri::{AppHandle, Emitter, Manager, State, Window};
@@ -33,6 +40,7 @@ use crate::{
 const CONSOLIDATION_INTERVAL_TURNS: u64 = 10;
 const NO_LLM_PAYLOAD_LOGS_MESSAGE: &str = "No LLM payload logs found for this conversation.";
 const FULL_CHAT_TOKEN_BUDGET: usize = 6_000;
+static DEV_LOG_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, serde::Serialize)]
 pub struct TurnResult {
@@ -71,6 +79,16 @@ pub struct StreamChunk {
 pub struct SavedChatMessageEvent {
     pub conversation_id: String,
     pub message: ChatMessage,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct DevLogEvent {
+    pub id: String,
+    pub timestamp: i64,
+    pub level: String,
+    pub category: String,
+    pub message: String,
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -640,6 +658,19 @@ pub async fn send_api_turn(
     context_mode: Option<String>,
 ) -> Result<TurnResult, String> {
     let context_mode = ContextMode::from_label(context_mode.as_deref());
+    emit_dev_log(
+        &window,
+        "info",
+        "app",
+        "User message submitted",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "context_mode": context_mode.label(),
+            "mode": mode.as_str(),
+            "replacement_assistant_id": replacement_assistant_id,
+            "user_message_chars": user_text.chars().count()
+        })),
+    );
     let (mut soul, context_messages, context_preview, snapshot_user_text, pre_turn_soul_json) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         let (soul, snapshot_user_text) = if let Some(message_id) = replacement_assistant_id {
@@ -689,6 +720,19 @@ pub async fn send_api_turn(
             pre_turn_soul_json,
         )
     };
+    emit_dev_log(
+        &window,
+        "info",
+        "context",
+        "Narrator context compiled",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "context_mode": context_mode.label(),
+            "context_tokens": context_preview.estimated_tokens,
+            "context_truncated": context_preview.truncated,
+            "history_messages": context_messages.len()
+        })),
+    );
 
     let effective_user_text =
         build_user_text_with_correction(&snapshot_user_text, correction_instruction.as_deref());
@@ -703,6 +747,23 @@ pub async fn send_api_turn(
     );
     let provider = ApiProvider::default();
     let stream_conversation_id = conversation_id.clone();
+    let narrator_token_estimate =
+        estimate_tokens(&serialize_api_messages(&narrator_payload.messages));
+    emit_dev_log(
+        &window,
+        "info",
+        "narrator",
+        "Narrator call started",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "provider": format!("narrator_{}", context_mode.label()),
+            "model": narrator_settings.model.trim(),
+            "base_url": narrator_settings.base_url.trim(),
+            "context_mode": context_mode.label(),
+            "estimated_total_tokens": narrator_token_estimate,
+            "truncated": narrator_payload.truncated
+        })),
+    );
     let payload_log_id = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         db::insert_llm_payload_log(
@@ -740,11 +801,37 @@ pub async fn send_api_turn(
         )
         .map_err(|err| err.to_string())?
     };
-    let raw_response = provider
+    emit_dev_log(
+        &window,
+        "debug",
+        "db",
+        "Narrator payload log stored",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "payload_log_id": payload_log_id
+        })),
+    );
+    let stream_chunk_count = Arc::new(AtomicU64::new(0));
+    let stream_byte_count = Arc::new(AtomicU64::new(0));
+    let stream_chunk_count_for_callback = Arc::clone(&stream_chunk_count);
+    let stream_byte_count_for_callback = Arc::clone(&stream_byte_count);
+    emit_dev_log(
+        &window,
+        "info",
+        "stream",
+        "Narrator streaming started",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str()
+        })),
+    );
+    let raw_response = match provider
         .complete_streaming_messages(
             &narrator_settings,
             narrator_payload.messages.clone(),
             |chunk| {
+                stream_chunk_count_for_callback.fetch_add(1, Ordering::Relaxed);
+                stream_byte_count_for_callback
+                    .fetch_add(chunk.as_bytes().len() as u64, Ordering::Relaxed);
                 window
                     .emit(
                         "api-chunk",
@@ -756,10 +843,63 @@ pub async fn send_api_turn(
                     .map_err(|err| err.to_string())
             },
         )
-        .await?;
-    let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
+        .await
+    {
+        Ok(response) => {
+            emit_dev_log(
+                &window,
+                "success",
+                "stream",
+                "Narrator streaming finished",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "chunks": stream_chunk_count.load(Ordering::Relaxed),
+                    "bytes": stream_byte_count.load(Ordering::Relaxed)
+                })),
+            );
+            response
+        }
+        Err(err) => {
+            emit_dev_log(
+                &window,
+                "error",
+                "narrator",
+                "Narrator provider failed",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "error": err.clone()
+                })),
+            );
+            return Err(err);
+        }
+    };
+    let parsed = match parse_hidden_state(&raw_response) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            emit_dev_log(
+                &window,
+                "error",
+                "narrator",
+                "Narrator response parse failed",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "error": err.to_string()
+                })),
+            );
+            return Err(err.to_string());
+        }
+    };
     let visible_response = parsed.visible_text.clone();
     if visible_response.trim().is_empty() {
+        emit_dev_log(
+            &window,
+            "error",
+            "narrator",
+            "Narrator provider returned empty visible response",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str()
+            })),
+        );
         return Err("Narrator provider returned an empty visible response".into());
     }
 
@@ -800,10 +940,35 @@ pub async fn send_api_turn(
             Err(err) => eprintln!("Saved narrator message reload failed: {err}"),
         }
     }
+    emit_dev_log(
+        &window,
+        "success",
+        "narrator",
+        "Narrator response saved",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "assistant_message_id": assistant_message_id,
+            "selected_variant_id": selected_variant_id,
+            "visible_chars": visible_response.chars().count()
+        })),
+    );
 
     let updater_system_prompt = build_state_updater_prompt(&soul);
     let updater_user_message =
         build_state_updater_user_message(&snapshot_user_text, &visible_response);
+    emit_dev_log(
+        &window,
+        "info",
+        "state_updater",
+        "State updater started",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "assistant_message_id": assistant_message_id,
+            "model": state_updater_settings.model.trim(),
+            "base_url": state_updater_settings.base_url.trim(),
+            "estimated_total_tokens": estimate_tokens(&updater_system_prompt) + estimate_tokens(&updater_user_message)
+        })),
+    );
     let updater_log_id = match state
         .conn
         .lock()
@@ -838,6 +1003,17 @@ pub async fn send_api_turn(
             eprintln!(
                 "State updater payload logging failed; narration saved without updater log: {err}"
             );
+            emit_dev_log(
+                &window,
+                "warn",
+                "db",
+                "State updater payload log failed",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "assistant_message_id": assistant_message_id,
+                    "error": err.clone()
+                })),
+            );
             None
         }
     };
@@ -864,6 +1040,17 @@ pub async fn send_api_turn(
             }
             Err(err) => {
                 eprintln!("State updater failed; narration saved without state update: {err}");
+                emit_dev_log(
+                    &window,
+                    "error",
+                    "state_updater",
+                    "State updater failed; narration saved without state update",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "error": err.clone()
+                    })),
+                );
                 (
                     HiddenState::default(),
                     EnginePatch::default(),
@@ -884,7 +1071,33 @@ pub async fn send_api_turn(
     debug.selected_variant_id = selected_variant_id;
     debug.state_updater_status = state_updater_status;
 
-    let _ = engine_patch.apply_to_soul(&mut soul);
+    match engine_patch.apply_to_soul(&mut soul) {
+        Ok(report) => emit_dev_log(
+            &window,
+            "success",
+            "state_updater",
+            "EnginePatch applied",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "assistant_message_id": assistant_message_id,
+                "relationship_updated": report.relationship_updated,
+                "memories_added": report.memories_added,
+                "world_updated": report.world_updated,
+                "body_updated": report.body_updated
+            })),
+        ),
+        Err(err) => emit_dev_log(
+            &window,
+            "error",
+            "state_updater",
+            "EnginePatch skipped by validation",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "assistant_message_id": assistant_message_id,
+                "error": format!("{err:?}")
+            })),
+        ),
+    }
     soul.turn_counter += 1;
     soul.turns_since_consolidation += 1;
 
@@ -895,6 +1108,17 @@ pub async fn send_api_turn(
                 db::set_llm_payload_log_message_id(&conn, updater_log_id, assistant_message_id)
             {
                 eprintln!("State updater payload log link failed; narration remains saved: {err}");
+                emit_dev_log(
+                    &window,
+                    "warn",
+                    "db",
+                    "State updater payload log link failed",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "error": err.to_string()
+                    })),
+                );
             }
         }
 
@@ -911,6 +1135,19 @@ pub async fn send_api_turn(
 
         (messages, context_preview, consolidation_ran)
     };
+    emit_dev_log(
+        &window,
+        "success",
+        "success",
+        "Turn complete",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "assistant_message_id": assistant_message_id,
+            "state_updater_status": debug.state_updater_status,
+            "consolidation_ran": consolidation_ran,
+            "messages": messages.len()
+        })),
+    );
 
     Ok(TurnResult {
         conversation_id,
@@ -1009,6 +1246,54 @@ fn save_visible_narrator_response(
     }
 
     Ok((assistant_message_id, variant.id))
+}
+
+fn emit_dev_log(
+    window: &Window,
+    level: &str,
+    category: &str,
+    message: &str,
+    details: Option<serde_json::Value>,
+) {
+    let sequence = DEV_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let event = DevLogEvent {
+        id: format!("{}-{sequence}", db::now_ts()),
+        timestamp: db::now_ts(),
+        level: level.to_string(),
+        category: category.to_string(),
+        message: message.to_string(),
+        details: details.map(redact_dev_log_details),
+    };
+    if let Err(err) = window.emit("dev-log", event) {
+        eprintln!("Dev log emit failed: {err}");
+    }
+}
+
+fn redact_dev_log_details(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let lowered = key.to_ascii_lowercase();
+                    let redacted = lowered.contains("api_key")
+                        || lowered == "authorization"
+                        || lowered.contains("secret")
+                        || lowered == "token"
+                        || lowered.ends_with("_token")
+                        || lowered.contains("bearer");
+                    if redacted {
+                        (key, serde_json::Value::String("[redacted]".into()))
+                    } else {
+                        (key, redact_dev_log_details(value))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(redact_dev_log_details).collect())
+        }
+        other => other,
+    }
 }
 
 fn messages_to_context(messages: Vec<ChatMessage>) -> Vec<ContextMessage> {
@@ -1165,7 +1450,7 @@ fn sanitize_state_updater_patch(
                     .push("Establish the first scene".into());
                 world_patch
                     .active_plot_resolve
-                    .push("Establish the first scene – Aurora is alone, expecting company, or has just let someone in.".into());
+                    .push("Establish the first scene ??Aurora is alone, expecting company, or has just let someone in.".into());
                 world_patch.active_plot_add.push(plot.into());
             }
         }
@@ -2326,6 +2611,29 @@ mod tests {
 
         let logs = db::list_llm_payload_logs(&conn, "dual-pass").expect("logs");
         assert_eq!(logs[0].message_id, Some(assistant_message_id));
+    }
+
+    #[test]
+    fn dev_log_details_redact_secrets_but_keep_token_estimates() {
+        let details = serde_json::json!({
+            "api_key": "secret-key",
+            "authorization": "Bearer secret-token",
+            "estimated_total_tokens": 123,
+            "nested": {
+                "refresh_token": "hidden",
+                "model": "safe-model"
+            }
+        });
+
+        let redacted = redact_dev_log_details(details);
+        let serialized = redacted.to_string();
+
+        assert!(!serialized.contains("secret-key"));
+        assert!(!serialized.contains("secret-token"));
+        assert!(!serialized.contains("hidden"));
+        assert!(serialized.contains("estimated_total_tokens"));
+        assert!(serialized.contains("123"));
+        assert!(serialized.contains("safe-model"));
     }
 
     #[test]

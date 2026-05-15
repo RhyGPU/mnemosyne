@@ -112,6 +112,28 @@ export type ChatMessage = {
   created_at: number;
 };
 
+export type DevLogLevel = "info" | "warn" | "error" | "debug" | "success";
+export type DevLogCategory =
+  | "app"
+  | "db"
+  | "api"
+  | "narrator"
+  | "state_updater"
+  | "context"
+  | "stream"
+  | "error"
+  | "warning"
+  | "success";
+
+export type DevLogEntry = {
+  id: string;
+  timestamp: number;
+  level: DevLogLevel;
+  category: DevLogCategory;
+  message: string;
+  details?: Record<string, unknown> | null;
+};
+
 export type AssistantMessageVariant = {
   id: number | null;
   message_id: number;
@@ -486,6 +508,11 @@ export function listenChatMessageSaved(
     "chat-message-saved",
     (event) => callback(event.payload),
   );
+}
+
+export function listenDevLog(callback: (payload: DevLogEntry) => void): Promise<() => void> {
+  if (!hasTauriRuntime()) return Promise.resolve(() => undefined);
+  return listen<DevLogEntry>("dev-log", (event) => callback(event.payload));
 }
 
 export function listProviderProfiles(): Promise<ProviderProfile[]> {

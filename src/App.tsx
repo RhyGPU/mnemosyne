@@ -13,6 +13,7 @@ import {
   Save,
   Sparkles,
   Square,
+  Terminal,
   Trash2,
 } from "lucide-react";
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -21,6 +22,9 @@ import {
   AssistantMessageVariant,
   ChatMessage,
   ContextPreview,
+  DevLogCategory,
+  DevLogEntry,
+  DevLogLevel,
   LlmPayloadPreview,
   ProviderProfile,
   SettingSoul,
@@ -49,6 +53,7 @@ import {
   listSouls,
   listenApiStream,
   listenChatMessageSaved,
+  listenDevLog,
   previewApiPayload,
   runConsolidation,
   saveSettingFile,
@@ -67,10 +72,32 @@ const CONSOLIDATION_INTERVAL_TURNS = 10;
 const NARRATOR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:narrator_provider_profile_id";
 const UPDATER_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:state_updater_provider_profile_id";
 const USE_NARRATOR_FOR_UPDATER_STORAGE_KEY = "mnemosyne:use_narrator_provider_for_updater";
+const DEV_LOG_LIMIT = 1000;
+const DEV_LOG_CATEGORIES: DevLogCategory[] = [
+  "app",
+  "db",
+  "api",
+  "narrator",
+  "state_updater",
+  "context",
+  "stream",
+  "error",
+  "warning",
+  "success",
+];
+const DEV_LOG_LEVELS: DevLogLevel[] = ["info", "warn", "error", "debug", "success"];
 type ProviderKind = "Mock" | "API";
 type NarrativeMode = "Realistic" | "Reader" | "God" | "Custom";
 type AppView = "library" | "chat";
 type ChatStartMode = "continue" | "fresh";
+type ActiveGeneration = {
+  id: number;
+  conversationId: string;
+  narratorSaved: boolean;
+  knownAssistantIds: Set<number>;
+  replacementAssistantId?: number;
+  replacementOriginalContent?: string;
+};
 type PsychePresetName =
   | "Stranger"
   | "Traumatized Survivor"
@@ -219,12 +246,20 @@ export function App() {
   const [status, setStatus] = useState("Ready");
   const [payloadCopied, setPayloadCopied] = useState(false);
   const [exportFeedback, setExportFeedback] = useState("");
+  const [devConsoleOpen, setDevConsoleOpen] = useState(false);
+  const [devLogs, setDevLogs] = useState<DevLogEntry[]>([]);
+  const [devConsolePaused, setDevConsolePaused] = useState(false);
+  const [devLogLevelFilter, setDevLogLevelFilter] = useState<DevLogLevel | "all">("all");
+  const [devLogCategoryFilter, setDevLogCategoryFilter] = useState<DevLogCategory | "all">("all");
   const [busy, setBusy] = useState(false);
+  const [stateUpdating, setStateUpdating] = useState(false);
   const didBootstrap = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const settingImportInputRef = useRef<HTMLInputElement>(null);
   const generationAbortRef = useRef<AbortController | null>(null);
   const generationIdRef = useRef(0);
+  const activeGenerationRef = useRef<ActiveGeneration | null>(null);
+  const devConsoleBodyRef = useRef<HTMLDivElement>(null);
   const currentConversationId = useMemo(
     () =>
       soul && setting
@@ -232,12 +267,56 @@ export function App() {
         : DEFAULT_CONVERSATION_ID,
     [setting?.setting_id, soul?.character_id],
   );
+  const currentConversationIdRef = useRef(currentConversationId);
+
+  useEffect(() => {
+    currentConversationIdRef.current = currentConversationId;
+  }, [currentConversationId]);
+
+  function appendDevLog(entry: DevLogEntry) {
+    setDevLogs((current) => [...current, sanitizeDevLogEntry(entry)].slice(-DEV_LOG_LIMIT));
+  }
+
+  function logDev(
+    level: DevLogLevel,
+    category: DevLogCategory,
+    message: string,
+    details?: Record<string, unknown>,
+  ) {
+    appendDevLog(makeDevLogEntry(level, category, message, details));
+  }
+
+  function reportError(error: unknown, message = "Operation failed", category: DevLogCategory = "error") {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    setStatus(errorMessage);
+    logDev("error", category, message, { error: errorMessage });
+  }
 
   useEffect(() => {
     if (didBootstrap.current) return;
     didBootstrap.current = true;
     void bootstrap();
   }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listenDevLog((payload) => {
+      appendDevLog(payload);
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!devConsoleOpen || devConsolePaused) return;
+    const body = devConsoleBodyRef.current;
+    if (!body) return;
+    body.scrollTop = body.scrollHeight;
+  }, [devLogs, devConsoleOpen, devConsolePaused]);
 
   useEffect(() => {
     localStorage.setItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY, selectedProviderProfileId);
@@ -289,7 +368,10 @@ export function App() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listenApiStream((payload) => {
-      if (payload.conversation_id !== currentConversationId) return;
+      if (payload.conversation_id !== currentConversationIdRef.current) return;
+      const activeGeneration = activeGenerationRef.current;
+      if (!activeGeneration || activeGeneration.conversationId !== payload.conversation_id) return;
+      if (activeGeneration.narratorSaved) return;
       setMessages((current) => appendStreamingChunk(current, payload.conversation_id, payload.chunk));
     }).then((cleanup) => {
       unlisten = cleanup;
@@ -298,14 +380,25 @@ export function App() {
     return () => {
       unlisten?.();
     };
-  }, [currentConversationId]);
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listenChatMessageSaved((payload) => {
-      if (payload.conversation_id !== currentConversationId) return;
+      if (payload.conversation_id !== currentConversationIdRef.current) return;
       setMessages((current) => upsertSavedChatMessage(current, payload.message));
-      setStatus("Narrator response saved; updating state");
+      const activeGeneration = activeGenerationRef.current;
+      if (activeGeneration?.conversationId === payload.conversation_id) {
+        activeGeneration.narratorSaved = true;
+        setBusy(false);
+        setStateUpdating(true);
+        setStatus("Updating state...");
+        logDev("success", "narrator", "Saved narrator message displayed", {
+          conversation_id: payload.conversation_id,
+          assistant_message_id: payload.message.id,
+        });
+        void reloadSavedNarratorMessages(payload.conversation_id);
+      }
     }).then((cleanup) => {
       unlisten = cleanup;
     });
@@ -313,7 +406,7 @@ export function App() {
     return () => {
       unlisten?.();
     };
-  }, [currentConversationId]);
+  }, []);
 
   function setCreatorFieldsFromSoul(nextSoul: Soul) {
     setCharacterName(nextSoul.character_name);
@@ -662,13 +755,63 @@ export function App() {
     replacementAssistantId?: number,
     correctionInstruction?: string,
   ) {
-    if (!text || busy || !soul) return;
+    if (!text || busy || stateUpdating || !soul) return;
     const generationId = generationIdRef.current + 1;
+    const turnConversationId = currentConversationId;
+    const replacementOriginalContent = replacementAssistantId
+      ? messages.find(
+          (message) =>
+            message.conversation_id === turnConversationId &&
+            message.id === replacementAssistantId &&
+            message.role === "assistant",
+        )?.content
+      : undefined;
     generationIdRef.current = generationId;
+    activeGenerationRef.current = {
+      id: generationId,
+      conversationId: turnConversationId,
+      narratorSaved: false,
+      knownAssistantIds: new Set(
+        messages
+          .filter((message) => message.conversation_id === turnConversationId && message.role === "assistant" && message.id > 0)
+          .map((message) => message.id),
+      ),
+      replacementAssistantId,
+      replacementOriginalContent,
+    };
     const abortController = new AbortController();
     generationAbortRef.current = abortController;
     setBusy(true);
+    setStateUpdating(false);
     setStatus(statusLabel ?? (provider === "API" ? "API provider thinking" : "Mock provider thinking"));
+    logDev("info", "app", "Generation started", {
+      conversation_id: turnConversationId,
+      provider,
+      mode,
+      context_mode: contextMode,
+      replacement_assistant_id: replacementAssistantId ?? null,
+    });
+    let savedMessagePollId: number | undefined;
+
+    const pollSavedNarrator = async () => {
+      const activeGeneration = activeGenerationRef.current;
+      if (!activeGeneration || activeGeneration.id !== generationId || activeGeneration.narratorSaved) return;
+      try {
+        const nextMessages = await listConversationMessages(turnConversationId);
+        if (turnConversationId !== currentConversationIdRef.current) return;
+        if (!hasSavedAssistantForGeneration(nextMessages, activeGeneration)) return;
+        activeGeneration.narratorSaved = true;
+        setMessages((current) => reconcilePersistedMessages(current, nextMessages));
+        setBusy(false);
+        setStateUpdating(true);
+        setStatus("Updating state...");
+        logDev("info", "db", "Saved narrator message reloaded by fallback poll", {
+          conversation_id: turnConversationId,
+        });
+      } catch {
+        // The final sendApiTurn result is still the authoritative fallback.
+      }
+    };
 
     try {
       const activeSetting = await persistCurrentSetting();
@@ -676,13 +819,16 @@ export function App() {
       await upsertSoul(activeSoul);
       if (provider === "API") {
         setMessages((current) =>
-          seedStreamingTurn(current, currentConversationId, text, replacementAssistantId),
+          seedStreamingTurn(current, turnConversationId, text, replacementAssistantId),
         );
+        savedMessagePollId = window.setInterval(() => {
+          void pollSavedNarrator();
+        }, 700);
       }
       const result =
         provider === "API"
           ? await sendApiTurn(
-              currentConversationId,
+              turnConversationId,
               activeSoul.character_id,
               text,
               mode,
@@ -694,7 +840,7 @@ export function App() {
               correctionInstruction,
             )
           : await sendMockTurn(
-              currentConversationId,
+              turnConversationId,
               activeSoul.character_id,
               text,
               mode,
@@ -702,6 +848,9 @@ export function App() {
               correctionInstruction,
             );
       if (generationIdRef.current !== generationId || abortController.signal.aborted) {
+        return;
+      }
+      if (result.conversation_id !== currentConversationIdRef.current) {
         return;
       }
       if (activeSetting) {
@@ -720,17 +869,65 @@ export function App() {
       setContext(result.context_preview);
       setLastTurnDebug(result.debug);
       setSouls(await listSouls());
-      setStatus(result.consolidation_ran ? "Turn saved; consolidation ran" : "Turn saved");
+      setStateUpdating(false);
+      setStatus(
+        result.debug.state_updater_status.startsWith("failed")
+          ? "Turn saved; state updater failed"
+          : result.consolidation_ran
+            ? "Turn saved; consolidation ran"
+            : "Turn saved",
+      );
+      logDev(
+        result.debug.state_updater_status.startsWith("failed") ? "warn" : "success",
+        result.debug.state_updater_status.startsWith("failed") ? "warning" : "success",
+        "Generation turn complete",
+        {
+          conversation_id: result.conversation_id,
+          assistant_message_id: result.debug.assistant_message_id,
+          selected_variant_id: result.debug.selected_variant_id,
+          state_updater_status: result.debug.state_updater_status,
+        },
+      );
     } catch (error) {
+      const activeGeneration = activeGenerationRef.current;
+      const narratorWasSaved =
+        activeGeneration?.id === generationId && activeGeneration.narratorSaved;
+      setStateUpdating(false);
+      if (provider === "API" && !narratorWasSaved && turnConversationId === currentConversationIdRef.current) {
+        try {
+          setMessages(await listConversationMessages(turnConversationId));
+        } catch {
+          setMessages((current) =>
+            clearFailedStreamingTurn(
+              current,
+              turnConversationId,
+              replacementAssistantId,
+              replacementOriginalContent,
+            ),
+          );
+        }
+      }
       if (abortController.signal.aborted) {
         setStatus("Generation stopped");
+        logDev("warn", "warning", "Generation stopped", { conversation_id: turnConversationId });
+      } else if (narratorWasSaved) {
+        setStatus(error instanceof Error ? `State update failed; narration saved: ${error.message}` : String(error));
+        logDev("error", "state_updater", "State update failed after narration save", {
+          conversation_id: turnConversationId,
+          error: error instanceof Error ? error.message : String(error),
+        });
       } else {
-        setStatus(error instanceof Error ? error.message : String(error));
+        reportError(error, "Generation failed", provider === "API" ? "api" : "app");
       }
     } finally {
+      if (savedMessagePollId !== undefined) {
+        window.clearInterval(savedMessagePollId);
+      }
       if (generationIdRef.current === generationId) {
         setBusy(false);
+        setStateUpdating(false);
         generationAbortRef.current = null;
+        activeGenerationRef.current = null;
       }
     }
   }
@@ -738,7 +935,7 @@ export function App() {
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     const text = draft.trim();
-    if (!text || busy || !soul) return;
+    if (!text || busy || stateUpdating || !soul) return;
 
     setDraft("");
     await executeTurn(text);
@@ -749,21 +946,52 @@ export function App() {
     await navigator.clipboard.writeText(formatLlmPayloadDebugBlock(llmPayload));
     setPayloadCopied(true);
     setStatus("LLM payload copied");
+    logDev("info", "app", "LLM payload copied");
     window.setTimeout(() => setPayloadCopied(false), 1800);
+  }
+
+  async function handleCopyDevLogs() {
+    await navigator.clipboard.writeText(formatDevLogs(devLogs));
+    setStatus("Dev Console logs copied");
+    logDev("info", "app", "Dev Console logs copied", { entries: devLogs.length });
+  }
+
+  function handleClearDevLogs() {
+    setDevLogs([]);
+    setStatus("Dev Console cleared");
+  }
+
+  function handleExportDevLogs() {
+    const content = formatDevLogs(devLogs);
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `mnemosyne-dev-console-${Date.now()}.log`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setStatus("Dev Console logs exported");
+    logDev("info", "app", "Dev Console logs exported", { entries: devLogs.length });
   }
 
   async function handleExportVisibleChatLog() {
     if (!currentConversationId) return;
     setBusy(true);
     try {
+      logDev("info", "app", "Visible chat export started", {
+        conversation_id: currentConversationId,
+      });
       const result = await exportVisibleChatLog(currentConversationId);
       const message = `${result.message} ${result.path}`;
       setExportFeedback(message);
       setStatus(message);
+      logDev("success", "app", "Visible chat export finished", {
+        conversation_id: currentConversationId,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setExportFeedback(message);
-      setStatus(message);
+      reportError(error, "Visible chat export failed", "error");
     } finally {
       setBusy(false);
     }
@@ -773,14 +1001,20 @@ export function App() {
     if (!currentConversationId) return;
     setBusy(true);
     try {
+      logDev("info", "app", "LLM payload history export started", {
+        conversation_id: currentConversationId,
+      });
       const result = await exportLlmPayloadHistory(currentConversationId);
       const message = `${result.message} ${result.path}`;
       setExportFeedback(message);
       setStatus(message);
+      logDev("success", "app", "LLM payload history export finished", {
+        conversation_id: currentConversationId,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setExportFeedback(message);
-      setStatus(message);
+      reportError(error, "LLM payload history export failed", "error");
     } finally {
       setBusy(false);
     }
@@ -817,7 +1051,7 @@ export function App() {
   }
 
   async function handleRegenerate() {
-    if (busy || !soul) return;
+    if (busy || stateUpdating || !soul) return;
     const lastUserMessage = [...activeMessages].reverse().find((message) => message.role === "user");
     if (!lastUserMessage) {
       setStatus("No user message to regenerate");
@@ -834,7 +1068,7 @@ export function App() {
   }
 
   async function handleRegenerateFromMessage(message: ChatMessage) {
-    if (busy || !soul || message.role !== "assistant") return;
+    if (busy || stateUpdating || !soul || message.role !== "assistant") return;
     if (message.id !== latestAssistantMessageId) {
       setStatus("Regenerating older messages requires branch rewind and will be added later.");
       return;
@@ -854,7 +1088,7 @@ export function App() {
   }
 
   async function handleFixWithInstruction(message: ChatMessage) {
-    if (busy || !soul || message.role !== "assistant") return;
+    if (busy || stateUpdating || !soul || message.role !== "assistant") return;
     if (message.id !== latestAssistantMessageId) {
       setStatus("Regenerating older messages requires branch rewind and will be added later.");
       return;
@@ -879,7 +1113,7 @@ export function App() {
   }
 
   async function handleDeleteChatMessage(message: ChatMessage) {
-    if (busy) return;
+    if (busy || stateUpdating) return;
     const confirmed = window.confirm(
       message.role === "assistant"
         ? "Delete this generated response? Soul memory is not rewound."
@@ -904,7 +1138,7 @@ export function App() {
   }
 
   async function handleEditUserMessage(message: ChatMessage) {
-    if (busy || message.role !== "user") return;
+    if (busy || stateUpdating || message.role !== "user") return;
     const nextContent = window.prompt(
       "Edit user message. Soul memory and later responses are not rewound.",
       message.content,
@@ -929,7 +1163,7 @@ export function App() {
   }
 
   async function handleSelectVariant(message: ChatMessage, direction: -1 | 1) {
-    if (busy || message.role !== "assistant") return;
+    if (busy || stateUpdating || message.role !== "assistant") return;
     const variants = variantsByMessage[message.id] ?? [];
     if (variants.length <= 1) return;
     const selectedIndex = selectedVariantIndex(variants);
@@ -960,8 +1194,10 @@ export function App() {
   function handleStopGeneration() {
     generationAbortRef.current?.abort();
     generationIdRef.current += 1;
+    activeGenerationRef.current = null;
     generationAbortRef.current = null;
     setBusy(false);
+    setStateUpdating(false);
     setStatus("Generation stopped");
   }
 
@@ -1087,6 +1323,11 @@ export function App() {
     if (!profile) return;
     applyNarratorProviderProfile(profile);
     setStatus(`Loaded narrator profile ${profile.name}`);
+    logDev("info", "app", "Narrator provider profile selected", {
+      profile: profile.name,
+      model: profile.model,
+      base_url: profile.base_url,
+    });
   }
 
   async function handleSelectStateUpdaterProfile(profileId: string) {
@@ -1095,6 +1336,11 @@ export function App() {
     if (!profile) return;
     applyStateUpdaterProviderProfile(profile);
     setStatus(`Loaded state updater profile ${profile.name}`);
+    logDev("info", "app", "State updater provider profile selected", {
+      profile: profile.name,
+      model: profile.model,
+      base_url: profile.base_url,
+    });
   }
 
   async function handleSaveNarratorProviderProfile() {
@@ -1116,6 +1362,21 @@ export function App() {
       setNarratorProviderProfileName(saved.name);
       setProviderProfiles(await listProviderProfiles());
       setStatus(`Saved narrator profile ${saved.name}`);
+      logDev("success", "app", "Narrator provider profile saved", {
+        profile: saved.name,
+        model: saved.model,
+        base_url: saved.base_url,
+      });
+    } catch (error) {
+      reportError(error, "Narrator provider profile save failed", "error");
+    }
+  }
+
+  async function reloadSavedNarratorMessages(conversationId: string) {
+    try {
+      const nextMessages = await listConversationMessages(conversationId);
+      if (conversationId !== currentConversationIdRef.current) return;
+      setMessages((current) => reconcilePersistedMessages(current, nextMessages));
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     }
@@ -1140,8 +1401,13 @@ export function App() {
       setUpdaterProviderProfileName(saved.name);
       setProviderProfiles(await listProviderProfiles());
       setStatus(`Saved state updater profile ${saved.name}`);
+      logDev("success", "app", "State updater provider profile saved", {
+        profile: saved.name,
+        model: saved.model,
+        base_url: saved.base_url,
+      });
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      reportError(error, "State updater provider profile save failed", "error");
     }
   }
 
@@ -1153,8 +1419,9 @@ export function App() {
       setNarratorProviderProfileName("Narrator API");
       setProviderProfiles(await listProviderProfiles());
       setStatus("Narrator profile deleted");
+      logDev("warn", "warning", "Narrator provider profile deleted");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      reportError(error, "Narrator provider profile delete failed", "error");
     }
   }
 
@@ -1166,8 +1433,9 @@ export function App() {
       setUpdaterProviderProfileName("Updater API");
       setProviderProfiles(await listProviderProfiles());
       setStatus("State updater profile deleted");
+      logDev("warn", "warning", "State updater provider profile deleted");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      reportError(error, "State updater provider profile delete failed", "error");
     }
   }
 
@@ -1286,6 +1554,118 @@ export function App() {
       [...activeMessages].reverse().find((message) => message.role === "assistant")?.id ?? null,
     [activeMessages],
   );
+  const turnInProgress = busy || stateUpdating;
+  const filteredDevLogs = useMemo(
+    () =>
+      devLogs.filter(
+        (entry) =>
+          (devLogLevelFilter === "all" || entry.level === devLogLevelFilter) &&
+          (devLogCategoryFilter === "all" || entry.category === devLogCategoryFilter),
+      ),
+    [devLogs, devLogLevelFilter, devLogCategoryFilter],
+  );
+  const devConsole = (
+    <>
+      <button
+        type="button"
+        className={`dev-console-toggle ${devConsoleOpen ? "open" : ""}`}
+        onClick={() => {
+          setDevConsoleOpen((open) => !open);
+          logDev("info", "app", devConsoleOpen ? "Dev Console closed" : "Dev Console opened");
+        }}
+      >
+        <Terminal size={16} />
+        <span>Dev Console</span>
+        <strong>{devLogs.length}</strong>
+      </button>
+      {devConsoleOpen ? (
+        <aside className="dev-console-panel" aria-label="Dev Console">
+          <header className="dev-console-header">
+            <div>
+              <span className="eyebrow">Live terminal</span>
+              <h2>Dev Console</h2>
+            </div>
+            <button type="button" onClick={() => setDevConsoleOpen(false)}>
+              Close
+            </button>
+          </header>
+          <div className="dev-console-controls">
+            <label>
+              <span>Level</span>
+              <select
+                value={devLogLevelFilter}
+                onChange={(event) => setDevLogLevelFilter(event.target.value as DevLogLevel | "all")}
+              >
+                <option value="all">All</option>
+                {DEV_LOG_LEVELS.map((level) => (
+                  <option key={level} value={level}>
+                    {level}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Category</span>
+              <select
+                value={devLogCategoryFilter}
+                onChange={(event) =>
+                  setDevLogCategoryFilter(event.target.value as DevLogCategory | "all")
+                }
+              >
+                <option value="all">All</option>
+                {DEV_LOG_CATEGORIES.map((category) => (
+                  <option key={category} value={category}>
+                    {category}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="dev-console-checkbox">
+              <input
+                type="checkbox"
+                checked={devConsolePaused}
+                onChange={(event) => setDevConsolePaused(event.target.checked)}
+              />
+              <span>Pause scroll</span>
+            </label>
+          </div>
+          <div className="dev-console-actions">
+            <button type="button" onClick={handleCopyDevLogs} disabled={devLogs.length === 0}>
+              <Clipboard size={14} />
+              <span>Copy</span>
+            </button>
+            <button type="button" onClick={handleExportDevLogs} disabled={devLogs.length === 0}>
+              <FileDown size={14} />
+              <span>Export</span>
+            </button>
+            <button type="button" onClick={handleClearDevLogs} disabled={devLogs.length === 0}>
+              <Trash2 size={14} />
+              <span>Clear</span>
+            </button>
+          </div>
+          <div className="dev-console-body" ref={devConsoleBodyRef}>
+            {filteredDevLogs.length === 0 ? (
+              <p className="dev-console-empty">No logs.</p>
+            ) : (
+              filteredDevLogs.map((entry) => (
+                <article className={`dev-log-entry ${entry.level}`} key={entry.id}>
+                  <div className="dev-log-line">
+                    <time>{formatDevLogTimestamp(entry.timestamp)}</time>
+                    <span className={`dev-log-level ${entry.level}`}>{entry.level}</span>
+                    <span className="dev-log-category">{entry.category}</span>
+                    <span className="dev-log-message">{entry.message}</span>
+                  </div>
+                  {entry.details && Object.keys(entry.details).length > 0 ? (
+                    <pre>{JSON.stringify(entry.details, null, 2)}</pre>
+                  ) : null}
+                </article>
+              ))
+            )}
+          </div>
+        </aside>
+      ) : null}
+    </>
+  );
 
   if (view === "chat") {
     return (
@@ -1332,7 +1712,7 @@ export function App() {
                           className="message-tool-action"
                           title={canGenerate ? "Regenerate response" : olderGenerationTitle}
                           onClick={() => handleRegenerateFromMessage(message)}
-                          disabled={busy || !canGenerate}
+                          disabled={turnInProgress || !canGenerate}
                         >
                           <RefreshCcw size={14} />
                           <span>Regenerate</span>
@@ -1341,7 +1721,7 @@ export function App() {
                           className="message-tool-action"
                           title={canGenerate ? "Fix response with instruction" : olderGenerationTitle}
                           onClick={() => handleFixWithInstruction(message)}
-                          disabled={busy || !canGenerate}
+                          disabled={turnInProgress || !canGenerate}
                         >
                           <span>Fix</span>
                         </button>
@@ -1349,7 +1729,7 @@ export function App() {
                           <button
                             title="Previous variant"
                             onClick={() => handleSelectVariant(message, -1)}
-                            disabled={busy || variants.length <= 1 || selectedIndex <= 0}
+                            disabled={turnInProgress || variants.length <= 1 || selectedIndex <= 0}
                           >
                             <ArrowLeft size={13} />
                           </button>
@@ -1360,7 +1740,7 @@ export function App() {
                             title="Next variant"
                             onClick={() => handleSelectVariant(message, 1)}
                             disabled={
-                              busy || variants.length <= 1 || selectedIndex >= variants.length - 1
+                              turnInProgress || variants.length <= 1 || selectedIndex >= variants.length - 1
                             }
                           >
                             <ArrowLeft size={13} className="next-variant-icon" />
@@ -1369,7 +1749,7 @@ export function App() {
                         <button
                           title="Delete this response"
                           onClick={() => handleDeleteChatMessage(message)}
-                          disabled={busy}
+                          disabled={turnInProgress}
                         >
                           <Trash2 size={14} />
                         </button>
@@ -1379,14 +1759,14 @@ export function App() {
                         <button
                           title="Edit this message"
                           onClick={() => handleEditUserMessage(message)}
-                          disabled={busy}
+                          disabled={turnInProgress}
                         >
                           <Pencil size={14} />
                         </button>
                         <button
                           title="Delete this message"
                           onClick={() => handleDeleteChatMessage(message)}
-                          disabled={busy}
+                          disabled={turnInProgress}
                         >
                           <Trash2 size={14} />
                         </button>
@@ -1411,18 +1791,19 @@ export function App() {
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             placeholder="Type message..."
-            disabled={busy}
+            disabled={turnInProgress}
           />
           {busy ? (
             <button type="button" aria-label="Stop generation" onClick={handleStopGeneration}>
               <Square size={16} />
             </button>
           ) : (
-            <button aria-label="Send message" disabled={!draft.trim() || !soul}>
+            <button aria-label="Send message" disabled={!draft.trim() || !soul || stateUpdating}>
               <Play size={18} />
             </button>
           )}
         </form>
+        {devConsole}
       </main>
     );
   }
@@ -1925,7 +2306,11 @@ export function App() {
             <span>Provider</span>
             <select
               value={provider}
-              onChange={(event) => setProvider(event.target.value as ProviderKind)}
+              onChange={(event) => {
+                const nextProvider = event.target.value as ProviderKind;
+                setProvider(nextProvider);
+                logDev("info", "app", "Provider mode changed", { provider: nextProvider });
+              }}
               disabled={busy}
             >
               <option>Mock</option>
@@ -1949,7 +2334,11 @@ export function App() {
             <span>Context Mode</span>
             <select
               value={contextMode}
-              onChange={(event) => setContextMode(event.target.value as ContextMode)}
+              onChange={(event) => {
+                const nextMode = event.target.value as ContextMode;
+                setContextMode(nextMode);
+                logDev("info", "context", "Context mode changed", { context_mode: nextMode });
+              }}
               disabled={busy || provider !== "API"}
             >
               <option value="brief">Mnemosyne Brief</option>
@@ -2760,6 +3149,7 @@ export function App() {
 
         <footer className="status-line">{status}</footer>
       </section>
+      {devConsole}
     </main>
   );
 }
@@ -2794,6 +3184,72 @@ Context Mode: ${payload.context_mode}
 Truncated: ${payload.truncated}
 Model: ${payload.model || "-"}
 Base URL: ${payload.base_url || "-"}`;
+}
+
+function makeDevLogEntry(
+  level: DevLogLevel,
+  category: DevLogCategory,
+  message: string,
+  details?: Record<string, unknown>,
+): DevLogEntry {
+  const id =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return sanitizeDevLogEntry({
+    id,
+    timestamp: Math.floor(Date.now() / 1000),
+    level,
+    category,
+    message,
+    details: details ?? null,
+  });
+}
+
+function sanitizeDevLogEntry(entry: DevLogEntry): DevLogEntry {
+  return {
+    ...entry,
+    details: sanitizeDevLogDetails(entry.details) as Record<string, unknown> | null | undefined,
+  };
+}
+
+function sanitizeDevLogDetails(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeDevLogDetails);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, nested]) => {
+      const lowered = key.toLowerCase();
+      const shouldRedact =
+        lowered.includes("api_key") ||
+        lowered === "authorization" ||
+        lowered.includes("secret") ||
+        lowered === "token" ||
+        lowered.endsWith("_token") ||
+        lowered.includes("bearer");
+      return [key, shouldRedact ? "[redacted]" : sanitizeDevLogDetails(nested)];
+    }),
+  );
+}
+
+function formatDevLogTimestamp(timestamp: number) {
+  const millis = timestamp > 1_000_000_000_000 ? timestamp : timestamp * 1000;
+  return new Date(millis).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function formatDevLogs(logs: DevLogEntry[]) {
+  return logs
+    .map((entry) => {
+      const details =
+        entry.details && Object.keys(entry.details).length
+          ? `\n${JSON.stringify(entry.details, null, 2)}`
+          : "";
+      return `[${formatDevLogTimestamp(entry.timestamp)}] ${entry.level.toUpperCase()} ${entry.category}: ${entry.message}${details}`;
+    })
+    .join("\n\n");
 }
 
 function selectedVariantIndex(variants: AssistantMessageVariant[]) {
@@ -2890,7 +3346,7 @@ function upsertSavedChatMessage(messages: ChatMessage[], savedMessage: ChatMessa
   if (existingIndex >= 0) {
     const next = [...messages];
     next[existingIndex] = savedMessage;
-    return next;
+    return removeDuplicateStreamingAssistants(next, savedMessage.conversation_id, savedMessage.id);
   }
 
   if (savedMessage.role === "assistant") {
@@ -2903,12 +3359,82 @@ function upsertSavedChatMessage(messages: ChatMessage[], savedMessage: ChatMessa
       ) {
         const next = [...messages];
         next[index] = savedMessage;
-        return next;
+        return removeDuplicateStreamingAssistants(next, savedMessage.conversation_id, savedMessage.id);
       }
     }
   }
 
-  return [...messages, savedMessage].sort((left, right) => left.id - right.id);
+  return removeDuplicateStreamingAssistants(
+    [...messages, savedMessage].sort((left, right) => left.id - right.id),
+    savedMessage.conversation_id,
+    savedMessage.id,
+  );
+}
+
+function removeDuplicateStreamingAssistants(
+  messages: ChatMessage[],
+  conversationId: string,
+  savedMessageId: number,
+) {
+  return messages.filter(
+    (message) =>
+      !(
+        message.conversation_id === conversationId &&
+        message.role === "assistant" &&
+        message.id < 0 &&
+        savedMessageId > 0
+      ),
+  );
+}
+
+function reconcilePersistedMessages(current: ChatMessage[], persisted: ChatMessage[]) {
+  if (!persisted.length) return current;
+  const persistedConversationId = persisted[0].conversation_id;
+  return [
+    ...current.filter((message) => message.conversation_id !== persistedConversationId),
+    ...persisted,
+  ].sort((left, right) => left.id - right.id);
+}
+
+function hasSavedAssistantForGeneration(messages: ChatMessage[], activeGeneration: ActiveGeneration) {
+  if (activeGeneration.replacementAssistantId) {
+    const replacement = messages.find(
+      (message) =>
+        message.id === activeGeneration.replacementAssistantId && message.role === "assistant",
+    );
+    return Boolean(
+      replacement &&
+        replacement.content.trim() &&
+        replacement.content !== activeGeneration.replacementOriginalContent,
+    );
+  }
+
+  return messages.some(
+    (message) =>
+      message.role === "assistant" &&
+      message.id > 0 &&
+      !activeGeneration.knownAssistantIds.has(message.id),
+  );
+}
+
+function clearFailedStreamingTurn(
+  messages: ChatMessage[],
+  conversationId: string,
+  replacementAssistantId?: number,
+  replacementOriginalContent?: string,
+) {
+  return messages.flatMap((message) => {
+    if (message.conversation_id !== conversationId || message.role !== "assistant") {
+      return [message];
+    }
+    if (replacementAssistantId && message.id === replacementAssistantId) {
+      return [{ ...message, content: replacementOriginalContent ?? message.content }];
+    }
+    if (message.id < 0) {
+      return [];
+    }
+    return [message];
+  });
 }
 
 function normalizeAssistantDisplay(content: string) {

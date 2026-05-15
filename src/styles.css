@@ -1026,6 +1026,217 @@ button:disabled {
   font-size: 0.82rem;
 }
 
+.dev-console-toggle {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 60;
+  display: inline-flex;
+  min-height: 40px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #28443b;
+  border-radius: 8px;
+  background: #101613;
+  color: #d8f0e6;
+  padding: 0 12px;
+  box-shadow: 0 12px 30px rgba(16, 22, 19, 0.24);
+  font-size: 0.82rem;
+  font-weight: 850;
+}
+
+.dev-console-toggle strong {
+  min-width: 24px;
+  border-radius: 999px;
+  background: #2aa889;
+  color: #06120e;
+  padding: 2px 7px;
+  text-align: center;
+}
+
+.dev-console-toggle.open {
+  right: min(438px, calc(100vw - 74px));
+}
+
+.dev-console-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 55;
+  display: flex;
+  width: min(420px, 100vw);
+  height: 100vh;
+  flex-direction: column;
+  border-left: 1px solid #28443b;
+  background: #0d1310;
+  color: #d8f0e6;
+  box-shadow: -20px 0 45px rgba(16, 22, 19, 0.32);
+}
+
+.dev-console-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #24362f;
+  padding: 14px;
+}
+
+.dev-console-header h2 {
+  margin: 2px 0 0;
+  color: #f4fff9;
+  font-size: 1rem;
+}
+
+.dev-console-header button,
+.dev-console-actions button {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #315247;
+  border-radius: 6px;
+  background: #16221d;
+  color: #d8f0e6;
+  padding: 0 9px;
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.dev-console-header button:disabled,
+.dev-console-actions button:disabled {
+  opacity: 0.45;
+}
+
+.dev-console-controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  border-bottom: 1px solid #24362f;
+  padding: 10px 14px;
+}
+
+.dev-console-controls label {
+  display: grid;
+  gap: 4px;
+  color: #99b8ad;
+  font-size: 0.7rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.dev-console-controls select {
+  min-height: 30px;
+  border: 1px solid #315247;
+  border-radius: 6px;
+  background: #111b17;
+  color: #d8f0e6;
+  padding: 0 8px;
+  text-transform: none;
+}
+
+.dev-console-checkbox {
+  grid-column: 1 / -1;
+  display: inline-flex !important;
+  min-height: 28px;
+  align-items: center;
+  gap: 8px;
+}
+
+.dev-console-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-bottom: 1px solid #24362f;
+  padding: 10px 14px;
+}
+
+.dev-console-body {
+  flex: 1;
+  overflow: auto;
+  padding: 10px 0 64px;
+  font-family: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
+.dev-console-empty {
+  margin: 16px 14px;
+  color: #78968b;
+}
+
+.dev-log-entry {
+  border-bottom: 1px solid rgba(49, 82, 71, 0.44);
+  padding: 8px 14px;
+}
+
+.dev-log-entry.error {
+  background: rgba(111, 36, 36, 0.28);
+}
+
+.dev-log-entry.warn {
+  background: rgba(120, 88, 28, 0.2);
+}
+
+.dev-log-line {
+  display: grid;
+  grid-template-columns: 72px 56px 104px 1fr;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.dev-log-line time {
+  color: #78968b;
+}
+
+.dev-log-level,
+.dev-log-category {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.dev-log-level.info {
+  color: #9fd8ff;
+}
+
+.dev-log-level.warn {
+  color: #ffd37d;
+}
+
+.dev-log-level.error {
+  color: #ff9b9b;
+}
+
+.dev-log-level.debug {
+  color: #bca8ff;
+}
+
+.dev-log-level.success {
+  color: #7de0ad;
+}
+
+.dev-log-category {
+  color: #a4c8ba;
+}
+
+.dev-log-message {
+  color: #f4fff9;
+  word-break: break-word;
+}
+
+.dev-log-entry pre {
+  max-height: 180px;
+  margin: 7px 0 0 136px;
+  overflow: auto;
+  border-left: 2px solid #315247;
+  color: #b9d7cd;
+  padding: 0 0 0 8px;
+  white-space: pre-wrap;
+}
+
 @media (max-width: 1180px) {
   .library-grid,
   .play-grid,
@@ -1079,5 +1290,22 @@ button:disabled {
 
   .start-chat-button {
     width: 100%;
+  }
+
+  .dev-console-panel {
+    width: 100vw;
+  }
+
+  .dev-console-toggle.open {
+    right: 18px;
+  }
+
+  .dev-log-line {
+    grid-template-columns: 64px 48px 82px 1fr;
+    gap: 6px;
+  }
+
+  .dev-log-entry pre {
+    margin-left: 0;
   }
 }
