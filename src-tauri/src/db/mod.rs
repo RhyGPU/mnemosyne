@@ -66,6 +66,20 @@ pub struct LlmPayloadLog {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EntityRecord {
+    pub entity_id: String,
+    pub conversation_id: String,
+    pub display_name: String,
+    pub aliases: Vec<String>,
+    pub kind: String,
+    pub controlled_by: String,
+    pub linked_soul_id: Option<String>,
+    pub active_in_scene: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderProfile {
     pub id: String,
@@ -198,6 +212,24 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
             FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
         );
+
+        CREATE TABLE IF NOT EXISTS conversation_entities (
+            conversation_id TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            aliases_json TEXT NOT NULL DEFAULT '[]',
+            kind TEXT NOT NULL DEFAULT 'unknown',
+            controlled_by TEXT NOT NULL DEFAULT 'unknown',
+            linked_soul_id TEXT,
+            active_in_scene INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (conversation_id, entity_id),
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_conversation_entities_active
+        ON conversation_entities(conversation_id, active_in_scene);
         ",
     )?;
     add_column_if_missing(
@@ -377,6 +409,89 @@ pub fn ensure_conversation(
         params![conversation_id, soul_id, now],
     )?;
     Ok(())
+}
+
+pub fn upsert_entity(conn: &Connection, entity: &EntityRecord) -> rusqlite::Result<EntityRecord> {
+    let now = now_ts();
+    let aliases_json = encode_aliases(&entity.aliases)?;
+    conn.execute(
+        "
+        INSERT INTO conversation_entities
+            (conversation_id, entity_id, display_name, aliases_json, kind, controlled_by, linked_soul_id, active_in_scene, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+        ON CONFLICT(conversation_id, entity_id) DO UPDATE SET
+            display_name = excluded.display_name,
+            aliases_json = excluded.aliases_json,
+            kind = excluded.kind,
+            controlled_by = excluded.controlled_by,
+            linked_soul_id = excluded.linked_soul_id,
+            active_in_scene = excluded.active_in_scene,
+            updated_at = excluded.updated_at
+        ",
+        params![
+            entity.conversation_id,
+            entity.entity_id,
+            entity.display_name,
+            aliases_json,
+            entity.kind,
+            entity.controlled_by,
+            entity.linked_soul_id,
+            if entity.active_in_scene { 1 } else { 0 },
+            now
+        ],
+    )?;
+    get_entity(conn, &entity.conversation_id, &entity.entity_id)
+}
+
+pub fn get_entity(
+    conn: &Connection,
+    conversation_id: &str,
+    entity_id: &str,
+) -> rusqlite::Result<EntityRecord> {
+    conn.query_row(
+        "
+        SELECT conversation_id, entity_id, display_name, aliases_json, kind, controlled_by, linked_soul_id, active_in_scene, created_at, updated_at
+        FROM conversation_entities
+        WHERE conversation_id = ?1 AND entity_id = ?2
+        ",
+        params![conversation_id, entity_id],
+        entity_from_row,
+    )
+}
+
+pub fn list_entities(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<EntityRecord>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT conversation_id, entity_id, display_name, aliases_json, kind, controlled_by, linked_soul_id, active_in_scene, created_at, updated_at
+        FROM conversation_entities
+        WHERE conversation_id = ?1
+        ORDER BY active_in_scene DESC, display_name COLLATE NOCASE ASC
+        ",
+    )?;
+    let rows = stmt.query_map([conversation_id], entity_from_row)?;
+    rows.collect()
+}
+
+pub fn add_entity_alias(
+    conn: &Connection,
+    conversation_id: &str,
+    entity_id: &str,
+    alias: &str,
+) -> rusqlite::Result<EntityRecord> {
+    let mut entity = get_entity(conn, conversation_id, entity_id)?;
+    let alias = alias.trim();
+    if !alias.is_empty()
+        && !entity
+            .aliases
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(alias))
+    {
+        entity.aliases.push(alias.to_string());
+    }
+    upsert_entity(conn, &entity)
 }
 
 pub fn insert_message(
@@ -1055,6 +1170,28 @@ fn provider_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provid
     })
 }
 
+fn entity_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntityRecord> {
+    let aliases_json: String = row.get(3)?;
+    let aliases = serde_json::from_str::<Vec<String>>(&aliases_json).unwrap_or_default();
+    Ok(EntityRecord {
+        conversation_id: row.get(0)?,
+        entity_id: row.get(1)?,
+        display_name: row.get(2)?,
+        aliases,
+        kind: row.get(4)?,
+        controlled_by: row.get(5)?,
+        linked_soul_id: row.get(6)?,
+        active_in_scene: row.get::<_, i64>(7)? != 0,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn encode_aliases(aliases: &[String]) -> rusqlite::Result<String> {
+    serde_json::to_string(aliases)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+}
+
 fn decode_soul(json: &str) -> rusqlite::Result<Soul> {
     serde_json::from_str(json).map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
@@ -1159,6 +1296,52 @@ mod tests {
             .expect("table query");
 
         assert_eq!(exists, 1);
+    }
+
+    #[test]
+    fn migration_creates_conversation_entities_table() {
+        let conn = init_memory_connection().expect("db");
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'conversation_entities'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table query");
+
+        assert_eq!(exists, 1);
+    }
+
+    #[test]
+    fn entity_registry_stores_aliases_and_active_state() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+        ensure_conversation(&conn, "entities", &soul.character_id).expect("conversation");
+
+        let entity = upsert_entity(
+            &conn,
+            &EntityRecord {
+                entity_id: "rhy".into(),
+                conversation_id: "entities".into(),
+                display_name: "Rhy".into(),
+                aliases: vec!["Rhy".into()],
+                kind: "user_controlled".into(),
+                controlled_by: "user".into(),
+                linked_soul_id: None,
+                active_in_scene: true,
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .expect("upsert entity");
+        assert_eq!(entity.display_name, "Rhy");
+
+        let entity = add_entity_alias(&conn, "entities", "rhy", "Rjy").expect("add alias");
+        assert!(entity.aliases.iter().any(|alias| alias == "Rjy"));
+        let entities = list_entities(&conn, "entities").expect("list");
+        assert_eq!(entities.len(), 1);
+        assert!(entities[0].active_in_scene);
     }
 
     #[test]

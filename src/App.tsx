@@ -16,7 +16,7 @@ import {
   Terminal,
   Trash2,
 } from "lucide-react";
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiProviderSettings,
   AssistantMessageVariant,
@@ -932,13 +932,25 @@ export function App() {
     }
   }
 
-  async function handleSubmit(event: FormEvent) {
-    event.preventDefault();
+  async function submitDraft() {
     const text = draft.trim();
     if (!text || busy || stateUpdating || !soul) return;
 
     setDraft("");
     await executeTurn(text);
+  }
+
+  async function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    await submitDraft();
+  }
+
+  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== "Enter" || !event.shiftKey || event.nativeEvent.isComposing) {
+      return;
+    }
+    event.preventDefault();
+    void submitDraft();
   }
 
   async function handleCopyLlmPayload() {
@@ -1564,106 +1576,110 @@ export function App() {
       ),
     [devLogs, devLogLevelFilter, devLogCategoryFilter],
   );
+  const devConsoleToggle = (
+    <button
+      type="button"
+      className={`dev-console-toggle ${devConsoleOpen ? "open" : ""}`}
+      onClick={() => {
+        setDevConsoleOpen((open) => !open);
+        logDev("info", "app", devConsoleOpen ? "Dev Console closed" : "Dev Console opened");
+      }}
+    >
+      <Terminal size={16} />
+      <span>Dev Console</span>
+      <strong>{devLogs.length}</strong>
+    </button>
+  );
+  const devConsolePanel = devConsoleOpen ? (
+    <aside className="dev-console-panel" aria-label="Dev Console">
+      <header className="dev-console-header">
+        <div>
+          <span className="eyebrow">Live terminal</span>
+          <h2>Dev Console</h2>
+        </div>
+        <button type="button" onClick={() => setDevConsoleOpen(false)}>
+          Close
+        </button>
+      </header>
+      <div className="dev-console-controls">
+        <label>
+          <span>Level</span>
+          <select
+            value={devLogLevelFilter}
+            onChange={(event) => setDevLogLevelFilter(event.target.value as DevLogLevel | "all")}
+          >
+            <option value="all">All</option>
+            {DEV_LOG_LEVELS.map((level) => (
+              <option key={level} value={level}>
+                {level}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Category</span>
+          <select
+            value={devLogCategoryFilter}
+            onChange={(event) =>
+              setDevLogCategoryFilter(event.target.value as DevLogCategory | "all")
+            }
+          >
+            <option value="all">All</option>
+            {DEV_LOG_CATEGORIES.map((category) => (
+              <option key={category} value={category}>
+                {category}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="dev-console-checkbox">
+          <input
+            type="checkbox"
+            checked={devConsolePaused}
+            onChange={(event) => setDevConsolePaused(event.target.checked)}
+          />
+          <span>Pause scroll</span>
+        </label>
+      </div>
+      <div className="dev-console-actions">
+        <button type="button" onClick={handleCopyDevLogs} disabled={devLogs.length === 0}>
+          <Clipboard size={14} />
+          <span>Copy</span>
+        </button>
+        <button type="button" onClick={handleExportDevLogs} disabled={devLogs.length === 0}>
+          <FileDown size={14} />
+          <span>Export</span>
+        </button>
+        <button type="button" onClick={handleClearDevLogs} disabled={devLogs.length === 0}>
+          <Trash2 size={14} />
+          <span>Clear</span>
+        </button>
+      </div>
+      <div className="dev-console-body" ref={devConsoleBodyRef}>
+        {filteredDevLogs.length === 0 ? (
+          <p className="dev-console-empty">No logs.</p>
+        ) : (
+          filteredDevLogs.map((entry) => (
+            <article className={`dev-log-entry ${entry.level}`} key={entry.id}>
+              <div className="dev-log-line">
+                <time>{formatDevLogTimestamp(entry.timestamp)}</time>
+                <span className={`dev-log-level ${entry.level}`}>{entry.level}</span>
+                <span className="dev-log-category">{entry.category}</span>
+                <span className="dev-log-message">{entry.message}</span>
+              </div>
+              {entry.details && Object.keys(entry.details).length > 0 ? (
+                <pre>{JSON.stringify(entry.details, null, 2)}</pre>
+              ) : null}
+            </article>
+          ))
+        )}
+      </div>
+    </aside>
+  ) : null;
   const devConsole = (
     <>
-      <button
-        type="button"
-        className={`dev-console-toggle ${devConsoleOpen ? "open" : ""}`}
-        onClick={() => {
-          setDevConsoleOpen((open) => !open);
-          logDev("info", "app", devConsoleOpen ? "Dev Console closed" : "Dev Console opened");
-        }}
-      >
-        <Terminal size={16} />
-        <span>Dev Console</span>
-        <strong>{devLogs.length}</strong>
-      </button>
-      {devConsoleOpen ? (
-        <aside className="dev-console-panel" aria-label="Dev Console">
-          <header className="dev-console-header">
-            <div>
-              <span className="eyebrow">Live terminal</span>
-              <h2>Dev Console</h2>
-            </div>
-            <button type="button" onClick={() => setDevConsoleOpen(false)}>
-              Close
-            </button>
-          </header>
-          <div className="dev-console-controls">
-            <label>
-              <span>Level</span>
-              <select
-                value={devLogLevelFilter}
-                onChange={(event) => setDevLogLevelFilter(event.target.value as DevLogLevel | "all")}
-              >
-                <option value="all">All</option>
-                {DEV_LOG_LEVELS.map((level) => (
-                  <option key={level} value={level}>
-                    {level}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Category</span>
-              <select
-                value={devLogCategoryFilter}
-                onChange={(event) =>
-                  setDevLogCategoryFilter(event.target.value as DevLogCategory | "all")
-                }
-              >
-                <option value="all">All</option>
-                {DEV_LOG_CATEGORIES.map((category) => (
-                  <option key={category} value={category}>
-                    {category}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="dev-console-checkbox">
-              <input
-                type="checkbox"
-                checked={devConsolePaused}
-                onChange={(event) => setDevConsolePaused(event.target.checked)}
-              />
-              <span>Pause scroll</span>
-            </label>
-          </div>
-          <div className="dev-console-actions">
-            <button type="button" onClick={handleCopyDevLogs} disabled={devLogs.length === 0}>
-              <Clipboard size={14} />
-              <span>Copy</span>
-            </button>
-            <button type="button" onClick={handleExportDevLogs} disabled={devLogs.length === 0}>
-              <FileDown size={14} />
-              <span>Export</span>
-            </button>
-            <button type="button" onClick={handleClearDevLogs} disabled={devLogs.length === 0}>
-              <Trash2 size={14} />
-              <span>Clear</span>
-            </button>
-          </div>
-          <div className="dev-console-body" ref={devConsoleBodyRef}>
-            {filteredDevLogs.length === 0 ? (
-              <p className="dev-console-empty">No logs.</p>
-            ) : (
-              filteredDevLogs.map((entry) => (
-                <article className={`dev-log-entry ${entry.level}`} key={entry.id}>
-                  <div className="dev-log-line">
-                    <time>{formatDevLogTimestamp(entry.timestamp)}</time>
-                    <span className={`dev-log-level ${entry.level}`}>{entry.level}</span>
-                    <span className="dev-log-category">{entry.category}</span>
-                    <span className="dev-log-message">{entry.message}</span>
-                  </div>
-                  {entry.details && Object.keys(entry.details).length > 0 ? (
-                    <pre>{JSON.stringify(entry.details, null, 2)}</pre>
-                  ) : null}
-                </article>
-              ))
-            )}
-          </div>
-        </aside>
-      ) : null}
+      {devConsoleToggle}
+      {devConsolePanel}
     </>
   );
 
@@ -1682,9 +1698,12 @@ export function App() {
             <h1>{soul?.character_name ?? "Mnemosyne"}</h1>
             <p className="session-state-label">{sessionContinuityLabel}</p>
           </div>
-          <div className="token-pill">
-            {context?.estimated_tokens ?? 0}
-            <span>tok</span>
+          <div className="chat-top-actions">
+            <div className="token-pill">
+              {context?.estimated_tokens ?? 0}
+              <span>tok</span>
+            </div>
+            {devConsoleToggle}
           </div>
         </header>
 
@@ -1787,11 +1806,13 @@ export function App() {
         </section>
 
         <form className="chat-only-composer" onSubmit={handleSubmit}>
-          <input
+          <textarea
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
-            placeholder="Type message..."
+            onKeyDown={handleComposerKeyDown}
+            placeholder="Type message... Enter for newline, Shift+Enter to send."
             disabled={turnInProgress}
+            rows={2}
           />
           {busy ? (
             <button type="button" aria-label="Stop generation" onClick={handleStopGeneration}>
@@ -1803,7 +1824,7 @@ export function App() {
             </button>
           )}
         </form>
-        {devConsole}
+        {devConsolePanel}
       </main>
     );
   }

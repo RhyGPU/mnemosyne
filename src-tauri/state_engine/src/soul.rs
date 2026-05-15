@@ -68,6 +68,18 @@ pub struct Relationship {
     pub commitment: f32,
     pub fear: f32,
     pub desire: f32,
+    #[serde(default)]
+    pub respect: f32,
+    #[serde(default)]
+    pub conflict: f32,
+    #[serde(default)]
+    pub dependency: f32,
+    #[serde(default)]
+    pub curiosity: f32,
+    #[serde(default)]
+    pub comfort: f32,
+    #[serde(default)]
+    pub boundary_pressure: f32,
     pub love_type: String,
 }
 
@@ -86,6 +98,16 @@ pub struct MemoryEntry {
     pub salience: f32,
     pub tag: String,
     pub retrieval_strength: f32,
+    #[serde(default)]
+    pub perceived_by_entity_id: Option<String>,
+    #[serde(default)]
+    pub target_entity_ids: Vec<String>,
+    #[serde(default)]
+    pub interpretation: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub objective_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -130,6 +152,12 @@ impl Soul {
                 commitment: 10.0,
                 fear: 10.0,
                 desire: 20.0,
+                respect: 10.0,
+                conflict: 0.0,
+                dependency: 0.0,
+                curiosity: 10.0,
+                comfort: 10.0,
+                boundary_pressure: 0.0,
                 love_type: String::new(),
             },
         );
@@ -210,6 +238,12 @@ pub fn neutral_user_relationship() -> Relationship {
         commitment: 10.0,
         fear: 10.0,
         desire: 20.0,
+        respect: 10.0,
+        conflict: 0.0,
+        dependency: 0.0,
+        curiosity: 10.0,
+        comfort: 10.0,
+        boundary_pressure: 0.0,
         love_type: String::new(),
     }
 }
@@ -290,6 +324,11 @@ mod tests {
             salience: 90.0,
             tag: "bonding".into(),
             retrieval_strength: 90.0,
+            perceived_by_entity_id: None,
+            target_entity_ids: Vec::new(),
+            interpretation: None,
+            confidence: None,
+            objective_event_id: None,
         });
         soul.relationships.get_mut("user").unwrap().trust = 130.0;
         soul.relationships.get_mut("user").unwrap().affection = 126.0;

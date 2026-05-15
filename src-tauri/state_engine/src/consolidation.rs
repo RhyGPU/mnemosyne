@@ -132,6 +132,11 @@ mod tests {
                 salience: 50.0,
                 tag: "routine".into(),
                 retrieval_strength: 50.0,
+                perceived_by_entity_id: None,
+                target_entity_ids: Vec::new(),
+                interpretation: None,
+                confidence: None,
+                objective_event_id: None,
             });
         }
         soul.memory.recent.push(MemoryEntry {
@@ -142,6 +147,11 @@ mod tests {
             salience: 95.0,
             tag: "near_death".into(),
             retrieval_strength: 95.0,
+            perceived_by_entity_id: None,
+            target_entity_ids: Vec::new(),
+            interpretation: None,
+            confidence: None,
+            objective_event_id: None,
         });
         soul.memory.recent.push(MemoryEntry {
             id: "weak".into(),
@@ -150,6 +160,11 @@ mod tests {
             salience: 10.0,
             tag: "observation".into(),
             retrieval_strength: 10.0,
+            perceived_by_entity_id: None,
+            target_entity_ids: Vec::new(),
+            interpretation: None,
+            confidence: None,
+            objective_event_id: None,
         });
 
         consolidate_soul(&mut soul);

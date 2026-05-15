@@ -303,28 +303,50 @@ fn build_world_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
 }
 
 fn build_relationship_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
-    let Some(relationship) = soul.relationships.get("user") else {
+    if soul.relationships.is_empty() {
         return section_from_lines(
-            "[RELATIONSHIP]",
-            vec!["No relationship state for the user has been established.".into()],
+            "[RELATIONSHIPS]",
+            vec!["No relationship state has been established.".into()],
             budget.relationship_tokens.min(budget.max_tokens),
         );
-    };
+    }
 
-    let lines = vec![format!(
-        "Toward user: trust {:.0}, affection {:.0}, intimacy {:.0}, passion {:.0}, commitment {:.0}, fear {:.0}, desire {:.0}. Label/style: {}.",
-        relationship.trust,
-        relationship.affection,
-        relationship.intimacy,
-        relationship.passion,
-        relationship.commitment,
-        relationship.fear,
-        relationship.desire,
-        fallback(&relationship.love_type, "not yet named"),
-    )];
+    let mut relationships = soul.relationships.iter().collect::<Vec<_>>();
+    relationships.sort_by(|left, right| display_entity_id(left.0).cmp(&display_entity_id(right.0)));
+    let lines = relationships
+        .into_iter()
+        .map(|(target, relationship)| {
+            let mut metrics = vec![
+                format!("trust {:.0}", relationship.trust),
+                format!("affection {:.0}", relationship.affection),
+                format!("intimacy {:.0}", relationship.intimacy),
+                format!("passion {:.0}", relationship.passion),
+                format!("commitment {:.0}", relationship.commitment),
+                format!("fear {:.0}", relationship.fear),
+                format!("desire {:.0}", relationship.desire),
+            ];
+            push_metric_if_nonzero(&mut metrics, "respect", relationship.respect);
+            push_metric_if_nonzero(&mut metrics, "conflict", relationship.conflict);
+            push_metric_if_nonzero(&mut metrics, "dependency", relationship.dependency);
+            push_metric_if_nonzero(&mut metrics, "curiosity", relationship.curiosity);
+            push_metric_if_nonzero(&mut metrics, "comfort", relationship.comfort);
+            push_metric_if_nonzero(
+                &mut metrics,
+                "boundary_pressure",
+                relationship.boundary_pressure,
+            );
+            format!(
+                "{} -> {}: {}. Label/style: {}.",
+                fallback(&soul.character_name, "Character"),
+                display_entity_id(target),
+                metrics.join(", "),
+                fallback(&relationship.love_type, "not yet named"),
+            )
+        })
+        .collect::<Vec<_>>();
 
     section_from_lines(
-        "[RELATIONSHIP]",
+        "[RELATIONSHIPS]",
         lines,
         budget.relationship_tokens.min(budget.max_tokens),
     )
@@ -435,7 +457,7 @@ fn compact_sections_to_budget(sections: &mut Vec<String>, max_tokens: usize) -> 
         "[RELEVANT MEMORIES]",
         "[CHARACTER SNAPSHOT]",
         "[WORLD SNAPSHOT]",
-        "[RELATIONSHIP]",
+        "[RELATIONSHIPS]",
         "[LATEST EXCHANGE, HIGH PRIORITY]",
     ];
 
@@ -726,6 +748,23 @@ fn fallback<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     clean(value).unwrap_or(fallback)
 }
 
+fn display_entity_id(entity_id: &str) -> String {
+    let trimmed = entity_id.trim();
+    if trimmed.eq_ignore_ascii_case("user") || trimmed.eq_ignore_ascii_case("default_player") {
+        return "default_player".into();
+    }
+    if trimmed.is_empty() {
+        return "unknown_speaker".into();
+    }
+    trimmed.to_string()
+}
+
+fn push_metric_if_nonzero(metrics: &mut Vec<String>, label: &str, value: f32) {
+    if value.abs() >= 0.5 {
+        metrics.push(format!("{label} {:.0}", value));
+    }
+}
+
 fn excerpt(text: &str, max_chars: usize) -> String {
     let text = text.trim();
     if text.chars().count() <= max_chars {
@@ -832,8 +871,40 @@ mod tests {
         assert!(preview.text.contains("[WORLD SNAPSHOT]"));
         assert!(preview.text.contains("[CHARACTER SNAPSHOT]"));
         assert!(preview.text.contains("[RELEVANT MEMORIES]"));
-        assert!(preview.text.contains("[RELATIONSHIP]"));
+        assert!(preview.text.contains("[RELATIONSHIPS]"));
         assert!(preview.text.contains("[LATEST EXCHANGE, HIGH PRIORITY]"));
+    }
+
+    #[test]
+    fn relationship_section_lists_directed_targets() {
+        let mut soul = new_default_soul("Aurora");
+        let mut junhwa = soul.relationships["user"].clone();
+        junhwa.trust = 8.0;
+        junhwa.affection = 18.0;
+        junhwa.fear = 35.0;
+        junhwa.dependency = 70.0;
+        junhwa.conflict = 60.0;
+        soul.relationships.insert("junhwa".into(), junhwa);
+        let mut rhy = soul.relationships["user"].clone();
+        rhy.trust = 16.0;
+        rhy.affection = 22.0;
+        rhy.fear = 8.0;
+        rhy.curiosity = 35.0;
+        rhy.comfort = 20.0;
+        soul.relationships.insert("rhy".into(), rhy);
+
+        let preview = compile_context_for_messages(&soul, &[]);
+
+        assert!(preview.text.contains("[RELATIONSHIPS]"));
+        assert!(preview
+            .text
+            .contains("Aurora -> junhwa: trust 8, affection 18"));
+        assert!(preview.text.contains("fear 35"));
+        assert!(preview.text.contains("dependency 70"));
+        assert!(preview
+            .text
+            .contains("Aurora -> rhy: trust 16, affection 22"));
+        assert!(preview.text.contains("curiosity 35"));
     }
 
     #[test]
@@ -1287,6 +1358,11 @@ mod tests {
             salience,
             tag: tag.into(),
             retrieval_strength,
+            perceived_by_entity_id: None,
+            target_entity_ids: Vec::new(),
+            interpretation: None,
+            confidence: None,
+            objective_event_id: None,
         }
     }
 

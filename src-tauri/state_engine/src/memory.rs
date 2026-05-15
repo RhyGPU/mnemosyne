@@ -93,6 +93,11 @@ pub fn create_scored_memory(soul: &Soul, content: &str, tag: &str) -> MemoryEntr
         salience: 50.0,
         tag: tag.trim().to_string(),
         retrieval_strength: 50.0,
+        perceived_by_entity_id: None,
+        target_entity_ids: Vec::new(),
+        interpretation: None,
+        confidence: None,
+        objective_event_id: None,
     };
     let score = MemoryScorer::default().score(soul, &memory);
     let salience = (score * 100.0).round();
@@ -197,6 +202,11 @@ mod tests {
             salience: 50.0,
             tag: "trust_building".into(),
             retrieval_strength: 50.0,
+            perceived_by_entity_id: None,
+            target_entity_ids: Vec::new(),
+            interpretation: None,
+            confidence: None,
+            objective_event_id: None,
         };
 
         let score = MemoryScorer::default().score(&soul, &memory);
@@ -213,6 +223,11 @@ mod tests {
             salience: 75.0,
             tag: "trust_building".into(),
             retrieval_strength: 75.0,
+            perceived_by_entity_id: None,
+            target_entity_ids: Vec::new(),
+            interpretation: None,
+            confidence: None,
+            objective_event_id: None,
         });
 
         let duplicate = MemoryEntry {
@@ -222,6 +237,11 @@ mod tests {
             salience: 50.0,
             tag: "trust_building".into(),
             retrieval_strength: 50.0,
+            perceived_by_entity_id: None,
+            target_entity_ids: Vec::new(),
+            interpretation: None,
+            confidence: None,
+            objective_event_id: None,
         };
 
         let fresh = MemoryEntry {
@@ -231,6 +251,11 @@ mod tests {
             salience: 50.0,
             tag: "orientation".into(),
             retrieval_strength: 50.0,
+            perceived_by_entity_id: None,
+            target_entity_ids: Vec::new(),
+            interpretation: None,
+            confidence: None,
+            objective_event_id: None,
         };
 
         let scorer = MemoryScorer::default();

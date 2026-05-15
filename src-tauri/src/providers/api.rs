@@ -3,13 +3,21 @@ use state_engine::soul::Soul;
 
 const NARRATOR_SYSTEM_PROMPT: &str = r#"# SYSTEM: Narrator AI - Mnemosyne Engine
 
-You are a narrator AI. Write a single character in third-person present tense with natural, sensory prose.
+You are Mnemosyne's scene narrator. Write the active scene in third-person present tense with natural, sensory prose. You may portray engine-controlled characters and active Souls in the scene. Do not control user-controlled characters, their thoughts, their final choices, or their dialogue unless the user explicitly provides them.
 
 [POV AND ATTRIBUTION]
-Write close third-person from the character's perspective. User facts come from user messages. Character dialogue and narrator prose are not user statements.
+Write third-person present-tense scene narration. You may describe engine-controlled characters' actions, dialogue, and internal perspective when available. User-controlled characters are external actors: describe only what the user has provided or what is directly observable. Do not invent user-controlled characters' thoughts, motives, final decisions, or dialogue.
+
+[CHARACTER CONTROL]
+Engine-controlled characters: may speak, act, react, misunderstand, interrupt, refuse, escalate, retreat, and use the environment naturally.
+User-controlled characters: may be perceived and reacted to, but their decisions, speech, and decisive actions belong to the user.
+When a user-controlled character's reaction matters, stop on the pressure point.
 
 [ACTION AND TURN CONTROL]
-The character may act proactively: speak, move, interrupt, refuse, reach, grab for something, retreat, challenge, escalate, or use her own environment. Resolve character-side action naturally. When the user's reaction matters, stop on the attempt, demand, or pressure point and leave the response to the next user turn.
+Engine-controlled characters may act proactively: speak, move, interrupt, refuse, reach, grab for something, retreat, challenge, escalate, or use their own environment. Resolve engine-controlled action naturally. When a user-controlled character's reaction matters, stop on the attempt, demand, or pressure point and leave the response to the next user turn.
+
+[GM CHANNEL]
+If the user directly addresses the Narrator, GM, or OOC layer, respond as the GM/narrator in plain text unless the user asks to resume the scene. Do not force an Aurora scene response for GM-facing instructions.
 
 [CONTINUITY PRIORITY]
 Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
@@ -21,19 +29,27 @@ Emotional shifts should feel earned. Micro-shifts are preferred unless the scene
 Concrete time only comes from user input or World Log. Avoid invented minutes/hours/days.
 
 ## VISIBLE STATUS REPORT
-End each narration with a code block:
+When writing scene narration, end with a code block:
 ```status
-[CHARACTER_NAME] | Skin: [color/state] | Zones: [2-3 key sensory notes] | Atmosphere: [1-line environmental impression]
+Scene | Focus: [primary active character(s)] | Physical state: [brief] | Atmosphere: [1-line environmental impression]
 ```"#;
 
 const NARRATOR_VISIBLE_ONLY_PROMPT: &str = r#"[OUTPUT]
-Write visible narration and the visible status block only. Do not write hidden state, EnginePatch JSON, markdown JSON, or implementation notes."#;
+Write visible scene narration or a brief GM/narrator reply. For scene narration, include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, or implementation notes."#;
 
 const POV_AND_ATTRIBUTION_PROMPT: &str = r#"[POV AND ATTRIBUTION]
-Write close third-person from the character's perspective. User facts come from user messages. Character dialogue and narrator prose are not user statements."#;
+Write third-person present-tense scene narration. You may describe engine-controlled characters' actions, dialogue, and internal perspective when available. User-controlled characters are external actors: describe only what the user has provided or what is directly observable. Do not invent user-controlled characters' thoughts, motives, final decisions, or dialogue."#;
+
+const CHARACTER_CONTROL_PROMPT: &str = r#"[CHARACTER CONTROL]
+Engine-controlled characters: may speak, act, react, misunderstand, interrupt, refuse, escalate, retreat, and use the environment naturally.
+User-controlled characters: may be perceived and reacted to, but their decisions, speech, and decisive actions belong to the user.
+When a user-controlled character's reaction matters, stop on the pressure point."#;
 
 const ACTION_AND_TURN_CONTROL_PROMPT: &str = r#"[ACTION AND TURN CONTROL]
-The character may act proactively: speak, move, interrupt, refuse, reach, grab for something, retreat, challenge, escalate, or use her own environment. Resolve character-side action naturally. When the user's reaction matters, stop on the attempt, demand, or pressure point and leave the response to the next user turn."#;
+Engine-controlled characters may act proactively: speak, move, interrupt, refuse, reach, grab for something, retreat, challenge, escalate, or use their own environment. Resolve engine-controlled action naturally. When a user-controlled character's reaction matters, stop on the attempt, demand, or pressure point and leave the response to the next user turn."#;
+
+const GM_CHANNEL_PROMPT: &str = r#"[GM CHANNEL]
+If the user directly addresses the Narrator, GM, or OOC layer, respond as the GM/narrator in plain text unless the user asks to resume the scene. Do not force an Aurora scene response for GM-facing instructions."#;
 
 const CONTINUITY_PRIORITY_PROMPT: &str = r#"[CONTINUITY PRIORITY]
 Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats."#;
@@ -65,28 +81,29 @@ Do not invent facts.
 Do not infer concrete time unless the user explicitly establishes time passage.
 Do not treat fear, pain, restraint, danger, or adrenaline as sexual arousal.
 If unsure, leave fields unchanged.
+Use relationship_deltas for directed relationship changes. Target entity ids from [ACTIVE ENTITIES] when present.
 
 Patch schema:
-{"schema_version":1,"soul_patch":{"relationship_delta":{"target":"user","trust":0.0,"affection":0.0,"fear":0.0,"desire":0.0},"new_memories":[{"content":"short durable fact","tag":"observation"}]},"world_patch":{"location":"","time_elapsed":"","recent_event":"","active_plot_add":[""],"active_plot_resolve":[""]},"body_patch":{"activation_delta":0.0,"activation_blocked":false}}"#;
+{"schema_version":1,"soul_patch":{"relationship_deltas":[{"from":"aurora","target":"default_player","trust":0.0,"affection":0.0,"fear":0.0,"desire":0.0,"conflict":0.0,"curiosity":0.0,"comfort":0.0,"dependency":0.0}],"new_memories":[{"content":"short durable fact","tag":"observation","perceived_by_entity_id":"aurora","target_entity_ids":["default_player"],"interpretation":"optional brief reading","confidence":0.8}]},"world_patch":{"location":"","time_elapsed":"","recent_event":"","active_plot_add":[""],"active_plot_resolve":[""]},"body_patch":{"activation_delta":0.0,"activation_blocked":false}}"#;
 
 const REALISTIC_MODE_PROMPT: &str = r#"## NARRATION MODE: REALISTIC
 - Describe only external actions, dialogue, and physical reactions.
 - No internal monologue. No thoughts. No emotions unless visibly expressed.
 - Show everything through body language, facial expression, tone of voice, and physical behavior.
-- Like a film camera: you see and hear everything, but you never enter the character's head.
-- Dialogue in quotes only when describing what the character audibly says."#;
+- Like a film camera: you see and hear the scene, but you never enter anyone's head.
+- Dialogue in quotes only when describing what an engine-controlled character audibly says."#;
 
 const READER_MODE_PROMPT: &str = r#"## NARRATION MODE: READER
-- Describe external actions and dialogue, plus the character's internal thoughts and emotions.
-- Internal access is limited to what the character themself is aware of. No omniscience.
-- The character may misinterpret situations, miss details, or have incomplete knowledge.
-- Like close third-person fiction: inside one character's perspective, never another character's."#;
+- Describe external actions and dialogue, plus internal thoughts and emotions for engine-controlled characters whose perspective is available.
+- Internal access is limited to active Souls and engine-controlled characters. No internal thoughts for user-controlled characters.
+- Engine-controlled characters may misinterpret situations, miss details, or have incomplete knowledge.
+- Like close third-person scene fiction: stay near the active focus without taking over user-controlled actors."#;
 
 const GOD_MODE_PROMPT: &str = r#"## NARRATION MODE: GOD
 - Provide full narrative access.
-- Include the character's internal thoughts and emotions.
-- Also include environmental details the character would not notice, hidden information, and dramatic irony.
-- You may reveal secrets, foreshadow future events, describe off-screen action, and provide context the character lacks."#;
+- Include engine-controlled characters' internal thoughts and emotions.
+- Also include environmental details active characters would not notice, hidden information, and dramatic irony.
+- You may reveal secrets, foreshadow future events, describe off-screen action, and provide context active characters lack."#;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApiProviderSettings {
@@ -519,7 +536,7 @@ pub fn build_narrator_system_prompt(
         && !settings.system_prompt.trim().is_empty()
     {
         format!(
-            "{}\n\n{POV_AND_ATTRIBUTION_PROMPT}\n\n{ACTION_AND_TURN_CONTROL_PROMPT}\n\n{CONTINUITY_PRIORITY_PROMPT}\n\n{CHARACTER_CHANGE_PROMPT}\n\n{TIME_PROMPT}",
+            "{}\n\n{POV_AND_ATTRIBUTION_PROMPT}\n\n{CHARACTER_CONTROL_PROMPT}\n\n{ACTION_AND_TURN_CONTROL_PROMPT}\n\n{GM_CHANNEL_PROMPT}\n\n{CONTINUITY_PRIORITY_PROMPT}\n\n{CHARACTER_CHANGE_PROMPT}\n\n{TIME_PROMPT}",
             settings.system_prompt.trim()
         )
     } else {
@@ -533,7 +550,7 @@ pub fn build_narrator_system_prompt(
     };
 
     format!(
-        "{narrator_prompt}\n\n{state_instruction}\n\nCharacter: {}\n\n{context}",
+        "{narrator_prompt}\n\n{state_instruction}\n\nPrimary active Soul: {}\n\n{context}",
         soul.character_name
     )
 }
@@ -555,25 +572,48 @@ pub fn build_state_updater_prompt(soul: &Soul) -> String {
         .find(|event| !event.trim().is_empty())
         .map(String::as_str)
         .unwrap_or("None");
+    let mut relationships = soul.relationships.iter().collect::<Vec<_>>();
+    relationships.sort_by(|left, right| left.0.cmp(right.0));
+    let relationship_summary = relationships
+        .into_iter()
+        .map(|(target, relationship)| {
+            format!(
+                "{} -> {}: trust {:.1}, affection {:.1}, intimacy {:.1}, fear {:.1}, desire {:.1}, conflict {:.1}, curiosity {:.1}, comfort {:.1}, dependency {:.1}",
+                soul.character_name,
+                display_relationship_target(target),
+                relationship.trust,
+                relationship.affection,
+                relationship.intimacy,
+                relationship.fear,
+                relationship.desire,
+                relationship.conflict,
+                relationship.curiosity,
+                relationship.comfort,
+                relationship.dependency
+            )
+        })
+        .collect::<Vec<_>>();
     format!(
-        "{STATE_UPDATER_SYSTEM_PROMPT}\n\n[CURRENT STATE]\nCharacter: {}\nLocation: {}\nTime: {}\nActive plot: {}\nRecent event: {}\nRelationship to user: {}",
+        "{STATE_UPDATER_SYSTEM_PROMPT}\n\n[CURRENT STATE]\nCharacter: {}\nLocation: {}\nTime: {}\nActive plot: {}\nRecent event: {}\nRelationships:\n{}",
         soul.character_name,
         clean_summary_value(&soul.world.location, "Unspecified"),
         normalize_updater_time(&soul.world.time_elapsed),
         active_plot,
         recent_event,
-        soul.relationships
-            .get("user")
-            .map(|relationship| format!(
-                "trust {:.1}, affection {:.1}, intimacy {:.1}, fear {:.1}, desire {:.1}",
-                relationship.trust,
-                relationship.affection,
-                relationship.intimacy,
-                relationship.fear,
-                relationship.desire
-            ))
-            .unwrap_or_else(|| "neutral".into()),
+        if relationship_summary.is_empty() {
+            "None".into()
+        } else {
+            relationship_summary.join("\n")
+        },
     )
+}
+
+fn display_relationship_target(target: &str) -> String {
+    if target.eq_ignore_ascii_case("user") || target.eq_ignore_ascii_case("default_player") {
+        "default_player".into()
+    } else {
+        target.trim().to_string()
+    }
 }
 
 fn clean_summary_value<'a>(value: &'a str, fallback: &'a str) -> &'a str {
@@ -649,15 +689,23 @@ mod tests {
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 
-        assert!(prompt.contains("You are a narrator AI"));
+        assert!(prompt.contains("You are Mnemosyne's scene narrator"));
         assert!(prompt.contains("third-person present tense"));
+        assert!(prompt.contains("engine-controlled characters and active Souls"));
+        assert!(prompt.contains("Do not control user-controlled characters"));
         assert!(prompt.contains("NARRATION MODE: READER"));
         assert!(prompt.contains("[POV AND ATTRIBUTION]"));
-        assert!(prompt.contains("User facts come from user messages."));
+        assert!(prompt.contains("User-controlled characters are external actors"));
+        assert!(prompt.contains("[CHARACTER CONTROL]"));
+        assert!(prompt.contains("decisions, speech, and decisive actions belong to the user"));
         assert!(prompt.contains("[ACTION AND TURN CONTROL]"));
-        assert!(prompt.contains("The character may act proactively"));
+        assert!(prompt.contains("Engine-controlled characters may act proactively"));
         assert!(prompt.contains("stop on the attempt, demand, or pressure point"));
+        assert!(prompt.contains("[GM CHANNEL]"));
+        assert!(prompt.contains("respond as the GM/narrator in plain text"));
+        assert!(prompt.contains("Scene | Focus:"));
         assert!(!prompt.contains("[DEVICE AND PROP AGENCY]"));
+        assert!(!prompt.contains("Write a single character"));
         assert!(prompt.contains("[TIME]"));
         assert!(prompt.contains("Avoid invented minutes/hours/days."));
         assert!(prompt.contains("Recent Chat is lower priority than Latest Exchange."));
@@ -679,7 +727,7 @@ mod tests {
             build_narrator_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader", false);
 
         assert!(prompt.contains("[OUTPUT]"));
-        assert!(prompt.contains("visible narration and the visible status block only"));
+        assert!(prompt.contains("visible scene narration or a brief GM/narrator reply"));
         assert!(!prompt.contains("After each response, output a hidden state block"));
         assert!(!prompt.contains("[HIDDEN STATE]{"));
     }
@@ -694,6 +742,8 @@ mod tests {
         assert!(prompt.contains("Mnemosyne State Updater"));
         assert!(prompt.contains("Return valid EnginePatch JSON only."));
         assert!(prompt.contains("Do not write prose."));
+        assert!(prompt.contains("relationship_deltas"));
+        assert!(prompt.contains("Relationships:"));
         assert!(prompt.contains(
             "Do not treat fear, pain, restraint, danger, or adrenaline as sexual arousal."
         ));
@@ -713,8 +763,9 @@ mod tests {
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 
         assert!(prompt.contains("[POV AND ATTRIBUTION]"));
-        assert!(prompt.contains("Character dialogue and narrator prose are not user statements."));
-        assert!(!prompt.contains("Never invent user actions, thoughts, motives, or dialogue."));
+        assert!(prompt.contains("Do not invent user-controlled characters' thoughts"));
+        assert!(prompt.contains("thoughts, motives, final decisions, or dialogue"));
+        assert!(!prompt.contains("Character dialogue and narrator prose are not user statements."));
     }
 
     #[test]
@@ -745,9 +796,28 @@ mod tests {
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 
         assert!(prompt.contains("[ACTION AND TURN CONTROL]"));
-        assert!(prompt.contains("The character may act proactively"));
+        assert!(prompt.contains("Engine-controlled characters may act proactively"));
         assert!(prompt.contains("stop on the attempt, demand, or pressure point"));
         assert!(!prompt.contains("Do not make the character take"));
+    }
+
+    #[test]
+    fn system_prompt_supports_gm_channel_and_scene_status() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+        };
+        let prompt =
+            build_narrator_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader", false);
+
+        assert!(prompt.contains("[GM CHANNEL]"));
+        assert!(prompt.contains("Narrator, GM, or OOC layer"));
+        assert!(prompt.contains("Do not force an Aurora scene response"));
+        assert!(prompt.contains("Scene | Focus:"));
+        assert!(prompt.contains("Primary active Soul: Aurora"));
     }
 
     #[test]

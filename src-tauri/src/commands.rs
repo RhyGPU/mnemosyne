@@ -24,8 +24,8 @@ use state_engine::{
 
 use crate::{
     db::{
-        self, AssistantMessageVariant, ChatMessage, LlmPayloadLog, ProviderProfile, SettingSummary,
-        SoulSummary,
+        self, AssistantMessageVariant, ChatMessage, EntityRecord, LlmPayloadLog, ProviderProfile,
+        SettingSummary, SoulSummary,
     },
     providers::{
         api::{
@@ -151,6 +151,31 @@ pub struct VariantSelectionResult {
 pub struct ExportResult {
     pub path: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone)]
+struct EntityTurnContext {
+    entities: Vec<EntityRecord>,
+    speaker: SpeakerResolution,
+}
+
+#[derive(Debug, Clone)]
+struct SpeakerResolution {
+    label: Option<String>,
+    entity_id: String,
+    display_name: String,
+    status: SpeakerResolutionStatus,
+    candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpeakerResolutionStatus {
+    NoLabel,
+    Exact,
+    FuzzyTypo,
+    Ambiguous,
+    Created,
+    Unknown,
 }
 
 #[tauri::command]
@@ -671,7 +696,14 @@ pub async fn send_api_turn(
             "user_message_chars": user_text.chars().count()
         })),
     );
-    let (mut soul, context_messages, context_preview, snapshot_user_text, pre_turn_soul_json) = {
+    let (
+        mut soul,
+        context_messages,
+        context_preview,
+        snapshot_user_text,
+        pre_turn_soul_json,
+        entity_context,
+    ) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         let (soul, snapshot_user_text) = if let Some(message_id) = replacement_assistant_id {
             let snapshot = db::get_turn_snapshot(&conn, &conversation_id, message_id)
@@ -692,6 +724,9 @@ pub async fn send_api_turn(
             db::insert_message(&conn, &conversation_id, "user", &user_text)
                 .map_err(|err| err.to_string())?;
         }
+        let entity_context =
+            resolve_speaker_for_turn(&conn, &conversation_id, &soul, &snapshot_user_text)
+                .map_err(|err| err.to_string())?;
 
         let history_limit = if context_mode == ContextMode::FullChat {
             100
@@ -718,8 +753,10 @@ pub async fn send_api_turn(
             context_preview,
             snapshot_user_text,
             pre_turn_soul_json,
+            entity_context,
         )
     };
+    emit_entity_resolution_log(&window, &conversation_id, &entity_context.speaker);
     emit_dev_log(
         &window,
         "info",
@@ -954,8 +991,12 @@ pub async fn send_api_turn(
     );
 
     let updater_system_prompt = build_state_updater_prompt(&soul);
-    let updater_user_message =
-        build_state_updater_user_message(&snapshot_user_text, &visible_response);
+    let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
+    let updater_user_message = build_state_updater_user_message(
+        &snapshot_user_text,
+        &visible_response,
+        Some(&entity_updater_context),
+    );
     emit_dev_log(
         &window,
         "info",
@@ -1072,20 +1113,23 @@ pub async fn send_api_turn(
     debug.state_updater_status = state_updater_status;
 
     match engine_patch.apply_to_soul(&mut soul) {
-        Ok(report) => emit_dev_log(
-            &window,
-            "success",
-            "state_updater",
-            "EnginePatch applied",
-            Some(serde_json::json!({
-                "conversation_id": conversation_id.as_str(),
-                "assistant_message_id": assistant_message_id,
-                "relationship_updated": report.relationship_updated,
-                "memories_added": report.memories_added,
-                "world_updated": report.world_updated,
-                "body_updated": report.body_updated
-            })),
-        ),
+        Ok(report) => {
+            emit_dev_log(
+                &window,
+                "success",
+                "state_updater",
+                "EnginePatch applied",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "assistant_message_id": assistant_message_id,
+                    "relationship_updated": report.relationship_updated,
+                    "memories_added": report.memories_added,
+                    "world_updated": report.world_updated,
+                    "body_updated": report.body_updated
+                })),
+            );
+            emit_relationship_delta_logs(&window, &conversation_id, &engine_patch);
+        }
         Err(err) => emit_dev_log(
             &window,
             "error",
@@ -1269,6 +1313,101 @@ fn emit_dev_log(
     }
 }
 
+fn emit_entity_resolution_log(window: &Window, conversation_id: &str, speaker: &SpeakerResolution) {
+    match speaker.status {
+        SpeakerResolutionStatus::NoLabel => {}
+        SpeakerResolutionStatus::Exact => emit_dev_log(
+            window,
+            "info",
+            "context",
+            "Speaker entity resolved",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "label": speaker.label.as_deref(),
+                "entity_id": speaker.entity_id.as_str(),
+                "display_name": speaker.display_name.as_str()
+            })),
+        ),
+        SpeakerResolutionStatus::FuzzyTypo => emit_dev_log(
+            window,
+            "warn",
+            "warning",
+            "Speaker label resolved to active entity",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "label": speaker.label.as_deref(),
+                "entity_id": speaker.entity_id.as_str(),
+                "display_name": speaker.display_name.as_str()
+            })),
+        ),
+        SpeakerResolutionStatus::Ambiguous => emit_dev_log(
+            window,
+            "warn",
+            "warning",
+            "Ambiguous speaker label",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "label": speaker.label.as_deref(),
+                "candidates": speaker.candidates.clone()
+            })),
+        ),
+        SpeakerResolutionStatus::Created => emit_dev_log(
+            window,
+            "success",
+            "context",
+            "Entity created",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "label": speaker.label.as_deref(),
+                "entity_id": speaker.entity_id.as_str(),
+                "display_name": speaker.display_name.as_str()
+            })),
+        ),
+        SpeakerResolutionStatus::Unknown => emit_dev_log(
+            window,
+            "warn",
+            "warning",
+            "Unknown speaker label",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "label": speaker.label.as_deref()
+            })),
+        ),
+    }
+}
+
+fn emit_relationship_delta_logs(window: &Window, conversation_id: &str, patch: &EnginePatch) {
+    let Some(soul_patch) = patch.soul_patch.as_ref() else {
+        return;
+    };
+    let mut deltas = Vec::new();
+    if let Some(delta) = soul_patch.relationship_delta.as_ref() {
+        deltas.push(delta);
+    }
+    deltas.extend(soul_patch.relationship_deltas.iter());
+    for delta in deltas {
+        emit_dev_log(
+            window,
+            "info",
+            "state_updater",
+            "Relationship delta applied",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "from": delta.from.as_deref().unwrap_or("active_soul"),
+                "target": delta.target.as_deref().unwrap_or("user"),
+                "trust": delta.trust,
+                "affection": delta.affection,
+                "fear": delta.fear,
+                "desire": delta.desire,
+                "conflict": delta.conflict,
+                "curiosity": delta.curiosity,
+                "comfort": delta.comfort,
+                "dependency": delta.dependency
+            })),
+        );
+    }
+}
+
 fn redact_dev_log_details(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => serde_json::Value::Object(
@@ -1306,6 +1445,443 @@ fn messages_to_context(messages: Vec<ChatMessage>) -> Vec<ContextMessage> {
         .collect()
 }
 
+fn ensure_default_entities(
+    conn: &Connection,
+    conversation_id: &str,
+    soul: &Soul,
+) -> rusqlite::Result<()> {
+    let default_player = EntityRecord {
+        entity_id: "default_player".into(),
+        conversation_id: conversation_id.into(),
+        display_name: "User".into(),
+        aliases: vec!["user".into(), "player".into(), "operator".into()],
+        kind: "operator".into(),
+        controlled_by: "user".into(),
+        linked_soul_id: None,
+        active_in_scene: true,
+        created_at: 0,
+        updated_at: 0,
+    };
+    db::upsert_entity(conn, &default_player)?;
+
+    let soul_entity = EntityRecord {
+        entity_id: normalize_entity_id(&soul.character_name),
+        conversation_id: conversation_id.into(),
+        display_name: soul.character_name.clone(),
+        aliases: vec![soul.character_name.clone()],
+        kind: "soul".into(),
+        controlled_by: "narrator".into(),
+        linked_soul_id: Some(soul.character_id.clone()),
+        active_in_scene: true,
+        created_at: 0,
+        updated_at: 0,
+    };
+    db::upsert_entity(conn, &soul_entity)?;
+    Ok(())
+}
+
+fn resolve_speaker_for_turn(
+    conn: &Connection,
+    conversation_id: &str,
+    soul: &Soul,
+    user_text: &str,
+) -> rusqlite::Result<EntityTurnContext> {
+    ensure_default_entities(conn, conversation_id, soul)?;
+    let label = extract_latest_speaker_label(user_text);
+    let mut entities = db::list_entities(conn, conversation_id)?;
+    let speaker = match label {
+        None => default_speaker_resolution(),
+        Some(label) => resolve_speaker_label(conn, conversation_id, &mut entities, &label)?,
+    };
+    entities = db::list_entities(conn, conversation_id)?;
+    Ok(EntityTurnContext { entities, speaker })
+}
+
+fn default_speaker_resolution() -> SpeakerResolution {
+    SpeakerResolution {
+        label: None,
+        entity_id: "default_player".into(),
+        display_name: "User".into(),
+        status: SpeakerResolutionStatus::NoLabel,
+        candidates: Vec::new(),
+    }
+}
+
+fn resolve_speaker_label(
+    conn: &Connection,
+    conversation_id: &str,
+    entities: &mut [EntityRecord],
+    label: &str,
+) -> rusqlite::Result<SpeakerResolution> {
+    if let Some(entity) = exact_entity_match(entities, label) {
+        return Ok(SpeakerResolution {
+            label: Some(label.to_string()),
+            entity_id: entity.entity_id.clone(),
+            display_name: entity.display_name.clone(),
+            status: SpeakerResolutionStatus::Exact,
+            candidates: Vec::new(),
+        });
+    }
+
+    if let Some(match_result) = best_fuzzy_entity_match(entities, label, true) {
+        if match_result.ambiguous {
+            return Ok(ambiguous_resolution(label, match_result.candidates));
+        }
+        let entity = match_result.entity;
+        let updated = db::add_entity_alias(conn, conversation_id, &entity.entity_id, label)?;
+        return Ok(SpeakerResolution {
+            label: Some(label.to_string()),
+            entity_id: updated.entity_id,
+            display_name: updated.display_name,
+            status: SpeakerResolutionStatus::FuzzyTypo,
+            candidates: Vec::new(),
+        });
+    }
+
+    if let Some(match_result) = best_fuzzy_entity_match(entities, label, false) {
+        if match_result.ambiguous {
+            return Ok(ambiguous_resolution(label, match_result.candidates));
+        }
+        let entity = match_result.entity;
+        let updated = db::add_entity_alias(conn, conversation_id, &entity.entity_id, label)?;
+        return Ok(SpeakerResolution {
+            label: Some(label.to_string()),
+            entity_id: updated.entity_id,
+            display_name: updated.display_name,
+            status: SpeakerResolutionStatus::FuzzyTypo,
+            candidates: Vec::new(),
+        });
+    }
+
+    if label_can_create_entity(label) {
+        let entity = EntityRecord {
+            entity_id: normalize_entity_id(label),
+            conversation_id: conversation_id.into(),
+            display_name: label.trim().to_string(),
+            aliases: vec![label.trim().to_string()],
+            kind: "user_controlled".into(),
+            controlled_by: "user".into(),
+            linked_soul_id: None,
+            active_in_scene: true,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let entity = db::upsert_entity(conn, &entity)?;
+        return Ok(SpeakerResolution {
+            label: Some(label.to_string()),
+            entity_id: entity.entity_id,
+            display_name: entity.display_name,
+            status: SpeakerResolutionStatus::Created,
+            candidates: Vec::new(),
+        });
+    }
+
+    Ok(SpeakerResolution {
+        label: Some(label.to_string()),
+        entity_id: "unknown_speaker".into(),
+        display_name: "Unknown speaker".into(),
+        status: SpeakerResolutionStatus::Unknown,
+        candidates: Vec::new(),
+    })
+}
+
+#[derive(Debug)]
+struct FuzzyEntityMatch {
+    entity: EntityRecord,
+    ambiguous: bool,
+    candidates: Vec<String>,
+}
+
+fn best_fuzzy_entity_match(
+    entities: &[EntityRecord],
+    label: &str,
+    active_only: bool,
+) -> Option<FuzzyEntityMatch> {
+    let normalized_label = normalize_match_key(label);
+    if normalized_label.len() < 2 {
+        return None;
+    }
+    let mut scored = entities
+        .iter()
+        .filter(|entity| !active_only || entity.active_in_scene)
+        .filter_map(|entity| {
+            best_entity_score(entity, &normalized_label)
+                .filter(|score| fuzzy_score_is_close(normalized_label.len(), *score))
+                .map(|score| (entity.clone(), score))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let (entity, score) = scored.first()?.clone();
+    let candidates = scored
+        .iter()
+        .take(3)
+        .map(|(entity, _)| entity.display_name.clone())
+        .collect::<Vec<_>>();
+    let ambiguous = scored
+        .get(1)
+        .map(|(_, second_score)| (score - *second_score).abs() < 0.08)
+        .unwrap_or(false);
+    Some(FuzzyEntityMatch {
+        entity,
+        ambiguous,
+        candidates,
+    })
+}
+
+fn exact_entity_match<'a>(entities: &'a [EntityRecord], label: &str) -> Option<&'a EntityRecord> {
+    let trimmed = label.trim();
+    entities.iter().find(|entity| {
+        entity.entity_id == trimmed
+            || entity.display_name == trimmed
+            || entity.aliases.iter().any(|alias| alias == trimmed)
+            || entity.entity_id.eq_ignore_ascii_case(trimmed)
+            || entity.display_name.eq_ignore_ascii_case(trimmed)
+            || entity
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(trimmed))
+    })
+}
+
+fn best_entity_score(entity: &EntityRecord, normalized_label: &str) -> Option<f32> {
+    let mut keys = vec![
+        normalize_match_key(&entity.entity_id),
+        normalize_match_key(&entity.display_name),
+    ];
+    keys.extend(
+        entity
+            .aliases
+            .iter()
+            .map(|alias| normalize_match_key(alias)),
+    );
+    keys.into_iter()
+        .filter(|key| !key.is_empty())
+        .map(|key| similarity_score(normalized_label, &key))
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+fn fuzzy_score_is_close(label_len: usize, score: f32) -> bool {
+    if label_len <= 4 {
+        score >= 0.66
+    } else {
+        score >= 0.82
+    }
+}
+
+fn ambiguous_resolution(label: &str, candidates: Vec<String>) -> SpeakerResolution {
+    SpeakerResolution {
+        label: Some(label.to_string()),
+        entity_id: "unknown_speaker".into(),
+        display_name: "Unknown speaker".into(),
+        status: SpeakerResolutionStatus::Ambiguous,
+        candidates,
+    }
+}
+
+fn extract_latest_speaker_label(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .filter_map(extract_speaker_label_from_line)
+        .next()
+}
+
+fn extract_speaker_label_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let colon_index = trimmed.find(':')?;
+    if colon_index == 0 || colon_index > 48 {
+        return None;
+    }
+    let label = trimmed[..colon_index].trim();
+    if label_can_be_speaker(label) {
+        Some(label.to_string())
+    } else {
+        None
+    }
+}
+
+fn label_can_be_speaker(label: &str) -> bool {
+    let label = label.trim();
+    !label.is_empty()
+        && label.chars().any(char::is_alphabetic)
+        && label.chars().all(|character| {
+            character.is_alphanumeric()
+                || character.is_whitespace()
+                || matches!(character, '_' | '-' | '\'' | '.')
+        })
+}
+
+fn label_can_create_entity(label: &str) -> bool {
+    let normalized = normalize_match_key(label);
+    normalized.len() >= 2
+        && normalized.len() <= 40
+        && !matches!(
+            normalized.as_str(),
+            "i" | "me" | "we" | "he" | "she" | "they" | "system" | "assistant" | "narrator"
+        )
+}
+
+fn normalize_entity_id(label: &str) -> String {
+    let normalized = normalize_match_key(label);
+    if normalized == "user" || normalized == "player" || normalized == "operator" {
+        "default_player".into()
+    } else if normalized.is_empty() {
+        "unknown_speaker".into()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_match_key(label: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_separator = false;
+    for character in label.trim().chars() {
+        if character.is_alphanumeric() {
+            normalized.extend(character.to_lowercase());
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            normalized.push('_');
+            previous_was_separator = true;
+        }
+    }
+    normalized.trim_matches('_').to_string()
+}
+
+fn similarity_score(left: &str, right: &str) -> f32 {
+    if left == right {
+        return 1.0;
+    }
+    let max_len = left.chars().count().max(right.chars().count());
+    if max_len == 0 {
+        return 0.0;
+    }
+    let distance = levenshtein(left, right);
+    (1.0 - (distance as f32 / max_len as f32)).clamp(0.0, 1.0)
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right_chars.len() + 1];
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let substitution = if left_char == *right_char { 0 } else { 1 };
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + substitution);
+        }
+        previous.clone_from(&current);
+    }
+    previous[right_chars.len()]
+}
+
+fn build_entity_updater_context(soul: &Soul, context: &EntityTurnContext) -> String {
+    let active_entities = context
+        .entities
+        .iter()
+        .filter(|entity| entity.active_in_scene)
+        .map(|entity| {
+            format!(
+                "- {} ({}) kind={}, controlled_by={}",
+                entity.entity_id, entity.display_name, entity.kind, entity.controlled_by
+            )
+        })
+        .collect::<Vec<_>>();
+    let relationship_lines = context
+        .entities
+        .iter()
+        .filter(|entity| entity.kind != "soul")
+        .filter_map(|entity| {
+            relationship_for_entity(soul, &entity.entity_id).map(|relationship| {
+                format!(
+                    "{} -> {}: trust {:.0}, affection {:.0}, fear {:.0}, desire {:.0}, conflict {:.0}, curiosity {:.0}, comfort {:.0}, dependency {:.0}",
+                    soul.character_name,
+                    entity.entity_id,
+                    relationship.trust,
+                    relationship.affection,
+                    relationship.fear,
+                    relationship.desire,
+                    relationship.conflict,
+                    relationship.curiosity,
+                    relationship.comfort,
+                    relationship.dependency
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    format!(
+        "[ACTIVE ENTITIES]\n{}\n\n[LATEST SPEAKER ENTITY]\n{}\n\n[RELEVANT RELATIONSHIPS]\n{}",
+        if active_entities.is_empty() {
+            "None".into()
+        } else {
+            active_entities.join("\n")
+        },
+        context.speaker.summary_line(),
+        if relationship_lines.is_empty() {
+            "No directed relationship records for active non-soul entities yet.".into()
+        } else {
+            relationship_lines.join("\n")
+        }
+    )
+}
+
+fn relationship_for_entity<'a>(
+    soul: &'a Soul,
+    entity_id: &str,
+) -> Option<&'a state_engine::soul::Relationship> {
+    soul.relationships.get(entity_id).or_else(|| {
+        if entity_id.eq_ignore_ascii_case("default_player") {
+            soul.relationships.get("user")
+        } else {
+            None
+        }
+    })
+}
+
+impl SpeakerResolution {
+    fn summary_line(&self) -> String {
+        match self.status {
+            SpeakerResolutionStatus::NoLabel => {
+                "No explicit speaker label; defaulting latest speaker to default_player (User)."
+                    .into()
+            }
+            SpeakerResolutionStatus::Exact => format!(
+                "Label {:?} resolved to {} ({}).",
+                self.label.as_deref().unwrap_or(""),
+                self.entity_id,
+                self.display_name
+            ),
+            SpeakerResolutionStatus::FuzzyTypo => format!(
+                "Label {:?} resolved as likely typo/alias for {} ({}).",
+                self.label.as_deref().unwrap_or(""),
+                self.entity_id,
+                self.display_name
+            ),
+            SpeakerResolutionStatus::Ambiguous => format!(
+                "Label {:?} is ambiguous; use unknown_speaker. Candidates: {}.",
+                self.label.as_deref().unwrap_or(""),
+                self.candidates.join(", ")
+            ),
+            SpeakerResolutionStatus::Created => format!(
+                "Label {:?} created entity {} ({}).",
+                self.label.as_deref().unwrap_or(""),
+                self.entity_id,
+                self.display_name
+            ),
+            SpeakerResolutionStatus::Unknown => format!(
+                "Label {:?} could not be resolved; use unknown_speaker.",
+                self.label.as_deref().unwrap_or("")
+            ),
+        }
+    }
+}
+
 fn compile_context_with_correction(
     soul: &Soul,
     messages: &[ContextMessage],
@@ -1340,9 +1916,19 @@ fn build_user_text_with_correction(
     }
 }
 
-fn build_state_updater_user_message(user_text: &str, narrator_response: &str) -> String {
+fn build_state_updater_user_message(
+    user_text: &str,
+    narrator_response: &str,
+    entity_context: Option<&str>,
+) -> String {
+    let entity_context = entity_context
+        .map(str::trim)
+        .filter(|context| !context.is_empty())
+        .map(|context| format!("{context}\n\n"))
+        .unwrap_or_default();
     format!(
-        "[LATEST USER MESSAGE]\n{}\n\n[NARRATOR RESPONSE]\n{}",
+        "{}[LATEST USER MESSAGE]\n{}\n\n[NARRATOR RESPONSE]\n{}",
+        entity_context,
         user_text.trim(),
         strip_hidden_state_blocks(narrator_response).trim()
     )
@@ -1357,7 +1943,7 @@ fn build_compact_updater_payload_for_test(
     format!(
         "{}\n\n{}",
         build_state_updater_prompt(soul),
-        build_state_updater_user_message(user_text, narrator_response)
+        build_state_updater_user_message(user_text, narrator_response, None)
     )
 }
 
@@ -1375,10 +1961,12 @@ fn parse_engine_patch_json(raw: &str) -> Result<EnginePatch, String> {
 }
 
 fn hidden_state_from_engine_patch(patch: &EnginePatch) -> HiddenState {
-    let relationship = patch
-        .soul_patch
-        .as_ref()
-        .and_then(|patch| patch.relationship_delta.as_ref());
+    let relationship = patch.soul_patch.as_ref().and_then(|patch| {
+        patch
+            .relationship_delta
+            .as_ref()
+            .or_else(|| patch.relationship_deltas.first())
+    });
     let memory = patch.soul_patch.as_ref().and_then(|patch| {
         patch
             .new_memories
@@ -1974,6 +2562,112 @@ mod tests {
     use state_engine::{context_compiler::estimate_tokens, hidden_state::HiddenState};
 
     #[test]
+    fn speaker_label_creates_named_entity() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert");
+        db::ensure_conversation(&conn, "entities", &soul.character_id).expect("conversation");
+
+        let context =
+            resolve_speaker_for_turn(&conn, "entities", &soul, "Rhy: I keep my hands visible.")
+                .expect("resolve");
+
+        assert_eq!(context.speaker.entity_id, "rhy");
+        assert_eq!(context.speaker.status, SpeakerResolutionStatus::Created);
+        assert!(context
+            .entities
+            .iter()
+            .any(|entity| entity.entity_id == "rhy" && entity.display_name == "Rhy"));
+    }
+
+    #[test]
+    fn typo_speaker_label_resolves_to_active_entity() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert");
+        db::ensure_conversation(&conn, "typo", &soul.character_id).expect("conversation");
+        resolve_speaker_for_turn(&conn, "typo", &soul, "Rhy: I answer first.").expect("seed");
+
+        let context = resolve_speaker_for_turn(&conn, "typo", &soul, "Rjy: I correct myself.")
+            .expect("resolve");
+
+        assert_eq!(context.speaker.entity_id, "rhy");
+        assert_eq!(context.speaker.status, SpeakerResolutionStatus::FuzzyTypo);
+        let rhy = db::get_entity(&conn, "typo", "rhy").expect("rhy");
+        assert!(rhy.aliases.iter().any(|alias| alias == "Rjy"));
+    }
+
+    #[test]
+    fn ambiguous_speaker_typo_does_not_create_duplicate_entity() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert");
+        db::ensure_conversation(&conn, "ambiguous", &soul.character_id).expect("conversation");
+        for name in ["Rhy", "Rey"] {
+            db::upsert_entity(
+                &conn,
+                &EntityRecord {
+                    entity_id: normalize_entity_id(name),
+                    conversation_id: "ambiguous".into(),
+                    display_name: name.into(),
+                    aliases: vec![name.into()],
+                    kind: "user_controlled".into(),
+                    controlled_by: "user".into(),
+                    linked_soul_id: None,
+                    active_in_scene: true,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .expect("seed entity");
+        }
+
+        let context = resolve_speaker_for_turn(&conn, "ambiguous", &soul, "Ry: Maybe typo.")
+            .expect("resolve");
+
+        assert_eq!(context.speaker.entity_id, "unknown_speaker");
+        assert_eq!(context.speaker.status, SpeakerResolutionStatus::Ambiguous);
+        let entities = db::list_entities(&conn, "ambiguous").expect("entities");
+        assert!(!entities.iter().any(|entity| entity.entity_id == "ry"));
+    }
+
+    #[test]
+    fn state_updater_message_includes_entities_and_latest_speaker() {
+        let conn = db::init_memory_connection().expect("db");
+        let mut soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert");
+        db::ensure_conversation(&conn, "updater-entities", &soul.character_id)
+            .expect("conversation");
+        let context = resolve_speaker_for_turn(
+            &conn,
+            "updater-entities",
+            &soul,
+            "Junhwa: I refuse the warrant.",
+        )
+        .expect("resolve");
+        soul.relationships.insert("junhwa".into(), {
+            let mut relationship = soul.relationships["user"].clone();
+            relationship.trust = 8.0;
+            relationship.fear = 35.0;
+            relationship.conflict = 60.0;
+            relationship
+        });
+        let entity_context = build_entity_updater_context(&soul, &context);
+        let message = build_state_updater_user_message(
+            "Junhwa: I refuse the warrant.",
+            "Aurora narrows her eyes.",
+            Some(&entity_context),
+        );
+
+        assert!(message.contains("[ACTIVE ENTITIES]"));
+        assert!(message.contains("[LATEST SPEAKER ENTITY]"));
+        assert!(message.contains("junhwa"));
+        assert!(message.contains("Aurora -> junhwa"));
+        assert!(message.contains("[LATEST USER MESSAGE]"));
+        assert!(message.contains("[NARRATOR RESPONSE]"));
+    }
+
+    #[test]
     fn hidden_state_application_updates_soul() {
         let mut soul = new_default_soul("Aurora");
         let state = HiddenState {
@@ -2081,7 +2775,9 @@ mod tests {
         let serialized = serde_json::to_string(&preview).expect("serialize preview");
 
         assert!(!serialized.contains("secret-key-that-must-not-appear"));
-        assert!(preview.system_message.contains("You are a narrator AI"));
+        assert!(preview
+            .system_message
+            .contains("You are Mnemosyne's scene narrator"));
         assert!(preview.user_message.contains("Current user turn"));
         assert!(preview.context.contains("[LATEST EXCHANGE, HIGH PRIORITY]"));
         assert!(preview

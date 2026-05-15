@@ -29,12 +29,14 @@ pub struct EnginePatch {
 #[serde(default, deny_unknown_fields)]
 pub struct SoulPatch {
     pub relationship_delta: Option<RelationshipDelta>,
+    pub relationship_deltas: Vec<RelationshipDelta>,
     pub new_memories: Vec<MemoryPatch>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RelationshipDelta {
+    pub from: Option<String>,
     pub target: Option<String>,
     pub trust: Option<f32>,
     pub affection: Option<f32>,
@@ -43,6 +45,12 @@ pub struct RelationshipDelta {
     pub commitment: Option<f32>,
     pub fear: Option<f32>,
     pub desire: Option<f32>,
+    pub respect: Option<f32>,
+    pub conflict: Option<f32>,
+    pub dependency: Option<f32>,
+    pub curiosity: Option<f32>,
+    pub comfort: Option<f32>,
+    pub boundary_pressure: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -50,6 +58,11 @@ pub struct RelationshipDelta {
 pub struct MemoryPatch {
     pub content: String,
     pub tag: Option<String>,
+    pub perceived_by_entity_id: Option<String>,
+    pub target_entity_ids: Vec<String>,
+    pub interpretation: Option<String>,
+    pub confidence: Option<f32>,
+    pub objective_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -192,6 +205,7 @@ impl From<&HiddenState> for EnginePatch {
             soul_patch.new_memories.push(MemoryPatch {
                 content: memory.to_string(),
                 tag: hidden_state.tag.clone(),
+                ..MemoryPatch::default()
             });
         }
 
@@ -237,30 +251,22 @@ impl SoulPatch {
         self.relationship_delta
             .as_ref()
             .map_or(true, RelationshipDelta::is_empty)
+            && self
+                .relationship_deltas
+                .iter()
+                .all(RelationshipDelta::is_empty)
             && self.new_memories.iter().all(MemoryPatch::is_empty)
     }
 
     fn apply_relationship(&self, soul: &mut Soul) -> bool {
-        let Some(delta) = &self.relationship_delta else {
-            return false;
-        };
-        if delta.is_empty() {
-            return false;
+        let mut changed = false;
+        if let Some(delta) = &self.relationship_delta {
+            changed |= apply_relationship_delta(soul, delta);
         }
-
-        let target = delta.target_name();
-        let relationship = soul
-            .relationships
-            .entry(target)
-            .or_insert_with(default_relationship);
-        apply_delta(&mut relationship.trust, delta.trust);
-        apply_delta(&mut relationship.affection, delta.affection);
-        apply_delta(&mut relationship.intimacy, delta.intimacy);
-        apply_delta(&mut relationship.passion, delta.passion);
-        apply_delta(&mut relationship.commitment, delta.commitment);
-        apply_delta(&mut relationship.fear, delta.fear);
-        apply_delta(&mut relationship.desire, delta.desire);
-        true
+        for delta in &self.relationship_deltas {
+            changed |= apply_relationship_delta(soul, delta);
+        }
+        changed
     }
 
     fn apply_memories(&self, soul: &mut Soul) -> usize {
@@ -270,7 +276,12 @@ impl SoulPatch {
                 continue;
             };
             let tag = memory.tag();
-            let recent = create_scored_memory(soul, content, tag);
+            let mut recent = create_scored_memory(soul, content, tag);
+            recent.perceived_by_entity_id = memory.cleaned_optional(&memory.perceived_by_entity_id);
+            recent.target_entity_ids = memory.cleaned_targets();
+            recent.interpretation = memory.cleaned_optional(&memory.interpretation);
+            recent.confidence = memory.confidence.filter(|confidence| confidence.is_finite());
+            recent.objective_event_id = memory.cleaned_optional(&memory.objective_event_id);
             soul.memory.recent.push(recent);
             added += 1;
         }
@@ -296,6 +307,12 @@ impl RelationshipDelta {
             && self.commitment.is_none()
             && self.fear.is_none()
             && self.desire.is_none()
+            && self.respect.is_none()
+            && self.conflict.is_none()
+            && self.dependency.is_none()
+            && self.curiosity.is_none()
+            && self.comfort.is_none()
+            && self.boundary_pressure.is_none()
     }
 
     fn target_name(&self) -> String {
@@ -324,6 +341,21 @@ impl MemoryPatch {
             .map(str::trim)
             .filter(|tag| !tag.is_empty())
             .unwrap_or("observation")
+    }
+
+    fn cleaned_optional(&self, value: &Option<String>) -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    fn cleaned_targets(&self) -> Vec<String> {
+        self.target_entity_ids
+            .iter()
+            .filter_map(|target| clean_str(target).map(str::to_string))
+            .collect()
     }
 }
 
@@ -493,6 +525,46 @@ fn finite_delta(value: f32, min: f32, max: f32) -> f32 {
     }
 }
 
+fn apply_relationship_delta(soul: &mut Soul, delta: &RelationshipDelta) -> bool {
+    if delta.is_empty() {
+        return false;
+    }
+
+    let target = relationship_storage_target(soul, &delta.target_name());
+    let relationship = soul
+        .relationships
+        .entry(target)
+        .or_insert_with(default_relationship);
+    apply_delta(&mut relationship.trust, delta.trust);
+    apply_delta(&mut relationship.affection, delta.affection);
+    apply_delta(&mut relationship.intimacy, delta.intimacy);
+    apply_delta(&mut relationship.passion, delta.passion);
+    apply_delta(&mut relationship.commitment, delta.commitment);
+    apply_delta(&mut relationship.fear, delta.fear);
+    apply_delta(&mut relationship.desire, delta.desire);
+    apply_delta(&mut relationship.respect, delta.respect);
+    apply_delta(&mut relationship.conflict, delta.conflict);
+    apply_delta(&mut relationship.dependency, delta.dependency);
+    apply_delta(&mut relationship.curiosity, delta.curiosity);
+    apply_delta(&mut relationship.comfort, delta.comfort);
+    apply_delta(&mut relationship.boundary_pressure, delta.boundary_pressure);
+    true
+}
+
+fn relationship_storage_target(soul: &Soul, target: &str) -> String {
+    if target.eq_ignore_ascii_case("default_player")
+        && soul.relationships.contains_key("user")
+        && !soul.relationships.contains_key("default_player")
+    {
+        "user".into()
+    } else if target.eq_ignore_ascii_case("user") && soul.relationships.contains_key("default_player")
+    {
+        "default_player".into()
+    } else {
+        target.to_string()
+    }
+}
+
 fn default_relationship() -> Relationship {
     Relationship {
         trust: 0.0,
@@ -502,6 +574,12 @@ fn default_relationship() -> Relationship {
         commitment: 0.0,
         fear: 0.0,
         desire: 0.0,
+        respect: 0.0,
+        conflict: 0.0,
+        dependency: 0.0,
+        curiosity: 0.0,
+        comfort: 0.0,
+        boundary_pressure: 0.0,
         love_type: String::new(),
     }
 }
@@ -620,6 +698,66 @@ mod tests {
     }
 
     #[test]
+    fn targeted_relationship_deltas_apply_separately() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                relationship_deltas: vec![
+                    RelationshipDelta {
+                        from: Some("aurora".into()),
+                        target: Some("junhwa".into()),
+                        trust: Some(-2.0),
+                        fear: Some(5.0),
+                        conflict: Some(8.0),
+                        ..RelationshipDelta::default()
+                    },
+                    RelationshipDelta {
+                        from: Some("aurora".into()),
+                        target: Some("rhy".into()),
+                        trust: Some(3.0),
+                        curiosity: Some(5.0),
+                        ..RelationshipDelta::default()
+                    },
+                ],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        let report = patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert!(report.relationship_updated);
+        assert_eq!(soul.relationships["junhwa"].trust, 0.0);
+        assert_eq!(soul.relationships["junhwa"].fear, 5.0);
+        assert_eq!(soul.relationships["junhwa"].conflict, 8.0);
+        assert_eq!(soul.relationships["rhy"].trust, 3.0);
+        assert_eq!(soul.relationships["rhy"].curiosity, 5.0);
+    }
+
+    #[test]
+    fn default_player_delta_updates_legacy_user_relationship() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                relationship_deltas: vec![RelationshipDelta {
+                    target: Some("default_player".into()),
+                    trust: Some(4.0),
+                    ..RelationshipDelta::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert_eq!(soul.relationships["user"].trust, 14.0);
+        assert!(!soul.relationships.contains_key("default_player"));
+    }
+
+    #[test]
     fn explicit_world_time_patch_applies() {
         let mut soul = new_default_soul("Aurora");
         let patch = EnginePatch {
@@ -663,6 +801,7 @@ mod tests {
                 new_memories: vec![MemoryPatch {
                     content: "Aurora remembers the hidden stairwell.".into(),
                     tag: Some("orientation".into()),
+                    ..MemoryPatch::default()
                 }],
                 ..SoulPatch::default()
             }),
