@@ -247,6 +247,13 @@ button {
   gap: 16px;
 }
 
+.panel-header-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .chat-header {
   min-height: 72px;
   padding: 18px 22px;
@@ -884,6 +891,92 @@ button:disabled {
 .button-grid button {
   width: 44px;
   height: 44px;
+}
+
+.disclaimer-screen {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  background:
+    linear-gradient(135deg, rgba(11, 18, 15, 0.96), rgba(25, 38, 33, 0.95)),
+    #0d1310;
+  padding: 28px;
+  color: #d8f0e6;
+}
+
+.disclaimer-card {
+  display: grid;
+  width: min(820px, 100%);
+  max-height: min(860px, calc(100vh - 56px));
+  gap: 18px;
+  overflow: auto;
+  border: 1px solid #315247;
+  border-radius: 8px;
+  background: #111b17;
+  box-shadow: 0 28px 70px rgba(0, 0, 0, 0.38);
+  padding: 26px;
+}
+
+.disclaimer-heading h1 {
+  margin: 0;
+  color: #f4fff9;
+  font-size: clamp(1.45rem, 3vw, 2.15rem);
+}
+
+.disclaimer-copy {
+  display: grid;
+  gap: 12px;
+  color: #c4ded5;
+  font-size: 0.98rem;
+  line-height: 1.62;
+}
+
+.disclaimer-copy p {
+  margin: 0;
+}
+
+.disclaimer-options {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid #24362f;
+  padding-top: 16px;
+}
+
+.disclaimer-options label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: #e8fff6;
+  font-size: 0.9rem;
+  font-weight: 800;
+  line-height: 1.4;
+}
+
+.disclaimer-options input {
+  width: 17px;
+  height: 17px;
+  margin-top: 2px;
+  accent-color: #2aa889;
+}
+
+.disclaimer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  border-top: 1px solid #24362f;
+  padding-top: 16px;
+}
+
+.disclaimer-actions .start-chat-button,
+.disclaimer-actions .ghost-action {
+  min-height: 42px;
+}
+
+.disclaimer-exit {
+  background: #16221d;
+  color: #d8f0e6;
+  border-color: #315247;
 }
 
 .button-grid .danger-button {

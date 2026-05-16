@@ -72,6 +72,8 @@ const CONSOLIDATION_INTERVAL_TURNS = 10;
 const NARRATOR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:narrator_provider_profile_id";
 const UPDATER_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:state_updater_provider_profile_id";
 const USE_NARRATOR_FOR_UPDATER_STORAGE_KEY = "mnemosyne:use_narrator_provider_for_updater";
+const DISCLAIMER_STORAGE_KEY = "mnemosyne_disclaimer_accepted_v1";
+const DISCLAIMER_VERSION = 1;
 const DEV_LOG_LIMIT = 1000;
 const DEV_LOG_CATEGORIES: DevLogCategory[] = [
   "app",
@@ -90,6 +92,7 @@ type ProviderKind = "Mock" | "API";
 type NarrativeMode = "Realistic" | "Reader" | "God" | "Custom";
 type AppView = "library" | "chat";
 type ChatStartMode = "continue" | "fresh";
+type DisclaimerMode = "launch" | "manual" | null;
 type ActiveGeneration = {
   id: number;
   conversationId: string;
@@ -251,6 +254,11 @@ export function App() {
   const [devConsolePaused, setDevConsolePaused] = useState(false);
   const [devLogLevelFilter, setDevLogLevelFilter] = useState<DevLogLevel | "all">("all");
   const [devLogCategoryFilter, setDevLogCategoryFilter] = useState<DevLogCategory | "all">("all");
+  const [disclaimerMode, setDisclaimerMode] = useState<DisclaimerMode>(() =>
+    hasAcceptedDisclaimerVersion() ? null : "launch",
+  );
+  const [disclaimerUnderstood, setDisclaimerUnderstood] = useState(false);
+  const [disclaimerRemember, setDisclaimerRemember] = useState(false);
   const [busy, setBusy] = useState(false);
   const [stateUpdating, setStateUpdating] = useState(false);
   const didBootstrap = useRef(false);
@@ -953,6 +961,41 @@ export function App() {
     void submitDraft();
   }
 
+  function handleViewDisclaimer() {
+    setDisclaimerUnderstood(false);
+    setDisclaimerRemember(false);
+    setDisclaimerMode("manual");
+    logDev("info", "app", "Disclaimer opened from settings");
+  }
+
+  function handleAcceptDisclaimer() {
+    if (!disclaimerUnderstood) return;
+    if (disclaimerRemember) {
+      localStorage.setItem(
+        DISCLAIMER_STORAGE_KEY,
+        JSON.stringify({
+          accepted: true,
+          accepted_at: Date.now(),
+          disclaimer_version: DISCLAIMER_VERSION,
+        }),
+      );
+    }
+    setDisclaimerMode(null);
+    setDisclaimerUnderstood(false);
+    setDisclaimerRemember(false);
+    setStatus("Disclaimer accepted");
+    logDev("info", "app", "Disclaimer accepted", {
+      persisted: disclaimerRemember,
+      disclaimer_version: DISCLAIMER_VERSION,
+    });
+  }
+
+  function handleCloseDisclaimer() {
+    setDisclaimerMode(null);
+    setDisclaimerUnderstood(false);
+    setDisclaimerRemember(false);
+  }
+
   async function handleCopyLlmPayload() {
     if (!llmPayload) return;
     await navigator.clipboard.writeText(formatLlmPayloadDebugBlock(llmPayload));
@@ -1576,6 +1619,17 @@ export function App() {
       ),
     [devLogs, devLogLevelFilter, devLogCategoryFilter],
   );
+  const disclaimerScreen = (
+    <DisclaimerScreen
+      mode={disclaimerMode}
+      understood={disclaimerUnderstood}
+      remember={disclaimerRemember}
+      onUnderstoodChange={setDisclaimerUnderstood}
+      onRememberChange={setDisclaimerRemember}
+      onAccept={handleAcceptDisclaimer}
+      onClose={handleCloseDisclaimer}
+    />
+  );
   const devConsoleToggle = (
     <button
       type="button"
@@ -1682,6 +1736,10 @@ export function App() {
       {devConsolePanel}
     </>
   );
+
+  if (disclaimerMode) {
+    return disclaimerScreen;
+  }
 
   if (view === "chat") {
     return (
@@ -2319,7 +2377,12 @@ export function App() {
             <span className="eyebrow">Connection</span>
             <h2>Provider Settings</h2>
           </div>
-          <Sparkles aria-hidden="true" />
+          <div className="panel-header-actions">
+            <button type="button" className="ghost-action" onClick={handleViewDisclaimer}>
+              <span>View Disclaimer</span>
+            </button>
+            <Sparkles aria-hidden="true" />
+          </div>
         </header>
 
         <div className="session-strip launcher-provider-strip">
@@ -3171,6 +3234,118 @@ export function App() {
         <footer className="status-line">{status}</footer>
       </section>
       {devConsole}
+    </main>
+  );
+}
+
+function hasAcceptedDisclaimerVersion() {
+  try {
+    const raw = localStorage.getItem(DISCLAIMER_STORAGE_KEY);
+    if (!raw) return false;
+    const parsed = JSON.parse(raw) as {
+      accepted?: boolean;
+      disclaimer_version?: number;
+    };
+    return parsed.accepted === true && (parsed.disclaimer_version ?? 0) >= DISCLAIMER_VERSION;
+  } catch {
+    return false;
+  }
+}
+
+function DisclaimerScreen({
+  mode,
+  understood,
+  remember,
+  onUnderstoodChange,
+  onRememberChange,
+  onAccept,
+  onClose,
+}: {
+  mode: DisclaimerMode;
+  understood: boolean;
+  remember: boolean;
+  onUnderstoodChange: (value: boolean) => void;
+  onRememberChange: (value: boolean) => void;
+  onAccept: () => void;
+  onClose: () => void;
+}) {
+  const isLaunch = mode === "launch";
+
+  return (
+    <main className="disclaimer-screen">
+      <section className="disclaimer-card" role="dialog" aria-modal={isLaunch} aria-labelledby="disclaimer-title">
+        <div className="disclaimer-heading">
+          <span className="eyebrow">Before you continue</span>
+          <h1 id="disclaimer-title">Mnemosyne Experimental Use Disclaimer</h1>
+        </div>
+
+        <div className="disclaimer-copy">
+          <p>Mnemosyne is experimental open-source AI roleplay software.</p>
+          <p>
+            Mnemosyne creates fictional continuity through memory, state tracking, and AI-generated narration. Characters may
+            appear persistent, emotionally responsive, or self-aware, but the software does not verify consciousness,
+            sentience, or real personhood.
+          </p>
+          <p>
+            You are responsible for how you use this software, what models/providers you connect, what content you generate,
+            and how you interpret fictional character continuity.
+          </p>
+          <p>
+            Mnemosyne is not therapy, medical care, legal advice, crisis support, or a substitute for real-world relationships
+            or professional help.
+          </p>
+          <p>
+            If you use external API providers, your prompts, character data, and generated responses may be sent to those
+            providers according to their own policies. Local use depends on your own configuration.
+          </p>
+          <p>
+            This software may produce emotionally intense, disturbing, intimate, fictional, or misleading outputs. Use personal
+            caution, especially during long sessions or emotionally heavy roleplay.
+          </p>
+          <p>
+            By continuing, you acknowledge that Mnemosyne is an experimental fiction and roleplay engine, and that you use it
+            at your own discretion.
+          </p>
+        </div>
+
+        {isLaunch ? (
+          <div className="disclaimer-options">
+            <label>
+              <input
+                type="checkbox"
+                checked={understood}
+                onChange={(event) => onUnderstoodChange(event.target.checked)}
+              />
+              <span>I understand and want to continue.</span>
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={remember}
+                onChange={(event) => onRememberChange(event.target.checked)}
+              />
+              <span>Do not show this again</span>
+            </label>
+          </div>
+        ) : null}
+
+        <div className="disclaimer-actions">
+          {isLaunch ? (
+            <>
+              <button type="button" className="ghost-action disclaimer-exit" onClick={() => window.close()}>
+                Exit
+              </button>
+              <button type="button" className="start-chat-button" onClick={onAccept} disabled={!understood}>
+                Accept and Continue
+              </button>
+            </>
+          ) : (
+            <button type="button" className="start-chat-button" onClick={onClose}>
+              Close
+            </button>
+          )}
+        </div>
+      </section>
     </main>
   );
 }
