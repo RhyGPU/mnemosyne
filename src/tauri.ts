@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export type Relationship = {
@@ -43,11 +43,17 @@ export type Soul = {
   schema_version: number;
   character_id: string;
   character_name: string;
+  soul_kind?: "savepoint" | "session_clone" | "imported_package" | "checkpoint" | string;
+  source_soul_id?: string | null;
+  source_savepoint_id?: string | null;
+  created_from_name?: string | null;
   profile: {
     description: string;
     appearance: string;
     personality: string;
     scenario: string;
+    opening_narrator_message?: string;
+    avatar_image_id?: string | null;
   };
   last_updated: number;
   turn_counter: number;
@@ -103,9 +109,30 @@ export type SettingSoul = {
 export type SoulSummary = {
   character_id: string;
   character_name: string;
+  soul_kind: string;
+  source_soul_id: string | null;
+  source_savepoint_id: string | null;
+  avatar_image_id?: string | null;
   last_updated: number;
   recent_count: number;
   core_count: number;
+};
+
+export type ConversationSummary = {
+  conversation_id: string;
+  title: string;
+  soul_id: string;
+  source_savepoint_id: string | null;
+  created_at: number;
+  updated_at: number;
+  last_message_preview: string | null;
+  message_count: number;
+};
+
+export type SessionStartResult = {
+  soul: Soul;
+  conversation: ConversationSummary;
+  messages: ChatMessage[];
 };
 
 export type SettingSummary = {
@@ -122,6 +149,32 @@ export type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   created_at: number;
+  attachments?: MessageAttachment[];
+};
+
+export type ImageAsset = {
+  id: string;
+  file_path: string;
+  thumbnail_path?: string | null;
+  source: "uploaded" | "generated" | "imported" | string;
+  mime_type?: string | null;
+  width?: number | null;
+  height?: number | null;
+  prompt?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  linked_soul_id?: string | null;
+  linked_conversation_id?: string | null;
+  linked_message_id?: number | null;
+  created_at: number;
+};
+
+export type MessageAttachment = {
+  id: number;
+  message_id: number;
+  image_asset_id: string;
+  created_at: number;
+  image: ImageAsset;
 };
 
 export type DevLogLevel = "info" | "warn" | "error" | "debug" | "success";
@@ -355,6 +408,9 @@ let browserMessages: ChatMessage[] = [];
 let browserAssistantVariants: AssistantMessageVariant[] = [];
 let browserPayloadLogs: LlmPayloadLog[] = [];
 let browserProviderProfiles: ProviderProfile[] = [];
+let browserImageAssets: ImageAsset[] = [];
+let browserMessageAttachments: MessageAttachment[] = [];
+let browserConversations: Array<{ conversation_id: string; title: string; soul_id: string; created_at: number; updated_at: number }> = [];
 const previewTurnSnapshots = new Map<string, { soul: Soul; userText: string }>();
 let nextMessageId = 1;
 let nextVariantId = 1;
@@ -384,21 +440,66 @@ export function createDefaultSoul(characterName: string): Promise<Soul> {
 
 export function createSessionSoulClone(
   soulId: string,
-): Promise<Soul> {
+  settingId?: string,
+  title?: string,
+): Promise<SessionStartResult> {
   return invokeOrPreview(
-    "create_fresh_scenario_soul",
-    { soulId, settingId: null },
+    "create_session_soul_from_savepoint",
+    { sourceSoulId: soulId, settingId: settingId ?? null, title: title ?? null },
     () => {
       const base = browserSouls.find((item) => item.character_id === soulId);
       if (!base) throw new Error("Soul not found");
       const fresh = makeFreshPreviewSoul(base);
       browserSouls.unshift(fresh);
-      return fresh;
+      const resolvedConversationId = settingId
+        ? `local-mock-${settingId}-${fresh.character_id}`
+        : previewConversationIdForSoul(fresh.character_id);
+      const conversation = ensurePreviewConversation(
+        resolvedConversationId,
+        fresh.character_id,
+        title?.trim() || `${base.character_name} Session`,
+      );
+      const opening = fresh.profile.opening_narrator_message?.trim();
+      if (opening && !browserMessages.some((message) => message.conversation_id === resolvedConversationId)) {
+        browserMessages.push(makePreviewMessage(resolvedConversationId, "assistant", opening));
+      }
+      return {
+        soul: fresh,
+        conversation: summarizePreviewConversation(conversation),
+        messages: browserMessages.filter((message) => message.conversation_id === resolvedConversationId),
+      };
     },
   );
 }
 
 export const createFreshScenarioSoul = createSessionSoulClone;
+
+export function saveSessionAsNewSoul(
+  sessionSoulId: string,
+  name: string,
+  soulKind: "savepoint" | "checkpoint" = "checkpoint",
+): Promise<Soul> {
+  return invokeOrPreview(
+    "save_session_as_new_soul",
+    { sessionSoulId, name, soulKind },
+    () => {
+      const session = browserSouls.find((item) => item.character_id === sessionSoulId);
+      if (!session) throw new Error("Soul not found");
+      const savepoint: Soul = {
+        ...deepClone(session),
+        character_id: crypto.randomUUID(),
+        character_name: name.trim() || `${session.character_name} Checkpoint`,
+        soul_kind: soulKind,
+        source_soul_id: session.character_id,
+        source_savepoint_id: session.source_savepoint_id ?? null,
+        created_from_name: session.character_name,
+        last_updated: Math.floor(Date.now() / 1000),
+      };
+      browserSouls.unshift(savepoint);
+      return savepoint;
+    },
+  );
+}
 
 export function createDefaultSetting(settingName: string): Promise<SettingSoul> {
   return invokeOrPreview("create_default_setting", { settingName }, () =>
@@ -407,7 +508,31 @@ export function createDefaultSetting(settingName: string): Promise<SettingSoul> 
 }
 
 export function listSouls(): Promise<SoulSummary[]> {
-  return invokeOrPreview("list_souls", {}, () => browserSouls.map(summarizeSoul));
+  return invokeOrPreview("list_souls", {}, () =>
+    browserSouls.filter((soul) => soul.soul_kind !== "session_clone").map(summarizeSoul),
+  );
+}
+
+export function listSoulsDebug(): Promise<SoulSummary[]> {
+  return invokeOrPreview("list_souls_debug", {}, () => browserSouls.map(summarizeSoul));
+}
+
+export function listConversations(): Promise<ConversationSummary[]> {
+  return invokeOrPreview("list_conversations", {}, () =>
+    browserConversations.map(summarizePreviewConversation),
+  );
+}
+
+export function renameConversation(
+  conversationId: string,
+  title: string,
+): Promise<ConversationSummary> {
+  return invokeOrPreview("rename_conversation", { conversationId, title }, () => {
+    const conversation = ensurePreviewConversation(conversationId, "", title);
+    conversation.title = sanitizePreviewConversationTitle(title);
+    conversation.updated_at = Math.floor(Date.now() / 1000);
+    return summarizePreviewConversation(conversation);
+  });
 }
 
 export function listSettings(): Promise<SettingSummary[]> {
@@ -467,6 +592,7 @@ export function deleteSoul(soulId: string): Promise<boolean> {
     browserPayloadLogs = browserPayloadLogs.filter(
       (log) => log.conversation_id !== previewConversationIdForSoul(soulId),
     );
+    browserConversations = browserConversations.filter((conversation) => conversation.soul_id !== soulId);
     return browserSouls.length !== beforeCount;
   });
 }
@@ -575,8 +701,142 @@ export function deleteProviderProfile(profileId: string): Promise<boolean> {
 
 export function listConversationMessages(conversationId: string): Promise<ChatMessage[]> {
   return invokeOrPreview("list_conversation_messages", { conversationId }, () =>
-    browserMessages.filter((message) => message.conversation_id === conversationId),
+    browserMessages
+      .filter((message) => message.conversation_id === conversationId)
+      .map(hydratePreviewMessage),
   );
+}
+
+export function importImageAsset(args: {
+  path: string;
+  linkedSoulId?: string | null;
+  linkedConversationId?: string | null;
+  linkedMessageId?: number | null;
+  source?: "uploaded" | "generated" | "imported";
+}): Promise<ImageAsset> {
+  return invokeOrPreview(
+    "import_image_asset",
+    {
+      path: args.path,
+      linkedSoulId: args.linkedSoulId ?? null,
+      linkedConversationId: args.linkedConversationId ?? null,
+      linkedMessageId: args.linkedMessageId ?? null,
+      source: args.source ?? "uploaded",
+    },
+    () => makePreviewImageAsset(args.path, args.source ?? "uploaded", {
+      linked_soul_id: args.linkedSoulId ?? null,
+      linked_conversation_id: args.linkedConversationId ?? null,
+      linked_message_id: args.linkedMessageId ?? null,
+    }),
+  );
+}
+
+export async function importImageAssetFromFile(args: {
+  file: File;
+  linkedSoulId?: string | null;
+  linkedConversationId?: string | null;
+  linkedMessageId?: number | null;
+  source?: "uploaded" | "generated" | "imported";
+}): Promise<ImageAsset> {
+  const dataBase64 = await fileToBase64(args.file);
+  return invokeOrPreview(
+    "import_image_asset_bytes",
+    {
+      fileName: args.file.name,
+      dataBase64,
+      linkedSoulId: args.linkedSoulId ?? null,
+      linkedConversationId: args.linkedConversationId ?? null,
+      linkedMessageId: args.linkedMessageId ?? null,
+      source: args.source ?? "uploaded",
+    },
+    () =>
+      makePreviewImageAsset(args.file.name, args.source ?? "uploaded", {
+        linked_soul_id: args.linkedSoulId ?? null,
+        linked_conversation_id: args.linkedConversationId ?? null,
+        linked_message_id: args.linkedMessageId ?? null,
+      }),
+  );
+}
+
+export function getImageAsset(imageAssetId: string): Promise<ImageAsset> {
+  return invokeOrPreview("get_image_asset", { imageAssetId }, () => {
+    const asset = browserImageAssets.find((item) => item.id === imageAssetId);
+    if (!asset) throw new Error("Image asset not found");
+    return asset;
+  });
+}
+
+export function getImageAssetDataUrl(imageAssetId: string): Promise<string> {
+  return invokeOrPreview("get_image_asset_data_url", { imageAssetId }, () => {
+    const asset = browserImageAssets.find((item) => item.id === imageAssetId);
+    if (!asset) throw new Error("Image asset not found");
+    return asset.file_path;
+  });
+}
+
+export function createUserImageMessage(
+  conversationId: string,
+  path: string,
+  content?: string,
+): Promise<ChatMessage[]> {
+  return invokeOrPreview(
+    "create_user_image_message",
+    { conversationId, path, content: content ?? null },
+    () => {
+      const message = makePreviewMessage(conversationId, "user", content?.trim() || "[Image]");
+      browserMessages.push(message);
+      const asset = makePreviewImageAsset(path, "uploaded", {
+        linked_conversation_id: conversationId,
+        linked_message_id: message.id,
+      });
+      browserMessageAttachments.push({
+        id: browserMessageAttachments.length + 1,
+        message_id: message.id,
+        image_asset_id: asset.id,
+        created_at: Math.floor(Date.now() / 1000),
+        image: asset,
+      });
+      return browserMessages
+        .filter((item) => item.conversation_id === conversationId)
+        .map(hydratePreviewMessage);
+    },
+  );
+}
+
+export async function createUserImageMessageFromFile(
+  conversationId: string,
+  file: File,
+  content?: string,
+): Promise<ChatMessage[]> {
+  const dataBase64 = await fileToBase64(file);
+  return invokeOrPreview(
+    "create_user_image_message_bytes",
+    { conversationId, fileName: file.name, dataBase64, content: content ?? null },
+    () => {
+      const message = makePreviewMessage(conversationId, "user", content?.trim() || "[Image]");
+      browserMessages.push(message);
+      const asset = makePreviewImageAsset(file.name, "uploaded", {
+        linked_conversation_id: conversationId,
+        linked_message_id: message.id,
+      });
+      browserMessageAttachments.push({
+        id: browserMessageAttachments.length + 1,
+        message_id: message.id,
+        image_asset_id: asset.id,
+        created_at: Math.floor(Date.now() / 1000),
+        image: asset,
+      });
+      return browserMessages
+        .filter((item) => item.conversation_id === conversationId)
+        .map(hydratePreviewMessage);
+    },
+  );
+}
+
+export function imageAssetSrc(asset?: ImageAsset | null): string {
+  if (!asset) return "";
+  if (asset.file_path.startsWith("blob:") || asset.file_path.startsWith("data:")) return asset.file_path;
+  return convertFileSrc(asset.thumbnail_path || asset.file_path);
 }
 
 export function deleteConversation(conversationId: string): Promise<boolean> {
@@ -589,6 +849,9 @@ export function deleteConversation(conversationId: string): Promise<boolean> {
       (variant) => variant.conversation_id !== conversationId,
     );
     browserPayloadLogs = browserPayloadLogs.filter((log) => log.conversation_id !== conversationId);
+    browserConversations = browserConversations.filter(
+      (conversation) => conversation.conversation_id !== conversationId,
+    );
     return browserMessages.length !== beforeCount;
   });
 }
@@ -812,11 +1075,17 @@ function makePreviewSoul(characterName: string): Soul {
     schema_version: 1,
     character_id: crypto.randomUUID(),
     character_name: characterName.trim() || "Unnamed Character",
+    soul_kind: "savepoint",
+    source_soul_id: null,
+    source_savepoint_id: null,
+    created_from_name: null,
     profile: {
       description: "",
       appearance: "",
       personality: "",
       scenario: "",
+      opening_narrator_message: "",
+      avatar_image_id: null,
     },
     last_updated: now,
     turn_counter: 0,
@@ -853,7 +1122,7 @@ function makePreviewSoul(characterName: string): Soul {
     relationships: {
       user: {
         trust: 10,
-        affection: 200,
+        affection: 20,
         intimacy: 10,
         passion: 10,
         commitment: 10,
@@ -898,6 +1167,10 @@ function makeFreshPreviewSoul(base: Soul): Soul {
   return {
     ...deepClone(base),
     character_id: crypto.randomUUID(),
+    soul_kind: "session_clone",
+    source_soul_id: base.character_id,
+    source_savepoint_id: base.source_savepoint_id ?? base.character_id,
+    created_from_name: base.character_name,
     last_updated: Math.floor(Date.now() / 1000),
   };
 }
@@ -906,9 +1179,61 @@ function summarizeSoul(soul: Soul): SoulSummary {
   return {
     character_id: soul.character_id,
     character_name: soul.character_name,
+    soul_kind: soul.soul_kind || "savepoint",
+    source_soul_id: soul.source_soul_id ?? null,
+    source_savepoint_id: soul.source_savepoint_id ?? null,
+    avatar_image_id: soul.profile.avatar_image_id ?? null,
     last_updated: soul.last_updated,
     recent_count: soul.memory.recent.length,
     core_count: soul.memory.core.length,
+  };
+}
+
+function sanitizePreviewConversationTitle(title: string) {
+  const trimmed = title.trim();
+  return (trimmed || "Untitled Session").slice(0, 120);
+}
+
+function ensurePreviewConversation(conversationId: string, soulId: string, title?: string) {
+  const now = Math.floor(Date.now() / 1000);
+  let conversation = browserConversations.find((item) => item.conversation_id === conversationId);
+  if (!conversation) {
+    conversation = {
+      conversation_id: conversationId,
+      title: sanitizePreviewConversationTitle(title || "Untitled Session"),
+      soul_id: soulId,
+      created_at: now,
+      updated_at: now,
+    };
+    browserConversations.unshift(conversation);
+  } else {
+    if (soulId) conversation.soul_id = soulId;
+    conversation.updated_at = now;
+  }
+  return conversation;
+}
+
+function summarizePreviewConversation(conversation: {
+  conversation_id: string;
+  title: string;
+  soul_id: string;
+  created_at: number;
+  updated_at: number;
+}): ConversationSummary {
+  const messages = browserMessages.filter(
+    (message) => message.conversation_id === conversation.conversation_id,
+  );
+  const lastMessage = messages.length ? messages[messages.length - 1] : undefined;
+  const soul = browserSouls.find((item) => item.character_id === conversation.soul_id);
+  return {
+    conversation_id: conversation.conversation_id,
+    title: conversation.title,
+    soul_id: conversation.soul_id,
+    source_savepoint_id: soul?.source_savepoint_id ?? null,
+    created_at: conversation.created_at,
+    updated_at: conversation.updated_at,
+    last_message_preview: lastMessage?.content.split(/\s+/).join(" ").slice(0, 140) ?? null,
+    message_count: messages.length,
   };
 }
 
@@ -935,6 +1260,7 @@ function sendPreviewTurn(
     soul = makePreviewSoul("Aurora Schwarz");
     browserSouls.push(soul);
   }
+  ensurePreviewConversation(conversationId, soul.character_id, `${soul.character_name} Session`);
 
   const snapshotKey = replacementAssistantId
     ? `${conversationId}:${replacementAssistantId}`
@@ -1024,6 +1350,7 @@ async function sendPreviewApiTurn(
 ): Promise<TurnResult> {
   const soul = browserSouls.find((item) => item.character_id === soulId);
   if (!soul) throw new Error("Soul not found");
+  ensurePreviewConversation(conversationId, soul.character_id, `${soul.character_name} Session`);
   if (!settings.api_key.trim()) throw new Error("API key is required for API provider mode");
   if (!settings.model.trim()) throw new Error("Model is required for API provider mode");
   if (!settings.base_url.trim()) throw new Error("Base URL is required for API provider mode");
@@ -1379,13 +1706,75 @@ function makePreviewMessage(
   role: ChatMessage["role"],
   content: string,
 ): ChatMessage {
+  const now = Math.floor(Date.now() / 1000);
+  const conversation = browserConversations.find(
+    (item) => item.conversation_id === conversationId,
+  );
+  if (conversation) conversation.updated_at = now;
   return {
     id: nextMessageId++,
     conversation_id: conversationId,
     role,
     content,
-    created_at: Math.floor(Date.now() / 1000),
+    created_at: now,
+    attachments: [],
   };
+}
+
+function makePreviewImageAsset(
+  path: string,
+  source: ImageAsset["source"],
+  links: Partial<Pick<ImageAsset, "linked_soul_id" | "linked_conversation_id" | "linked_message_id">> = {},
+): ImageAsset {
+  if (!/\.(png|jpe?g|webp|gif)(\?|#|$)/i.test(path)) {
+    throw new Error("Unsupported image type. Use PNG, JPG, WEBP, or GIF.");
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const asset: ImageAsset = {
+    id: crypto.randomUUID(),
+    file_path: path,
+    thumbnail_path: null,
+    source,
+    mime_type: mimeFromPreviewPath(path),
+    width: null,
+    height: null,
+    prompt: null,
+    provider: null,
+    model: null,
+    linked_soul_id: links.linked_soul_id ?? null,
+    linked_conversation_id: links.linked_conversation_id ?? null,
+    linked_message_id: links.linked_message_id ?? null,
+    created_at: now,
+  };
+  browserImageAssets.unshift(asset);
+  return asset;
+}
+
+function mimeFromPreviewPath(path: string) {
+  const lower = path.toLowerCase();
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".gif")) return "image/gif";
+  return null;
+}
+
+function hydratePreviewMessage(message: ChatMessage): ChatMessage {
+  const attachments = browserMessageAttachments.filter(
+    (attachment) => attachment.message_id === message.id,
+  );
+  return { ...message, attachments };
+}
+
+async function fileToBase64(file: File): Promise<string> {
+  const buffer = await file.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.slice(index, index + chunkSize));
+  }
+  return btoa(binary);
 }
 
 function consolidatePreviewSoul(soul: Soul) {

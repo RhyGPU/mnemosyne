@@ -6,6 +6,7 @@ import {
   Database,
   FileDown,
   FileUp,
+  Image as ImageIcon,
   MessageSquareText,
   Pencil,
   Play,
@@ -15,6 +16,7 @@ import {
   Square,
   Terminal,
   Trash2,
+  X,
 } from "lucide-react";
 import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -26,6 +28,7 @@ import {
   DevLogEntry,
   DevLogLevel,
   LlmPayloadPreview,
+  ImageAsset,
   ProviderProfile,
   SettingSoul,
   SettingSummary,
@@ -34,6 +37,7 @@ import {
   TurnDebug,
   ContextMode,
   compileContext,
+  createUserImageMessageFromFile,
   createDefaultSoul,
   createSessionSoulClone,
   createDefaultSetting,
@@ -45,7 +49,10 @@ import {
   exportLlmPayloadHistory,
   exportVisibleChatLog,
   getSetting,
+  getImageAsset,
+  getImageAssetDataUrl,
   getSoul,
+  importImageAssetFromFile,
   listProviderProfiles,
   listAssistantMessageVariants,
   listConversationMessages,
@@ -55,7 +62,9 @@ import {
   listenChatMessageSaved,
   listenDevLog,
   previewApiPayload,
+  renameConversation,
   runConsolidation,
+  saveSessionAsNewSoul,
   saveSettingFile,
   saveSoulFile,
   selectAssistantMessageVariant,
@@ -204,6 +213,7 @@ export function App() {
   const [characterAppearance, setCharacterAppearance] = useState("");
   const [characterPersonality, setCharacterPersonality] = useState("");
   const [characterScenario, setCharacterScenario] = useState("");
+  const [openingNarratorMessage, setOpeningNarratorMessage] = useState("");
   const [settingName, setSettingName] = useState("Starter Setting");
   const [worldDraft, setWorldDraft] = useState<WorldDraft>({
     location: "Unspecified starting scene.",
@@ -248,6 +258,9 @@ export function App() {
   const [chatStartMode, setChatStartMode] = useState<ChatStartMode>("fresh");
   const [sourceSavepointId, setSourceSavepointId] = useState<string | null>(null);
   const [sessionContinuityLabel, setSessionContinuityLabel] = useState("New Session clones the selected Soul savepoint");
+  const [currentSessionTitle, setCurrentSessionTitle] = useState("New Session");
+  const [avatarAsset, setAvatarAsset] = useState<ImageAsset | null>(null);
+  const [previewImageAsset, setPreviewImageAsset] = useState<ImageAsset | null>(null);
   const [status, setStatus] = useState("Ready");
   const [payloadCopied, setPayloadCopied] = useState(false);
   const [exportFeedback, setExportFeedback] = useState("");
@@ -266,6 +279,8 @@ export function App() {
   const didBootstrap = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const settingImportInputRef = useRef<HTMLInputElement>(null);
+  const avatarInputRef = useRef<HTMLInputElement>(null);
+  const chatImageInputRef = useRef<HTMLInputElement>(null);
   const generationAbortRef = useRef<AbortController | null>(null);
   const generationIdRef = useRef(0);
   const activeGenerationRef = useRef<ActiveGeneration | null>(null);
@@ -364,6 +379,25 @@ export function App() {
   }, [currentConversationId, messages]);
 
   useEffect(() => {
+    let cancelled = false;
+    const avatarId = soul?.profile.avatar_image_id;
+    if (!avatarId) {
+      setAvatarAsset(null);
+      return;
+    }
+    getImageAsset(avatarId)
+      .then((asset) => {
+        if (!cancelled) setAvatarAsset(asset);
+      })
+      .catch(() => {
+        if (!cancelled) setAvatarAsset(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [soul?.profile.avatar_image_id]);
+
+  useEffect(() => {
     if (!soul) {
       setLlmPayload(null);
       return;
@@ -435,6 +469,7 @@ export function App() {
     setCharacterAppearance(nextSoul.profile.appearance);
     setCharacterPersonality(nextSoul.profile.personality);
     setCharacterScenario(nextSoul.profile.scenario);
+    setOpeningNarratorMessage(nextSoul.profile.opening_narrator_message ?? "");
     setPsyche(psycheFromSoul(nextSoul));
     setPsychePreset("Custom");
   }
@@ -480,6 +515,7 @@ export function App() {
     const appearance = characterAppearance.trim();
     const personality = characterPersonality.trim();
     const scenario = characterScenario.trim();
+    const opening = openingNarratorMessage.trim();
     const world = normalizeWorldDraft(worldDraft);
     const core = [...nextSoul.memory.core];
     for (const memory of [
@@ -498,6 +534,8 @@ export function App() {
         appearance,
         personality,
         scenario,
+        opening_narrator_message: opening,
+        avatar_image_id: nextSoul.profile.avatar_image_id ?? null,
       },
       global: {
         ...nextSoul.global,
@@ -690,6 +728,7 @@ export function App() {
       await upsertSoul(nextSoul);
       setSoul(nextSoul);
       setSourceSavepointId(null);
+      setCurrentSessionTitle("New Session");
       setMessages([]);
       setLastTurnDebug(null);
       setSouls(await listSouls());
@@ -711,6 +750,7 @@ export function App() {
       setStatus(`Selected ${nextSoul.character_name}`);
       setSoul(nextSoul);
       setSourceSavepointId(null);
+      setCurrentSessionTitle("New Session");
       setCreatorFieldsFromSoul(nextSoul);
       setLastTurnDebug(null);
       setMessages(
@@ -1099,6 +1139,7 @@ export function App() {
     if (chatStartMode === "continue") {
       setSourceSavepointId(null);
       setSessionContinuityLabel("Using persistent Soul continuity");
+      setCurrentSessionTitle(`${soul.character_name} Continuity`);
       setView("chat");
       return;
     }
@@ -1106,18 +1147,18 @@ export function App() {
     setBusy(true);
     try {
       const sourceId = soul.character_id;
-      const sessionSoul = await createSessionSoulClone(sourceId);
-      const nextConversationId = setting
-        ? conversationIdForSettingAndSoul(setting.setting_id, sessionSoul.character_id)
-        : conversationIdForSoul(sessionSoul.character_id);
+      const session = await createSessionSoulClone(sourceId, setting?.setting_id);
+      const sessionSoul = session.soul;
+      const nextConversationId = session.conversation.conversation_id;
       setSoul(sessionSoul);
       setSourceSavepointId(sourceId);
       setCreatorFieldsFromSoul(sessionSoul);
-      setMessages(await listConversationMessages(nextConversationId));
+      setMessages(session.messages);
       setContext(await compileContext(sessionSoul.character_id, nextConversationId));
       setSouls(await listSouls());
       setLastTurnDebug(null);
       setSessionContinuityLabel("New Session clone; source savepoint remains unchanged");
+      setCurrentSessionTitle(session.conversation.title);
       setStatus("Started New Session from an exact Soul savepoint clone.");
       logDev("info", "context", "new session cloned selected Soul savepoint", {
         source_soul_id: sourceId,
@@ -1132,6 +1173,105 @@ export function App() {
       setView("chat");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRenameCurrentSession() {
+    if (busy || !currentConversationId) return;
+    const nextTitle = window.prompt("Session title", currentSessionTitle);
+    if (nextTitle === null) return;
+    const trimmed = nextTitle.trim();
+    if (!trimmed) {
+      setStatus("Session title cannot be empty");
+      return;
+    }
+    setBusy(true);
+    try {
+      const renamed = await renameConversation(currentConversationId, trimmed);
+      setCurrentSessionTitle(renamed.title);
+      setStatus(`Renamed session: ${renamed.title}`);
+      logDev("success", "app", "Session renamed", {
+        conversation_id: renamed.conversation_id,
+        title: renamed.title,
+      });
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleAvatarImageSelected(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file || !soul) return;
+    setBusy(true);
+    try {
+      const asset = await importImageAssetFromFile({
+        file,
+        linkedSoulId: soul.character_id,
+        source: "uploaded",
+      });
+      const nextSoul = cloneForUi(soul);
+      nextSoul.profile.avatar_image_id = asset.id;
+      nextSoul.last_updated = Math.floor(Date.now() / 1000);
+      await upsertSoul(nextSoul);
+      setSoul(nextSoul);
+      setAvatarAsset(asset);
+      setSouls(await listSouls());
+      setStatus("Soul avatar updated");
+      logDev("success", "db", "avatar_updated", {
+        soul_id: nextSoul.character_id,
+        image_asset_id: asset.id,
+      });
+    } catch (error) {
+      reportError(error, "Avatar image update failed", "db");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRemoveAvatarImage() {
+    if (!soul || !soul.profile.avatar_image_id) return;
+    setBusy(true);
+    try {
+      const nextSoul = cloneForUi(soul);
+      nextSoul.profile.avatar_image_id = null;
+      nextSoul.last_updated = Math.floor(Date.now() / 1000);
+      await upsertSoul(nextSoul);
+      setSoul(nextSoul);
+      setAvatarAsset(null);
+      setSouls(await listSouls());
+      setStatus("Soul avatar removed");
+      logDev("success", "db", "avatar_updated", {
+        soul_id: nextSoul.character_id,
+        image_asset_id: null,
+      });
+    } catch (error) {
+      reportError(error, "Avatar image remove failed", "db");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleChatImageSelected(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file || !soul) return;
+    setBusy(true);
+    try {
+      const nextMessages = await createUserImageMessageFromFile(currentConversationId, file, draft);
+      setDraft("");
+      setMessages(nextMessages);
+      setContext(await compileContext(soul.character_id, currentConversationId));
+      setStatus("Image attached to chat");
+      logDev("success", "db", "chat_image_attached", {
+        conversation_id: currentConversationId,
+      });
+    } catch (error) {
+      reportError(error, "Chat image attach failed", "db");
     } finally {
       setBusy(false);
     }
@@ -1528,26 +1668,14 @@ export function App() {
     }
   }
 
-  function cloneCurrentSoulSavepoint(name: string) {
-    if (!soul) return null;
-    return {
-      ...cloneForUi(soul),
-      character_id: crypto.randomUUID(),
-      character_name: name.trim() || soul.character_name,
-      last_updated: Math.floor(Date.now() / 1000),
-    };
-  }
-
   async function handleSaveCurrentSessionAsNewSoul() {
     if (!soul) return;
     const defaultName = `${soul.character_name} Savepoint`;
     const name = window.prompt("Name this new Soul savepoint", defaultName);
     if (name === null) return;
-    const savepoint = cloneCurrentSoulSavepoint(name);
-    if (!savepoint) return;
     setBusy(true);
     try {
-      await upsertSoul(savepoint);
+      const savepoint = await saveSessionAsNewSoul(soul.character_id, name, "savepoint");
       setSouls(await listSouls());
       setStatus(`Saved new Soul savepoint: ${savepoint.character_name}`);
       logDev("success", "db", "Current session saved as new Soul savepoint", {
@@ -1566,11 +1694,9 @@ export function App() {
     const defaultName = `${soul.character_name} Checkpoint ${formatCheckpointTimestamp(new Date())}`;
     const name = window.prompt("Name this checkpoint", defaultName);
     if (name === null) return;
-    const checkpoint = cloneCurrentSoulSavepoint(name);
-    if (!checkpoint) return;
     setBusy(true);
     try {
-      await upsertSoul(checkpoint);
+      const checkpoint = await saveSessionAsNewSoul(soul.character_id, name, "checkpoint");
       setSouls(await listSouls());
       setStatus(`Created checkpoint: ${checkpoint.character_name}`);
       logDev("success", "db", "Checkpoint created from current session Soul", {
@@ -1587,8 +1713,8 @@ export function App() {
   async function handleUpdateSourceSavepoint() {
     if (!soul) return;
     const targetSoulId = sourceSavepointId ?? soul.character_id;
-    const targetName =
-      souls.find((item) => item.character_id === targetSoulId)?.character_name ?? soul.character_name;
+    const sourceSummary = souls.find((item) => item.character_id === targetSoulId);
+    const targetName = sourceSummary?.character_name ?? soul.character_name;
     const confirmed = window.confirm(
       `Update source savepoint "${targetName}" with the current session Soul? This overwrites that saved checkpoint.`,
     );
@@ -1597,6 +1723,9 @@ export function App() {
     const updatedSource = {
       ...cloneForUi(soul),
       character_id: targetSoulId,
+      soul_kind: sourceSummary?.soul_kind ?? "savepoint",
+      source_soul_id: sourceSummary?.source_soul_id ?? null,
+      source_savepoint_id: sourceSummary?.source_savepoint_id ?? null,
       last_updated: Math.floor(Date.now() / 1000),
     };
     setBusy(true);
@@ -1667,6 +1796,7 @@ export function App() {
       await upsertSoul(importedSoul);
       setSoul(importedSoul);
       setSourceSavepointId(null);
+      setCurrentSessionTitle("New Session");
       setCreatorFieldsFromSoul(importedSoul);
       setMessages(
         await listConversationMessages(
@@ -1874,7 +2004,19 @@ export function App() {
             <span className="eyebrow">
               {setting?.setting_name ?? "Local Setting"} / {provider} / {mode}
             </span>
-            <h1>{soul?.character_name ?? "Mnemosyne"}</h1>
+            <h1>
+              {currentSessionTitle || "New Session"}
+              <button
+                className="inline-icon-button"
+                type="button"
+                title="Rename session"
+                onClick={handleRenameCurrentSession}
+                disabled={busy}
+              >
+                <Pencil size={14} />
+              </button>
+            </h1>
+            <p>{soul?.character_name ?? "Mnemosyne"}</p>
             <p className="session-state-label">{sessionContinuityLabel}</p>
           </div>
           <div className="chat-top-actions">
@@ -1978,6 +2120,27 @@ export function App() {
                   ) : (
                     <p>{message.content}</p>
                   )}
+                  {message.attachments?.length ? (
+                    <div className="message-attachments">
+                      {message.attachments.map((attachment) => (
+                        <button
+                          className="image-attachment"
+                          type="button"
+                          key={attachment.id}
+                          onClick={() => setPreviewImageAsset(attachment.image)}
+                          title="Open image preview"
+                        >
+                          <AssetImage asset={attachment.image} alt="Chat attachment" />
+                          <span>
+                            {attachment.image.source}
+                            {attachment.image.width && attachment.image.height
+                              ? ` / ${attachment.image.width}x${attachment.image.height}`
+                              : ""}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
                 </article>
               );
             })
@@ -1985,6 +2148,13 @@ export function App() {
         </section>
 
         <form className="chat-only-composer" onSubmit={handleSubmit}>
+          <input
+            ref={chatImageInputRef}
+            className="hidden-file"
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif"
+            onChange={handleChatImageSelected}
+          />
           <textarea
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
@@ -1998,11 +2168,23 @@ export function App() {
               <Square size={16} />
             </button>
           ) : (
-            <button aria-label="Send message" disabled={!draft.trim() || !soul || stateUpdating}>
-              <Play size={18} />
-            </button>
+            <>
+              <button
+                type="button"
+                aria-label="Attach image"
+                title="Attach image"
+                onClick={() => chatImageInputRef.current?.click()}
+                disabled={!soul || stateUpdating}
+              >
+                <ImageIcon size={18} />
+              </button>
+              <button aria-label="Send message" disabled={!draft.trim() || !soul || stateUpdating}>
+                <Play size={18} />
+              </button>
+            </>
           )}
         </form>
+        <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
         {devConsolePanel}
       </main>
     );
@@ -2102,6 +2284,30 @@ export function App() {
             {settingEditorOpen ? (
               <div className="collapsible-content">
                 <div className="form-grid single-column-form">
+                  <section className="avatar-editor">
+                    <SoulAvatar soulName={characterName} asset={avatarAsset} />
+                    <div>
+                      <strong>Profile Picture</strong>
+                      <p>{avatarAsset ? imageAssetMeta(avatarAsset) : "Placeholder avatar"}</p>
+                      <div className="inline-actions">
+                        <input
+                          ref={avatarInputRef}
+                          className="hidden-file"
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif"
+                          onChange={handleAvatarImageSelected}
+                        />
+                        <button type="button" onClick={() => avatarInputRef.current?.click()} disabled={busy || !soul}>
+                          <ImageIcon size={16} />
+                          <span>{avatarAsset ? "Change" : "Upload"}</span>
+                        </button>
+                        <button type="button" onClick={handleRemoveAvatarImage} disabled={busy || !avatarAsset}>
+                          <X size={16} />
+                          <span>Remove</span>
+                        </button>
+                      </div>
+                    </div>
+                  </section>
                   <label className="field">
                     <span>Name</span>
                     <input
@@ -2171,9 +2377,7 @@ export function App() {
               <span className="eyebrow">Characters</span>
               <h2>Local Souls</h2>
             </div>
-            <div className="avatar" aria-hidden="true">
-              {soul?.character_name.slice(0, 1) ?? "M"}
-            </div>
+            <SoulAvatar soulName={soul?.character_name ?? "Mnemosyne"} asset={avatarAsset} />
           </header>
 
           <div className="action-grid compact-actions">
@@ -2241,9 +2445,13 @@ export function App() {
                   className={`soul-row ${soul?.character_id === item.character_id ? "selected" : ""}`}
                   onClick={() => handleSelectSoul(item.character_id)}
                 >
-                  <span>{item.character_name}</span>
+                  <span className="soul-row-main">
+                    <span className="soul-row-avatar">{item.avatar_image_id ? <ImageIcon size={14} /> : item.character_name.slice(0, 1)}</span>
+                    <span>{item.character_name}</span>
+                  </span>
                   <small>
                     {item.core_count} core / {item.recent_count} recent
+                    {item.avatar_image_id ? " / avatar image" : " / placeholder"}
                   </small>
                 </button>
               ))
@@ -2267,6 +2475,30 @@ export function App() {
             {soulEditorOpen ? (
               <div className="collapsible-content">
                 <div className="form-grid single-column-form">
+                  <section className="avatar-editor">
+                    <SoulAvatar soulName={characterName} asset={avatarAsset} />
+                    <div>
+                      <strong>Profile Picture</strong>
+                      <p>{avatarAsset ? imageAssetMeta(avatarAsset) : "Placeholder avatar"}</p>
+                      <div className="inline-actions">
+                        <input
+                          ref={avatarInputRef}
+                          className="hidden-file"
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif"
+                          onChange={handleAvatarImageSelected}
+                        />
+                        <button type="button" onClick={() => avatarInputRef.current?.click()} disabled={busy || !soul}>
+                          <ImageIcon size={16} />
+                          <span>{avatarAsset ? "Change" : "Upload"}</span>
+                        </button>
+                        <button type="button" onClick={handleRemoveAvatarImage} disabled={busy || !avatarAsset}>
+                          <X size={16} />
+                          <span>Remove</span>
+                        </button>
+                      </div>
+                    </div>
+                  </section>
                   <label className="field">
                     <span>Character</span>
                     <input
@@ -2289,6 +2521,14 @@ export function App() {
                       value={characterScenario}
                       onChange={(event) => setCharacterScenario(event.target.value)}
                       placeholder="Character-specific role, premise, or card notes"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Opening Narrator Message</span>
+                    <textarea
+                      value={openingNarratorMessage}
+                      onChange={(event) => setOpeningNarratorMessage(event.target.value)}
+                      placeholder="Optional first narrator message shown when starting a new session from this Soul."
                     />
                   </label>
                   <label className="field">
@@ -2926,6 +3166,14 @@ export function App() {
                     />
                   </label>
                   <label className="field">
+                    <span>Opening Narrator Message</span>
+                    <textarea
+                      value={openingNarratorMessage}
+                      onChange={(event) => setOpeningNarratorMessage(event.target.value)}
+                      placeholder="Optional first narrator message shown when starting a new session from this Soul."
+                    />
+                  </label>
+                  <label className="field">
                     <span>Personality</span>
                     <textarea
                       value={characterPersonality}
@@ -3370,6 +3618,7 @@ export function App() {
 
         <footer className="status-line">{status}</footer>
       </section>
+      <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
       {devConsole}
     </main>
   );
@@ -3597,6 +3846,63 @@ function Stat({ label, value }: { label: string; value: number }) {
       <strong>{Math.round(value)}</strong>
     </div>
   );
+}
+
+function SoulAvatar({ soulName, asset }: { soulName: string; asset?: ImageAsset | null }) {
+  return (
+    <div className={`avatar ${asset ? "image-avatar" : ""}`} aria-hidden="true">
+      {asset ? <AssetImage asset={asset} alt="" /> : soulName.slice(0, 1) || "M"}
+    </div>
+  );
+}
+
+function AssetImage({ asset, alt }: { asset: ImageAsset; alt: string }) {
+  const [src, setSrc] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    getImageAssetDataUrl(asset.id)
+      .then((dataUrl) => {
+        if (!cancelled) setSrc(dataUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setSrc("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [asset.id]);
+  return src ? <img src={src} alt={alt} /> : <span className="image-loading">Loading image</span>;
+}
+
+function ImagePreviewModal({
+  asset,
+  onClose,
+}: {
+  asset: ImageAsset | null;
+  onClose: () => void;
+}) {
+  if (!asset) return null;
+  return (
+    <div className="image-preview-backdrop" role="dialog" aria-modal="true" onClick={onClose}>
+      <section className="image-preview-modal" onClick={(event) => event.stopPropagation()}>
+        <button type="button" className="image-preview-close" onClick={onClose} aria-label="Close image preview">
+          <X size={18} />
+        </button>
+        <AssetImage asset={asset} alt="Image preview" />
+        <div className="image-preview-meta">
+          <strong>{asset.source}</strong>
+          <span>{imageAssetMeta(asset)}</span>
+          {asset.prompt ? <p>{asset.prompt}</p> : null}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function imageAssetMeta(asset: ImageAsset) {
+  const dimensions = asset.width && asset.height ? `${asset.width}x${asset.height}` : "dimensions unknown";
+  const mime = asset.mime_type ?? "image";
+  return `${mime} / ${dimensions}`;
 }
 
 function formatDebugDelta(value: number | null | undefined) {
@@ -3922,6 +4228,12 @@ async function soulFromImport(raw: unknown, fallbackName: string) {
   const personality = stringFrom(profile.personality) || stringFrom(record.personality);
   const scenario =
     stringFrom(profile.scenario) || stringFrom(record.scenario) || stringFrom(record.setting);
+  const openingNarratorMessage =
+    stringFrom(profile.opening_narrator_message) ||
+    stringFrom(record.opening_narrator_message) ||
+    stringFrom(record.first_message) ||
+    stringFrom(record.initial_message);
+  const avatarImageId = stringFrom(profile.avatar_image_id) || stringFrom(record.avatar_image_id);
   const location = stringFrom(world.location) || scenario || base.world.location;
   const core = stringArrayFrom(isRecord(memory) ? memory.core : undefined);
 
@@ -3931,11 +4243,17 @@ async function soulFromImport(raw: unknown, fallbackName: string) {
     schema_version: Number(record.schema_version) || base.schema_version,
     character_id: stringFrom(record.character_id) || base.character_id,
     character_name: importedName || base.character_name,
+    soul_kind: stringFrom(record.soul_kind) || "imported_package",
+    source_soul_id: stringFrom(record.source_soul_id) || null,
+    source_savepoint_id: stringFrom(record.source_savepoint_id) || null,
+    created_from_name: stringFrom(record.created_from_name) || null,
     profile: {
       description,
       appearance,
       personality,
       scenario,
+      opening_narrator_message: openingNarratorMessage,
+      avatar_image_id: avatarImageId || null,
     },
     memory: {
       ...base.memory,

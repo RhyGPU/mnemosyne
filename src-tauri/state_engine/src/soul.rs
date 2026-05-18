@@ -10,6 +10,14 @@ pub struct Soul {
     pub schema_version: u32,
     pub character_id: String,
     pub character_name: String,
+    #[serde(default = "default_soul_kind")]
+    pub soul_kind: String,
+    #[serde(default)]
+    pub source_soul_id: Option<String>,
+    #[serde(default)]
+    pub source_savepoint_id: Option<String>,
+    #[serde(default)]
+    pub created_from_name: Option<String>,
     #[serde(default)]
     pub profile: CharacterProfile,
     pub last_updated: i64,
@@ -31,6 +39,14 @@ pub struct CharacterProfile {
     pub appearance: String,
     pub personality: String,
     pub scenario: String,
+    #[serde(default)]
+    pub opening_narrator_message: String,
+    #[serde(default)]
+    pub avatar_image_id: Option<String>,
+}
+
+fn default_soul_kind() -> String {
+    "savepoint".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -204,7 +220,7 @@ impl Soul {
             "user".into(),
             Relationship {
                 trust: 10.0,
-                affection: 200.0,
+                affection: 20.0,
                 intimacy: 10.0,
                 passion: 10.0,
                 commitment: 10.0,
@@ -224,6 +240,10 @@ impl Soul {
             schema_version: CURRENT_SCHEMA_VERSION,
             character_id: Uuid::new_v4().to_string(),
             character_name: character_name.trim().to_string(),
+            soul_kind: default_soul_kind(),
+            source_soul_id: None,
+            source_savepoint_id: None,
+            created_from_name: None,
             profile: CharacterProfile::default(),
             last_updated: now as i64,
             turn_counter: 0,
@@ -276,8 +296,33 @@ pub fn session_soul_from_savepoint(base: &Soul) -> Soul {
     let now = current_timestamp();
     let mut session = base.clone();
     session.character_id = Uuid::new_v4().to_string();
+    session.soul_kind = "session_clone".into();
+    session.source_soul_id = Some(base.character_id.clone());
+    session.source_savepoint_id = Some(
+        base.source_savepoint_id
+            .clone()
+            .unwrap_or_else(|| base.character_id.clone()),
+    );
+    session.created_from_name = Some(base.character_name.clone());
     session.last_updated = now as i64;
     session
+}
+
+pub fn soul_savepoint_from_session(session: &Soul, name: &str, soul_kind: &str) -> Soul {
+    let now = current_timestamp();
+    let mut savepoint = session.clone();
+    savepoint.character_id = Uuid::new_v4().to_string();
+    savepoint.character_name = name.trim().to_string();
+    savepoint.soul_kind = match soul_kind.trim() {
+        "checkpoint" => "checkpoint".into(),
+        "imported_package" => "imported_package".into(),
+        _ => "savepoint".into(),
+    };
+    savepoint.source_soul_id = Some(session.character_id.clone());
+    savepoint.source_savepoint_id = session.source_savepoint_id.clone();
+    savepoint.created_from_name = Some(session.character_name.clone());
+    savepoint.last_updated = now as i64;
+    savepoint
 }
 
 pub fn neutral_user_relationship() -> Relationship {
@@ -328,6 +373,17 @@ mod tests {
 
         assert_eq!(decoded.character_name, "Aurora Schwarz");
         assert_eq!(decoded.profile, CharacterProfile::default());
+    }
+
+    #[test]
+    fn default_soul_kind_and_affection_are_savepoint_defaults() {
+        let soul = new_default_soul("Aurora Schwarz");
+
+        assert_eq!(soul.soul_kind, "savepoint");
+        assert_eq!(soul.relationships["user"].affection, 20.0);
+        assert!(soul.source_soul_id.is_none());
+        assert!(soul.source_savepoint_id.is_none());
+        assert!(soul.profile.opening_narrator_message.is_empty());
     }
 
     #[test]
@@ -420,6 +476,16 @@ mod tests {
         let session = session_soul_from_savepoint(&soul);
 
         assert_ne!(session.character_id, soul.character_id);
+        assert_eq!(session.soul_kind, "session_clone");
+        assert_eq!(session.source_soul_id.as_deref(), Some(soul.character_id.as_str()));
+        assert_eq!(
+            session.source_savepoint_id.as_deref(),
+            Some(soul.character_id.as_str())
+        );
+        assert_eq!(
+            session.created_from_name.as_deref(),
+            Some(soul.character_name.as_str())
+        );
         assert_eq!(session.character_name, soul.character_name);
         assert_eq!(session.profile, soul.profile);
         assert_eq!(session.turn_counter, soul.turn_counter);

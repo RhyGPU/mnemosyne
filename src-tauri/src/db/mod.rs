@@ -9,6 +9,10 @@ use tauri::{AppHandle, Manager};
 pub struct SoulSummary {
     pub character_id: String,
     pub character_name: String,
+    pub soul_kind: String,
+    pub source_soul_id: Option<String>,
+    pub source_savepoint_id: Option<String>,
+    pub avatar_image_id: Option<String>,
     pub last_updated: i64,
     pub recent_count: usize,
     pub core_count: usize,
@@ -30,6 +34,47 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageAsset {
+    pub id: String,
+    pub file_path: String,
+    pub thumbnail_path: Option<String>,
+    pub source: String,
+    pub mime_type: Option<String>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub prompt: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub linked_soul_id: Option<String>,
+    pub linked_conversation_id: Option<String>,
+    pub linked_message_id: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MessageAttachment {
+    pub id: i64,
+    pub message_id: i64,
+    pub image_asset_id: String,
+    pub created_at: i64,
+    pub image: ImageAsset,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationSummary {
+    pub conversation_id: String,
+    pub title: String,
+    pub soul_id: String,
+    pub source_savepoint_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_message_preview: Option<String>,
+    pub message_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +172,9 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS souls (
             character_id TEXT PRIMARY KEY,
             character_name TEXT NOT NULL,
+            soul_kind TEXT NOT NULL DEFAULT 'savepoint',
+            source_soul_id TEXT,
+            source_savepoint_id TEXT,
             last_updated INTEGER NOT NULL,
             soul_json TEXT NOT NULL
         );
@@ -141,6 +189,7 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
             soul_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT 'Untitled Session',
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             FOREIGN KEY (soul_id) REFERENCES souls(character_id) ON DELETE CASCADE
@@ -230,6 +279,38 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_conversation_entities_active
         ON conversation_entities(conversation_id, active_in_scene);
+
+        CREATE TABLE IF NOT EXISTS image_assets (
+            id TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            thumbnail_path TEXT,
+            source TEXT NOT NULL CHECK(source IN ('uploaded', 'generated', 'imported')),
+            mime_type TEXT,
+            width INTEGER,
+            height INTEGER,
+            prompt TEXT,
+            provider TEXT,
+            model TEXT,
+            linked_soul_id TEXT,
+            linked_conversation_id TEXT,
+            linked_message_id INTEGER,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (linked_soul_id) REFERENCES souls(character_id) ON DELETE SET NULL,
+            FOREIGN KEY (linked_conversation_id) REFERENCES conversations(id) ON DELETE SET NULL,
+            FOREIGN KEY (linked_message_id) REFERENCES messages(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS message_attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id INTEGER NOT NULL,
+            image_asset_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+            FOREIGN KEY (image_asset_id) REFERENCES image_assets(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
+        ON message_attachments(message_id);
         ",
     )?;
     add_column_if_missing(
@@ -243,6 +324,20 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "llm_payload_logs",
         "truncated",
         "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "souls",
+        "soul_kind",
+        "TEXT NOT NULL DEFAULT 'savepoint'",
+    )?;
+    add_column_if_missing(conn, "souls", "source_soul_id", "TEXT")?;
+    add_column_if_missing(conn, "souls", "source_savepoint_id", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "conversations",
+        "title",
+        "TEXT NOT NULL DEFAULT 'Untitled Session'",
     )?;
     Ok(())
 }
@@ -270,33 +365,56 @@ pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+fn normalized_soul_kind(kind: &str) -> String {
+    match kind.trim() {
+        "session_clone" => "session_clone".into(),
+        "imported_package" => "imported_package".into(),
+        "checkpoint" => "checkpoint".into(),
+        _ => "savepoint".into(),
+    }
+}
+
+fn summarize_soul(soul: &Soul) -> SoulSummary {
+    SoulSummary {
+        character_id: soul.character_id.clone(),
+        character_name: soul.character_name.clone(),
+        soul_kind: normalized_soul_kind(&soul.soul_kind),
+        source_soul_id: soul.source_soul_id.clone(),
+        source_savepoint_id: soul.source_savepoint_id.clone(),
+        avatar_image_id: soul.profile.avatar_image_id.clone(),
+        last_updated: soul.last_updated,
+        recent_count: soul.memory.recent.len(),
+        core_count: soul.memory.core.len(),
+    }
+}
+
 pub fn upsert_soul(conn: &Connection, soul: &Soul) -> rusqlite::Result<SoulSummary> {
     let soul_json = serde_json::to_string(soul)
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
     conn.execute(
         "
-        INSERT INTO souls (character_id, character_name, last_updated, soul_json)
-        VALUES (?1, ?2, ?3, ?4)
+        INSERT INTO souls (character_id, character_name, soul_kind, source_soul_id, source_savepoint_id, last_updated, soul_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ON CONFLICT(character_id) DO UPDATE SET
             character_name = excluded.character_name,
+            soul_kind = excluded.soul_kind,
+            source_soul_id = excluded.source_soul_id,
+            source_savepoint_id = excluded.source_savepoint_id,
             last_updated = excluded.last_updated,
             soul_json = excluded.soul_json
         ",
         params![
             soul.character_id,
             soul.character_name,
+            normalized_soul_kind(&soul.soul_kind),
+            soul.source_soul_id.as_deref(),
+            soul.source_savepoint_id.as_deref(),
             soul.last_updated,
             soul_json
         ],
     )?;
 
-    Ok(SoulSummary {
-        character_id: soul.character_id.clone(),
-        character_name: soul.character_name.clone(),
-        last_updated: soul.last_updated,
-        recent_count: soul.memory.recent.len(),
-        core_count: soul.memory.core.len(),
-    })
+    Ok(summarize_soul(soul))
 }
 
 pub fn upsert_setting(
@@ -352,20 +470,34 @@ pub fn delete_setting(conn: &Connection, setting_id: &str) -> rusqlite::Result<b
 }
 
 pub fn list_souls(conn: &Connection) -> rusqlite::Result<Vec<SoulSummary>> {
+    list_souls_with_filter(conn, false)
+}
+
+pub fn list_souls_including_session_clones(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<SoulSummary>> {
+    list_souls_with_filter(conn, true)
+}
+
+fn list_souls_with_filter(
+    conn: &Connection,
+    include_session_clones: bool,
+) -> rusqlite::Result<Vec<SoulSummary>> {
     let mut stmt =
         conn.prepare("SELECT soul_json FROM souls ORDER BY last_updated DESC, character_name ASC")?;
     let rows = stmt.query_map([], |row| {
         let soul_json: String = row.get(0)?;
-        decode_soul(&soul_json).map(|soul| SoulSummary {
-            character_id: soul.character_id,
-            character_name: soul.character_name,
-            last_updated: soul.last_updated,
-            recent_count: soul.memory.recent.len(),
-            core_count: soul.memory.core.len(),
-        })
+        decode_soul(&soul_json).map(|soul| summarize_soul(&soul))
     })?;
 
-    rows.collect()
+    rows.filter_map(|row| match row {
+        Ok(summary) if include_session_clones || summary.soul_kind != "session_clone" => {
+            Some(Ok(summary))
+        }
+        Ok(_) => None,
+        Err(err) => Some(Err(err)),
+    })
+    .collect()
 }
 
 pub fn get_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<Soul> {
@@ -385,7 +517,7 @@ pub fn delete_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
 pub fn primary_soul(conn: &Connection) -> rusqlite::Result<Option<Soul>> {
     let soul_json: Option<String> = conn
         .query_row(
-            "SELECT soul_json FROM souls ORDER BY last_updated DESC LIMIT 1",
+            "SELECT soul_json FROM souls WHERE soul_kind != 'session_clone' ORDER BY last_updated DESC LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -399,16 +531,123 @@ pub fn ensure_conversation(
     conversation_id: &str,
     soul_id: &str,
 ) -> rusqlite::Result<()> {
+    ensure_conversation_with_title(conn, conversation_id, soul_id, None).map(|_| ())
+}
+
+pub fn ensure_conversation_with_title(
+    conn: &Connection,
+    conversation_id: &str,
+    soul_id: &str,
+    title: Option<&str>,
+) -> rusqlite::Result<ConversationSummary> {
     let now = now_ts();
+    let title = sanitize_conversation_title(title.unwrap_or("Untitled Session"));
     conn.execute(
         "
-        INSERT INTO conversations (id, soul_id, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?3)
+        INSERT INTO conversations (id, soul_id, title, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?4)
         ON CONFLICT(id) DO UPDATE SET soul_id = excluded.soul_id, updated_at = excluded.updated_at
         ",
-        params![conversation_id, soul_id, now],
+        params![conversation_id, soul_id, title, now],
     )?;
-    Ok(())
+    get_conversation_summary(conn, conversation_id)
+}
+
+pub fn rename_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+    title: &str,
+) -> rusqlite::Result<ConversationSummary> {
+    let title = sanitize_conversation_title(title);
+    let updated = now_ts();
+    conn.execute(
+        "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
+        params![title, updated, conversation_id],
+    )?;
+    get_conversation_summary(conn, conversation_id)
+}
+
+pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<ConversationSummary>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT id FROM conversations
+        ORDER BY updated_at DESC, created_at DESC
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.map(|row| get_conversation_summary(conn, &row?))
+        .collect()
+}
+
+pub fn get_conversation_summary(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<ConversationSummary> {
+    conn.query_row(
+        "
+        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL)
+        FROM conversations c
+        LEFT JOIN souls s ON s.character_id = c.soul_id
+        WHERE c.id = ?1
+        ",
+        [conversation_id],
+        |row| {
+            let conversation_id: String = row.get(0)?;
+            let last_message_preview = last_message_preview(conn, &conversation_id)?;
+            let message_count = count_messages(conn, &conversation_id)?;
+            Ok(ConversationSummary {
+                conversation_id,
+                title: row.get(1)?,
+                soul_id: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                source_savepoint_id: row.get(5)?,
+                last_message_preview,
+                message_count,
+            })
+        },
+    )
+}
+
+fn sanitize_conversation_title(title: &str) -> String {
+    let trimmed = title.trim();
+    let title = if trimmed.is_empty() {
+        "Untitled Session"
+    } else {
+        trimmed
+    };
+    title.chars().take(120).collect()
+}
+
+fn last_message_preview(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "
+        SELECT content FROM messages
+        WHERE conversation_id = ?1
+        ORDER BY id DESC
+        LIMIT 1
+        ",
+        [conversation_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|value| {
+        value.map(|content| {
+            let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+            compact.chars().take(140).collect()
+        })
+    })
+}
+
+fn count_messages(conn: &Connection, conversation_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+        [conversation_id],
+        |row| row.get(0),
+    )
 }
 
 pub fn upsert_entity(conn: &Connection, entity: &EntityRecord) -> rusqlite::Result<EntityRecord> {
@@ -568,6 +807,120 @@ pub fn update_user_message_content(
         )?;
     }
     Ok(affected > 0)
+}
+
+pub fn upsert_image_asset(conn: &Connection, asset: &ImageAsset) -> rusqlite::Result<ImageAsset> {
+    conn.execute(
+        "
+        INSERT INTO image_assets
+            (id, file_path, thumbnail_path, source, mime_type, width, height, prompt, provider, model, linked_soul_id, linked_conversation_id, linked_message_id, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        ON CONFLICT(id) DO UPDATE SET
+            file_path = excluded.file_path,
+            thumbnail_path = excluded.thumbnail_path,
+            source = excluded.source,
+            mime_type = excluded.mime_type,
+            width = excluded.width,
+            height = excluded.height,
+            prompt = excluded.prompt,
+            provider = excluded.provider,
+            model = excluded.model,
+            linked_soul_id = excluded.linked_soul_id,
+            linked_conversation_id = excluded.linked_conversation_id,
+            linked_message_id = excluded.linked_message_id
+        ",
+        params![
+            asset.id,
+            asset.file_path,
+            asset.thumbnail_path,
+            asset.source,
+            asset.mime_type,
+            asset.width,
+            asset.height,
+            asset.prompt,
+            asset.provider,
+            asset.model,
+            asset.linked_soul_id,
+            asset.linked_conversation_id,
+            asset.linked_message_id,
+            asset.created_at,
+        ],
+    )?;
+    get_image_asset(conn, &asset.id)
+}
+
+pub fn get_image_asset(conn: &Connection, image_asset_id: &str) -> rusqlite::Result<ImageAsset> {
+    conn.query_row(
+        "
+        SELECT id, file_path, thumbnail_path, source, mime_type, width, height, prompt, provider, model, linked_soul_id, linked_conversation_id, linked_message_id, created_at
+        FROM image_assets
+        WHERE id = ?1
+        ",
+        [image_asset_id],
+        image_asset_from_row,
+    )
+}
+
+pub fn attach_image_to_message(
+    conn: &Connection,
+    message_id: i64,
+    image_asset_id: &str,
+) -> rusqlite::Result<MessageAttachment> {
+    let now = now_ts();
+    conn.execute(
+        "
+        INSERT INTO message_attachments (message_id, image_asset_id, created_at)
+        VALUES (?1, ?2, ?3)
+        ",
+        params![message_id, image_asset_id, now],
+    )?;
+    let attachment_id = conn.last_insert_rowid();
+    conn.execute(
+        "UPDATE image_assets SET linked_message_id = ?1 WHERE id = ?2",
+        params![message_id, image_asset_id],
+    )?;
+    get_message_attachment(conn, attachment_id)
+}
+
+pub fn list_message_attachments(
+    conn: &Connection,
+    message_id: i64,
+) -> rusqlite::Result<Vec<MessageAttachment>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT
+            ma.id, ma.message_id, ma.image_asset_id, ma.created_at,
+            ia.id, ia.file_path, ia.thumbnail_path, ia.source, ia.mime_type, ia.width, ia.height,
+            ia.prompt, ia.provider, ia.model, ia.linked_soul_id, ia.linked_conversation_id,
+            ia.linked_message_id, ia.created_at
+        FROM message_attachments ma
+        JOIN image_assets ia ON ia.id = ma.image_asset_id
+        WHERE ma.message_id = ?1
+        ORDER BY ma.id ASC
+        ",
+    )?;
+    let rows = stmt.query_map([message_id], message_attachment_from_row)?;
+    rows.collect()
+}
+
+fn get_message_attachment(
+    conn: &Connection,
+    attachment_id: i64,
+) -> rusqlite::Result<MessageAttachment> {
+    conn.query_row(
+        "
+        SELECT
+            ma.id, ma.message_id, ma.image_asset_id, ma.created_at,
+            ia.id, ia.file_path, ia.thumbnail_path, ia.source, ia.mime_type, ia.width, ia.height,
+            ia.prompt, ia.provider, ia.model, ia.linked_soul_id, ia.linked_conversation_id,
+            ia.linked_message_id, ia.created_at
+        FROM message_attachments ma
+        JOIN image_assets ia ON ia.id = ma.image_asset_id
+        WHERE ma.id = ?1
+        ",
+        [attachment_id],
+        message_attachment_from_row,
+    )
 }
 
 pub fn list_assistant_message_variants(
@@ -858,12 +1211,14 @@ pub fn list_messages_before_id(
     let rows = stmt.query_map(
         params![conversation_id, before_message_id, limit as i64],
         |row| {
+            let message_id = row.get(0)?;
             Ok(ChatMessage {
-                id: row.get(0)?,
+                id: message_id,
                 conversation_id: row.get(1)?,
                 role: row.get(2)?,
                 content: row.get(3)?,
                 created_at: row.get(4)?,
+                attachments: list_message_attachments(conn, message_id)?,
             })
         },
     )?;
@@ -914,12 +1269,14 @@ pub fn list_messages(
     )?;
 
     let rows = stmt.query_map(params![conversation_id, limit as i64], |row| {
+        let message_id = row.get(0)?;
         Ok(ChatMessage {
-            id: row.get(0)?,
+            id: message_id,
             conversation_id: row.get(1)?,
             role: row.get(2)?,
             content: row.get(3)?,
             created_at: row.get(4)?,
+            attachments: list_message_attachments(conn, message_id)?,
         })
     })?;
 
@@ -939,15 +1296,61 @@ pub fn get_message(
         ",
         params![conversation_id, message_id],
         |row| {
+            let message_id = row.get(0)?;
             Ok(ChatMessage {
-                id: row.get(0)?,
+                id: message_id,
                 conversation_id: row.get(1)?,
                 role: row.get(2)?,
                 content: row.get(3)?,
                 created_at: row.get(4)?,
+                attachments: list_message_attachments(conn, message_id)?,
             })
         },
     )
+}
+
+fn image_asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageAsset> {
+    Ok(ImageAsset {
+        id: row.get(0)?,
+        file_path: row.get(1)?,
+        thumbnail_path: row.get(2)?,
+        source: row.get(3)?,
+        mime_type: row.get(4)?,
+        width: row.get(5)?,
+        height: row.get(6)?,
+        prompt: row.get(7)?,
+        provider: row.get(8)?,
+        model: row.get(9)?,
+        linked_soul_id: row.get(10)?,
+        linked_conversation_id: row.get(11)?,
+        linked_message_id: row.get(12)?,
+        created_at: row.get(13)?,
+    })
+}
+
+fn message_attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageAttachment> {
+    Ok(MessageAttachment {
+        id: row.get(0)?,
+        message_id: row.get(1)?,
+        image_asset_id: row.get(2)?,
+        created_at: row.get(3)?,
+        image: ImageAsset {
+            id: row.get(4)?,
+            file_path: row.get(5)?,
+            thumbnail_path: row.get(6)?,
+            source: row.get(7)?,
+            mime_type: row.get(8)?,
+            width: row.get(9)?,
+            height: row.get(10)?,
+            prompt: row.get(11)?,
+            provider: row.get(12)?,
+            model: row.get(13)?,
+            linked_soul_id: row.get(14)?,
+            linked_conversation_id: row.get(15)?,
+            linked_message_id: row.get(16)?,
+            created_at: row.get(17)?,
+        },
+    })
 }
 
 fn ensure_base_assistant_variant(conn: &Connection, message: &ChatMessage) -> rusqlite::Result<()> {
@@ -1218,7 +1621,9 @@ fn summarize_setting(setting: &SettingSoul) -> SettingSummary {
 mod tests {
     use super::*;
     use state_engine::setting::new_default_setting;
-    use state_engine::soul::new_default_soul;
+    use state_engine::soul::{
+        new_default_soul, session_soul_from_savepoint, soul_savepoint_from_session,
+    };
 
     #[test]
     fn migrations_persist_souls_and_messages() {
@@ -1242,6 +1647,44 @@ mod tests {
         let messages = list_messages(&conn, "mock", 5).expect("messages");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content, "Regenerated");
+    }
+
+    #[test]
+    fn image_asset_metadata_and_message_attachment_persist() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "image-chat", &soul.character_id).expect("conversation");
+        let message_id =
+            insert_message_and_get_id(&conn, "image-chat", "user", "[Image]").expect("message");
+        let asset = ImageAsset {
+            id: "asset-1".into(),
+            file_path: "C:\\app-data\\images\\asset-1.png".into(),
+            thumbnail_path: None,
+            source: "uploaded".into(),
+            mime_type: Some("image/png".into()),
+            width: Some(2),
+            height: Some(3),
+            prompt: None,
+            provider: None,
+            model: None,
+            linked_soul_id: None,
+            linked_conversation_id: Some("image-chat".into()),
+            linked_message_id: Some(message_id),
+            created_at: now_ts(),
+        };
+        upsert_image_asset(&conn, &asset).expect("asset");
+        attach_image_to_message(&conn, message_id, &asset.id).expect("attachment");
+
+        let messages = list_messages(&conn, "image-chat", 10).expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].attachments.len(), 1);
+        assert_eq!(
+            messages[0].attachments[0].image.mime_type.as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(messages[0].attachments[0].image.width, Some(2));
+        assert_eq!(get_image_asset(&conn, "asset-1").unwrap().height, Some(3));
     }
 
     #[test]
@@ -1310,6 +1753,84 @@ mod tests {
             .expect("table query");
 
         assert_eq!(exists, 1);
+    }
+
+    #[test]
+    fn normal_soul_library_excludes_session_clones() {
+        let conn = init_memory_connection().expect("db");
+        let mut savepoint = new_default_soul("Aurora Start");
+        savepoint.world.location = "Apartment door".into();
+        upsert_soul(&conn, &savepoint).expect("savepoint");
+        let session = session_soul_from_savepoint(&savepoint);
+        upsert_soul(&conn, &session).expect("session");
+
+        let library = list_souls(&conn).expect("library");
+        assert_eq!(library.len(), 1);
+        assert_eq!(library[0].character_id, savepoint.character_id);
+        assert_eq!(library[0].soul_kind, "savepoint");
+
+        let debug = list_souls_including_session_clones(&conn).expect("debug");
+        assert_eq!(debug.len(), 2);
+        let session_summary = debug
+            .iter()
+            .find(|summary| summary.character_id == session.character_id)
+            .expect("session summary");
+        assert_eq!(session_summary.soul_kind, "session_clone");
+        assert_eq!(
+            session_summary.source_savepoint_id.as_deref(),
+            Some(savepoint.character_id.as_str())
+        );
+    }
+
+    #[test]
+    fn session_checkpoint_savepoint_does_not_mutate_source() {
+        let conn = init_memory_connection().expect("db");
+        let mut savepoint = new_default_soul("Aurora After 10 Talks");
+        savepoint.relationships.get_mut("user").unwrap().trust = 77.0;
+        upsert_soul(&conn, &savepoint).expect("savepoint");
+        let mut session = session_soul_from_savepoint(&savepoint);
+        session.world.location = "New session room".into();
+        session.relationships.get_mut("user").unwrap().trust = 12.0;
+        upsert_soul(&conn, &session).expect("session");
+
+        let checkpoint = soul_savepoint_from_session(&session, "Aurora Checkpoint", "checkpoint");
+        upsert_soul(&conn, &checkpoint).expect("checkpoint");
+
+        let source = get_soul(&conn, &savepoint.character_id).expect("source");
+        assert_eq!(source.relationships["user"].trust, 77.0);
+        assert_ne!(source.world.location, "New session room");
+        let checkpoint = get_soul(&conn, &checkpoint.character_id).expect("checkpoint");
+        assert_eq!(checkpoint.soul_kind, "checkpoint");
+        assert_eq!(checkpoint.world.location, "New session room");
+        assert_eq!(
+            checkpoint.source_savepoint_id.as_deref(),
+            Some(savepoint.character_id.as_str())
+        );
+    }
+
+    #[test]
+    fn conversation_titles_can_be_renamed_independently_of_soul() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        let conversation = ensure_conversation_with_title(
+            &conn,
+            "session-title",
+            &soul.character_id,
+            Some("First title"),
+        )
+        .expect("conversation");
+        assert_eq!(conversation.title, "First title");
+
+        let renamed =
+            rename_conversation(&conn, "session-title", "Renamed Session").expect("rename");
+        assert_eq!(renamed.title, "Renamed Session");
+        assert_eq!(
+            get_soul(&conn, &soul.character_id).unwrap().character_name,
+            "Aurora"
+        );
+        let conversations = list_conversations(&conn).expect("conversations");
+        assert_eq!(conversations[0].title, "Renamed Session");
     }
 
     #[test]

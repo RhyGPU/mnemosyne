@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{engine::general_purpose, Engine as _};
 use rusqlite::Connection;
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
@@ -21,13 +22,16 @@ use state_engine::{
     hidden_state::{parse_hidden_state, HiddenState},
     patch::{EnginePatch, MemoryApplyAction},
     setting::{new_default_setting, SettingSoul},
-    soul::{new_default_soul, session_soul_from_savepoint, MemorySourceType, Soul},
+    soul::{
+        new_default_soul, session_soul_from_savepoint, soul_savepoint_from_session,
+        MemorySourceType, Soul,
+    },
 };
 
 use crate::{
     db::{
-        self, AssistantMessageVariant, ChatMessage, EntityRecord, LlmPayloadLog, ProviderProfile,
-        SettingSummary, SoulSummary,
+        self, AssistantMessageVariant, ChatMessage, ConversationSummary, EntityRecord, ImageAsset,
+        LlmPayloadLog, ProviderProfile, SettingSummary, SoulSummary,
     },
     providers::{
         api::{
@@ -46,6 +50,14 @@ const NARRATOR_BRIEF_TARGET_TOKENS: usize = 2_500;
 const STATE_UPDATER_TARGET_TOKENS: usize = 1_200;
 const STATE_UPDATER_TIMEOUT_SECONDS: u64 = 12;
 static DEV_LOG_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy)]
+struct ImageFileInfo {
+    extension: &'static str,
+    mime_type: &'static str,
+    width: Option<i64>,
+    height: Option<i64>,
+}
 
 #[derive(Debug, serde::Serialize)]
 pub struct TurnResult {
@@ -163,6 +175,13 @@ pub struct ExportResult {
     pub message: String,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct SessionStartResult {
+    pub soul: Soul,
+    pub conversation: ConversationSummary,
+    pub messages: Vec<ChatMessage>,
+}
+
 #[derive(Debug, Clone)]
 struct EntityTurnContext {
     entities: Vec<EntityRecord>,
@@ -227,6 +246,92 @@ pub fn create_fresh_scenario_soul(
 }
 
 #[tauri::command]
+pub fn create_session_soul_from_savepoint(
+    state: State<'_, AppState>,
+    source_soul_id: String,
+    setting_id: Option<String>,
+    title: Option<String>,
+) -> Result<SessionStartResult, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let source = db::get_soul(&conn, &source_soul_id).map_err(|err| err.to_string())?;
+    let session = session_soul_from_savepoint(&source);
+    db::upsert_soul(&conn, &session).map_err(|err| err.to_string())?;
+    let conversation_id = conversation_id_for_session(setting_id.as_deref(), &session.character_id);
+    let default_title = format!("{} Session", source.character_name.trim());
+    let title = title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&default_title);
+    db::ensure_conversation_with_title(&conn, &conversation_id, &session.character_id, Some(title))
+        .map_err(|err| err.to_string())?;
+    let opening = session.profile.opening_narrator_message.trim();
+    seed_opening_narrator_message(&conn, &conversation_id, opening)
+        .map_err(|err| err.to_string())?;
+    let conversation =
+        db::get_conversation_summary(&conn, &conversation_id).map_err(|err| err.to_string())?;
+    let messages =
+        db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?;
+    Ok(SessionStartResult {
+        soul: session,
+        conversation,
+        messages,
+    })
+}
+
+fn seed_opening_narrator_message(
+    conn: &Connection,
+    conversation_id: &str,
+    opening: &str,
+) -> rusqlite::Result<Option<i64>> {
+    let opening = opening.trim();
+    if opening.is_empty() || !db::list_messages(conn, conversation_id, 1)?.is_empty() {
+        return Ok(None);
+    }
+    let message_id = db::insert_message_and_get_id(conn, conversation_id, "assistant", opening)?;
+    db::create_assistant_message_variant(
+        conn,
+        conversation_id,
+        message_id,
+        opening,
+        Some("opening"),
+        Some("opening_seed"),
+        true,
+        None,
+        None,
+    )?;
+    Ok(Some(message_id))
+}
+
+fn conversation_id_for_session(setting_id: Option<&str>, session_soul_id: &str) -> String {
+    match setting_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(setting_id) => format!("local-mock-{setting_id}-{session_soul_id}"),
+        None => format!("local-mock-{session_soul_id}"),
+    }
+}
+
+#[tauri::command]
+pub fn save_session_as_new_soul(
+    state: State<'_, AppState>,
+    session_soul_id: String,
+    name: String,
+    soul_kind: Option<String>,
+) -> Result<Soul, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let session = db::get_soul(&conn, &session_soul_id).map_err(|err| err.to_string())?;
+    let kind = soul_kind.as_deref().unwrap_or("checkpoint");
+    let name = name.trim();
+    let name = if name.is_empty() {
+        format!("{} Checkpoint", session.character_name)
+    } else {
+        name.to_string()
+    };
+    let savepoint = soul_savepoint_from_session(&session, &name, kind);
+    db::upsert_soul(&conn, &savepoint).map_err(|err| err.to_string())?;
+    Ok(savepoint)
+}
+
+#[tauri::command]
 pub fn create_default_setting(setting_name: String) -> SettingSoul {
     new_default_setting(&setting_name)
 }
@@ -244,21 +349,399 @@ pub fn load_setting_file(path: String) -> Result<SettingSoul, String> {
 }
 
 #[tauri::command]
-pub fn save_soul_file(path: String, soul: Soul) -> Result<(), String> {
+pub fn save_soul_file(app: AppHandle, path: String, soul: Soul) -> Result<(), String> {
     let content = serde_json::to_string_pretty(&soul).map_err(|err| err.to_string())?;
-    fs::write(PathBuf::from(path), content).map_err(|err| err.to_string())
+    let path = resolve_export_path(&app, &path, "soul.json")?;
+    fs::write(path, content).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-pub fn save_setting_file(path: String, setting: SettingSoul) -> Result<(), String> {
+pub fn save_setting_file(app: AppHandle, path: String, setting: SettingSoul) -> Result<(), String> {
     let content = serde_json::to_string_pretty(&setting).map_err(|err| err.to_string())?;
-    fs::write(PathBuf::from(path), content).map_err(|err| err.to_string())
+    let path = resolve_export_path(&app, &path, "setting.json")?;
+    fs::write(path, content).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 pub fn list_souls(state: State<'_, AppState>) -> Result<Vec<SoulSummary>, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::list_souls(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_souls_debug(state: State<'_, AppState>) -> Result<Vec<SoulSummary>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_souls_including_session_clones(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<ConversationSummary>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_conversations(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn rename_conversation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    title: String,
+) -> Result<ConversationSummary, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::rename_conversation(&conn, &conversation_id, &title).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn import_image_asset(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    path: String,
+    linked_soul_id: Option<String>,
+    linked_conversation_id: Option<String>,
+    linked_message_id: Option<i64>,
+    source: Option<String>,
+) -> Result<ImageAsset, String> {
+    let source = normalize_image_source(source.as_deref())?;
+    let source_path = PathBuf::from(path);
+    let source_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image")
+        .to_string();
+    emit_dev_log(
+        &window,
+        "info",
+        "db",
+        "image_import_started",
+        Some(serde_json::json!({ "source": source, "file": source_name })),
+    );
+
+    let result = import_image_asset_inner(
+        &app,
+        &state,
+        &source_path,
+        linked_soul_id,
+        linked_conversation_id,
+        linked_message_id,
+        &source,
+    );
+    match &result {
+        Ok(asset) => emit_dev_log(
+            &window,
+            "success",
+            "db",
+            "image_import_success",
+            Some(serde_json::json!({
+                "image_asset_id": asset.id,
+                "source": asset.source,
+                "stored_file": Path::new(&asset.file_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("image")
+            })),
+        ),
+        Err(err) => emit_dev_log(
+            &window,
+            "error",
+            "db",
+            "image_import_failed",
+            Some(serde_json::json!({ "file": source_name, "error": err })),
+        ),
+    }
+    result
+}
+
+fn import_image_asset_inner(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    source_path: &Path,
+    linked_soul_id: Option<String>,
+    linked_conversation_id: Option<String>,
+    linked_message_id: Option<i64>,
+    source: &str,
+) -> Result<ImageAsset, String> {
+    let bytes = fs::read(source_path).map_err(|err| format!("Image read failed: {err}"))?;
+    import_image_asset_bytes_inner(
+        app,
+        state,
+        &bytes,
+        linked_soul_id,
+        linked_conversation_id,
+        linked_message_id,
+        source,
+    )
+}
+
+fn import_image_asset_bytes_inner(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    bytes: &[u8],
+    linked_soul_id: Option<String>,
+    linked_conversation_id: Option<String>,
+    linked_message_id: Option<i64>,
+    source: &str,
+) -> Result<ImageAsset, String> {
+    let info = inspect_image_bytes(bytes)?;
+    let mut images_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
+    images_dir.push("images");
+    fs::create_dir_all(images_dir.join("thumbnails")).map_err(|err| err.to_string())?;
+    let id = uuid_like_id();
+    let file_name = format!("{id}.{}", info.extension);
+    let target_path = images_dir.join(file_name);
+    fs::write(&target_path, bytes).map_err(|err| format!("Image copy failed: {err}"))?;
+
+    let asset = ImageAsset {
+        id,
+        file_path: target_path.display().to_string(),
+        thumbnail_path: None,
+        source: source.to_string(),
+        mime_type: Some(info.mime_type.to_string()),
+        width: info.width,
+        height: info.height,
+        prompt: None,
+        provider: None,
+        model: None,
+        linked_soul_id,
+        linked_conversation_id,
+        linked_message_id,
+        created_at: db::now_ts(),
+    };
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let saved = db::upsert_image_asset(&conn, &asset).map_err(|err| err.to_string())?;
+    if let Some(message_id) = saved.linked_message_id {
+        db::attach_image_to_message(&conn, message_id, &saved.id).map_err(|err| err.to_string())?;
+    }
+    Ok(saved)
+}
+
+#[tauri::command]
+pub fn import_image_asset_bytes(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    file_name: String,
+    data_base64: String,
+    linked_soul_id: Option<String>,
+    linked_conversation_id: Option<String>,
+    linked_message_id: Option<i64>,
+    source: Option<String>,
+) -> Result<ImageAsset, String> {
+    let source = normalize_image_source(source.as_deref())?;
+    emit_dev_log(
+        &window,
+        "info",
+        "db",
+        "image_import_started",
+        Some(serde_json::json!({ "source": source, "file": safe_image_log_name(&file_name) })),
+    );
+    let decoded = general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|err| format!("Image decode failed: {err}"));
+    let result = decoded.and_then(|bytes| {
+        import_image_asset_bytes_inner(
+            &app,
+            &state,
+            &bytes,
+            linked_soul_id,
+            linked_conversation_id,
+            linked_message_id,
+            &source,
+        )
+    });
+    match &result {
+        Ok(asset) => emit_dev_log(
+            &window,
+            "success",
+            "db",
+            "image_import_success",
+            Some(serde_json::json!({
+                "image_asset_id": asset.id,
+                "source": asset.source,
+                "stored_file": Path::new(&asset.file_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("image")
+            })),
+        ),
+        Err(err) => emit_dev_log(
+            &window,
+            "error",
+            "db",
+            "image_import_failed",
+            Some(serde_json::json!({ "file": safe_image_log_name(&file_name), "error": err })),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+pub fn create_user_image_message(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    conversation_id: String,
+    path: String,
+    content: Option<String>,
+) -> Result<Vec<ChatMessage>, String> {
+    emit_dev_log(
+        &window,
+        "info",
+        "db",
+        "image_import_started",
+        Some(serde_json::json!({ "conversation_id": conversation_id })),
+    );
+    let message_id = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let content = content
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("[Image]");
+        db::insert_message_and_get_id(&conn, &conversation_id, "user", content)
+            .map_err(|err| err.to_string())?
+    };
+    let asset = import_image_asset_inner(
+        &app,
+        &state,
+        &PathBuf::from(path),
+        None,
+        Some(conversation_id.clone()),
+        Some(message_id),
+        "uploaded",
+    );
+    match asset {
+        Ok(asset) => {
+            emit_dev_log(
+                &window,
+                "success",
+                "db",
+                "chat_image_attached",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "message_id": message_id,
+                    "image_asset_id": asset.id
+                })),
+            );
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())
+        }
+        Err(err) => {
+            let conn = state.conn.lock().map_err(|lock_err| lock_err.to_string())?;
+            let _ = db::delete_message(&conn, &conversation_id, message_id);
+            emit_dev_log(
+                &window,
+                "error",
+                "db",
+                "image_import_failed",
+                Some(serde_json::json!({ "conversation_id": conversation_id, "error": err })),
+            );
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn create_user_image_message_bytes(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    conversation_id: String,
+    file_name: String,
+    data_base64: String,
+    content: Option<String>,
+) -> Result<Vec<ChatMessage>, String> {
+    emit_dev_log(
+        &window,
+        "info",
+        "db",
+        "image_import_started",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id,
+            "file": safe_image_log_name(&file_name)
+        })),
+    );
+    let message_id = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let content = content
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("[Image]");
+        db::insert_message_and_get_id(&conn, &conversation_id, "user", content)
+            .map_err(|err| err.to_string())?
+    };
+    let result = general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|err| format!("Image decode failed: {err}"))
+        .and_then(|bytes| {
+            import_image_asset_bytes_inner(
+                &app,
+                &state,
+                &bytes,
+                None,
+                Some(conversation_id.clone()),
+                Some(message_id),
+                "uploaded",
+            )
+        });
+    match result {
+        Ok(asset) => {
+            emit_dev_log(
+                &window,
+                "success",
+                "db",
+                "chat_image_attached",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "message_id": message_id,
+                    "image_asset_id": asset.id
+                })),
+            );
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())
+        }
+        Err(err) => {
+            let conn = state.conn.lock().map_err(|lock_err| lock_err.to_string())?;
+            let _ = db::delete_message(&conn, &conversation_id, message_id);
+            emit_dev_log(
+                &window,
+                "error",
+                "db",
+                "image_import_failed",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "file": safe_image_log_name(&file_name),
+                    "error": err
+                })),
+            );
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_image_asset(
+    state: State<'_, AppState>,
+    image_asset_id: String,
+) -> Result<ImageAsset, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::get_image_asset(&conn, &image_asset_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn get_image_asset_data_url(
+    state: State<'_, AppState>,
+    image_asset_id: String,
+) -> Result<String, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let asset = db::get_image_asset(&conn, &image_asset_id).map_err(|err| err.to_string())?;
+    let bytes = fs::read(&asset.file_path).map_err(|err| format!("Image read failed: {err}"))?;
+    let info = inspect_image_bytes(&bytes)?;
+    let mime_type = asset.mime_type.as_deref().unwrap_or(info.mime_type);
+    Ok(format!(
+        "data:{mime_type};base64,{}",
+        general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 #[tauri::command]
@@ -3669,6 +4152,139 @@ fn write_export_file(
     Ok(dir)
 }
 
+fn normalize_image_source(source: Option<&str>) -> Result<String, String> {
+    match source.unwrap_or("uploaded").trim() {
+        "uploaded" => Ok("uploaded".into()),
+        "generated" => Ok("generated".into()),
+        "imported" => Ok("imported".into()),
+        _ => Err("Unsupported image source".into()),
+    }
+}
+
+fn uuid_like_id() -> String {
+    format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        DEV_LOG_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn inspect_image_bytes(bytes: &[u8]) -> Result<ImageFileInfo, String> {
+    let header = &bytes[..bytes.len().min(32)];
+    if header.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok(ImageFileInfo {
+            extension: "png",
+            mime_type: "image/png",
+            width: read_be_u32(header, 16),
+            height: read_be_u32(header, 20),
+        });
+    }
+    if header.starts_with(&[0xff, 0xd8, 0xff]) {
+        let (width, height) = jpeg_dimensions_from_bytes(bytes).unwrap_or((None, None));
+        return Ok(ImageFileInfo {
+            extension: "jpg",
+            mime_type: "image/jpeg",
+            width,
+            height,
+        });
+    }
+    if header.len() >= 12 && &header[0..4] == b"RIFF" && &header[8..12] == b"WEBP" {
+        return Ok(ImageFileInfo {
+            extension: "webp",
+            mime_type: "image/webp",
+            width: None,
+            height: None,
+        });
+    }
+    if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+        return Ok(ImageFileInfo {
+            extension: "gif",
+            mime_type: "image/gif",
+            width: read_le_u16(header, 6),
+            height: read_le_u16(header, 8),
+        });
+    }
+    Err("Unsupported image type. Use PNG, JPG, WEBP, or GIF.".into())
+}
+
+fn read_be_u32(header: &[u8], offset: usize) -> Option<i64> {
+    header
+        .get(offset..offset + 4)
+        .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64)
+}
+
+fn read_le_u16(header: &[u8], offset: usize) -> Option<i64> {
+    header
+        .get(offset..offset + 2)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as i64)
+}
+
+fn jpeg_dimensions_from_bytes(bytes: &[u8]) -> Result<(Option<i64>, Option<i64>), String> {
+    let mut index = 2;
+    while index + 9 < bytes.len() {
+        if bytes[index] != 0xff {
+            index += 1;
+            continue;
+        }
+        let marker = bytes[index + 1];
+        index += 2;
+        if marker == 0xd9 || marker == 0xda || index + 2 > bytes.len() {
+            break;
+        }
+        let length = u16::from_be_bytes([bytes[index], bytes[index + 1]]) as usize;
+        if length < 2 || index + length > bytes.len() {
+            break;
+        }
+        if matches!(marker, 0xc0 | 0xc1 | 0xc2 | 0xc3) && index + 7 < bytes.len() {
+            let height = u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]) as i64;
+            let width = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as i64;
+            return Ok((Some(width), Some(height)));
+        }
+        index += length;
+    }
+    Ok((None, None))
+}
+
+fn safe_image_log_name(file_name: &str) -> String {
+    Path::new(file_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image")
+        .to_string()
+}
+
+fn resolve_export_path(
+    app: &AppHandle,
+    requested: &str,
+    fallback_extension: &str,
+) -> Result<PathBuf, String> {
+    let requested_path = PathBuf::from(requested);
+    if requested_path.is_absolute() {
+        if let Some(parent) = requested_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        return Ok(requested_path);
+    }
+    let mut dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().app_data_dir())
+        .map_err(|err| err.to_string())?;
+    dir.push("mnemosyne-exports");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let requested_name = requested_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_extension);
+    let mut file_name = safe_filename(requested_name);
+    if !file_name.contains('.') {
+        file_name.push('.');
+        file_name.push_str(fallback_extension);
+    }
+    dir.push(file_name);
+    Ok(dir)
+}
+
 fn safe_filename(value: &str) -> String {
     let safe = value
         .chars()
@@ -3780,6 +4396,64 @@ fn debug_from_hidden_state(
 mod tests {
     use super::*;
     use state_engine::{context_compiler::estimate_tokens, hidden_state::HiddenState};
+
+    #[test]
+    fn opening_narrator_message_seeds_visible_assistant_without_payload_logs() {
+        let conn = db::init_memory_connection().expect("db");
+        let mut soul = new_default_soul("Aurora");
+        soul.profile.opening_narrator_message = "Aurora waits by the door.".into();
+        db::upsert_soul(&conn, &soul).expect("soul");
+        db::ensure_conversation_with_title(
+            &conn,
+            "opening-session",
+            &soul.character_id,
+            Some("Opening test"),
+        )
+        .expect("conversation");
+
+        let seeded = seed_opening_narrator_message(
+            &conn,
+            "opening-session",
+            &soul.profile.opening_narrator_message,
+        )
+        .expect("seed");
+
+        assert!(seeded.is_some());
+        let messages = db::list_messages(&conn, "opening-session", 10).expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].content, "Aurora waits by the door.");
+        assert!(db::list_llm_payload_logs(&conn, "opening-session")
+            .expect("logs")
+            .is_empty());
+        assert!(
+            seed_opening_narrator_message(&conn, "opening-session", "Another")
+                .expect("second seed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn image_file_validation_accepts_png_and_rejects_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let png_path = dir.path().join("tiny.png");
+        fs::write(
+            &png_path,
+            [
+                0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D',
+                b'R', 0, 0, 0, 2, 0, 0, 0, 3,
+            ],
+        )
+        .expect("png");
+        let info = inspect_image_bytes(&fs::read(&png_path).expect("png bytes")).expect("png info");
+        assert_eq!(info.mime_type, "image/png");
+        assert_eq!(info.width, Some(2));
+        assert_eq!(info.height, Some(3));
+
+        let text_path = dir.path().join("not-image.txt");
+        fs::write(&text_path, b"nope").expect("text");
+        assert!(inspect_image_bytes(&fs::read(&text_path).expect("text bytes")).is_err());
+    }
 
     #[test]
     fn speaker_label_creates_named_entity() {
@@ -4629,6 +5303,7 @@ mod tests {
                 role: "user".into(),
                 content: "Hello.".into(),
                 created_at: 10,
+                attachments: Vec::new(),
             },
             ChatMessage {
                 id: 2,
@@ -4638,6 +5313,7 @@ mod tests {
                     "Visible narrator text.\n[HIDDEN STATE]{\"tag\":\"observation\"}[/HIDDEN STATE]"
                         .into(),
                 created_at: 11,
+                attachments: Vec::new(),
             },
         ];
 
