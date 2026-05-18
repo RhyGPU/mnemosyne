@@ -19,6 +19,18 @@ export type RecentMemory = {
   salience: number;
   tag: string;
   retrieval_strength: number;
+  source_type?: string;
+  source_session_id?: string | null;
+  source_conversation_id?: string | null;
+  source_message_id?: number | null;
+  source_entity_id?: string | null;
+  is_lived_experience?: boolean;
+  is_imported_context?: boolean;
+  perceived_by_entity_id?: string | null;
+  target_entity_ids?: string[];
+  interpretation?: string | null;
+  confidence?: number | null;
+  objective_event_id?: string | null;
 };
 
 export type SchemaMemory = {
@@ -121,6 +133,7 @@ export type DevLogCategory =
   | "state_updater"
   | "context"
   | "stream"
+  | "performance"
   | "error"
   | "warning"
   | "success";
@@ -170,6 +183,11 @@ export type TurnDebug = {
   assistant_message_id: number | null;
   selected_variant_id: number | null;
   state_updater_status: string;
+  replay_detected: boolean;
+  replay_score: number;
+  replay_reason: string | null;
+  replay_compared_against_message_id: number | null;
+  output_contract_warning: string | null;
   tag: string | null;
   trust_delta: number | null;
   affection_delta: number | null;
@@ -364,25 +382,23 @@ export function createDefaultSoul(characterName: string): Promise<Soul> {
   );
 }
 
-export function createFreshScenarioSoul(
+export function createSessionSoulClone(
   soulId: string,
-  settingId?: string,
 ): Promise<Soul> {
   return invokeOrPreview(
     "create_fresh_scenario_soul",
-    { soulId, settingId: settingId ?? null },
+    { soulId, settingId: null },
     () => {
       const base = browserSouls.find((item) => item.character_id === soulId);
       if (!base) throw new Error("Soul not found");
-      const setting = settingId
-        ? browserSettings.find((item) => item.setting_id === settingId)
-        : undefined;
-      const fresh = makeFreshPreviewSoul(base, setting?.world);
+      const fresh = makeFreshPreviewSoul(base);
       browserSouls.unshift(fresh);
       return fresh;
     },
   );
 }
+
+export const createFreshScenarioSoul = createSessionSoulClone;
 
 export function createDefaultSetting(settingName: string): Promise<SettingSoul> {
   return invokeOrPreview("create_default_setting", { settingName }, () =>
@@ -878,34 +894,11 @@ function makePreviewSetting(settingName: string): SettingSoul {
   };
 }
 
-function makeFreshPreviewSoul(base: Soul, scenarioWorld?: Soul["world"]): Soul {
-  const defaultSoul = makePreviewSoul(base.character_name);
+function makeFreshPreviewSoul(base: Soul): Soul {
   return {
     ...deepClone(base),
     character_id: crypto.randomUUID(),
     last_updated: Math.floor(Date.now() / 1000),
-    turn_counter: 0,
-    turns_since_consolidation: 0,
-    arousal: defaultSoul.arousal,
-    world: scenarioWorld ? deepClone(scenarioWorld) : defaultSoul.world,
-    relationships: {
-      ...deepClone(base.relationships),
-      user: {
-        trust: 10,
-        affection: 20,
-        intimacy: 10,
-        passion: 10,
-        commitment: 10,
-        fear: 10,
-        desire: 20,
-        love_type: "",
-      },
-    },
-    memory: {
-      core: [...base.memory.core],
-      recent: [],
-      schemas: [],
-    },
   };
 }
 
@@ -990,6 +983,9 @@ function sendPreviewTurn(
     salience: template.salience,
     tag: template.tag,
     retrieval_strength: template.salience,
+    source_type: "current_session",
+    is_lived_experience: true,
+    is_imported_context: false,
   });
   soul.memory.recent = soul.memory.recent.slice(0, 12);
   soul.world.recent_events.push(`${template.worldFrame}: ${userText}`);
@@ -1144,6 +1140,9 @@ async function sendPreviewApiTurn(
     salience: template.salience,
     tag: template.tag,
     retrieval_strength: template.salience,
+    source_type: inferPreviewMemorySource(userText),
+    is_lived_experience: inferPreviewMemorySource(userText) === "current_session",
+    is_imported_context: inferPreviewMemorySource(userText) !== "current_session",
   });
   soul.memory.recent = soul.memory.recent.slice(0, 12);
   soul.world.recent_events.push(
@@ -1703,6 +1702,28 @@ function normalizePreviewTag(tag: string | undefined, fallbackText: string): Pre
   return classifyPreviewTag(fallbackText);
 }
 
+function inferPreviewMemorySource(userText: string): string {
+  const lower = userText.toLowerCase();
+  if (
+    lower.includes("# mnemosyne chat log") ||
+    (lower.includes("## user") && lower.includes("## narrator") && lower.includes("created:"))
+  ) {
+    return "imported_log";
+  }
+  if (
+    lower.includes("cross-session bleed") ||
+    lower.includes("memory bleed") ||
+    lower.includes("another version") ||
+    lower.includes("parallel timeline")
+  ) {
+    return "cross_session_bleed";
+  }
+  if (lower.includes("previous session") || lower.includes("prior session") || lower.includes("archived chat")) {
+    return "previous_session";
+  }
+  return "current_session";
+}
+
 function generatedPreviewApiHiddenState(
   soul: Soul,
   userText: string,
@@ -1734,6 +1755,11 @@ function debugFromHiddenState(
     assistant_message_id: null,
     selected_variant_id: null,
     state_updater_status: "legacy_hidden_state",
+    replay_detected: false,
+    replay_score: 0,
+    replay_reason: null,
+    replay_compared_against_message_id: null,
+    output_contract_warning: null,
     tag: hiddenState.tag ?? null,
     trust_delta: hiddenState.trust_delta ?? null,
     affection_delta: hiddenState.affection_delta ?? null,

@@ -4,7 +4,7 @@ use crate::{
     arousal::ArousalSignal,
     hidden_state::HiddenState,
     memory::create_scored_memory,
-    soul::{current_timestamp, Relationship, Soul},
+    soul::{current_timestamp, MemorySourceType, Relationship, Soul},
 };
 
 pub const PATCH_PROTOCOL_VERSION: u32 = 1;
@@ -14,6 +14,7 @@ const RELATIONSHIP_SCALAR_MIN: f32 = 0.0;
 const RELATIONSHIP_SCALAR_MAX: f32 = 300.0;
 const MAX_RECENT_MEMORIES: usize = 12;
 const MAX_RECENT_EVENTS: usize = 12;
+const MEMORY_HYGIENE_SCAN_LIMIT: usize = 30;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -58,6 +59,13 @@ pub struct RelationshipDelta {
 pub struct MemoryPatch {
     pub content: String,
     pub tag: Option<String>,
+    pub source_type: Option<MemorySourceType>,
+    pub source_session_id: Option<String>,
+    pub source_conversation_id: Option<String>,
+    pub source_message_id: Option<i64>,
+    pub source_entity_id: Option<String>,
+    pub is_lived_experience: Option<bool>,
+    pub is_imported_context: Option<bool>,
     pub perceived_by_entity_id: Option<String>,
     pub target_entity_ids: Vec<String>,
     pub interpretation: Option<String>,
@@ -111,8 +119,26 @@ pub struct SensoryAssociationPatch {
 pub struct PatchReport {
     pub relationship_updated: bool,
     pub memories_added: usize,
+    pub memory_events: Vec<MemoryApplyEvent>,
     pub world_updated: bool,
     pub body_updated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryApplyEvent {
+    pub action: MemoryApplyAction,
+    pub source_type: MemorySourceType,
+    pub content: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MemoryApplyAction {
+    Added,
+    RejectedDuplicate,
+    RejectedGeneric,
+    Merged,
+    Deprioritized,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,7 +156,9 @@ impl EnginePatch {
         let mut report = PatchReport::default();
         if let Some(soul_patch) = &self.soul_patch {
             report.relationship_updated = soul_patch.apply_relationship(soul);
-            report.memories_added = soul_patch.apply_memories(soul);
+            let memory_report = soul_patch.apply_memories(soul);
+            report.memories_added = memory_report.added;
+            report.memory_events = memory_report.events;
         }
         if let Some(world_patch) = &self.world_patch {
             report.world_updated = world_patch.apply(soul);
@@ -269,23 +297,102 @@ impl SoulPatch {
         changed
     }
 
-    fn apply_memories(&self, soul: &mut Soul) -> usize {
-        let mut added = 0;
-        for memory in &self.new_memories {
+    fn apply_memories(&self, soul: &mut Soul) -> MemoryApplyReport {
+        let mut report = MemoryApplyReport::default();
+        for memory in self.new_memories.iter().take(memory_patch_limit(&self.new_memories)) {
             let Some(content) = memory.content() else {
                 continue;
             };
+            let cleaned_content = sanitize_memory_content(content);
+            let content = cleaned_content.as_str();
+            let source_type = memory.resolved_source_type(content);
+            if is_generic_memory_content(content) {
+                report.events.push(MemoryApplyEvent {
+                    action: MemoryApplyAction::RejectedGeneric,
+                    source_type,
+                    content: content.to_string(),
+                    reason: Some("generic filler memory".into()),
+                });
+                continue;
+            }
+            if let Some(existing_index) = duplicate_memory_index(soul, content, memory.tag()) {
+                report.events.push(MemoryApplyEvent {
+                    action: MemoryApplyAction::RejectedDuplicate,
+                    source_type,
+                    content: content.to_string(),
+                    reason: Some(format!(
+                        "similar to existing memory {}",
+                        soul.memory.recent[existing_index].id
+                    )),
+                });
+                continue;
+            }
+            if let Some(existing_index) = mergeable_memory_index(soul, content, memory.tag()) {
+                let existing = &mut soul.memory.recent[existing_index];
+                existing.salience = existing.salience.max(55.0).min(100.0);
+                existing.retrieval_strength = existing.retrieval_strength.max(55.0).min(100.0);
+                if existing.confidence.is_none() {
+                    existing.confidence =
+                        memory.confidence.filter(|confidence| confidence.is_finite());
+                }
+                report.events.push(MemoryApplyEvent {
+                    action: MemoryApplyAction::Merged,
+                    source_type,
+                    content: content.to_string(),
+                    reason: Some(format!("merged into memory {}", existing.id)),
+                });
+                continue;
+            }
             let tag = memory.tag();
             let mut recent = create_scored_memory(soul, content, tag);
+            recent.source_type = source_type;
+            recent.source_session_id = memory.cleaned_optional(&memory.source_session_id);
+            recent.source_conversation_id = memory.cleaned_optional(&memory.source_conversation_id);
+            recent.source_message_id = memory.source_message_id;
+            recent.source_entity_id = memory.cleaned_optional(&memory.source_entity_id);
+            recent.is_imported_context = memory
+                .is_imported_context
+                .unwrap_or_else(|| source_type.imported_or_cross_session());
+            recent.is_lived_experience = memory.is_lived_experience.unwrap_or_else(|| {
+                !matches!(
+                    source_type,
+                    MemorySourceType::ImportedLog
+                        | MemorySourceType::PreviousSession
+                        | MemorySourceType::CrossSessionBleed
+                        | MemorySourceType::UserClaimed
+                )
+            });
             recent.perceived_by_entity_id = memory.cleaned_optional(&memory.perceived_by_entity_id);
             recent.target_entity_ids = memory.cleaned_targets();
             recent.interpretation = memory.cleaned_optional(&memory.interpretation);
-            recent.confidence = memory.confidence.filter(|confidence| confidence.is_finite());
+            recent.confidence = memory
+                .confidence
+                .filter(|confidence| confidence.is_finite())
+                .or_else(|| matches!(source_type, MemorySourceType::Unknown).then_some(0.45));
             recent.objective_event_id = memory.cleaned_optional(&memory.objective_event_id);
+            let mut action = MemoryApplyAction::Added;
+            if is_generic_emotional_reaction(content, tag) {
+                recent.salience = (recent.salience * 0.55).min(40.0);
+                recent.retrieval_strength = (recent.retrieval_strength * 0.55).min(40.0);
+                action = MemoryApplyAction::Deprioritized;
+            }
+            boost_high_value_memory(
+                &mut recent.salience,
+                &mut recent.retrieval_strength,
+                content,
+                tag,
+            );
+            let event_content = recent.content.clone();
             soul.memory.recent.push(recent);
-            added += 1;
+            report.added += 1;
+            report.events.push(MemoryApplyEvent {
+                action,
+                source_type,
+                content: event_content,
+                reason: None,
+            });
         }
-        if added > 0 {
+        if report.added > 0 {
             soul.memory.recent.sort_by(|left, right| {
                 right
                     .salience
@@ -294,8 +401,26 @@ impl SoulPatch {
             });
             soul.memory.recent.truncate(MAX_RECENT_MEMORIES);
         }
-        added
+        report
     }
+}
+
+fn memory_patch_limit(memories: &[MemoryPatch]) -> usize {
+    if memories
+        .iter()
+        .any(|memory| memory.source_type == Some(MemorySourceType::ImportedLog)
+            || infer_memory_source_type(&memory.content) == Some(MemorySourceType::ImportedLog))
+    {
+        3
+    } else {
+        memories.len()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct MemoryApplyReport {
+    added: usize,
+    events: Vec<MemoryApplyEvent>,
 }
 
 impl RelationshipDelta {
@@ -343,6 +468,12 @@ impl MemoryPatch {
             .unwrap_or("observation")
     }
 
+    fn resolved_source_type(&self, content: &str) -> MemorySourceType {
+        self.source_type.unwrap_or_else(|| {
+            infer_memory_source_type(content).unwrap_or(MemorySourceType::CurrentSession)
+        })
+    }
+
     fn cleaned_optional(&self, value: &Option<String>) -> Option<String> {
         value
             .as_deref()
@@ -357,6 +488,200 @@ impl MemoryPatch {
             .filter_map(|target| clean_str(target).map(str::to_string))
             .collect()
     }
+}
+
+fn infer_memory_source_type(text: &str) -> Option<MemorySourceType> {
+    let lower = text.to_ascii_lowercase();
+    if looks_like_imported_log(&lower) {
+        Some(MemorySourceType::ImportedLog)
+    } else if contains_any(
+        &lower,
+        &[
+            "cross-session bleed",
+            "cross session bleed",
+            "another version",
+            "parallel timeline",
+            "imported memory",
+            "memory bleed",
+        ],
+    ) {
+        Some(MemorySourceType::CrossSessionBleed)
+    } else if contains_any(
+        &lower,
+        &[
+            "previous session",
+            "prior session",
+            "archived chat",
+            "old chat log",
+        ],
+    ) {
+        Some(MemorySourceType::PreviousSession)
+    } else {
+        None
+    }
+}
+
+fn sanitize_memory_content(content: &str) -> String {
+    let mut cleaned = content.trim().to_string();
+    for marker in ["Context cue:", "context cue:"] {
+        if let Some(index) = cleaned.find(marker) {
+            cleaned.truncate(index);
+        }
+    }
+    cleaned
+        .trim()
+        .trim_end_matches(['.', ';', ','])
+        .trim()
+        .to_string()
+}
+
+fn looks_like_imported_log(lower_text: &str) -> bool {
+    lower_text.contains("# mnemosyne chat log")
+        || (lower_text.contains("## user")
+            && lower_text.contains("## narrator")
+            && lower_text.contains("created:"))
+        || lower_text.contains("# mnemosyne llm payload history")
+}
+
+fn is_generic_memory_content(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    let normalized = normalize_memory_text(content);
+    normalized.split_whitespace().count() <= 3
+        || contains_any(
+            &lower,
+            &[
+                "neutral exchange added texture",
+                "the exchange added emotional texture",
+                "the scene continued",
+                "she observed the user's words",
+                "a recent chat provided context",
+                "recent chat is available",
+                "fresh scene context",
+                "context cue",
+            ],
+        )
+}
+
+fn is_generic_emotional_reaction(content: &str, tag: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    matches!(
+        tag,
+        "observation" | "minor_observation" | "routine" | "small_talk"
+    ) && contains_any(
+        &lower,
+        &[
+            "felt tense",
+            "felt nervous",
+            "was tense",
+            "stayed tense",
+            "reacted emotionally",
+            "listened to the user",
+            "noticed the user's words",
+            "watched the user",
+        ],
+    )
+}
+
+fn boost_high_value_memory(
+    salience: &mut f32,
+    retrieval_strength: &mut f32,
+    content: &str,
+    tag: &str,
+) {
+    let lower = content.to_ascii_lowercase();
+    if matches!(
+        tag,
+        "identity_continuity"
+            | "identity_change"
+            | "promise"
+            | "commitment"
+            | "relationship_turning_point"
+            | "breakthrough"
+            | "threat"
+            | "orientation"
+    ) || contains_any(
+        &lower,
+        &[
+            "promise",
+            "commitment",
+            "vow",
+            "identity",
+            "turning point",
+            "confession",
+            "learned the truth",
+            "active plot",
+            "warrant",
+            "evacuation",
+        ],
+    ) {
+        *salience = salience.max(70.0);
+        *retrieval_strength = retrieval_strength.max(70.0);
+    }
+}
+
+fn duplicate_memory_index(soul: &Soul, content: &str, tag: &str) -> Option<usize> {
+    similar_memory_index(soul, content, tag, 0.82)
+}
+
+fn mergeable_memory_index(soul: &Soul, content: &str, tag: &str) -> Option<usize> {
+    similar_memory_index(soul, content, tag, 0.64)
+}
+
+fn similar_memory_index(soul: &Soul, content: &str, tag: &str, threshold: f32) -> Option<usize> {
+    let new_tokens = memory_token_set(content);
+    if new_tokens.is_empty() {
+        return None;
+    }
+    soul.memory
+        .recent
+        .iter()
+        .enumerate()
+        .skip(soul.memory.recent.len().saturating_sub(MEMORY_HYGIENE_SCAN_LIMIT))
+        .filter(|(_, memory)| memory.tag == tag)
+        .find(|(_, memory)| {
+            memory_similarity(&new_tokens, &memory_token_set(&memory.content)) >= threshold
+        })
+        .map(|(index, _)| index)
+}
+
+fn memory_token_set(text: &str) -> Vec<String> {
+    let mut tokens = normalize_memory_text(text)
+        .split_whitespace()
+        .filter(|token| token.len() > 2)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn normalize_memory_text(text: &str) -> String {
+    text.to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character.is_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn memory_similarity(left: &[String], right: &[String]) -> f32 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let intersection = left.iter().filter(|token| right.contains(token)).count();
+    let union = left.len() + right.len() - intersection;
+    intersection as f32 / union as f32
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 impl WorldPatch {
@@ -814,6 +1139,134 @@ mod tests {
         assert_eq!(soul.memory.recent.len(), 1);
         assert_eq!(soul.memory.recent[0].tag, "orientation");
         assert!(soul.memory.recent[0].salience > 0.0);
+        assert_eq!(
+            soul.memory.recent[0].source_type,
+            MemorySourceType::CurrentSession
+        );
+        assert!(soul.memory.recent[0].is_lived_experience);
+    }
+
+    #[test]
+    fn imported_log_memory_is_not_lived_experience() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                new_memories: vec![MemoryPatch {
+                    content: "# Mnemosyne Chat Log\n## User\nHello\n## Narrator\nAurora argued about ownership.\nCreated: 100".into(),
+                    tag: Some("identity_continuity".into()),
+                    ..MemoryPatch::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        let report = patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert_eq!(report.memories_added, 1);
+        assert_eq!(
+            soul.memory.recent[0].source_type,
+            MemorySourceType::ImportedLog
+        );
+        assert!(!soul.memory.recent[0].is_lived_experience);
+        assert!(soul.memory.recent[0].is_imported_context);
+    }
+
+    #[test]
+    fn duplicate_memory_is_rejected() {
+        let mut soul = new_default_soul("Aurora");
+        let first = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                new_memories: vec![MemoryPatch {
+                    content: "Aurora accepted the user's careful promise to return.".into(),
+                    tag: Some("promise".into()),
+                    ..MemoryPatch::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        first.apply_to_soul(&mut soul).expect("first applies");
+        let duplicate = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                new_memories: vec![MemoryPatch {
+                    content: "Aurora accepted the user's careful promise to return.".into(),
+                    tag: Some("promise".into()),
+                    ..MemoryPatch::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        let report = duplicate.apply_to_soul(&mut soul).expect("duplicate applies");
+
+        assert_eq!(report.memories_added, 0);
+        assert_eq!(soul.memory.recent.len(), 1);
+        assert!(report
+            .memory_events
+            .iter()
+            .any(|event| event.action == MemoryApplyAction::RejectedDuplicate));
+    }
+
+    #[test]
+    fn generic_filler_memory_is_rejected() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                new_memories: vec![MemoryPatch {
+                    content: "The scene continued.".into(),
+                    tag: Some("observation".into()),
+                    ..MemoryPatch::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        let report = patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert_eq!(report.memories_added, 0);
+        assert!(soul.memory.recent.is_empty());
+        assert!(report
+            .memory_events
+            .iter()
+            .any(|event| event.action == MemoryApplyAction::RejectedGeneric));
+    }
+
+    #[test]
+    fn imported_log_memory_patch_is_capped_to_three_summaries() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                new_memories: (0..8)
+                    .map(|index| MemoryPatch {
+                        content: format!(
+                            "# Mnemosyne Chat Log\n## User\nentry {index}\n## Narrator\nimported fact {index}\nCreated: {index}"
+                        ),
+                        tag: Some("identity_continuity".into()),
+                        ..MemoryPatch::default()
+                    })
+                    .collect(),
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        let report = patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert_eq!(report.memories_added, 3);
+        assert_eq!(soul.memory.recent.len(), 3);
+        assert!(soul.memory.recent.iter().all(|memory| {
+            memory.source_type == MemorySourceType::ImportedLog
+                && !memory.is_lived_experience
+                && memory.is_imported_context
+        }));
     }
 
     #[test]

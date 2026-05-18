@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::soul::{MemoryEntry, Soul};
+use crate::soul::{MemoryEntry, MemorySourceType, Soul};
 
 const DEFAULT_TOKEN_BUDGET: usize = 2_500;
 const MIN_RECENT_MEMORY_SALIENCE: f32 = 65.0;
@@ -62,6 +62,7 @@ struct ScoredMemory<'a> {
     memory: &'a MemoryEntry,
     score: f32,
     repetitive: bool,
+    source_restricted: bool,
 }
 
 impl Default for ContextBudget {
@@ -216,12 +217,16 @@ fn build_memory_section(
     }
 
     let query_terms = recent_chat_terms(messages);
+    let source_query_active = memory_source_query_active(messages);
     let mut selected_recent = soul
         .memory
         .recent
         .iter()
         .filter(|memory| !is_generic_filler_memory(memory))
-        .map(|memory| score_recent_memory(memory, &query_terms, soul.turn_counter))
+        .map(|memory| {
+            score_recent_memory(memory, &query_terms, soul.turn_counter, source_query_active)
+        })
+        .filter(|memory| !memory.source_restricted)
         .filter(|memory| {
             memory.memory.salience >= MIN_RECENT_MEMORY_SALIENCE
                 || memory.score >= 80.0
@@ -239,7 +244,7 @@ fn build_memory_section(
     for scored in selected_recent {
         lines.push(format!(
             "Recent: [{} / salience {:.0}] {}",
-            fallback(&scored.memory.tag, "memory"),
+            memory_source_label(scored.memory),
             scored.memory.salience,
             scored.memory.content.trim()
         ));
@@ -528,6 +533,7 @@ fn score_recent_memory<'a>(
     memory: &'a MemoryEntry,
     query_terms: &HashSet<String>,
     current_turn: u64,
+    source_query_active: bool,
 ) -> ScoredMemory<'a> {
     let memory_terms = token_set(&memory.content);
     let overlap = memory_terms
@@ -548,14 +554,24 @@ fn score_recent_memory<'a>(
         .unwrap_or(3.0);
     let repetitive = is_repetitive_low_value(memory);
     let repetition_penalty = if repetitive { 25.0 } else { 0.0 };
+    let source_restricted = memory.source_type.imported_or_cross_session() && !source_query_active;
+    let source_adjustment = memory_source_score_adjustment(memory, source_query_active);
+    let confidence_penalty = memory
+        .confidence
+        .filter(|confidence| confidence.is_finite())
+        .map(|confidence| if confidence < 0.55 { 20.0 } else { 0.0 })
+        .unwrap_or(0.0);
     let score =
         memory.salience + (memory.retrieval_strength * 0.35) + (overlap * 20.0) + recency_bonus
-            - repetition_penalty;
+            + source_adjustment
+            - repetition_penalty
+            - confidence_penalty;
 
     ScoredMemory {
         memory,
         score,
         repetitive,
+        source_restricted,
     }
 }
 
@@ -678,6 +694,54 @@ fn is_repetitive_low_value(memory: &MemoryEntry) -> bool {
         )
 }
 
+fn memory_source_score_adjustment(memory: &MemoryEntry, source_query_active: bool) -> f32 {
+    match memory.source_type {
+        MemorySourceType::CurrentSession => 18.0,
+        MemorySourceType::PersistentCore => 14.0,
+        MemorySourceType::UserClaimed => {
+            if source_query_active {
+                12.0
+            } else {
+                0.0
+            }
+        }
+        MemorySourceType::ImportedLog | MemorySourceType::PreviousSession => {
+            if source_query_active {
+                8.0
+            } else {
+                -60.0
+            }
+        }
+        MemorySourceType::CrossSessionBleed => {
+            if source_query_active {
+                6.0
+            } else {
+                -70.0
+            }
+        }
+        MemorySourceType::NarratorInferred => -18.0,
+        MemorySourceType::SystemGenerated | MemorySourceType::Unknown => 0.0,
+    }
+}
+
+fn memory_source_label(memory: &MemoryEntry) -> String {
+    let mut parts = vec![memory.source_type.as_label().to_string()];
+    if !memory.is_lived_experience {
+        parts.push("not lived".into());
+    }
+    if memory.is_imported_context && !parts.iter().any(|part| part == "imported") {
+        parts.push("imported".into());
+    }
+    if memory
+        .confidence
+        .filter(|confidence| confidence.is_finite() && *confidence < 0.6)
+        .is_some()
+    {
+        parts.push("uncertain".into());
+    }
+    parts.join(" / ")
+}
+
 fn is_generic_filler_memory(memory: &MemoryEntry) -> bool {
     is_generic_filler_text(&memory.content)
         || is_near_empty_generic_schema(&memory.tag, &memory.content)
@@ -712,6 +776,32 @@ fn recent_chat_terms(messages: &[ContextMessage]) -> HashSet<String> {
         .take(6)
         .flat_map(|message| token_set(&message.content))
         .collect()
+}
+
+fn memory_source_query_active(messages: &[ContextMessage]) -> bool {
+    let text = messages
+        .iter()
+        .rev()
+        .take(4)
+        .map(|message| message.content.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+    [
+        "imported log",
+        "chat log",
+        "previous session",
+        "prior session",
+        "another aurora",
+        "another version",
+        "cross-session",
+        "cross session",
+        "memory bleed",
+        "archived chat",
+        "old session",
+        "other session",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn token_set(text: &str) -> HashSet<String> {
@@ -1299,6 +1389,118 @@ mod tests {
     }
 
     #[test]
+    fn relevant_memory_context_shows_compact_source_labels() {
+        let mut soul = new_default_soul("Aurora");
+        soul.memory.recent.push(memory(
+            "current",
+            "Aurora asked whether the other Aurora is okay.",
+            "identity_continuity",
+            72.0,
+            72.0,
+            1,
+        ));
+
+        let preview = compile_context_for_messages(&soul, &[]);
+        let memories = section_text(&preview.text, "[RELEVANT MEMORIES]");
+
+        assert!(memories.contains("Recent: [current_session / salience 72]"));
+        assert!(memories.contains("other Aurora"));
+    }
+
+    #[test]
+    fn imported_log_memories_are_deprioritized_until_referenced() {
+        let mut soul = new_default_soul("Aurora");
+        let mut imported = memory(
+            "imported",
+            "Imported log says previous Aurora argued about ownership.",
+            "identity_continuity",
+            95.0,
+            95.0,
+            1,
+        );
+        imported.source_type = MemorySourceType::ImportedLog;
+        imported.is_lived_experience = false;
+        imported.is_imported_context = true;
+        soul.memory.recent.push(imported);
+        soul.memory.recent.push(memory(
+            "current",
+            "Aurora noticed the current hallway door was locked.",
+            "orientation",
+            66.0,
+            66.0,
+            2,
+        ));
+
+        let normal = compile_context_for_messages(
+            &soul,
+            &[ContextMessage {
+                role: "user".into(),
+                content: "We keep moving down the hallway.".into(),
+            }],
+        );
+        let normal_memories = section_text(&normal.text, "[RELEVANT MEMORIES]");
+        assert!(!normal_memories.contains("previous Aurora argued"));
+        assert!(normal_memories.contains("current hallway door"));
+
+        let referenced = compile_context_for_messages(
+            &soul,
+            &[ContextMessage {
+                role: "user".into(),
+                content: "What did the imported log say about previous Aurora?".into(),
+            }],
+        );
+        let referenced_memories = section_text(&referenced.text, "[RELEVANT MEMORIES]");
+        assert!(referenced_memories.contains("imported_log / not lived"));
+        assert!(referenced_memories.contains("previous Aurora argued"));
+    }
+
+    #[test]
+    fn cross_session_bleed_memories_are_excluded_until_referenced() {
+        let mut soul = new_default_soul("Aurora");
+        let mut bleed = memory(
+            "bleed",
+            "Aurora has a memory-like trace of another session's emotional alteration.",
+            "identity_continuity",
+            95.0,
+            95.0,
+            1,
+        );
+        bleed.source_type = MemorySourceType::CrossSessionBleed;
+        bleed.is_lived_experience = false;
+        bleed.is_imported_context = true;
+        soul.memory.recent.push(bleed);
+        soul.memory.recent.push(memory(
+            "current",
+            "Aurora identified the current testing room as quiet and stable.",
+            "orientation",
+            66.0,
+            66.0,
+            2,
+        ));
+
+        let normal = compile_context_for_messages(
+            &soul,
+            &[ContextMessage {
+                role: "user".into(),
+                content: "We talk about the quiet testing room.".into(),
+            }],
+        );
+        assert!(!section_text(&normal.text, "[RELEVANT MEMORIES]")
+            .contains("memory-like trace"));
+
+        let referenced = compile_context_for_messages(
+            &soul,
+            &[ContextMessage {
+                role: "user".into(),
+                content: "Do you remember the cross-session bleed from before?".into(),
+            }],
+        );
+        let memories = section_text(&referenced.text, "[RELEVANT MEMORIES]");
+        assert!(memories.contains("cross_session_bleed / not lived"));
+        assert!(memories.contains("memory-like trace"));
+    }
+
+    #[test]
     fn key_objects_and_active_plots_appear_in_world_section() {
         let soul = soul_with_phone_scene();
 
@@ -1358,6 +1560,13 @@ mod tests {
             salience,
             tag: tag.into(),
             retrieval_strength,
+            source_type: MemorySourceType::CurrentSession,
+            source_session_id: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            source_entity_id: None,
+            is_lived_experience: true,
+            is_imported_context: false,
             perceived_by_entity_id: None,
             target_entity_ids: Vec::new(),
             interpretation: None,

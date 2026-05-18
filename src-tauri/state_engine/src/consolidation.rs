@@ -118,7 +118,7 @@ fn title_case_tag(tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::soul::new_default_soul;
+    use crate::soul::{new_default_soul, MemorySourceType};
 
     #[test]
     fn consolidation_promotes_discards_and_merges() {
@@ -132,6 +132,13 @@ mod tests {
                 salience: 50.0,
                 tag: "routine".into(),
                 retrieval_strength: 50.0,
+                source_type: MemorySourceType::CurrentSession,
+                source_session_id: None,
+                source_conversation_id: None,
+                source_message_id: None,
+                source_entity_id: None,
+                is_lived_experience: true,
+                is_imported_context: false,
                 perceived_by_entity_id: None,
                 target_entity_ids: Vec::new(),
                 interpretation: None,
@@ -147,6 +154,13 @@ mod tests {
             salience: 95.0,
             tag: "near_death".into(),
             retrieval_strength: 95.0,
+            source_type: MemorySourceType::CurrentSession,
+            source_session_id: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            source_entity_id: None,
+            is_lived_experience: true,
+            is_imported_context: false,
             perceived_by_entity_id: None,
             target_entity_ids: Vec::new(),
             interpretation: None,
@@ -160,6 +174,13 @@ mod tests {
             salience: 10.0,
             tag: "observation".into(),
             retrieval_strength: 10.0,
+            source_type: MemorySourceType::CurrentSession,
+            source_session_id: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            source_entity_id: None,
+            is_lived_experience: true,
+            is_imported_context: false,
             perceived_by_entity_id: None,
             target_entity_ids: Vec::new(),
             interpretation: None,

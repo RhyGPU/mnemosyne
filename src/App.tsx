@@ -35,7 +35,7 @@ import {
   ContextMode,
   compileContext,
   createDefaultSoul,
-  createFreshScenarioSoul,
+  createSessionSoulClone,
   createDefaultSetting,
   deleteConversation,
   deleteMessage,
@@ -83,6 +83,7 @@ const DEV_LOG_CATEGORIES: DevLogCategory[] = [
   "state_updater",
   "context",
   "stream",
+  "performance",
   "error",
   "warning",
   "success",
@@ -244,8 +245,9 @@ export function App() {
   });
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
   const [view, setView] = useState<AppView>("library");
-  const [chatStartMode, setChatStartMode] = useState<ChatStartMode>("continue");
-  const [sessionContinuityLabel, setSessionContinuityLabel] = useState("Using persistent Soul continuity");
+  const [chatStartMode, setChatStartMode] = useState<ChatStartMode>("fresh");
+  const [sourceSavepointId, setSourceSavepointId] = useState<string | null>(null);
+  const [sessionContinuityLabel, setSessionContinuityLabel] = useState("New Session clones the selected Soul savepoint");
   const [status, setStatus] = useState("Ready");
   const [payloadCopied, setPayloadCopied] = useState(false);
   const [exportFeedback, setExportFeedback] = useState("");
@@ -268,6 +270,7 @@ export function App() {
   const generationIdRef = useRef(0);
   const activeGenerationRef = useRef<ActiveGeneration | null>(null);
   const devConsoleBodyRef = useRef<HTMLDivElement>(null);
+  const chatOnlyBodyRef = useRef<HTMLElement>(null);
   const currentConversationId = useMemo(
     () =>
       soul && setting
@@ -325,6 +328,16 @@ export function App() {
     if (!body) return;
     body.scrollTop = body.scrollHeight;
   }, [devLogs, devConsoleOpen, devConsolePaused]);
+
+  useEffect(() => {
+    if (view !== "chat") return;
+    const body = chatOnlyBodyRef.current;
+    if (!body) return;
+    const frame = window.requestAnimationFrame(() => {
+      body.scrollTop = body.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [view, currentConversationId, messages.length]);
 
   useEffect(() => {
     localStorage.setItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY, selectedProviderProfileId);
@@ -676,6 +689,7 @@ export function App() {
       );
       await upsertSoul(nextSoul);
       setSoul(nextSoul);
+      setSourceSavepointId(null);
       setMessages([]);
       setLastTurnDebug(null);
       setSouls(await listSouls());
@@ -696,6 +710,7 @@ export function App() {
       const nextSoul = await getSoul(selected.character_id);
       setStatus(`Selected ${nextSoul.character_name}`);
       setSoul(nextSoul);
+      setSourceSavepointId(null);
       setCreatorFieldsFromSoul(nextSoul);
       setLastTurnDebug(null);
       setMessages(
@@ -823,7 +838,12 @@ export function App() {
 
     try {
       const activeSetting = await persistCurrentSetting();
-      const activeSoul = activeSetting ? mirrorSettingIntoSoul(soul, activeSetting) : soul;
+      const shouldSeedSettingWorld = Boolean(
+        activeMessages.length === 0 && chatStartMode === "continue" && activeSetting,
+      );
+      const activeSoul = shouldSeedSettingWorld
+        ? mirrorSettingIntoSoul(soul, activeSetting!)
+        : soul;
       await upsertSoul(activeSoul);
       if (provider === "API") {
         setMessages((current) =>
@@ -861,16 +881,9 @@ export function App() {
       if (result.conversation_id !== currentConversationIdRef.current) {
         return;
       }
-      if (activeSetting) {
-        const updatedSetting = {
-          ...activeSetting,
-          turn_counter: activeSetting.turn_counter + 1,
-          last_updated: Math.floor(Date.now() / 1000),
-          world: result.soul.world,
-        };
-        await upsertSetting(updatedSetting);
-        setSetting(updatedSetting);
-        setEditorFieldsFromSetting(updatedSetting);
+      if (activeSetting && shouldSeedSettingWorld) {
+        setSetting(activeSetting);
+        setEditorFieldsFromSetting(activeSetting);
       }
       setSoul(result.soul);
       setMessages(result.messages);
@@ -878,12 +891,18 @@ export function App() {
       setLastTurnDebug(result.debug);
       setSouls(await listSouls());
       setStateUpdating(false);
+      const replayStatus = result.debug.replay_detected
+        ? result.debug.replay_reason?.includes("regenerated before save")
+          ? "Turn saved; anti-replay regenerated"
+          : "Turn saved; anti-replay warning"
+        : null;
       setStatus(
-        result.debug.state_updater_status.startsWith("failed")
+        replayStatus ??
+          (result.debug.state_updater_status.startsWith("failed")
           ? "Turn saved; state updater failed"
           : result.consolidation_ran
             ? "Turn saved; consolidation ran"
-            : "Turn saved",
+            : "Turn saved"),
       );
       logDev(
         result.debug.state_updater_status.startsWith("failed") ? "warn" : "success",
@@ -1078,6 +1097,7 @@ export function App() {
   async function handleStartChat() {
     if (!soul || busy) return;
     if (chatStartMode === "continue") {
+      setSourceSavepointId(null);
       setSessionContinuityLabel("Using persistent Soul continuity");
       setView("chat");
       return;
@@ -1085,18 +1105,30 @@ export function App() {
 
     setBusy(true);
     try {
-      const freshSoul = await createFreshScenarioSoul(soul.character_id, setting?.setting_id);
+      const sourceId = soul.character_id;
+      const sessionSoul = await createSessionSoulClone(sourceId);
       const nextConversationId = setting
-        ? conversationIdForSettingAndSoul(setting.setting_id, freshSoul.character_id)
-        : conversationIdForSoul(freshSoul.character_id);
-      setSoul(freshSoul);
-      setCreatorFieldsFromSoul(freshSoul);
+        ? conversationIdForSettingAndSoul(setting.setting_id, sessionSoul.character_id)
+        : conversationIdForSoul(sessionSoul.character_id);
+      setSoul(sessionSoul);
+      setSourceSavepointId(sourceId);
+      setCreatorFieldsFromSoul(sessionSoul);
       setMessages(await listConversationMessages(nextConversationId));
-      setContext(await compileContext(freshSoul.character_id, nextConversationId));
+      setContext(await compileContext(sessionSoul.character_id, nextConversationId));
       setSouls(await listSouls());
       setLastTurnDebug(null);
-      setSessionContinuityLabel("Fresh scenario state");
-      setStatus("Started fresh scenario state; original Soul continuity was preserved.");
+      setSessionContinuityLabel("New Session clone; source savepoint remains unchanged");
+      setStatus("Started New Session from an exact Soul savepoint clone.");
+      logDev("info", "context", "new session cloned selected Soul savepoint", {
+        source_soul_id: sourceId,
+        session_soul_id: sessionSoul.character_id,
+        conversation_id: nextConversationId,
+        active_plots: sessionSoul.world.active_plots,
+        recent_events: sessionSoul.world.recent_events.length,
+        memories: sessionSoul.memory.recent.length,
+        schemas: sessionSoul.memory.schemas.length,
+        relationship_targets: Object.keys(sessionSoul.relationships),
+      });
       setView("chat");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -1308,6 +1340,7 @@ export function App() {
 
       if (remaining.length === 0) {
         setSoul(null);
+        setSourceSavepointId(null);
         setMessages([]);
         setContext(null);
         setStatus("Soul deleted");
@@ -1319,6 +1352,7 @@ export function App() {
         ? conversationIdForSettingAndSoul(setting.setting_id, nextSoul.character_id)
         : conversationIdForSoul(nextSoul.character_id);
       setSoul(nextSoul);
+      setSourceSavepointId(null);
       setCreatorFieldsFromSoul(nextSoul);
       setMessages(await listConversationMessages(nextConversationId));
       setContext(await compileContext(nextSoul.character_id, nextConversationId));
@@ -1494,19 +1528,105 @@ export function App() {
     }
   }
 
+  function cloneCurrentSoulSavepoint(name: string) {
+    if (!soul) return null;
+    return {
+      ...cloneForUi(soul),
+      character_id: crypto.randomUUID(),
+      character_name: name.trim() || soul.character_name,
+      last_updated: Math.floor(Date.now() / 1000),
+    };
+  }
+
+  async function handleSaveCurrentSessionAsNewSoul() {
+    if (!soul) return;
+    const defaultName = `${soul.character_name} Savepoint`;
+    const name = window.prompt("Name this new Soul savepoint", defaultName);
+    if (name === null) return;
+    const savepoint = cloneCurrentSoulSavepoint(name);
+    if (!savepoint) return;
+    setBusy(true);
+    try {
+      await upsertSoul(savepoint);
+      setSouls(await listSouls());
+      setStatus(`Saved new Soul savepoint: ${savepoint.character_name}`);
+      logDev("success", "db", "Current session saved as new Soul savepoint", {
+        current_soul_id: soul.character_id,
+        new_soul_id: savepoint.character_id,
+      });
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCreateCheckpoint() {
+    if (!soul) return;
+    const defaultName = `${soul.character_name} Checkpoint ${formatCheckpointTimestamp(new Date())}`;
+    const name = window.prompt("Name this checkpoint", defaultName);
+    if (name === null) return;
+    const checkpoint = cloneCurrentSoulSavepoint(name);
+    if (!checkpoint) return;
+    setBusy(true);
+    try {
+      await upsertSoul(checkpoint);
+      setSouls(await listSouls());
+      setStatus(`Created checkpoint: ${checkpoint.character_name}`);
+      logDev("success", "db", "Checkpoint created from current session Soul", {
+        current_soul_id: soul.character_id,
+        checkpoint_soul_id: checkpoint.character_id,
+      });
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleUpdateSourceSavepoint() {
+    if (!soul) return;
+    const targetSoulId = sourceSavepointId ?? soul.character_id;
+    const targetName =
+      souls.find((item) => item.character_id === targetSoulId)?.character_name ?? soul.character_name;
+    const confirmed = window.confirm(
+      `Update source savepoint "${targetName}" with the current session Soul? This overwrites that saved checkpoint.`,
+    );
+    if (!confirmed) return;
+
+    const updatedSource = {
+      ...cloneForUi(soul),
+      character_id: targetSoulId,
+      last_updated: Math.floor(Date.now() / 1000),
+    };
+    setBusy(true);
+    try {
+      await upsertSoul(updatedSource);
+      setSouls(await listSouls());
+      if (targetSoulId === soul.character_id) {
+        setSoul(updatedSource);
+      }
+      setStatus(`Updated source savepoint: ${targetName}`);
+      logDev("warn", "db", "Source savepoint updated explicitly", {
+        source_soul_id: targetSoulId,
+        current_session_soul_id: soul.character_id,
+      });
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleSaveSoul() {
     if (!soul) return;
     setBusy(true);
     try {
-      const activeSetting = await persistCurrentSetting();
-      const nextSoul = activeSetting
-        ? mirrorSettingIntoSoul(applyCreatorFields(soul), activeSetting)
-        : applyCreatorFields(soul);
-      await upsertSoul(nextSoul);
-      setSoul(nextSoul);
-      await saveSoulFile(`${nextSoul.character_name.replace(/\s+/g, "_")}.soul.json`, nextSoul);
-      setSouls(await listSouls());
-      setStatus("Soul exported beside the app working directory");
+      await saveSoulFile(`${soul.character_name.replace(/\s+/g, "_")}.soul.json`, soul);
+      setStatus("Current Soul exported; no savepoint was modified");
+      logDev("success", "app", "Current Soul exported without mutation", {
+        soul_id: soul.character_id,
+      });
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1546,6 +1666,7 @@ export function App() {
       const importedSoul = await soulFromImport(raw, file.name);
       await upsertSoul(importedSoul);
       setSoul(importedSoul);
+      setSourceSavepointId(null);
       setCreatorFieldsFromSoul(importedSoul);
       setMessages(
         await listConversationMessages(
@@ -1765,7 +1886,7 @@ export function App() {
           </div>
         </header>
 
-        <section className="chat-only-body">
+        <section className="chat-only-body" ref={chatOnlyBodyRef}>
           {activeMessages.length === 0 ? (
             <div className="empty-state">
               <MessageSquareText size={34} />
@@ -1869,7 +1990,7 @@ export function App() {
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={handleComposerKeyDown}
             placeholder="Type message... Enter for newline, Shift+Enter to send."
-            disabled={turnInProgress}
+            disabled={busy}
             rows={2}
           />
           {busy ? (
@@ -2075,27 +2196,25 @@ export function App() {
               <FileUp size={18} />
               <span>Import</span>
             </button>
-            <button title="Export Soul" onClick={handleSaveSoul} disabled={!soul || busy}>
+            <button title="Save Current Session as New Soul" onClick={handleSaveCurrentSessionAsNewSoul} disabled={!soul || busy}>
+              <Sparkles size={18} />
+              <span>Save As</span>
+            </button>
+            <button title="Create Checkpoint from current Session Soul" onClick={handleCreateCheckpoint} disabled={!soul || busy}>
+              <Database size={18} />
+              <span>Checkpoint</span>
+            </button>
+            <button title="Export Current Soul without modifying savepoints" onClick={handleSaveSoul} disabled={!soul || busy}>
               <FileDown size={18} />
               <span>Export</span>
             </button>
             <button
-              title="Persist current Soul"
-              onClick={async () => {
-                if (!soul) return;
-                const activeSetting = await persistCurrentSetting();
-                const nextSoul = activeSetting
-                  ? mirrorSettingIntoSoul(applyCreatorFields(soul), activeSetting)
-                  : applyCreatorFields(soul);
-                await upsertSoul(nextSoul);
-                setSoul(nextSoul);
-                setSouls(await listSouls());
-                setStatus("Soul and active Setting persisted");
-              }}
+              title="Update Source Savepoint explicitly"
+              onClick={handleUpdateSourceSavepoint}
               disabled={!soul || busy}
             >
               <Save size={18} />
-              <span>Save</span>
+              <span>Update Source</span>
             </button>
             <button title="Run consolidation" onClick={handleConsolidate} disabled={!soul || busy}>
               <RefreshCcw size={18} />
@@ -2687,12 +2806,12 @@ export function App() {
                 onChange={() => setChatStartMode("fresh")}
                 disabled={busy}
               />
-              <span>Start fresh scenario state</span>
+              <span>New Session from savepoint clone</span>
             </label>
           </div>
           <p className="session-state-label">
             {chatStartMode === "fresh"
-              ? "Fresh scenario state resets world, recent memories, and relationship for this new session."
+              ? "New Session clones the selected Soul exactly, starts an empty chat, and mutates only the clone."
               : "Using persistent Soul continuity"}
           </p>
         </div>
@@ -3110,6 +3229,24 @@ export function App() {
               <div>
                 <dt>Updater</dt>
                 <dd>{lastTurnDebug?.state_updater_status ?? "-"}</dd>
+              </div>
+              <div>
+                <dt>Anti-Replay</dt>
+                <dd>
+                  {lastTurnDebug
+                    ? lastTurnDebug.replay_detected
+                      ? `Triggered (${lastTurnDebug.replay_score.toFixed(2)})`
+                      : `Passed (${lastTurnDebug.replay_score.toFixed(2)})`
+                    : "-"}
+                </dd>
+              </div>
+              <div>
+                <dt>Replay Reason</dt>
+                <dd>{lastTurnDebug?.replay_reason ?? "-"}</dd>
+              </div>
+              <div>
+                <dt>Output Guard</dt>
+                <dd>{lastTurnDebug?.output_contract_warning ?? "-"}</dd>
               </div>
               <div>
                 <dt>Tag</dt>
@@ -3651,13 +3788,10 @@ function stripHiddenStateBlocks(content: string) {
 }
 
 function normalizeTrailingStatusBlock(content: string) {
-  const statusMatch = content.match(/```status[\s\S]*?```[\t ]*$/);
-  if (!statusMatch || statusMatch.index === undefined) {
-    return content;
-  }
-  const start = statusMatch.index;
-  const body = content.slice(0, start).trimEnd();
-  const status = statusMatch[0].trim();
+  const statusBlocks = [...content.matchAll(/```status[\s\S]*?```/gi)];
+  if (!statusBlocks.length) return content;
+  const status = statusBlocks[statusBlocks.length - 1][0].trim();
+  const body = content.replace(/```status[\s\S]*?```/gi, "").trimEnd();
   return body ? `${body}\n\n${status}` : status;
 }
 
@@ -3758,6 +3892,17 @@ function normalizeWorldDraft(world: WorldDraft) {
     keyObjects: linesFromText(world.keyObjects, []),
     timeElapsed: world.timeElapsed.trim() || "Session start",
   };
+}
+
+function cloneForUi<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function formatCheckpointTimestamp(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
+    date.getHours(),
+  )}${pad(date.getMinutes())}`;
 }
 
 async function soulFromImport(raw: unknown, fallbackName: string) {

@@ -90,6 +90,50 @@ pub struct MemoryStore {
     pub schemas: Vec<SchemaEntry>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySourceType {
+    CurrentSession,
+    PreviousSession,
+    ImportedLog,
+    CrossSessionBleed,
+    UserClaimed,
+    NarratorInferred,
+    SystemGenerated,
+    PersistentCore,
+    #[default]
+    Unknown,
+}
+
+impl MemorySourceType {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            MemorySourceType::CurrentSession => "current_session",
+            MemorySourceType::PreviousSession => "previous_session",
+            MemorySourceType::ImportedLog => "imported_log",
+            MemorySourceType::CrossSessionBleed => "cross_session_bleed",
+            MemorySourceType::UserClaimed => "user_claimed",
+            MemorySourceType::NarratorInferred => "narrator_inferred",
+            MemorySourceType::SystemGenerated => "system_generated",
+            MemorySourceType::PersistentCore => "persistent_core",
+            MemorySourceType::Unknown => "unknown",
+        }
+    }
+
+    pub fn imported_or_cross_session(self) -> bool {
+        matches!(
+            self,
+            MemorySourceType::ImportedLog
+                | MemorySourceType::PreviousSession
+                | MemorySourceType::CrossSessionBleed
+        )
+    }
+}
+
+const fn default_lived_experience() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryEntry {
     pub id: String,
@@ -98,6 +142,20 @@ pub struct MemoryEntry {
     pub salience: f32,
     pub tag: String,
     pub retrieval_strength: f32,
+    #[serde(default)]
+    pub source_type: MemorySourceType,
+    #[serde(default)]
+    pub source_session_id: Option<String>,
+    #[serde(default)]
+    pub source_conversation_id: Option<String>,
+    #[serde(default)]
+    pub source_message_id: Option<i64>,
+    #[serde(default)]
+    pub source_entity_id: Option<String>,
+    #[serde(default = "default_lived_experience")]
+    pub is_lived_experience: bool,
+    #[serde(default)]
+    pub is_imported_context: bool,
     #[serde(default)]
     pub perceived_by_entity_id: Option<String>,
     #[serde(default)]
@@ -214,19 +272,12 @@ pub fn new_default_soul(character_name: &str) -> Soul {
     Soul::default_for_character(character_name)
 }
 
-pub fn fresh_scenario_soul(base: &Soul, scenario_world: Option<WorldLog>) -> Soul {
+pub fn session_soul_from_savepoint(base: &Soul) -> Soul {
     let now = current_timestamp();
-    let mut fresh = base.clone();
-    fresh.character_id = Uuid::new_v4().to_string();
-    fresh.last_updated = now as i64;
-    fresh.turn_counter = 0;
-    fresh.turns_since_consolidation = 0;
-    fresh.world = scenario_world.unwrap_or_default();
-    fresh.memory.recent.clear();
-    fresh.memory.schemas.clear();
-    fresh.relationships.insert("user".into(), neutral_user_relationship());
-    fresh.arousal = ArousalState::default();
-    fresh
+    let mut session = base.clone();
+    session.character_id = Uuid::new_v4().to_string();
+    session.last_updated = now as i64;
+    session
 }
 
 pub fn neutral_user_relationship() -> Relationship {
@@ -302,6 +353,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_memory_json_defaults_source_metadata() {
+        let raw = r#"{
+            "id":"old",
+            "timestamp":1,
+            "content":"Aurora kept an old remembered fact.",
+            "salience":75.0,
+            "tag":"observation",
+            "retrieval_strength":75.0
+        }"#;
+
+        let decoded: MemoryEntry = serde_json::from_str(raw).expect("legacy memory");
+
+        assert_eq!(decoded.source_type, MemorySourceType::Unknown);
+        assert!(decoded.is_lived_experience);
+        assert!(!decoded.is_imported_context);
+    }
+
+    #[test]
     fn world_log_json_roundtrip_is_independent() {
         let mut world = WorldLog::default();
         world.location = "Carver City service tunnel".into();
@@ -313,10 +382,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_scenario_resets_volatile_state() {
+    fn new_session_clones_selected_savepoint_fictional_state() {
         let mut soul = new_default_soul("Aurora Schwarz");
         soul.world.location = "Aurora's kitchen counter.".into();
         soul.world.recent_events = vec!["Romantic kitchen scene resolved.".into()];
+        soul.world.active_plots = vec!["Interact with Rhy".into()];
+        soul.world.key_objects = vec!["old phone on couch".into()];
+        soul.world.time_elapsed = "One year after the first meeting.".into();
         soul.memory.recent.push(MemoryEntry {
             id: "recent".into(),
             timestamp: 1,
@@ -324,30 +396,51 @@ mod tests {
             salience: 90.0,
             tag: "bonding".into(),
             retrieval_strength: 90.0,
+            source_type: MemorySourceType::CurrentSession,
+            source_session_id: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            source_entity_id: None,
+            is_lived_experience: true,
+            is_imported_context: false,
             perceived_by_entity_id: None,
             target_entity_ids: Vec::new(),
             interpretation: None,
             confidence: None,
             objective_event_id: None,
         });
+        soul.memory.schemas.push(SchemaEntry {
+            schema_type: "attachment_pattern".into(),
+            summary: "Aurora remembers promises that felt stabilizing.".into(),
+            count: 2,
+        });
         soul.relationships.get_mut("user").unwrap().trust = 130.0;
         soul.relationships.get_mut("user").unwrap().affection = 126.0;
-        let scenario_world = WorldLog {
-            location: "Debt collector office threshold.".into(),
-            active_plots: vec!["Collect the overdue payment".into()],
-            recent_events: Vec::new(),
-            key_objects: Vec::new(),
-            time_elapsed: "Session start".into(),
-        };
 
-        let fresh = fresh_scenario_soul(&soul, Some(scenario_world.clone()));
+        let session = session_soul_from_savepoint(&soul);
 
-        assert_ne!(fresh.character_id, soul.character_id);
-        assert_eq!(fresh.world, scenario_world);
-        assert!(fresh.memory.recent.is_empty());
-        assert!(fresh.memory.schemas.is_empty());
-        assert_eq!(fresh.relationships["user"], neutral_user_relationship());
+        assert_ne!(session.character_id, soul.character_id);
+        assert_eq!(session.character_name, soul.character_name);
+        assert_eq!(session.profile, soul.profile);
+        assert_eq!(session.turn_counter, soul.turn_counter);
+        assert_eq!(session.turns_since_consolidation, soul.turns_since_consolidation);
+        assert_eq!(session.global, soul.global);
+        assert_eq!(session.trauma, soul.trauma);
+        assert_eq!(session.relationships, soul.relationships);
+        assert_eq!(session.arousal, soul.arousal);
+        assert_eq!(session.memory, soul.memory);
+        assert_eq!(session.world, soul.world);
+
+        let mut changed_session = session.clone();
+        changed_session.world.location = "Different session room.".into();
+        changed_session.relationships.get_mut("user").unwrap().trust = 1.0;
+        changed_session.memory.recent[0].content = "Session-only change.".into();
         assert_eq!(soul.world.location, "Aurora's kitchen counter.");
         assert_eq!(soul.relationships["user"].trust, 130.0);
+        assert_eq!(
+            soul.memory.recent[0].source_type,
+            MemorySourceType::CurrentSession
+        );
+        assert_eq!(soul.memory.recent[0].content, "Aurora warmed to the user.");
     }
 }

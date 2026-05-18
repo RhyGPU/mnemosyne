@@ -1,10 +1,12 @@
 use std::{
+    collections::HashSet,
     fs,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 use rusqlite::Connection;
@@ -17,9 +19,9 @@ use state_engine::{
         ContextMessage, ContextPreview,
     },
     hidden_state::{parse_hidden_state, HiddenState},
-    patch::EnginePatch,
+    patch::{EnginePatch, MemoryApplyAction},
     setting::{new_default_setting, SettingSoul},
-    soul::{fresh_scenario_soul, new_default_soul, Soul},
+    soul::{new_default_soul, session_soul_from_savepoint, MemorySourceType, Soul},
 };
 
 use crate::{
@@ -40,6 +42,9 @@ use crate::{
 const CONSOLIDATION_INTERVAL_TURNS: u64 = 10;
 const NO_LLM_PAYLOAD_LOGS_MESSAGE: &str = "No LLM payload logs found for this conversation.";
 const FULL_CHAT_TOKEN_BUDGET: usize = 6_000;
+const NARRATOR_BRIEF_TARGET_TOKENS: usize = 2_500;
+const STATE_UPDATER_TARGET_TOKENS: usize = 1_200;
+const STATE_UPDATER_TIMEOUT_SECONDS: u64 = 12;
 static DEV_LOG_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, serde::Serialize)]
@@ -62,6 +67,11 @@ pub struct TurnDebug {
     pub assistant_message_id: Option<i64>,
     pub selected_variant_id: Option<i64>,
     pub state_updater_status: String,
+    pub replay_detected: bool,
+    pub replay_score: f32,
+    pub replay_reason: Option<String>,
+    pub replay_compared_against_message_id: Option<i64>,
+    pub output_contract_warning: Option<String>,
     pub tag: Option<String>,
     pub trust_delta: Option<f32>,
     pub affection_delta: Option<f32>,
@@ -178,6 +188,26 @@ enum SpeakerResolutionStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone)]
+struct ReplaySource {
+    message_id: i64,
+    content: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReplayGuardResult {
+    replay_detected: bool,
+    replay_score: f32,
+    replay_reason: Option<String>,
+    compared_against_message_id: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct OutputContractResult {
+    text: String,
+    warning: Option<String>,
+}
+
 #[tauri::command]
 pub fn create_default_soul(character_name: String) -> Soul {
     new_default_soul(&character_name)
@@ -187,17 +217,11 @@ pub fn create_default_soul(character_name: String) -> Soul {
 pub fn create_fresh_scenario_soul(
     state: State<'_, AppState>,
     soul_id: String,
-    setting_id: Option<String>,
+    _setting_id: Option<String>,
 ) -> Result<Soul, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let base = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
-    let scenario_world = setting_id
-        .as_deref()
-        .filter(|id| !id.trim().is_empty())
-        .map(|id| db::get_setting(&conn, id).map(|setting| setting.world))
-        .transpose()
-        .map_err(|err| err.to_string())?;
-    let fresh = fresh_scenario_soul(&base, scenario_world);
+    let fresh = session_soul_from_savepoint(&base);
     db::upsert_soul(&conn, &fresh).map_err(|err| err.to_string())?;
     Ok(fresh)
 }
@@ -583,7 +607,14 @@ fn send_mock_turn_with_conn(
     let provider = MockProvider::default();
     let raw_response = provider.complete(&soul, &context_preview.text, &snapshot_user_text, &mode);
     let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
-    let debug = debug_from_hidden_state("Mock", &parsed.hidden_state, true, false);
+    let (visible_response, replay_guard, output_contract_warning) =
+        guard_narrator_visible_response(&parsed.visible_text, &snapshot_user_text, &[]);
+    let mut debug = debug_from_hidden_state("Mock", &parsed.hidden_state, true, false);
+    debug.replay_detected = replay_guard.replay_detected;
+    debug.replay_score = replay_guard.replay_score;
+    debug.replay_reason = replay_guard.replay_reason;
+    debug.replay_compared_against_message_id = replay_guard.compared_against_message_id;
+    debug.output_contract_warning = output_contract_warning;
     let debug_json = serde_json::to_string(&debug).map_err(|err| err.to_string())?;
 
     parsed.apply_to_soul(&mut soul);
@@ -592,7 +623,7 @@ fn send_mock_turn_with_conn(
     let assistant_message_id = if let Some(message_id) = replacement_assistant_id {
         message_id
     } else {
-        db::insert_message_and_get_id(&conn, &conversation_id, "assistant", &parsed.visible_text)
+        db::insert_message_and_get_id(&conn, &conversation_id, "assistant", &visible_response)
             .map_err(|err| err.to_string())?
     };
 
@@ -601,7 +632,7 @@ fn send_mock_turn_with_conn(
             &conn,
             &conversation_id,
             assistant_message_id,
-            &parsed.visible_text,
+            &visible_response,
             None,
             Some(
                 if correction_instruction
@@ -625,7 +656,7 @@ fn send_mock_turn_with_conn(
             &conn,
             &conversation_id,
             assistant_message_id,
-            &parsed.visible_text,
+            &visible_response,
             Some("original"),
             Some(&pre_turn_soul_json),
             Some(&debug_json),
@@ -660,7 +691,7 @@ fn send_mock_turn_with_conn(
     Ok(TurnResult {
         conversation_id,
         soul,
-        visible_response: parsed.visible_text,
+        visible_response,
         context_preview,
         messages,
         consolidation_ran,
@@ -682,6 +713,8 @@ pub async fn send_api_turn(
     correction_instruction: Option<String>,
     context_mode: Option<String>,
 ) -> Result<TurnResult, String> {
+    let turn_started = Instant::now();
+    let mut stage_started = Instant::now();
     let context_mode = ContextMode::from_label(context_mode.as_deref());
     emit_dev_log(
         &window,
@@ -703,6 +736,7 @@ pub async fn send_api_turn(
         snapshot_user_text,
         pre_turn_soul_json,
         entity_context,
+        replay_sources,
     ) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         let (soul, snapshot_user_text) = if let Some(message_id) = replacement_assistant_id {
@@ -723,6 +757,13 @@ pub async fn send_api_turn(
         if replacement_assistant_id.is_none() {
             db::insert_message(&conn, &conversation_id, "user", &user_text)
                 .map_err(|err| err.to_string())?;
+            emit_perf_log(
+                &window,
+                &conversation_id,
+                "save user message",
+                stage_started.elapsed(),
+            );
+            stage_started = Instant::now();
         }
         let entity_context =
             resolve_speaker_for_turn(&conn, &conversation_id, &soul, &snapshot_user_text)
@@ -740,12 +781,48 @@ pub async fn send_api_turn(
             None => db::list_messages(&conn, &conversation_id, history_limit),
         }
         .map_err(|err| err.to_string())?;
+        let mut replay_sources = recent_assistant_replay_sources(&before_messages, 2);
+        if let Some(message_id) = replacement_assistant_id {
+            if let Ok(message) = db::get_message(&conn, &conversation_id, message_id) {
+                if message.role == "assistant" {
+                    replay_sources.insert(
+                        0,
+                        ReplaySource {
+                            message_id: message.id,
+                            content: message.content,
+                        },
+                    );
+                    replay_sources.truncate(2);
+                }
+            }
+        }
         let context_messages = messages_to_context(before_messages);
         let context_preview = compile_context_with_correction(
             &soul,
             &context_messages,
             correction_instruction.as_deref(),
         );
+        emit_perf_log(
+            &window,
+            &conversation_id,
+            "compile narrator context",
+            stage_started.elapsed(),
+        );
+        if context_mode == ContextMode::Brief
+            && context_preview.estimated_tokens > NARRATOR_BRIEF_TARGET_TOKENS
+        {
+            emit_dev_log(
+                &window,
+                "warn",
+                "performance",
+                "narrator payload exceeds brief budget",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "estimated_tokens": context_preview.estimated_tokens,
+                    "target_tokens": NARRATOR_BRIEF_TARGET_TOKENS
+                })),
+            );
+        }
         let pre_turn_soul_json = serde_json::to_string(&soul).map_err(|err| err.to_string())?;
         (
             soul,
@@ -754,6 +831,7 @@ pub async fn send_api_turn(
             snapshot_user_text,
             pre_turn_soul_json,
             entity_context,
+            replay_sources,
         )
     };
     emit_entity_resolution_log(&window, &conversation_id, &entity_context.speaker);
@@ -801,7 +879,7 @@ pub async fn send_api_turn(
             "truncated": narrator_payload.truncated
         })),
     );
-    let payload_log_id = {
+    let mut payload_log_id = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         db::insert_llm_payload_log(
             &conn,
@@ -861,6 +939,7 @@ pub async fn send_api_turn(
             "conversation_id": conversation_id.as_str()
         })),
     );
+    let narrator_call_started = Instant::now();
     let raw_response = match provider
         .complete_streaming_messages(
             &narrator_settings,
@@ -883,6 +962,12 @@ pub async fn send_api_turn(
         .await
     {
         Ok(response) => {
+            emit_perf_log(
+                &window,
+                &conversation_id,
+                "narrator API call",
+                narrator_call_started.elapsed(),
+            );
             emit_dev_log(
                 &window,
                 "success",
@@ -926,7 +1011,296 @@ pub async fn send_api_turn(
             return Err(err.to_string());
         }
     };
-    let visible_response = parsed.visible_text.clone();
+    emit_dev_log(
+        &window,
+        "debug",
+        "narrator",
+        "anti_replay_check_started",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "compared_sources": replay_sources.len(),
+            "compared_message_ids": replay_sources
+                .iter()
+                .map(|source| source.message_id)
+                .collect::<Vec<_>>()
+        })),
+    );
+    let (mut visible_response, replay_guard, mut output_contract_warning) =
+        guard_narrator_visible_response(&parsed.visible_text, &snapshot_user_text, &replay_sources);
+    let debug_replay_detected = replay_guard.replay_detected;
+    let mut debug_replay_score = replay_guard.replay_score;
+    let mut debug_replay_reason = replay_guard.replay_reason.clone();
+    let mut debug_replay_compared_against_message_id = replay_guard.compared_against_message_id;
+
+    if let Some(warning) = output_contract_warning.as_ref() {
+        emit_dev_log(
+            &window,
+            "warn",
+            "narrator",
+            "Output contract guard normalized narrator response",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "warning": warning
+            })),
+        );
+    }
+
+    if replay_guard.replay_detected {
+        emit_dev_log(
+            &window,
+            "warn",
+            "narrator",
+            "anti_replay_detected",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "score": replay_guard.replay_score,
+                "reason": replay_guard.replay_reason.as_deref(),
+                "compared_against_message_id": replay_guard.compared_against_message_id
+            })),
+        );
+        emit_dev_log(
+            &window,
+            "info",
+            "narrator",
+            "anti_replay_regenerate_started",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str()
+            })),
+        );
+
+        let retry_messages = messages_with_repair_instruction(&narrator_payload.messages);
+        let retry_payload_log_id =
+            match state
+                .conn
+                .lock()
+                .map_err(|err| err.to_string())
+                .and_then(|conn| {
+                    db::insert_llm_payload_log(
+                        &conn,
+                        &LlmPayloadLog {
+                            id: 0,
+                            conversation_id: conversation_id.clone(),
+                            message_id: replacement_assistant_id,
+                            provider: format!(
+                                "narrator_{}_anti_replay_retry",
+                                context_mode.label()
+                            ),
+                            mode: mode.trim().to_string(),
+                            context_mode: context_mode.label().into(),
+                            model: narrator_settings.model.trim().to_string(),
+                            base_url: narrator_settings.base_url.trim().to_string(),
+                            system_message: retry_messages
+                                .first()
+                                .map(|message| message.content.clone())
+                                .unwrap_or_default(),
+                            user_message: last_user_message_content(&retry_messages),
+                            context_text: serialize_api_messages(&retry_messages),
+                            estimated_system_tokens: estimate_tokens(
+                                retry_messages
+                                    .first()
+                                    .map(|message| message.content.as_str())
+                                    .unwrap_or_default(),
+                            ),
+                            estimated_user_tokens: estimate_tokens(&last_user_message_content(
+                                &retry_messages,
+                            )),
+                            estimated_total_tokens: estimate_tokens(&serialize_api_messages(
+                                &retry_messages,
+                            )),
+                            truncated: narrator_payload.truncated,
+                            created_at: db::now_ts(),
+                        },
+                    )
+                    .map_err(|err| err.to_string())
+                }) {
+                Ok(log_id) => Some(log_id),
+                Err(err) => {
+                    emit_dev_log(
+                        &window,
+                        "warn",
+                        "db",
+                        "Anti-replay retry payload log failed",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "error": err
+                        })),
+                    );
+                    None
+                }
+            };
+
+        match provider
+            .complete_streaming_messages(&narrator_settings, retry_messages, |_| Ok(()))
+            .await
+        {
+            Ok(retry_raw_response) => match parse_hidden_state(&retry_raw_response) {
+                Ok(retry_parsed) => {
+                    let (retry_visible_response, retry_guard, retry_output_warning) =
+                        guard_narrator_visible_response(
+                            &retry_parsed.visible_text,
+                            &snapshot_user_text,
+                            &replay_sources,
+                        );
+                    if retry_visible_response.trim().is_empty() {
+                        emit_dev_log(
+                            &window,
+                            "warn",
+                            "narrator",
+                            "anti_replay_regenerate_failed",
+                            Some(serde_json::json!({
+                                "conversation_id": conversation_id.as_str(),
+                                "reason": "Retry returned empty visible response"
+                            })),
+                        );
+                        emit_dev_log(
+                            &window,
+                            "warn",
+                            "warning",
+                            "anti_replay_final_warning",
+                            Some(serde_json::json!({
+                                "conversation_id": conversation_id.as_str(),
+                                "score": replay_guard.replay_score,
+                                "reason": "Original repeated earlier narration; retry returned empty response"
+                            })),
+                        );
+                        debug_replay_reason = Some(
+                            "Initial draft repeated earlier narration; retry returned empty response"
+                                .into(),
+                        );
+                    } else {
+                        visible_response = retry_visible_response;
+                        if let Some(log_id) = retry_payload_log_id {
+                            payload_log_id = log_id;
+                        }
+                        if let Some(warning) = retry_output_warning.as_ref() {
+                            emit_dev_log(
+                                &window,
+                                "warn",
+                                "narrator",
+                                "Output contract guard normalized anti-replay retry",
+                                Some(serde_json::json!({
+                                    "conversation_id": conversation_id.as_str(),
+                                    "warning": warning
+                                })),
+                            );
+                        }
+                        output_contract_warning = retry_output_warning;
+                        if retry_guard.replay_detected {
+                            emit_dev_log(
+                                &window,
+                                "warn",
+                                "narrator",
+                                "anti_replay_regenerate_failed",
+                                Some(serde_json::json!({
+                                    "conversation_id": conversation_id.as_str(),
+                                    "score": retry_guard.replay_score,
+                                    "reason": retry_guard.replay_reason.as_deref(),
+                                    "compared_against_message_id": retry_guard.compared_against_message_id
+                                })),
+                            );
+                            emit_dev_log(
+                                &window,
+                                "warn",
+                                "warning",
+                                "anti_replay_final_warning",
+                                Some(serde_json::json!({
+                                    "conversation_id": conversation_id.as_str(),
+                                    "score": retry_guard.replay_score,
+                                    "reason": retry_guard.replay_reason.as_deref()
+                                })),
+                            );
+                            debug_replay_score = retry_guard.replay_score;
+                            debug_replay_reason = retry_guard
+                                .replay_reason
+                                .clone()
+                                .map(|reason| format!("{reason}; saved after one retry"));
+                            debug_replay_compared_against_message_id =
+                                retry_guard.compared_against_message_id;
+                        } else {
+                            emit_dev_log(
+                                &window,
+                                "success",
+                                "narrator",
+                                "anti_replay_passed",
+                                Some(serde_json::json!({
+                                    "conversation_id": conversation_id.as_str(),
+                                    "score": retry_guard.replay_score,
+                                    "retry": true
+                                })),
+                            );
+                            debug_replay_reason = Some(
+                                "Initial draft repeated earlier narration; regenerated before save"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    emit_dev_log(
+                        &window,
+                        "warn",
+                        "narrator",
+                        "anti_replay_regenerate_failed",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "error": err.to_string()
+                        })),
+                    );
+                    emit_dev_log(
+                        &window,
+                        "warn",
+                        "warning",
+                        "anti_replay_final_warning",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "score": replay_guard.replay_score,
+                            "reason": "Retry parse failed; saving original guarded response"
+                        })),
+                    );
+                    debug_replay_reason =
+                        Some("Initial draft repeated earlier narration; retry parse failed".into());
+                }
+            },
+            Err(err) => {
+                emit_dev_log(
+                    &window,
+                    "warn",
+                    "narrator",
+                    "anti_replay_regenerate_failed",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "error": err
+                    })),
+                );
+                emit_dev_log(
+                    &window,
+                    "warn",
+                    "warning",
+                    "anti_replay_final_warning",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "score": replay_guard.replay_score,
+                        "reason": "Retry provider failed; saving original guarded response"
+                    })),
+                );
+                debug_replay_reason =
+                    Some("Initial draft repeated earlier narration; retry provider failed".into());
+            }
+        }
+    } else {
+        emit_dev_log(
+            &window,
+            "success",
+            "narrator",
+            "anti_replay_passed",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "score": replay_guard.replay_score,
+                "compared_against_message_id": replay_guard.compared_against_message_id
+            })),
+        );
+    }
+
     if visible_response.trim().is_empty() {
         emit_dev_log(
             &window,
@@ -940,6 +1314,7 @@ pub async fn send_api_turn(
         return Err("Narrator provider returned an empty visible response".into());
     }
 
+    let save_narrator_started = Instant::now();
     let (assistant_message_id, selected_variant_id) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         save_visible_narrator_response(
@@ -953,6 +1328,12 @@ pub async fn send_api_turn(
             payload_log_id,
         )?
     };
+    emit_perf_log(
+        &window,
+        &conversation_id,
+        "save narrator response",
+        save_narrator_started.elapsed(),
+    );
     {
         let saved_message = state
             .conn
@@ -990,6 +1371,7 @@ pub async fn send_api_turn(
         })),
     );
 
+    let updater_payload_started = Instant::now();
     let updater_system_prompt = build_state_updater_prompt(&soul);
     let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
     let updater_user_message = build_state_updater_user_message(
@@ -997,6 +1379,27 @@ pub async fn send_api_turn(
         &visible_response,
         Some(&entity_updater_context),
     );
+    let updater_token_estimate =
+        estimate_tokens(&updater_system_prompt) + estimate_tokens(&updater_user_message);
+    emit_perf_log(
+        &window,
+        &conversation_id,
+        "compile updater payload",
+        updater_payload_started.elapsed(),
+    );
+    if updater_token_estimate > STATE_UPDATER_TARGET_TOKENS {
+        emit_dev_log(
+            &window,
+            "warn",
+            "performance",
+            "state updater payload exceeds budget",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "estimated_tokens": updater_token_estimate,
+                "target_tokens": STATE_UPDATER_TARGET_TOKENS
+            })),
+        );
+    }
     emit_dev_log(
         &window,
         "info",
@@ -1007,7 +1410,7 @@ pub async fn send_api_turn(
             "assistant_message_id": assistant_message_id,
             "model": state_updater_settings.model.trim(),
             "base_url": state_updater_settings.base_url.trim(),
-            "estimated_total_tokens": estimate_tokens(&updater_system_prompt) + estimate_tokens(&updater_user_message)
+            "estimated_total_tokens": updater_token_estimate
         })),
     );
     let updater_log_id = match state
@@ -1031,8 +1434,7 @@ pub async fn send_api_turn(
                     context_text: updater_system_prompt.clone(),
                     estimated_system_tokens: estimate_tokens(&updater_system_prompt),
                     estimated_user_tokens: estimate_tokens(&updater_user_message),
-                    estimated_total_tokens: estimate_tokens(&updater_system_prompt)
-                        + estimate_tokens(&updater_user_message),
+                    estimated_total_tokens: updater_token_estimate,
                     truncated: false,
                     created_at: db::now_ts(),
                 },
@@ -1058,15 +1460,59 @@ pub async fn send_api_turn(
             None
         }
     };
-    let updater_result = provider
-        .complete_prompt(
+    let updater_call_started = Instant::now();
+    let updater_response_result = provider
+        .complete_prompt_with_timeout(
             &state_updater_settings,
             &updater_system_prompt,
             &updater_user_message,
             0.0,
+            Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS),
         )
-        .await
-        .and_then(|updater_response| parse_engine_patch_json(&updater_response));
+        .await;
+    let updater_call_elapsed = updater_call_started.elapsed();
+    if updater_call_elapsed >= Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS) {
+        emit_dev_log(
+            &window,
+            "warn",
+            "state_updater",
+            "State updater timed out; narration saved without state update",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "assistant_message_id": assistant_message_id,
+                "timeout_seconds": STATE_UPDATER_TIMEOUT_SECONDS,
+                "elapsed_ms": updater_call_elapsed.as_millis()
+            })),
+        );
+    }
+    emit_perf_log(
+        &window,
+        &conversation_id,
+        "state updater API call",
+        updater_call_elapsed,
+    );
+    let parse_started = Instant::now();
+    let updater_result = match updater_response_result {
+        Ok(updater_response) => parse_engine_patch_json(&updater_response),
+        Err(err) => {
+            if updater_call_elapsed >= Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS)
+                || err.to_lowercase().contains("timed out")
+            {
+                Err(format!(
+                    "State updater timed out after {}s; narration saved without state update",
+                    STATE_UPDATER_TIMEOUT_SECONDS
+                ))
+            } else {
+                Err(err)
+            }
+        }
+    };
+    emit_perf_log(
+        &window,
+        &conversation_id,
+        "parse EnginePatch",
+        parse_started.elapsed(),
+    );
     let (hidden_state, engine_patch, state_updater_status, hidden_state_found) =
         match updater_result {
             Ok(patch) => {
@@ -1111,9 +1557,27 @@ pub async fn send_api_turn(
     debug.assistant_message_id = Some(assistant_message_id);
     debug.selected_variant_id = selected_variant_id;
     debug.state_updater_status = state_updater_status;
+    debug.replay_detected = debug_replay_detected;
+    debug.replay_score = debug_replay_score;
+    debug.replay_reason = debug_replay_reason;
+    debug.replay_compared_against_message_id = debug_replay_compared_against_message_id;
+    debug.output_contract_warning = output_contract_warning;
 
+    let apply_started = Instant::now();
     match engine_patch.apply_to_soul(&mut soul) {
         Ok(report) => {
+            emit_perf_log(
+                &window,
+                &conversation_id,
+                "apply EnginePatch",
+                apply_started.elapsed(),
+            );
+            emit_perf_log(
+                &window,
+                &conversation_id,
+                "memory hygiene",
+                apply_started.elapsed(),
+            );
             emit_dev_log(
                 &window,
                 "success",
@@ -1129,22 +1593,32 @@ pub async fn send_api_turn(
                 })),
             );
             emit_relationship_delta_logs(&window, &conversation_id, &engine_patch);
+            emit_memory_apply_logs(&window, &conversation_id, &report.memory_events);
         }
-        Err(err) => emit_dev_log(
-            &window,
-            "error",
-            "state_updater",
-            "EnginePatch skipped by validation",
-            Some(serde_json::json!({
-                "conversation_id": conversation_id.as_str(),
-                "assistant_message_id": assistant_message_id,
-                "error": format!("{err:?}")
-            })),
-        ),
+        Err(err) => {
+            emit_perf_log(
+                &window,
+                &conversation_id,
+                "apply EnginePatch",
+                apply_started.elapsed(),
+            );
+            emit_dev_log(
+                &window,
+                "error",
+                "state_updater",
+                "EnginePatch skipped by validation",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "assistant_message_id": assistant_message_id,
+                    "error": format!("{err:?}")
+                })),
+            )
+        }
     }
     soul.turn_counter += 1;
     soul.turns_since_consolidation += 1;
 
+    let refresh_started = Instant::now();
     let (messages, context_preview, consolidation_ran) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         if let Some(updater_log_id) = updater_log_id {
@@ -1179,6 +1653,12 @@ pub async fn send_api_turn(
 
         (messages, context_preview, consolidation_ran)
     };
+    emit_perf_log(
+        &window,
+        &conversation_id,
+        "refresh frontend state",
+        refresh_started.elapsed(),
+    );
     emit_dev_log(
         &window,
         "success",
@@ -1191,6 +1671,12 @@ pub async fn send_api_turn(
             "consolidation_ran": consolidation_ran,
             "messages": messages.len()
         })),
+    );
+    emit_perf_log(
+        &window,
+        &conversation_id,
+        "total turn time",
+        turn_started.elapsed(),
     );
 
     Ok(TurnResult {
@@ -1232,6 +1718,11 @@ fn save_visible_narrator_response(
         assistant_message_id: Some(assistant_message_id),
         selected_variant_id: None,
         state_updater_status: "pending".into(),
+        replay_detected: false,
+        replay_score: 0.0,
+        replay_reason: None,
+        replay_compared_against_message_id: None,
+        output_contract_warning: None,
         tag: None,
         trust_delta: None,
         affection_delta: None,
@@ -1311,6 +1802,24 @@ fn emit_dev_log(
     if let Err(err) = window.emit("dev-log", event) {
         eprintln!("Dev log emit failed: {err}");
     }
+}
+
+fn emit_perf_log(window: &Window, conversation_id: &str, stage: &str, elapsed: Duration) {
+    emit_dev_log(
+        window,
+        if elapsed.as_millis() > 2_000 {
+            "info"
+        } else {
+            "debug"
+        },
+        "performance",
+        &format!("{stage}: {} ms", elapsed.as_millis()),
+        Some(serde_json::json!({
+            "conversation_id": conversation_id,
+            "stage": stage,
+            "elapsed_ms": elapsed.as_millis()
+        })),
+    );
 }
 
 fn emit_entity_resolution_log(window: &Window, conversation_id: &str, speaker: &SpeakerResolution) {
@@ -1408,6 +1917,80 @@ fn emit_relationship_delta_logs(window: &Window, conversation_id: &str, patch: &
     }
 }
 
+fn emit_memory_apply_logs(
+    window: &Window,
+    conversation_id: &str,
+    events: &[state_engine::patch::MemoryApplyEvent],
+) {
+    for event in events {
+        let (level, category, message) = match event.action {
+            MemoryApplyAction::Added => ("info", "state_updater", "memory_added"),
+            MemoryApplyAction::RejectedDuplicate => {
+                ("warn", "warning", "memory_rejected_duplicate")
+            }
+            MemoryApplyAction::RejectedGeneric => ("warn", "warning", "memory_rejected_generic"),
+            MemoryApplyAction::Merged => ("info", "state_updater", "memory_merged"),
+            MemoryApplyAction::Deprioritized => ("debug", "state_updater", "memory_deprioritized"),
+        };
+        emit_dev_log(
+            window,
+            level,
+            category,
+            message,
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "source_type": event.source_type.as_label(),
+                "content_preview": excerpt_for_log(&event.content, 160),
+                "reason": event.reason.as_deref()
+            })),
+        );
+        if event.source_type == MemorySourceType::ImportedLog {
+            emit_dev_log(
+                window,
+                "info",
+                "context",
+                "imported_log_detected",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "content_preview": excerpt_for_log(&event.content, 160)
+                })),
+            );
+        }
+        if matches!(
+            event.source_type,
+            MemorySourceType::CrossSessionBleed | MemorySourceType::PreviousSession
+        ) {
+            emit_dev_log(
+                window,
+                "info",
+                "context",
+                "cross_session_memory_tagged",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "source_type": event.source_type.as_label(),
+                    "content_preview": excerpt_for_log(&event.content, 160)
+                })),
+            );
+        }
+    }
+}
+
+fn excerpt_for_log(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    let chars = trimmed.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        trimmed.to_string()
+    } else {
+        format!(
+            "{}...",
+            chars
+                .into_iter()
+                .take(max_chars.saturating_sub(3))
+                .collect::<String>()
+        )
+    }
+}
+
 fn redact_dev_log_details(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => serde_json::Value::Object(
@@ -1443,6 +2026,481 @@ fn messages_to_context(messages: Vec<ChatMessage>) -> Vec<ContextMessage> {
             content: message.content,
         })
         .collect()
+}
+
+fn recent_assistant_replay_sources(messages: &[ChatMessage], limit: usize) -> Vec<ReplaySource> {
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "assistant")
+        .take(limit)
+        .map(|message| ReplaySource {
+            message_id: message.id,
+            content: message.content.clone(),
+        })
+        .collect()
+}
+
+fn guard_narrator_visible_response(
+    raw_visible_response: &str,
+    user_text: &str,
+    replay_sources: &[ReplaySource],
+) -> (String, ReplayGuardResult, Option<String>) {
+    let output = apply_output_contract_guard(raw_visible_response, user_text);
+    let replay = detect_replay(&output.text, replay_sources);
+    (output.text, replay, output.warning)
+}
+
+fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContractResult {
+    let mut warnings = Vec::new();
+    let without_hidden = strip_hidden_state_blocks(content);
+    if without_hidden.trim_end() != content.trim_end() {
+        warnings.push("hidden state stripped");
+    }
+    let (without_engine_patch, engine_patch_stripped) =
+        strip_engine_patch_payloads(&without_hidden);
+    if engine_patch_stripped {
+        warnings.push("EnginePatch JSON stripped");
+    }
+
+    let (body, status_blocks) = remove_status_blocks(&without_engine_patch);
+    if status_blocks.len() > 1 {
+        warnings.push("multiple status blocks normalized");
+    }
+    let mut normalized = body.trim().to_string();
+    let gm_reply = is_gm_facing_user_message(user_text) || is_plain_gm_reply(&normalized);
+
+    if let Some(status) = status_blocks.last() {
+        let status = normalize_status_block(status);
+        if !normalized.is_empty() {
+            normalized.push_str("\n\n");
+        }
+        normalized.push_str(&status);
+    } else if !gm_reply && !normalized.is_empty() {
+        normalized.push_str(
+            "\n\n```status\nScene | Focus: Unknown | Physical state: Not specified | Atmosphere: Not specified\n```",
+        );
+        warnings.push("fallback status block appended");
+    }
+
+    OutputContractResult {
+        text: normalized.trim_end().to_string(),
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
+    }
+}
+
+fn remove_status_blocks(content: &str) -> (String, Vec<String>) {
+    let mut body = String::new();
+    let mut status_blocks = Vec::new();
+    let mut current_status = String::new();
+    let mut in_status = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if !in_status && trimmed.eq_ignore_ascii_case("```status") {
+            in_status = true;
+            current_status.clear();
+            current_status.push_str("```status\n");
+            continue;
+        }
+
+        if in_status {
+            if trimmed == "```" {
+                current_status.push_str("```");
+                status_blocks.push(current_status.trim_end().to_string());
+                current_status.clear();
+                in_status = false;
+            } else {
+                current_status.push_str(line);
+                current_status.push('\n');
+            }
+            continue;
+        }
+
+        body.push_str(line);
+        body.push('\n');
+    }
+
+    if in_status && !current_status.trim().is_empty() {
+        status_blocks.push(current_status.trim_end().to_string());
+    }
+
+    (body.trim_end().to_string(), status_blocks)
+}
+
+fn normalize_status_block(status_block: &str) -> String {
+    let mut lines = status_block.lines();
+    let first_line = lines.next().unwrap_or_default().trim();
+    let body_lines = if first_line.eq_ignore_ascii_case("```status") {
+        lines
+            .filter(|line| line.trim() != "```")
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+    } else {
+        status_block
+            .lines()
+            .filter(|line| line.trim() != "```")
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+    };
+    let body = body_lines
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = if body.trim().is_empty() {
+        "Scene | Focus: Unknown | Physical state: Not specified | Atmosphere: Not specified"
+            .to_string()
+    } else {
+        body
+    };
+    format!("```status\n{}\n```", body.trim())
+}
+
+fn strip_engine_patch_payloads(content: &str) -> (String, bool) {
+    let (without_fenced, stripped_fenced) = strip_engine_patch_fenced_blocks(content);
+    let (without_raw, stripped_raw) = strip_engine_patch_raw_json_objects(&without_fenced);
+    (
+        without_raw.trim_end().to_string(),
+        stripped_fenced || stripped_raw,
+    )
+}
+
+fn strip_engine_patch_fenced_blocks(content: &str) -> (String, bool) {
+    let mut output = String::new();
+    let mut fenced_block = String::new();
+    let mut in_fence = false;
+    let mut stripped = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if !in_fence && trimmed.starts_with("```") {
+            in_fence = true;
+            fenced_block.clear();
+            fenced_block.push_str(line);
+            fenced_block.push('\n');
+            continue;
+        }
+
+        if in_fence {
+            fenced_block.push_str(line);
+            fenced_block.push('\n');
+            if line.trim() == "```" {
+                if looks_like_engine_patch_text(&fenced_block) {
+                    stripped = true;
+                } else {
+                    output.push_str(&fenced_block);
+                }
+                fenced_block.clear();
+                in_fence = false;
+            }
+            continue;
+        }
+
+        output.push_str(line);
+        output.push('\n');
+    }
+
+    if in_fence && !fenced_block.is_empty() {
+        if looks_like_engine_patch_text(&fenced_block) {
+            stripped = true;
+        } else {
+            output.push_str(&fenced_block);
+        }
+    }
+
+    (output.trim_end().to_string(), stripped)
+}
+
+fn strip_engine_patch_raw_json_objects(content: &str) -> (String, bool) {
+    let char_indices = content.char_indices().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut last_emit = 0usize;
+    let mut cursor = 0usize;
+    let mut stripped = false;
+
+    while cursor < char_indices.len() {
+        let (byte_index, character) = char_indices[cursor];
+        if character == '{' {
+            if let Some(end_byte) = matching_json_object_end(content, byte_index) {
+                let candidate = &content[byte_index..end_byte];
+                if looks_like_engine_patch_text(candidate)
+                    && serde_json::from_str::<serde_json::Value>(candidate).is_ok()
+                {
+                    output.push_str(&content[last_emit..byte_index]);
+                    last_emit = end_byte;
+                    stripped = true;
+                    while cursor < char_indices.len() && char_indices[cursor].0 < end_byte {
+                        cursor += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+        cursor += 1;
+    }
+
+    output.push_str(&content[last_emit..]);
+    (output.trim_end().to_string(), stripped)
+}
+
+fn matching_json_object_end(content: &str, start_byte: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, character) in content[start_byte..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(start_byte + offset + character.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn looks_like_engine_patch_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("\"schema_version\"")
+        && (lower.contains("\"soul_patch\"")
+            || lower.contains("\"world_patch\"")
+            || lower.contains("\"body_patch\"")
+            || lower.contains("\"relationship_deltas\""))
+}
+
+fn is_gm_facing_user_message(user_text: &str) -> bool {
+    let lower = user_text.to_ascii_lowercase();
+    let trimmed = lower.trim_start();
+    trimmed.starts_with("gm:")
+        || trimmed.starts_with("narrator:")
+        || trimmed.starts_with("ooc:")
+        || trimmed.starts_with("[ooc]")
+        || lower.contains("talking to the narrator")
+        || lower.contains("talking to the gm")
+        || lower.contains("addressing the narrator")
+        || lower.contains("address the narrator")
+}
+
+fn is_plain_gm_reply(response: &str) -> bool {
+    let lower = response.to_ascii_lowercase();
+    let trimmed = lower.trim_start();
+    trimmed.starts_with("gm:")
+        || trimmed.starts_with("narrator:")
+        || trimmed.starts_with("ooc:")
+        || trimmed.starts_with("[ooc]")
+}
+
+fn detect_replay(new_response: &str, replay_sources: &[ReplaySource]) -> ReplayGuardResult {
+    let mut best = ReplayGuardResult::default();
+    for source in replay_sources {
+        let candidate = compare_replay_against_source(new_response, source);
+        if candidate.replay_score > best.replay_score {
+            best = candidate;
+        }
+    }
+    best
+}
+
+fn compare_replay_against_source(new_response: &str, source: &ReplaySource) -> ReplayGuardResult {
+    let new_clean = normalize_for_replay(new_response);
+    let previous_clean = normalize_for_replay(&source.content);
+    if new_clean.is_empty() || previous_clean.is_empty() {
+        return ReplayGuardResult {
+            compared_against_message_id: Some(source.message_id),
+            ..ReplayGuardResult::default()
+        };
+    }
+
+    let paragraph_score = paragraph_replay_score(new_response, &source.content);
+    let sentence_score = sentence_overlap_score(&new_clean, &previous_clean);
+    let shingle_score = shingle_overlap_score(&new_clean, &previous_clean, 10);
+    let (score, reason) = [
+        (paragraph_score, "paragraph nearly identical"),
+        (sentence_score, "sentence overlap exceeded threshold"),
+        (
+            shingle_score,
+            "repeated wording shingles exceeded threshold",
+        ),
+    ]
+    .into_iter()
+    .max_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+    .unwrap_or((0.0, "no overlap"));
+    let replay_detected = score > 0.35
+        || (paragraph_score >= 0.90
+            && repeated_long_paragraph_exists(new_response, &source.content));
+
+    ReplayGuardResult {
+        replay_detected,
+        replay_score: score,
+        replay_reason: replay_detected.then(|| reason.to_string()),
+        compared_against_message_id: Some(source.message_id),
+    }
+}
+
+fn normalize_for_replay(content: &str) -> String {
+    let (without_status, _) = remove_status_blocks(&strip_hidden_state_blocks(content));
+    let (without_patch, _) = strip_engine_patch_payloads(&without_status);
+    without_patch
+        .to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character.is_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sentence_overlap_score(new_clean: &str, previous_clean: &str) -> f32 {
+    let previous_sentences = split_replay_sentences(previous_clean)
+        .into_iter()
+        .filter(|sentence| sentence.chars().count() >= 60)
+        .collect::<HashSet<_>>();
+    if previous_sentences.is_empty() {
+        return 0.0;
+    }
+    let new_sentences = split_replay_sentences(new_clean)
+        .into_iter()
+        .filter(|sentence| sentence.chars().count() >= 60)
+        .collect::<Vec<_>>();
+    let total_chars = new_sentences
+        .iter()
+        .map(|sentence| sentence.chars().count())
+        .sum::<usize>();
+    if total_chars == 0 {
+        return 0.0;
+    }
+    let overlap_chars = new_sentences
+        .iter()
+        .filter(|sentence| previous_sentences.contains(*sentence))
+        .map(|sentence| sentence.chars().count())
+        .sum::<usize>();
+    overlap_chars as f32 / total_chars as f32
+}
+
+fn split_replay_sentences(text: &str) -> Vec<String> {
+    text.split(['.', '!', '?', '\n'])
+        .map(str::trim)
+        .filter(|sentence| !sentence.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn shingle_overlap_score(new_clean: &str, previous_clean: &str, shingle_size: usize) -> f32 {
+    let new_words = new_clean.split_whitespace().collect::<Vec<_>>();
+    let previous_words = previous_clean.split_whitespace().collect::<Vec<_>>();
+    if new_words.len() < shingle_size || previous_words.len() < shingle_size {
+        return 0.0;
+    }
+    let new_shingles = word_shingles(&new_words, shingle_size);
+    let previous_shingles = word_shingles(&previous_words, shingle_size);
+    if new_shingles.is_empty() {
+        return 0.0;
+    }
+    let overlap = new_shingles
+        .iter()
+        .filter(|shingle| previous_shingles.contains(*shingle))
+        .count();
+    overlap as f32 / new_shingles.len() as f32
+}
+
+fn word_shingles(words: &[&str], size: usize) -> HashSet<String> {
+    words
+        .windows(size)
+        .map(|window| window.join(" "))
+        .collect::<HashSet<_>>()
+}
+
+fn paragraph_replay_score(new_response: &str, previous_response: &str) -> f32 {
+    let new_paragraphs = replay_paragraphs(new_response);
+    let previous_paragraphs = replay_paragraphs(previous_response);
+    let mut best = 0.0f32;
+    for new_paragraph in &new_paragraphs {
+        if new_paragraph.chars().count() < 250 {
+            continue;
+        }
+        for previous_paragraph in &previous_paragraphs {
+            if previous_paragraph.chars().count() < 250 {
+                continue;
+            }
+            best = best.max(word_jaccard_similarity(new_paragraph, previous_paragraph));
+        }
+    }
+    best
+}
+
+fn repeated_long_paragraph_exists(new_response: &str, previous_response: &str) -> bool {
+    paragraph_replay_score(new_response, previous_response) >= 0.90
+}
+
+fn replay_paragraphs(content: &str) -> Vec<String> {
+    let (without_status, _) = remove_status_blocks(&strip_hidden_state_blocks(content));
+    without_status
+        .split("\n\n")
+        .map(normalize_for_replay)
+        .filter(|paragraph| !paragraph.is_empty())
+        .collect()
+}
+
+fn word_jaccard_similarity(left: &str, right: &str) -> f32 {
+    let left_words = left.split_whitespace().collect::<HashSet<_>>();
+    let right_words = right.split_whitespace().collect::<HashSet<_>>();
+    if left_words.is_empty() || right_words.is_empty() {
+        return 0.0;
+    }
+    let intersection = left_words.intersection(&right_words).count();
+    let union = left_words.union(&right_words).count();
+    intersection as f32 / union as f32
+}
+
+fn messages_with_repair_instruction(messages: &[ApiMessage]) -> Vec<ApiMessage> {
+    let mut repaired = messages.to_vec();
+    if let Some(last_user) = repaired
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == "user")
+    {
+        last_user.content = format!(
+            "{}\n\n[REPAIR INSTRUCTION - HIGH PRIORITY]\nThe previous draft repeated earlier narration. Continue from the latest user input and do not reuse previous wording.",
+            last_user.content.trim()
+        );
+    }
+    repaired
+}
+
+fn last_user_message_content(messages: &[ApiMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
 }
 
 fn ensure_default_entities(
@@ -1926,12 +2984,51 @@ fn build_state_updater_user_message(
         .filter(|context| !context.is_empty())
         .map(|context| format!("{context}\n\n"))
         .unwrap_or_default();
+    let compact_user = compact_user_message_for_updater(user_text);
+    let compact_narrator = compact_narrator_response_for_updater(narrator_response);
     format!(
         "{}[LATEST USER MESSAGE]\n{}\n\n[NARRATOR RESPONSE]\n{}",
-        entity_context,
-        user_text.trim(),
-        strip_hidden_state_blocks(narrator_response).trim()
+        entity_context, compact_user, compact_narrator
     )
+}
+
+fn compact_user_message_for_updater(user_text: &str) -> String {
+    let trimmed = user_text.trim();
+    if looks_like_imported_log_text(&trimmed.to_ascii_lowercase()) {
+        return format!(
+            "[IMPORTED LOG DETECTED]\nThe user pasted a Mnemosyne/exported chat log. Treat it as imported context, not current lived experience. Create at most 1-3 imported_log memories if durable facts matter.\nExcerpt:\n{}",
+            head_tail_excerpt_chars(trimmed, 700, 500, 1_300)
+        );
+    }
+    head_tail_excerpt_chars(trimmed, 900, 700, 1_700)
+}
+
+fn compact_narrator_response_for_updater(narrator_response: &str) -> String {
+    let visible = strip_status_blocks_for_export(&strip_hidden_state_blocks(narrator_response));
+    head_tail_excerpt_chars(visible.trim(), 500, 1_300, 1_900)
+}
+
+fn head_tail_excerpt_chars(
+    text: &str,
+    head_chars: usize,
+    tail_chars: usize,
+    max_chars: usize,
+) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    let head = chars.iter().take(head_chars).collect::<String>();
+    let tail = chars
+        .iter()
+        .rev()
+        .take(tail_chars)
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}\n...[truncated for updater budget]...\n{tail}")
 }
 
 #[cfg(test)]
@@ -2005,6 +3102,7 @@ fn sanitize_state_updater_patch(
     narrator_response: &str,
 ) -> EnginePatch {
     let turn_text = format!("{user_text}\n{narrator_response}");
+    tag_memory_sources_from_turn(&mut patch, user_text, &turn_text);
     let threat_scene = is_threat_or_emergency(&turn_text) || latest_world_event_is_threat(soul);
     let explicit_intimacy = explicitly_intimate(user_text);
     if let Some(body_patch) = patch.body_patch.as_mut() {
@@ -2042,12 +3140,129 @@ fn sanitize_state_updater_patch(
                 world_patch.active_plot_add.push(plot.into());
             }
         }
+        cleanup_stale_active_plots(soul, world_patch, &turn_text);
         if world_patch.is_empty_for_commands() {
             patch.world_patch = None;
         }
     }
 
     patch
+}
+
+fn tag_memory_sources_from_turn(patch: &mut EnginePatch, user_text: &str, turn_text: &str) {
+    let Some(soul_patch) = patch.soul_patch.as_mut() else {
+        return;
+    };
+    let turn_source = infer_turn_memory_source(user_text, turn_text);
+    for memory in &mut soul_patch.new_memories {
+        let memory_source = memory
+            .source_type
+            .or_else(|| infer_turn_memory_source(&memory.content, &memory.content))
+            .or(turn_source);
+        if let Some(source_type) = memory_source {
+            memory.source_type = Some(source_type);
+            if source_type.imported_or_cross_session() {
+                memory.is_lived_experience.get_or_insert(false);
+                memory.is_imported_context.get_or_insert(true);
+            }
+            if source_type == MemorySourceType::UserClaimed {
+                memory.is_lived_experience.get_or_insert(false);
+            }
+            if source_type == MemorySourceType::Unknown {
+                memory.confidence.get_or_insert(0.45);
+            }
+        } else {
+            memory
+                .source_type
+                .get_or_insert(MemorySourceType::CurrentSession);
+            memory.is_lived_experience.get_or_insert(true);
+            memory.is_imported_context.get_or_insert(false);
+        }
+    }
+}
+
+fn infer_turn_memory_source(user_text: &str, turn_text: &str) -> Option<MemorySourceType> {
+    let user_lower = user_text.to_ascii_lowercase();
+    let turn_lower = turn_text.to_ascii_lowercase();
+    if looks_like_imported_log_text(&user_lower) {
+        Some(MemorySourceType::ImportedLog)
+    } else if contains_any_text(
+        &turn_lower,
+        &[
+            "cross-session bleed",
+            "cross session bleed",
+            "memory bleed",
+            "another version",
+            "parallel timeline",
+            "imported memory",
+        ],
+    ) {
+        Some(MemorySourceType::CrossSessionBleed)
+    } else if contains_any_text(
+        &turn_lower,
+        &[
+            "previous session",
+            "prior session",
+            "archived chat",
+            "old chat log",
+        ],
+    ) {
+        Some(MemorySourceType::PreviousSession)
+    } else if contains_any_text(
+        &user_lower,
+        &[
+            "i explain",
+            "i tell her that",
+            "i tell aurora that",
+            "the truth is",
+            "it means",
+        ],
+    ) {
+        Some(MemorySourceType::UserClaimed)
+    } else {
+        None
+    }
+}
+
+fn looks_like_imported_log_text(lower_text: &str) -> bool {
+    lower_text.contains("# mnemosyne chat log")
+        || (lower_text.contains("## user")
+            && lower_text.contains("## narrator")
+            && lower_text.contains("created:"))
+        || lower_text.contains("# mnemosyne llm payload history")
+}
+
+fn contains_any_text(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn cleanup_stale_active_plots(
+    soul: &Soul,
+    world_patch: &mut state_engine::patch::WorldPatch,
+    turn_text: &str,
+) {
+    let has_new_plot = world_patch
+        .active_plot_add
+        .iter()
+        .any(|plot| !plot.trim().is_empty());
+    if has_new_plot {
+        for plot in &soul.world.active_plots {
+            let lower = plot.to_ascii_lowercase();
+            if lower.contains("establish the first scene")
+                || (lower.contains("interact with rhy")
+                    && !turn_text.to_ascii_lowercase().contains("rhy"))
+            {
+                world_patch.active_plot_resolve.push(plot.clone());
+            }
+        }
+    }
+    dedupe_strings(&mut world_patch.active_plot_resolve);
+    dedupe_strings(&mut world_patch.active_plot_add);
+}
+
+fn dedupe_strings(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.trim().to_ascii_lowercase()));
 }
 
 fn normalize_time_for_updater(raw: &str) -> String {
@@ -2548,6 +3763,11 @@ fn debug_from_hidden_state(
         assistant_message_id: None,
         selected_variant_id: None,
         state_updater_status: "legacy_hidden_state".into(),
+        replay_detected: false,
+        replay_score: 0.0,
+        replay_reason: None,
+        replay_compared_against_message_id: None,
+        output_contract_warning: None,
         tag: hidden_state.tag.clone(),
         trust_delta: hidden_state.trust_delta,
         affection_delta: hidden_state.affection_delta,
@@ -2733,12 +3953,12 @@ mod tests {
         assert_eq!(result.soul.turns_since_consolidation, 0);
         assert!(result.soul.memory.recent.len() <= 4);
         assert!(result.soul.memory.core.len() > soul.memory.core.len());
-        assert!(result
+        assert!(!result
             .soul
             .memory
-            .schemas
+            .core
             .iter()
-            .any(|schema| schema.schema_type == "observation"));
+            .any(|memory| memory.contains("neutral exchange added texture")));
         assert!(!result
             .soul
             .memory
@@ -2928,6 +4148,56 @@ mod tests {
     }
 
     #[test]
+    fn imported_chat_log_memory_is_tagged_before_apply() {
+        let soul = new_default_soul("Aurora");
+        let user = "# Mnemosyne Chat Log\n\n## User\nOld turn\n\n## Narrator\nPrevious Aurora argued.\nCreated: 100";
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"soul_patch":{"new_memories":[{"content":"Imported log says previous Aurora argued about ownership.","tag":"identity_continuity"}]}}"#,
+        )
+        .expect("patch");
+
+        let filtered =
+            sanitize_state_updater_patch(patch, &soul, user, "Aurora studies the pasted log.");
+        let memory = filtered
+            .soul_patch
+            .as_ref()
+            .and_then(|patch| patch.new_memories.first())
+            .expect("memory");
+
+        assert_eq!(memory.source_type, Some(MemorySourceType::ImportedLog));
+        assert_eq!(memory.is_lived_experience, Some(false));
+        assert_eq!(memory.is_imported_context, Some(true));
+    }
+
+    #[test]
+    fn previous_session_memory_is_tagged_before_apply() {
+        let soul = new_default_soul("Aurora");
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"soul_patch":{"new_memories":[{"content":"Aurora learned this may belong to a previous session version of herself.","tag":"identity_continuity"}]}}"#,
+        )
+        .expect("patch");
+
+        let filtered = sanitize_state_updater_patch(
+            patch,
+            &soul,
+            "I explain this was from a previous session.",
+            "Aurora treats it as imported context, not direct memory.",
+        );
+        let memory = filtered
+            .soul_patch
+            .as_ref()
+            .and_then(|patch| patch.new_memories.first())
+            .expect("memory");
+
+        assert!(matches!(
+            memory.source_type,
+            Some(MemorySourceType::PreviousSession | MemorySourceType::CrossSessionBleed)
+        ));
+        assert_eq!(memory.is_lived_experience, Some(false));
+        assert_eq!(memory.is_imported_context, Some(true));
+    }
+
+    #[test]
     fn unsupported_state_updater_time_jump_is_ignored() {
         let patch = parse_engine_patch_json(
             r#"{"schema_version":1,"world_patch":{"time_elapsed":"Three days later","recent_event":"Aurora spoke."}}"#,
@@ -2999,6 +4269,24 @@ mod tests {
         assert!(!payload.contains("Old unrelated cohabitation"));
         assert!(estimate_tokens(&payload) < 1_200);
         assert!(payload.contains("Time: Late evening, just after midnight."));
+    }
+
+    #[test]
+    fn updater_payload_compacts_long_imported_chat_log() {
+        let soul = new_default_soul("Aurora");
+        let long_log = format!(
+            "# Mnemosyne Chat Log\n{}\n## User\nold\n## Narrator\nold\nCreated: 1",
+            "very long imported line ".repeat(600)
+        );
+        let payload = build_compact_updater_payload_for_test(
+            &soul,
+            &long_log,
+            "Aurora studies the imported log and does not treat it as lived experience.",
+        );
+
+        assert!(payload.contains("[IMPORTED LOG DETECTED]"));
+        assert!(estimate_tokens(&payload) < STATE_UPDATER_TARGET_TOKENS);
+        assert!(!payload.contains(&"very long imported line ".repeat(100)));
     }
 
     #[test]
@@ -3473,6 +4761,113 @@ mod tests {
         assert!(exported.contains(NO_LLM_PAYLOAD_LOGS_MESSAGE));
         assert!(exported.contains("Mock conversations do not send LLM payloads."));
         assert!(!exported.contains("## Payload 1"));
+    }
+
+    #[test]
+    fn output_contract_keeps_only_last_status_block() {
+        let raw = "```status\nScene | Focus: Old | Physical state: Old | Atmosphere: Old\n```\n\nAurora steps back from the doorway.\n\n```status\nScene | Focus: Aurora | Physical state: Guarded | Atmosphere: Tense\n```";
+
+        let result = apply_output_contract_guard(raw, "I knock on the door.");
+
+        assert_eq!(result.text.matches("```status").count(), 1);
+        assert!(!result.text.contains("Focus: Old"));
+        assert!(result.text.contains("Aurora steps back"));
+        assert!(result.text.ends_with(
+            "```status\nScene | Focus: Aurora | Physical state: Guarded | Atmosphere: Tense\n```"
+        ));
+        assert!(result
+            .warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("multiple status blocks"));
+    }
+
+    #[test]
+    fn output_contract_appends_fallback_status_for_scene_narration() {
+        let result =
+            apply_output_contract_guard("Aurora watches the hallway in silence.", "I wait.");
+
+        assert!(result.text.contains("Aurora watches the hallway"));
+        assert!(result.text.contains("Scene | Focus: Unknown"));
+        assert!(result
+            .warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("fallback status"));
+    }
+
+    #[test]
+    fn output_contract_allows_gm_reply_without_status() {
+        let result = apply_output_contract_guard(
+            "GM: Yes, I understand the out-of-character correction.",
+            "I am talking to the Narrator. The GM.",
+        );
+
+        assert!(!result.text.contains("```status"));
+        assert!(result.text.starts_with("GM:"));
+    }
+
+    #[test]
+    fn output_contract_strips_engine_patch_json() {
+        let raw = "Aurora exhales.\n\n```json\n{\"schema_version\":1,\"world_patch\":{\"recent_event\":\"Should not be visible\"}}\n```\n\n[HIDDEN STATE]{\"tag\":\"observation\"}[/HIDDEN STATE]";
+
+        let result = apply_output_contract_guard(raw, "I speak.");
+
+        assert!(result.text.contains("Aurora exhales."));
+        assert!(!result.text.contains("schema_version"));
+        assert!(!result.text.contains("HIDDEN STATE"));
+        assert!(result.text.contains("```status"));
+        assert!(result
+            .warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("EnginePatch JSON stripped"));
+    }
+
+    #[test]
+    fn anti_replay_detects_repeated_previous_paragraph() {
+        let repeated = "Aurora braces one hand against the doorframe, listening to the alarm chew through the hallway while dust trembles down from the ceiling. She does not soften, does not step aside, and does not pretend the room is safe; every line of her body stays angled toward the threat as she demands the truth.";
+        let source = ReplaySource {
+            message_id: 42,
+            content: format!("{repeated}\n\n```status\nScene | Focus: Aurora | Physical state: Alert | Atmosphere: Alarmed\n```"),
+        };
+
+        let result = detect_replay(repeated, &[source]);
+
+        assert!(result.replay_detected);
+        assert_eq!(result.compared_against_message_id, Some(42));
+        assert!(result.replay_score > 0.35);
+    }
+
+    #[test]
+    fn anti_replay_ignores_matching_status_blocks() {
+        let source = ReplaySource {
+            message_id: 7,
+            content: "A completely different prior scene.\n\n```status\nScene | Focus: Aurora | Physical state: Alert | Atmosphere: Alarmed\n```"
+                .into(),
+        };
+        let new_response = "Aurora answers the corrected premise instead of replaying the prior beat.\n\n```status\nScene | Focus: Aurora | Physical state: Alert | Atmosphere: Alarmed\n```";
+
+        let result = detect_replay(new_response, &[source]);
+
+        assert!(!result.replay_detected);
+    }
+
+    #[test]
+    fn anti_replay_passes_distinct_response() {
+        let source = ReplaySource {
+            message_id: 9,
+            content:
+                "Aurora talks about firewalls and system bleed-through in a prior explanation."
+                    .into(),
+        };
+        let new_response =
+            "The GM acknowledges the correction and resets the scene premise around the new system error.";
+
+        let result = detect_replay(new_response, &[source]);
+
+        assert!(!result.replay_detected);
+        assert!(result.replay_score <= 0.35);
     }
 
     fn assert_order(text: &str, first: &str, second: &str) {

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use state_engine::soul::Soul;
+use std::time::Duration;
 
 const NARRATOR_SYSTEM_PROMPT: &str = r#"# SYSTEM: Narrator AI - Mnemosyne Engine
 
@@ -82,9 +83,10 @@ Do not infer concrete time unless the user explicitly establishes time passage.
 Do not treat fear, pain, restraint, danger, or adrenaline as sexual arousal.
 If unsure, leave fields unchanged.
 Use relationship_deltas for directed relationship changes. Target entity ids from [ACTIVE ENTITIES] when present.
+Tag memories by source_type. Do not mark imported logs, previous sessions, or cross-session bleed as current lived experience. If uncertain, use source_type unknown and lower confidence.
 
 Patch schema:
-{"schema_version":1,"soul_patch":{"relationship_deltas":[{"from":"aurora","target":"default_player","trust":0.0,"affection":0.0,"fear":0.0,"desire":0.0,"conflict":0.0,"curiosity":0.0,"comfort":0.0,"dependency":0.0}],"new_memories":[{"content":"short durable fact","tag":"observation","perceived_by_entity_id":"aurora","target_entity_ids":["default_player"],"interpretation":"optional brief reading","confidence":0.8}]},"world_patch":{"location":"","time_elapsed":"","recent_event":"","active_plot_add":[""],"active_plot_resolve":[""]},"body_patch":{"activation_delta":0.0,"activation_blocked":false}}"#;
+{"schema_version":1,"soul_patch":{"relationship_deltas":[{"from":"aurora","target":"default_player","trust":0.0,"affection":0.0,"fear":0.0,"desire":0.0,"conflict":0.0,"curiosity":0.0,"comfort":0.0,"dependency":0.0}],"new_memories":[{"content":"short durable fact","tag":"observation","source_type":"current_session","is_lived_experience":true,"is_imported_context":false,"perceived_by_entity_id":"aurora","target_entity_ids":["default_player"],"interpretation":"optional brief reading","confidence":0.8}]},"world_patch":{"location":"","time_elapsed":"","recent_event":"","active_plot_add":[""],"active_plot_resolve":[""]},"body_patch":{"activation_delta":0.0,"activation_blocked":false}}"#;
 
 const REALISTIC_MODE_PROMPT: &str = r#"## NARRATION MODE: REALISTIC
 - Describe only external actions, dialogue, and physical reactions.
@@ -266,6 +268,36 @@ impl ApiProvider {
         user_text: &str,
         temperature: f32,
     ) -> Result<String, String> {
+        self.complete_prompt_inner(settings, system_prompt, user_text, temperature, None)
+            .await
+    }
+
+    pub async fn complete_prompt_with_timeout(
+        &self,
+        settings: &ApiProviderSettings,
+        system_prompt: &str,
+        user_text: &str,
+        temperature: f32,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        self.complete_prompt_inner(
+            settings,
+            system_prompt,
+            user_text,
+            temperature,
+            Some(timeout),
+        )
+        .await
+    }
+
+    async fn complete_prompt_inner(
+        &self,
+        settings: &ApiProviderSettings,
+        system_prompt: &str,
+        user_text: &str,
+        temperature: f32,
+        timeout: Option<Duration>,
+    ) -> Result<String, String> {
         let api_key = settings.api_key.trim();
         let model = settings.model.trim();
         let base_url = settings.base_url.trim();
@@ -295,11 +327,16 @@ impl ApiProvider {
             ],
         };
 
-        let response = self
+        let mut request_builder = self
             .client
             .post(chat_completions_url(base_url))
             .bearer_auth(api_key)
-            .json(&request)
+            .json(&request);
+        if let Some(timeout) = timeout {
+            request_builder = request_builder.timeout(timeout);
+        }
+
+        let response = request_builder
             .send()
             .await
             .map_err(|err| format!("API request failed: {err}"))?;
