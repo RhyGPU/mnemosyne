@@ -526,9 +526,10 @@ export function listConversations(): Promise<ConversationSummary[]> {
 export function renameConversation(
   conversationId: string,
   title: string,
+  soulId?: string | null,
 ): Promise<ConversationSummary> {
-  return invokeOrPreview("rename_conversation", { conversationId, title }, () => {
-    const conversation = ensurePreviewConversation(conversationId, "", title);
+  return invokeOrPreview("rename_conversation", { conversationId, title, soulId: soulId ?? null }, () => {
+    const conversation = ensurePreviewConversation(conversationId, soulId ?? "", title);
     conversation.title = sanitizePreviewConversationTitle(title);
     conversation.updated_at = Math.floor(Date.now() / 1000);
     return summarizePreviewConversation(conversation);

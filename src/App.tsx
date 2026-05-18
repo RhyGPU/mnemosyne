@@ -23,6 +23,7 @@ import {
   ApiProviderSettings,
   AssistantMessageVariant,
   ChatMessage,
+  ConversationSummary,
   ContextPreview,
   DevLogCategory,
   DevLogEntry,
@@ -53,6 +54,7 @@ import {
   getImageAssetDataUrl,
   getSoul,
   importImageAssetFromFile,
+  listConversations,
   listProviderProfiles,
   listAssistantMessageVariants,
   listConversationMessages,
@@ -201,6 +203,7 @@ const PSYCHE_PRESETS: Record<PsychePresetName, PsycheDraft> = {
 export function App() {
   const [souls, setSouls] = useState<SoulSummary[]>([]);
   const [settings, setSettings] = useState<SettingSummary[]>([]);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [soul, setSoul] = useState<Soul | null>(null);
   const [setting, setSetting] = useState<SettingSoul | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -256,10 +259,12 @@ export function App() {
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
   const [view, setView] = useState<AppView>("library");
   const [chatStartMode, setChatStartMode] = useState<ChatStartMode>("fresh");
-  const [sourceSavepointId, setSourceSavepointId] = useState<string | null>(null);
-  const [sessionContinuityLabel, setSessionContinuityLabel] = useState("New Session clones the selected Soul savepoint");
+  const [sessionContinuityLabel, setSessionContinuityLabel] = useState("New Session starts from the selected Soul snapshot");
   const [currentSessionTitle, setCurrentSessionTitle] = useState("New Session");
-  const [avatarAsset, setAvatarAsset] = useState<ImageAsset | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [selectedAvatarAsset, setSelectedAvatarAsset] = useState<ImageAsset | null>(null);
+  const [draftAvatarAsset, setDraftAvatarAsset] = useState<ImageAsset | null>(null);
+  const [draftAvatarImageId, setDraftAvatarImageId] = useState<string | null>(null);
   const [previewImageAsset, setPreviewImageAsset] = useState<ImageAsset | null>(null);
   const [status, setStatus] = useState("Ready");
   const [payloadCopied, setPayloadCopied] = useState(false);
@@ -286,14 +291,28 @@ export function App() {
   const activeGenerationRef = useRef<ActiveGeneration | null>(null);
   const devConsoleBodyRef = useRef<HTMLDivElement>(null);
   const chatOnlyBodyRef = useRef<HTMLElement>(null);
-  const currentConversationId = useMemo(
+  const defaultConversationId = useMemo(
     () =>
       soul && setting
         ? conversationIdForSettingAndSoul(setting.setting_id, soul.character_id)
         : DEFAULT_CONVERSATION_ID,
     [setting?.setting_id, soul?.character_id],
   );
+  const currentConversationId = activeConversationId ?? defaultConversationId;
   const currentConversationIdRef = useRef(currentConversationId);
+  const visibleConversations = useMemo(
+    () =>
+      conversations.filter((conversation) => {
+        if (!soul) return false;
+        return (
+          conversation.soul_id === soul.character_id ||
+          conversation.source_savepoint_id === soul.character_id ||
+          (Boolean(soul.source_savepoint_id) &&
+            conversation.source_savepoint_id === soul.source_savepoint_id)
+        );
+      }),
+    [conversations, soul?.character_id, soul?.source_savepoint_id],
+  );
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId;
@@ -370,9 +389,9 @@ export function App() {
   }, [useNarratorProviderForUpdater]);
 
   useEffect(() => {
-    if (!soul) return;
+    if (!soul || view !== "chat") return;
     void refreshContext(soul.character_id, currentConversationId);
-  }, [soul?.character_id, currentConversationId, messages.length]);
+  }, [soul?.character_id, currentConversationId, messages.length, view]);
 
   useEffect(() => {
     void refreshAssistantVariants(currentConversationId, messages);
@@ -382,23 +401,33 @@ export function App() {
     let cancelled = false;
     const avatarId = soul?.profile.avatar_image_id;
     if (!avatarId) {
-      setAvatarAsset(null);
+      setSelectedAvatarAsset(null);
+      setDraftAvatarAsset(null);
+      setDraftAvatarImageId(null);
       return;
     }
     getImageAsset(avatarId)
       .then((asset) => {
-        if (!cancelled) setAvatarAsset(asset);
+        if (!cancelled) {
+          setSelectedAvatarAsset(asset);
+          setDraftAvatarAsset(asset);
+          setDraftAvatarImageId(asset.id);
+        }
       })
       .catch(() => {
-        if (!cancelled) setAvatarAsset(null);
+        if (!cancelled) {
+          setSelectedAvatarAsset(null);
+          setDraftAvatarAsset(null);
+          setDraftAvatarImageId(avatarId);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [soul?.profile.avatar_image_id]);
+  }, [soul?.character_id, soul?.profile.avatar_image_id]);
 
   useEffect(() => {
-    if (!soul) {
+    if (!soul || view !== "chat") {
       setLlmPayload(null);
       return;
     }
@@ -418,6 +447,7 @@ export function App() {
     stateUpdaterSettings.base_url,
     stateUpdaterSettings.model,
     contextMode,
+    view,
   ]);
 
   useEffect(() => {
@@ -535,7 +565,7 @@ export function App() {
         personality,
         scenario,
         opening_narrator_message: opening,
-        avatar_image_id: nextSoul.profile.avatar_image_id ?? null,
+        avatar_image_id: draftAvatarImageId,
       },
       global: {
         ...nextSoul.global,
@@ -624,28 +654,15 @@ export function App() {
   }
 
   async function bootstrap() {
-    const [existingSouls, existingSettings, existingProviderProfiles] = await Promise.all([
+    const [existingSouls, existingSettings, existingConversations] = await Promise.all([
       listSouls(),
       listSettings(),
-      listProviderProfiles(),
+      listConversations(),
     ]);
     setSouls(existingSouls);
     setSettings(existingSettings);
-    setProviderProfiles(existingProviderProfiles);
-    if (existingProviderProfiles.length > 0) {
-      const savedNarratorId = localStorage.getItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY) ?? "";
-      const savedUpdaterId = localStorage.getItem(UPDATER_PROVIDER_PROFILE_STORAGE_KEY) ?? "";
-      const narratorProfile =
-        existingProviderProfiles.find((profile) => profile.id === savedNarratorId) ??
-        existingProviderProfiles[0];
-      const updaterProfile = existingProviderProfiles.find((profile) => profile.id === savedUpdaterId);
-      setSelectedProviderProfileId(narratorProfile.id);
-      applyNarratorProviderProfile(narratorProfile);
-      if (updaterProfile) {
-        setSelectedStateUpdaterProfileId(updaterProfile.id);
-        applyStateUpdaterProviderProfile(updaterProfile);
-      }
-    }
+    setConversations(existingConversations);
+    void loadProviderProfiles();
 
     let activeSetting: SettingSoul;
     if (existingSettings.length > 0) {
@@ -662,11 +679,7 @@ export function App() {
       const firstSoul = await getSoul(existingSouls[0].character_id);
       setSoul(firstSoul);
       setCreatorFieldsFromSoul(firstSoul);
-      setMessages(
-        await listConversationMessages(
-          conversationIdForSettingAndSoul(activeSetting.setting_id, firstSoul.character_id),
-        ),
-      );
+      setCurrentSessionTitle("New Session");
       setStatus("Loaded local Soul and Setting indexes");
       return;
     }
@@ -676,6 +689,31 @@ export function App() {
     setSoul(nextSoul);
     setSouls(await listSouls());
     setStatus("Created starter Soul and Setting");
+  }
+
+  async function loadProviderProfiles() {
+    try {
+      const existingProviderProfiles = await listProviderProfiles();
+      setProviderProfiles(existingProviderProfiles);
+    if (existingProviderProfiles.length > 0) {
+      const savedNarratorId = localStorage.getItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY) ?? "";
+      const savedUpdaterId = localStorage.getItem(UPDATER_PROVIDER_PROFILE_STORAGE_KEY) ?? "";
+      const narratorProfile =
+        existingProviderProfiles.find((profile) => profile.id === savedNarratorId) ??
+        existingProviderProfiles[0];
+      const updaterProfile = existingProviderProfiles.find((profile) => profile.id === savedUpdaterId);
+      setSelectedProviderProfileId(narratorProfile.id);
+      applyNarratorProviderProfile(narratorProfile);
+      if (updaterProfile) {
+        setSelectedStateUpdaterProfileId(updaterProfile.id);
+        applyStateUpdaterProviderProfile(updaterProfile);
+      }
+    }
+    } catch (error) {
+      logDev("warn", "app", "Provider profile load deferred failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   async function refreshContext(soulId: string, conversationId: string) {
@@ -727,12 +765,19 @@ export function App() {
       );
       await upsertSoul(nextSoul);
       setSoul(nextSoul);
-      setSourceSavepointId(null);
+      setSelectedAvatarAsset(draftAvatarAsset);
+      setActiveConversationId(null);
       setCurrentSessionTitle("New Session");
       setMessages([]);
       setLastTurnDebug(null);
       setSouls(await listSouls());
       setStatus("New Soul created");
+      if (draftAvatarImageId) {
+        logDev("success", "db", "avatar_updated", {
+          soul_id: nextSoul.character_id,
+          image_asset_id: draftAvatarImageId,
+        });
+      }
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -749,17 +794,11 @@ export function App() {
       const nextSoul = await getSoul(selected.character_id);
       setStatus(`Selected ${nextSoul.character_name}`);
       setSoul(nextSoul);
-      setSourceSavepointId(null);
+      setActiveConversationId(null);
       setCurrentSessionTitle("New Session");
       setCreatorFieldsFromSoul(nextSoul);
       setLastTurnDebug(null);
-      setMessages(
-        await listConversationMessages(
-          setting
-            ? conversationIdForSettingAndSoul(setting.setting_id, nextSoul.character_id)
-            : conversationIdForSoul(nextSoul.character_id),
-        ),
-      );
+      setMessages([]);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -777,6 +816,7 @@ export function App() {
       setSetting(nextSetting);
       setEditorFieldsFromSetting(nextSetting);
       setSettings(await listSettings());
+      setActiveConversationId(null);
       setMessages([]);
       setLastTurnDebug(null);
       setStatus("New Setting created");
@@ -797,13 +837,8 @@ export function App() {
       setSetting(nextSetting);
       setEditorFieldsFromSetting(nextSetting);
       setLastTurnDebug(null);
-      setMessages(
-        soul
-          ? await listConversationMessages(
-              conversationIdForSettingAndSoul(nextSetting.setting_id, soul.character_id),
-            )
-          : [],
-      );
+      setActiveConversationId(null);
+      setMessages([]);
       setStatus(`Selected ${nextSetting.setting_name}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -930,6 +965,7 @@ export function App() {
       setContext(result.context_preview);
       setLastTurnDebug(result.debug);
       setSouls(await listSouls());
+      setConversations(await listConversations());
       setStateUpdating(false);
       const replayStatus = result.debug.replay_detected
         ? result.debug.replay_reason?.includes("regenerated before save")
@@ -1137,9 +1173,13 @@ export function App() {
   async function handleStartChat() {
     if (!soul || busy) return;
     if (chatStartMode === "continue") {
-      setSourceSavepointId(null);
+      const existingConversation = conversations.find(
+        (conversation) => conversation.conversation_id === defaultConversationId,
+      );
+      setActiveConversationId(defaultConversationId);
       setSessionContinuityLabel("Using persistent Soul continuity");
-      setCurrentSessionTitle(`${soul.character_name} Continuity`);
+      setCurrentSessionTitle(existingConversation?.title ?? `${soul.character_name} Continuity`);
+      setMessages(existingConversation ? await listConversationMessages(defaultConversationId) : []);
       setView("chat");
       return;
     }
@@ -1150,17 +1190,18 @@ export function App() {
       const session = await createSessionSoulClone(sourceId, setting?.setting_id);
       const sessionSoul = session.soul;
       const nextConversationId = session.conversation.conversation_id;
+      setActiveConversationId(nextConversationId);
       setSoul(sessionSoul);
-      setSourceSavepointId(sourceId);
       setCreatorFieldsFromSoul(sessionSoul);
       setMessages(session.messages);
       setContext(await compileContext(sessionSoul.character_id, nextConversationId));
       setSouls(await listSouls());
+      setConversations(await listConversations());
       setLastTurnDebug(null);
-      setSessionContinuityLabel("New Session clone; source savepoint remains unchanged");
+      setSessionContinuityLabel("Isolated Session; source Soul remains unchanged");
       setCurrentSessionTitle(session.conversation.title);
-      setStatus("Started New Session from an exact Soul savepoint clone.");
-      logDev("info", "context", "new session cloned selected Soul savepoint", {
+      setStatus("Started isolated Session from the selected Soul.");
+      logDev("info", "context", "new session cloned selected Soul", {
         source_soul_id: sourceId,
         session_soul_id: sessionSoul.character_id,
         conversation_id: nextConversationId,
@@ -1189,8 +1230,15 @@ export function App() {
     }
     setBusy(true);
     try {
-      const renamed = await renameConversation(currentConversationId, trimmed);
+      const renamed = await renameConversation(currentConversationId, trimmed, soul?.character_id);
       setCurrentSessionTitle(renamed.title);
+      setConversations((current) =>
+        current.some((conversation) => conversation.conversation_id === renamed.conversation_id)
+          ? current.map((conversation) =>
+              conversation.conversation_id === renamed.conversation_id ? renamed : conversation,
+            )
+          : [renamed, ...current],
+      );
       setStatus(`Renamed session: ${renamed.title}`);
       logDev("success", "app", "Session renamed", {
         conversation_id: renamed.conversation_id,
@@ -1203,57 +1251,61 @@ export function App() {
     }
   }
 
-  async function handleAvatarImageSelected(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file || !soul) return;
+  async function handleSelectConversation(conversation: ConversationSummary) {
+    if (busy) return;
     setBusy(true);
     try {
-      const asset = await importImageAssetFromFile({
-        file,
-        linkedSoulId: soul.character_id,
-        source: "uploaded",
-      });
-      const nextSoul = cloneForUi(soul);
-      nextSoul.profile.avatar_image_id = asset.id;
-      nextSoul.last_updated = Math.floor(Date.now() / 1000);
-      await upsertSoul(nextSoul);
-      setSoul(nextSoul);
-      setAvatarAsset(asset);
-      setSouls(await listSouls());
-      setStatus("Soul avatar updated");
-      logDev("success", "db", "avatar_updated", {
-        soul_id: nextSoul.character_id,
-        image_asset_id: asset.id,
-      });
+      const conversationSoul = await getSoul(conversation.soul_id);
+      setSoul(conversationSoul);
+      setCreatorFieldsFromSoul(conversationSoul);
+      setActiveConversationId(conversation.conversation_id);
+      setCurrentSessionTitle(conversation.title);
+      setSessionContinuityLabel(
+        conversation.source_savepoint_id
+          ? "Loaded named Session clone"
+          : "Loaded persistent Soul continuity chat",
+      );
+      setMessages(await listConversationMessages(conversation.conversation_id));
+      setLastTurnDebug(null);
+      setView("chat");
+      setStatus(`Loaded chat: ${conversation.title}`);
     } catch (error) {
-      reportError(error, "Avatar image update failed", "db");
+      setStatus(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(false);
     }
   }
 
-  async function handleRemoveAvatarImage() {
-    if (!soul || !soul.profile.avatar_image_id) return;
+  async function handleAvatarImageSelected(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
     setBusy(true);
     try {
-      const nextSoul = cloneForUi(soul);
-      nextSoul.profile.avatar_image_id = null;
-      nextSoul.last_updated = Math.floor(Date.now() / 1000);
-      await upsertSoul(nextSoul);
-      setSoul(nextSoul);
-      setAvatarAsset(null);
-      setSouls(await listSouls());
-      setStatus("Soul avatar removed");
-      logDev("success", "db", "avatar_updated", {
-        soul_id: nextSoul.character_id,
-        image_asset_id: null,
+      const asset = await importImageAssetFromFile({
+        file,
+        source: "uploaded",
+      });
+      setDraftAvatarAsset(asset);
+      setDraftAvatarImageId(asset.id);
+      setStatus("Draft profile picture updated");
+      logDev("info", "db", "avatar_draft_updated", {
+        image_asset_id: asset.id,
       });
     } catch (error) {
-      reportError(error, "Avatar image remove failed", "db");
+      reportError(error, "Avatar image import failed", "db");
     } finally {
       setBusy(false);
     }
+  }
+
+  function handleRemoveAvatarImage() {
+    setDraftAvatarAsset(null);
+    setDraftAvatarImageId(null);
+    setStatus("Draft profile picture removed");
+    logDev("info", "db", "avatar_draft_updated", {
+      image_asset_id: null,
+    });
   }
 
   async function handleChatImageSelected(event: ChangeEvent<HTMLInputElement>) {
@@ -1265,6 +1317,7 @@ export function App() {
       const nextMessages = await createUserImageMessageFromFile(currentConversationId, file, draft);
       setDraft("");
       setMessages(nextMessages);
+      setConversations(await listConversations());
       setContext(await compileContext(soul.character_id, currentConversationId));
       setStatus("Image attached to chat");
       logDev("success", "db", "chat_image_attached", {
@@ -1454,6 +1507,8 @@ export function App() {
     setBusy(true);
     try {
       await deleteConversation(currentConversationId);
+      setActiveConversationId(null);
+      setConversations(await listConversations());
       setMessages([]);
       setContext(await compileContext(soul.character_id, currentConversationId));
       setLastTurnDebug(null);
@@ -1477,10 +1532,11 @@ export function App() {
       await deleteSoul(soul.character_id);
       const remaining = await listSouls();
       setSouls(remaining);
+      setConversations(await listConversations());
+      setActiveConversationId(null);
 
       if (remaining.length === 0) {
         setSoul(null);
-        setSourceSavepointId(null);
         setMessages([]);
         setContext(null);
         setStatus("Soul deleted");
@@ -1488,14 +1544,10 @@ export function App() {
       }
 
       const nextSoul = await getSoul(remaining[0].character_id);
-      const nextConversationId = setting
-        ? conversationIdForSettingAndSoul(setting.setting_id, nextSoul.character_id)
-        : conversationIdForSoul(nextSoul.character_id);
       setSoul(nextSoul);
-      setSourceSavepointId(null);
       setCreatorFieldsFromSoul(nextSoul);
-      setMessages(await listConversationMessages(nextConversationId));
-      setContext(await compileContext(nextSoul.character_id, nextConversationId));
+      setMessages([]);
+      setContext(null);
       setStatus("Soul deleted; selected next local Soul");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -1531,13 +1583,8 @@ export function App() {
       const nextSetting = await getSetting(remaining[0].setting_id);
       setSetting(nextSetting);
       setEditorFieldsFromSetting(nextSetting);
-      setMessages(
-        soul
-          ? await listConversationMessages(
-              conversationIdForSettingAndSoul(nextSetting.setting_id, soul.character_id),
-            )
-          : [],
-      );
+      setActiveConversationId(null);
+      setMessages([]);
       setStatus("Setting deleted; selected next local Setting");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -1668,77 +1715,19 @@ export function App() {
     }
   }
 
-  async function handleSaveCurrentSessionAsNewSoul() {
+  async function handleCreateSnapshot() {
     if (!soul) return;
-    const defaultName = `${soul.character_name} Savepoint`;
-    const name = window.prompt("Name this new Soul savepoint", defaultName);
+    const defaultName = `${soul.character_name} Snapshot ${formatSnapshotTimestamp(new Date())}`;
+    const name = window.prompt("Name this Soul snapshot", defaultName);
     if (name === null) return;
     setBusy(true);
     try {
-      const savepoint = await saveSessionAsNewSoul(soul.character_id, name, "savepoint");
+      const snapshot = await saveSessionAsNewSoul(soul.character_id, name, "checkpoint");
       setSouls(await listSouls());
-      setStatus(`Saved new Soul savepoint: ${savepoint.character_name}`);
-      logDev("success", "db", "Current session saved as new Soul savepoint", {
+      setStatus(`Created Soul snapshot: ${snapshot.character_name}`);
+      logDev("success", "db", "Snapshot created from current Soul", {
         current_soul_id: soul.character_id,
-        new_soul_id: savepoint.character_id,
-      });
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleCreateCheckpoint() {
-    if (!soul) return;
-    const defaultName = `${soul.character_name} Checkpoint ${formatCheckpointTimestamp(new Date())}`;
-    const name = window.prompt("Name this checkpoint", defaultName);
-    if (name === null) return;
-    setBusy(true);
-    try {
-      const checkpoint = await saveSessionAsNewSoul(soul.character_id, name, "checkpoint");
-      setSouls(await listSouls());
-      setStatus(`Created checkpoint: ${checkpoint.character_name}`);
-      logDev("success", "db", "Checkpoint created from current session Soul", {
-        current_soul_id: soul.character_id,
-        checkpoint_soul_id: checkpoint.character_id,
-      });
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleUpdateSourceSavepoint() {
-    if (!soul) return;
-    const targetSoulId = sourceSavepointId ?? soul.character_id;
-    const sourceSummary = souls.find((item) => item.character_id === targetSoulId);
-    const targetName = sourceSummary?.character_name ?? soul.character_name;
-    const confirmed = window.confirm(
-      `Update source savepoint "${targetName}" with the current session Soul? This overwrites that saved checkpoint.`,
-    );
-    if (!confirmed) return;
-
-    const updatedSource = {
-      ...cloneForUi(soul),
-      character_id: targetSoulId,
-      soul_kind: sourceSummary?.soul_kind ?? "savepoint",
-      source_soul_id: sourceSummary?.source_soul_id ?? null,
-      source_savepoint_id: sourceSummary?.source_savepoint_id ?? null,
-      last_updated: Math.floor(Date.now() / 1000),
-    };
-    setBusy(true);
-    try {
-      await upsertSoul(updatedSource);
-      setSouls(await listSouls());
-      if (targetSoulId === soul.character_id) {
-        setSoul(updatedSource);
-      }
-      setStatus(`Updated source savepoint: ${targetName}`);
-      logDev("warn", "db", "Source savepoint updated explicitly", {
-        source_soul_id: targetSoulId,
-        current_session_soul_id: soul.character_id,
+        snapshot_soul_id: snapshot.character_id,
       });
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -1752,7 +1741,7 @@ export function App() {
     setBusy(true);
     try {
       await saveSoulFile(`${soul.character_name.replace(/\s+/g, "_")}.soul.json`, soul);
-      setStatus("Current Soul exported; no savepoint was modified");
+      setStatus("Current Soul exported; app library was not modified");
       logDev("success", "app", "Current Soul exported without mutation", {
         soul_id: soul.character_id,
       });
@@ -1776,7 +1765,7 @@ export function App() {
         nextSetting,
       );
       setSettings(await listSettings());
-      setStatus("Setting exported beside the app working directory");
+      setStatus("Setting exported to mnemosyne-exports");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1795,16 +1784,10 @@ export function App() {
       const importedSoul = await soulFromImport(raw, file.name);
       await upsertSoul(importedSoul);
       setSoul(importedSoul);
-      setSourceSavepointId(null);
+      setActiveConversationId(null);
       setCurrentSessionTitle("New Session");
       setCreatorFieldsFromSoul(importedSoul);
-      setMessages(
-        await listConversationMessages(
-          setting
-            ? conversationIdForSettingAndSoul(setting.setting_id, importedSoul.character_id)
-            : conversationIdForSoul(importedSoul.character_id),
-        ),
-      );
+      setMessages([]);
       setSouls(await listSouls());
       setStatus(`Imported ${importedSoul.character_name}`);
     } catch (error) {
@@ -1827,13 +1810,8 @@ export function App() {
       setSetting(importedSetting);
       setEditorFieldsFromSetting(importedSetting);
       setSettings(await listSettings());
-      setMessages(
-        soul
-          ? await listConversationMessages(
-              conversationIdForSettingAndSoul(importedSetting.setting_id, soul.character_id),
-            )
-          : [],
-      );
+      setActiveConversationId(null);
+      setMessages([]);
       setStatus(`Imported ${importedSetting.setting_name}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -2284,30 +2262,6 @@ export function App() {
             {settingEditorOpen ? (
               <div className="collapsible-content">
                 <div className="form-grid single-column-form">
-                  <section className="avatar-editor">
-                    <SoulAvatar soulName={characterName} asset={avatarAsset} />
-                    <div>
-                      <strong>Profile Picture</strong>
-                      <p>{avatarAsset ? imageAssetMeta(avatarAsset) : "Placeholder avatar"}</p>
-                      <div className="inline-actions">
-                        <input
-                          ref={avatarInputRef}
-                          className="hidden-file"
-                          type="file"
-                          accept="image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif"
-                          onChange={handleAvatarImageSelected}
-                        />
-                        <button type="button" onClick={() => avatarInputRef.current?.click()} disabled={busy || !soul}>
-                          <ImageIcon size={16} />
-                          <span>{avatarAsset ? "Change" : "Upload"}</span>
-                        </button>
-                        <button type="button" onClick={handleRemoveAvatarImage} disabled={busy || !avatarAsset}>
-                          <X size={16} />
-                          <span>Remove</span>
-                        </button>
-                      </div>
-                    </div>
-                  </section>
                   <label className="field">
                     <span>Name</span>
                     <input
@@ -2377,7 +2331,7 @@ export function App() {
               <span className="eyebrow">Characters</span>
               <h2>Local Souls</h2>
             </div>
-            <SoulAvatar soulName={soul?.character_name ?? "Mnemosyne"} asset={avatarAsset} />
+            <SoulAvatar soulName={soul?.character_name ?? "Mnemosyne"} asset={selectedAvatarAsset} />
           </header>
 
           <div className="action-grid compact-actions">
@@ -2400,25 +2354,13 @@ export function App() {
               <FileUp size={18} />
               <span>Import</span>
             </button>
-            <button title="Save Current Session as New Soul" onClick={handleSaveCurrentSessionAsNewSoul} disabled={!soul || busy}>
-              <Sparkles size={18} />
-              <span>Save As</span>
-            </button>
-            <button title="Create Checkpoint from current Session Soul" onClick={handleCreateCheckpoint} disabled={!soul || busy}>
-              <Database size={18} />
-              <span>Checkpoint</span>
-            </button>
-            <button title="Export Current Soul without modifying savepoints" onClick={handleSaveSoul} disabled={!soul || busy}>
-              <FileDown size={18} />
-              <span>Export</span>
-            </button>
-            <button
-              title="Update Source Savepoint explicitly"
-              onClick={handleUpdateSourceSavepoint}
-              disabled={!soul || busy}
-            >
+            <button title="Snapshot current Soul into the library" onClick={handleCreateSnapshot} disabled={!soul || busy}>
               <Save size={18} />
-              <span>Update Source</span>
+              <span>Snapshot</span>
+            </button>
+            <button title="Export Current Soul without modifying the app library" onClick={handleSaveSoul} disabled={!soul || busy}>
+              <FileDown size={18} />
+              <span>Export JSON</span>
             </button>
             <button title="Run consolidation" onClick={handleConsolidate} disabled={!soul || busy}>
               <RefreshCcw size={18} />
@@ -2476,10 +2418,10 @@ export function App() {
               <div className="collapsible-content">
                 <div className="form-grid single-column-form">
                   <section className="avatar-editor">
-                    <SoulAvatar soulName={characterName} asset={avatarAsset} />
+                    <SoulAvatar soulName={characterName} asset={draftAvatarAsset} />
                     <div>
-                      <strong>Profile Picture</strong>
-                      <p>{avatarAsset ? imageAssetMeta(avatarAsset) : "Placeholder avatar"}</p>
+                      <strong>Draft Profile Picture</strong>
+                      <p>{draftAvatarAsset ? imageAssetMeta(draftAvatarAsset) : "Draft has no profile picture"}</p>
                       <div className="inline-actions">
                         <input
                           ref={avatarInputRef}
@@ -2488,11 +2430,11 @@ export function App() {
                           accept="image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif"
                           onChange={handleAvatarImageSelected}
                         />
-                        <button type="button" onClick={() => avatarInputRef.current?.click()} disabled={busy || !soul}>
+                        <button type="button" onClick={() => avatarInputRef.current?.click()} disabled={busy}>
                           <ImageIcon size={16} />
-                          <span>{avatarAsset ? "Change" : "Upload"}</span>
+                          <span>{draftAvatarAsset ? "Change" : "Upload"}</span>
                         </button>
-                        <button type="button" onClick={handleRemoveAvatarImage} disabled={busy || !avatarAsset}>
+                        <button type="button" onClick={handleRemoveAvatarImage} disabled={busy || !draftAvatarImageId}>
                           <X size={16} />
                           <span>Remove</span>
                         </button>
@@ -3046,14 +2988,39 @@ export function App() {
                 onChange={() => setChatStartMode("fresh")}
                 disabled={busy}
               />
-              <span>New Session from savepoint clone</span>
+              <span>New isolated Session</span>
             </label>
           </div>
           <p className="session-state-label">
             {chatStartMode === "fresh"
-              ? "New Session clones the selected Soul exactly, starts an empty chat, and mutates only the clone."
+              ? "Starts an isolated chat from the selected Soul; the library Soul remains unchanged."
               : "Using persistent Soul continuity"}
           </p>
+          <section className="session-list" aria-label="Saved chats">
+            <div className="session-list-heading">
+              <span className="eyebrow">Chats</span>
+              <strong>{visibleConversations.length}</strong>
+            </div>
+            {visibleConversations.length === 0 ? (
+              <p className="muted">No named chats for this Soul yet.</p>
+            ) : (
+              visibleConversations.slice(0, 8).map((conversation) => (
+                <button
+                  key={conversation.conversation_id}
+                  type="button"
+                  className="session-row"
+                  onClick={() => handleSelectConversation(conversation)}
+                  disabled={busy}
+                >
+                  <span>{conversation.title}</span>
+                  <small>
+                    {conversation.message_count} messages
+                    {conversation.last_message_preview ? ` / ${conversation.last_message_preview}` : ""}
+                  </small>
+                </button>
+              ))
+            )}
+          </section>
         </div>
         <button className="start-chat-button" onClick={handleStartChat} disabled={!soul || busy}>
           <MessageSquareText size={20} />
@@ -4204,7 +4171,7 @@ function cloneForUi<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function formatCheckpointTimestamp(date: Date) {
+function formatSnapshotTimestamp(date: Date) {
   const pad = (value: number) => String(value).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
     date.getHours(),

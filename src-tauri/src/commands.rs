@@ -385,9 +385,22 @@ pub fn rename_conversation(
     state: State<'_, AppState>,
     conversation_id: String,
     title: String,
+    soul_id: Option<String>,
 ) -> Result<ConversationSummary, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    db::rename_conversation(&conn, &conversation_id, &title).map_err(|err| err.to_string())
+    match db::rename_conversation(&conn, &conversation_id, &title) {
+        Ok(conversation) => Ok(conversation),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            let soul_id = soul_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "Conversation not found".to_string())?;
+            db::ensure_conversation_with_title(&conn, &conversation_id, soul_id, Some(&title))
+                .map_err(|err| err.to_string())
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[tauri::command]

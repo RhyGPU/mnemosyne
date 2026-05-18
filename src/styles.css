@@ -718,6 +718,48 @@ button:disabled {
   background: #e8f0ed;
 }
 
+.session-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.session-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.session-list-heading strong {
+  color: #1d5e52;
+  font-size: 0.86rem;
+}
+
+.session-row {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  border: 1px solid #d9d3c3;
+  border-radius: 6px;
+  background: #fffdf8;
+  color: #16201c;
+  padding: 9px 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-row span {
+  font-weight: 800;
+}
+
+.session-row small {
+  color: #6b786f;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .stat-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

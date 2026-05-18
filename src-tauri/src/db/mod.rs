@@ -175,6 +175,9 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             soul_kind TEXT NOT NULL DEFAULT 'savepoint',
             source_soul_id TEXT,
             source_savepoint_id TEXT,
+            avatar_image_id TEXT,
+            recent_count INTEGER NOT NULL DEFAULT 0,
+            core_count INTEGER NOT NULL DEFAULT 0,
             last_updated INTEGER NOT NULL,
             soul_json TEXT NOT NULL
         );
@@ -182,9 +185,17 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS settings (
             setting_id TEXT PRIMARY KEY,
             setting_name TEXT NOT NULL,
+            turn_counter INTEGER NOT NULL DEFAULT 0,
+            location TEXT NOT NULL DEFAULT '',
             last_updated INTEGER NOT NULL,
             setting_json TEXT NOT NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_souls_kind_updated
+        ON souls(soul_kind, last_updated DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_settings_updated
+        ON settings(last_updated DESC);
 
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
@@ -203,6 +214,9 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             created_at INTEGER NOT NULL,
             FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
         );
+
+        CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_id
+        ON messages(conversation_id, id);
 
         CREATE TABLE IF NOT EXISTS provider_profiles (
             id TEXT PRIMARY KEY,
@@ -333,12 +347,34 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     add_column_if_missing(conn, "souls", "source_soul_id", "TEXT")?;
     add_column_if_missing(conn, "souls", "source_savepoint_id", "TEXT")?;
+    let added_avatar_image_id = add_column_if_missing(conn, "souls", "avatar_image_id", "TEXT")?;
+    let added_recent_count =
+        add_column_if_missing(conn, "souls", "recent_count", "INTEGER NOT NULL DEFAULT 0")?;
+    let added_core_count =
+        add_column_if_missing(conn, "souls", "core_count", "INTEGER NOT NULL DEFAULT 0")?;
+    let added_soul_summary_columns =
+        added_avatar_image_id || added_recent_count || added_core_count;
+    let added_setting_turn_counter = add_column_if_missing(
+        conn,
+        "settings",
+        "turn_counter",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    let added_setting_location =
+        add_column_if_missing(conn, "settings", "location", "TEXT NOT NULL DEFAULT ''")?;
+    let added_setting_summary_columns = added_setting_turn_counter || added_setting_location;
     add_column_if_missing(
         conn,
         "conversations",
         "title",
         "TEXT NOT NULL DEFAULT 'Untitled Session'",
     )?;
+    if added_soul_summary_columns {
+        backfill_soul_summary_columns(conn)?;
+    }
+    if added_setting_summary_columns {
+        backfill_setting_summary_columns(conn)?;
+    }
     Ok(())
 }
 
@@ -347,7 +383,7 @@ fn add_column_if_missing(
     table: &str,
     column: &str,
     definition: &str,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = stmt
         .query_map([], |row| row.get::<_, String>(1))?
@@ -356,6 +392,60 @@ fn add_column_if_missing(
         conn.execute(
             &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
             [],
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn backfill_soul_summary_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let rows = {
+        let mut stmt = conn.prepare("SELECT character_id, soul_json FROM souls")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (character_id, soul_json) in rows {
+        let soul = decode_soul(&soul_json)?;
+        conn.execute(
+            "
+            UPDATE souls
+            SET avatar_image_id = ?1, recent_count = ?2, core_count = ?3
+            WHERE character_id = ?4
+            ",
+            params![
+                soul.profile.avatar_image_id.as_deref(),
+                soul.memory.recent.len() as i64,
+                soul.memory.core.len() as i64,
+                character_id,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn backfill_setting_summary_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let rows = {
+        let mut stmt = conn.prepare("SELECT setting_id, setting_json FROM settings")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (setting_id, setting_json) in rows {
+        let setting = decode_setting(&setting_json)?;
+        conn.execute(
+            "
+            UPDATE settings
+            SET turn_counter = ?1, location = ?2
+            WHERE setting_id = ?3
+            ",
+            params![
+                setting.turn_counter as i64,
+                setting.world.location,
+                setting_id,
+            ],
         )?;
     }
     Ok(())
@@ -388,18 +478,38 @@ fn summarize_soul(soul: &Soul) -> SoulSummary {
     }
 }
 
+fn soul_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SoulSummary> {
+    let recent_count: i64 = row.get(7)?;
+    let core_count: i64 = row.get(8)?;
+    Ok(SoulSummary {
+        character_id: row.get(0)?,
+        character_name: row.get(1)?,
+        soul_kind: normalized_soul_kind(&row.get::<_, String>(2)?),
+        source_soul_id: row.get(3)?,
+        source_savepoint_id: row.get(4)?,
+        avatar_image_id: row.get(5)?,
+        last_updated: row.get(6)?,
+        recent_count: recent_count.max(0) as usize,
+        core_count: core_count.max(0) as usize,
+    })
+}
+
 pub fn upsert_soul(conn: &Connection, soul: &Soul) -> rusqlite::Result<SoulSummary> {
     let soul_json = serde_json::to_string(soul)
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
     conn.execute(
         "
-        INSERT INTO souls (character_id, character_name, soul_kind, source_soul_id, source_savepoint_id, last_updated, soul_json)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        INSERT INTO souls
+            (character_id, character_name, soul_kind, source_soul_id, source_savepoint_id, avatar_image_id, recent_count, core_count, last_updated, soul_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         ON CONFLICT(character_id) DO UPDATE SET
             character_name = excluded.character_name,
             soul_kind = excluded.soul_kind,
             source_soul_id = excluded.source_soul_id,
             source_savepoint_id = excluded.source_savepoint_id,
+            avatar_image_id = excluded.avatar_image_id,
+            recent_count = excluded.recent_count,
+            core_count = excluded.core_count,
             last_updated = excluded.last_updated,
             soul_json = excluded.soul_json
         ",
@@ -409,6 +519,9 @@ pub fn upsert_soul(conn: &Connection, soul: &Soul) -> rusqlite::Result<SoulSumma
             normalized_soul_kind(&soul.soul_kind),
             soul.source_soul_id.as_deref(),
             soul.source_savepoint_id.as_deref(),
+            soul.profile.avatar_image_id.as_deref(),
+            soul.memory.recent.len() as i64,
+            soul.memory.core.len() as i64,
             soul.last_updated,
             soul_json
         ],
@@ -425,16 +538,20 @@ pub fn upsert_setting(
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
     conn.execute(
         "
-        INSERT INTO settings (setting_id, setting_name, last_updated, setting_json)
-        VALUES (?1, ?2, ?3, ?4)
+        INSERT INTO settings (setting_id, setting_name, turn_counter, location, last_updated, setting_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         ON CONFLICT(setting_id) DO UPDATE SET
             setting_name = excluded.setting_name,
+            turn_counter = excluded.turn_counter,
+            location = excluded.location,
             last_updated = excluded.last_updated,
             setting_json = excluded.setting_json
         ",
         params![
             setting.setting_id,
             setting.setting_name,
+            setting.turn_counter as i64,
+            setting.world.location.as_str(),
             setting.last_updated,
             setting_json
         ],
@@ -445,11 +562,21 @@ pub fn upsert_setting(
 
 pub fn list_settings(conn: &Connection) -> rusqlite::Result<Vec<SettingSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT setting_json FROM settings ORDER BY last_updated DESC, setting_name ASC",
+        "
+        SELECT setting_id, setting_name, last_updated, turn_counter, location
+        FROM settings
+        ORDER BY last_updated DESC, setting_name ASC
+        ",
     )?;
     let rows = stmt.query_map([], |row| {
-        let setting_json: String = row.get(0)?;
-        decode_setting(&setting_json).map(|setting| summarize_setting(&setting))
+        let turn_counter: i64 = row.get(3)?;
+        Ok(SettingSummary {
+            setting_id: row.get(0)?,
+            setting_name: row.get(1)?,
+            last_updated: row.get(2)?,
+            turn_counter: turn_counter.max(0) as u64,
+            location: row.get(4)?,
+        })
     })?;
 
     rows.collect()
@@ -483,21 +610,26 @@ fn list_souls_with_filter(
     conn: &Connection,
     include_session_clones: bool,
 ) -> rusqlite::Result<Vec<SoulSummary>> {
-    let mut stmt =
-        conn.prepare("SELECT soul_json FROM souls ORDER BY last_updated DESC, character_name ASC")?;
-    let rows = stmt.query_map([], |row| {
-        let soul_json: String = row.get(0)?;
-        decode_soul(&soul_json).map(|soul| summarize_soul(&soul))
-    })?;
+    let sql = if include_session_clones {
+        "
+        SELECT character_id, character_name, soul_kind, source_soul_id, source_savepoint_id,
+               avatar_image_id, last_updated, recent_count, core_count
+        FROM souls
+        ORDER BY last_updated DESC, character_name ASC
+        "
+    } else {
+        "
+        SELECT character_id, character_name, soul_kind, source_soul_id, source_savepoint_id,
+               avatar_image_id, last_updated, recent_count, core_count
+        FROM souls
+        WHERE soul_kind != 'session_clone'
+        ORDER BY last_updated DESC, character_name ASC
+        "
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], soul_summary_from_row)?;
 
-    rows.filter_map(|row| match row {
-        Ok(summary) if include_session_clones || summary.soul_kind != "session_clone" => {
-            Some(Ok(summary))
-        }
-        Ok(_) => None,
-        Err(err) => Some(Err(err)),
-    })
-    .collect()
+    rows.collect()
 }
 
 pub fn get_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<Soul> {
@@ -570,13 +702,44 @@ pub fn rename_conversation(
 pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<ConversationSummary>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id FROM conversations
-        ORDER BY updated_at DESC, created_at DESC
+        SELECT
+            c.id,
+            c.title,
+            c.soul_id,
+            COALESCE(s.source_savepoint_id, NULL),
+            c.created_at,
+            c.updated_at,
+            (
+                SELECT content
+                FROM messages
+                WHERE conversation_id = c.id
+                ORDER BY id DESC
+                LIMIT 1
+            ) AS last_message_preview,
+            (
+                SELECT COUNT(*)
+                FROM messages
+                WHERE conversation_id = c.id
+            ) AS message_count
+        FROM conversations c
+        LEFT JOIN souls s ON s.character_id = c.soul_id
+        ORDER BY c.updated_at DESC, c.created_at DESC
         ",
     )?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    rows.map(|row| get_conversation_summary(conn, &row?))
-        .collect()
+    let rows = stmt.query_map([], |row| {
+        let preview: Option<String> = row.get(6)?;
+        Ok(ConversationSummary {
+            conversation_id: row.get(0)?,
+            title: row.get(1)?,
+            soul_id: row.get(2)?,
+            source_savepoint_id: row.get(3)?,
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+            last_message_preview: preview.map(compact_preview),
+            message_count: row.get(7)?,
+        })
+    })?;
+    rows.collect()
 }
 
 pub fn get_conversation_summary(
@@ -619,6 +782,11 @@ fn sanitize_conversation_title(title: &str) -> String {
     title.chars().take(120).collect()
 }
 
+fn compact_preview(content: String) -> String {
+    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(140).collect()
+}
+
 fn last_message_preview(
     conn: &Connection,
     conversation_id: &str,
@@ -634,12 +802,7 @@ fn last_message_preview(
         |row| row.get::<_, String>(0),
     )
     .optional()
-    .map(|value| {
-        value.map(|content| {
-            let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
-            compact.chars().take(140).collect()
-        })
-    })
+    .map(|value| value.map(compact_preview))
 }
 
 fn count_messages(conn: &Connection, conversation_id: &str) -> rusqlite::Result<i64> {
