@@ -37,6 +37,10 @@ import {
   SoulSummary,
   TurnDebug,
   ContextMode,
+  clearSoulMemories,
+  clearSoulProfileScenario,
+  clearSoulRecentEvents,
+  clearSoulWorldState,
   compileContext,
   createUserImageMessageFromFile,
   createDefaultSoul,
@@ -637,13 +641,6 @@ export function App() {
     };
   }
 
-  function mirrorSettingIntoSoul(nextSoul: Soul, nextSetting: SettingSoul) {
-    return {
-      ...nextSoul,
-      world: nextSetting.world,
-    };
-  }
-
   async function persistCurrentSetting() {
     if (!setting) return null;
     const nextSetting = applySettingFields(setting);
@@ -719,6 +716,48 @@ export function App() {
   async function refreshContext(soulId: string, conversationId: string) {
     const preview = await compileContext(soulId, conversationId);
     setContext(preview);
+  }
+
+  async function handleSoulRepair(kind: "world" | "scenario" | "events" | "memories") {
+    if (!soul) return;
+    const labels = {
+      world: "clear world state",
+      scenario: "clear profile scenario",
+      events: "clear recent events",
+      memories: "clear memories",
+    } as const;
+    const confirmed = window.confirm(`Debug repair: ${labels[kind]} for ${soul.character_name}?`);
+    if (!confirmed) return;
+    setBusy(true);
+    try {
+      const nextSoul =
+        kind === "world"
+          ? await clearSoulWorldState(soul.character_id)
+          : kind === "scenario"
+            ? await clearSoulProfileScenario(soul.character_id)
+            : kind === "events"
+              ? await clearSoulRecentEvents(soul.character_id)
+              : await clearSoulMemories(soul.character_id);
+      setSoul(nextSoul);
+      setSouls((current: SoulSummary[]) =>
+        current.map((item: SoulSummary) =>
+          item.character_id === nextSoul.character_id
+            ? {
+                ...item,
+                recent_count: nextSoul.memory.recent.length,
+                core_count: nextSoul.memory.core.length,
+              }
+            : item,
+        ),
+      );
+      await refreshContext(nextSoul.character_id, currentConversationId);
+      logDev("warn", "app", "Soul debug repair applied", { kind, soul_id: nextSoul.character_id });
+      setStatus(`Debug repair applied: ${labels[kind]}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function refreshAssistantVariants(conversationId: string, nextMessages = messages) {
@@ -912,14 +951,8 @@ export function App() {
     };
 
     try {
-      const activeSetting = await persistCurrentSetting();
-      const shouldSeedSettingWorld = Boolean(
-        activeMessages.length === 0 && chatStartMode === "continue" && activeSetting,
-      );
-      const activeSoul = shouldSeedSettingWorld
-        ? mirrorSettingIntoSoul(soul, activeSetting!)
-        : soul;
-      await upsertSoul(activeSoul);
+      await persistCurrentSetting();
+      await upsertSoul(soul);
       if (provider === "API") {
         setMessages((current) =>
           seedStreamingTurn(current, turnConversationId, text, replacementAssistantId),
@@ -932,7 +965,7 @@ export function App() {
         provider === "API"
           ? await sendApiTurn(
               turnConversationId,
-              activeSoul.character_id,
+              soul.character_id,
               text,
               mode,
               apiSettings,
@@ -944,7 +977,7 @@ export function App() {
             )
           : await sendMockTurn(
               turnConversationId,
-              activeSoul.character_id,
+              soul.character_id,
               text,
               mode,
               replacementAssistantId,
@@ -955,10 +988,6 @@ export function App() {
       }
       if (result.conversation_id !== currentConversationIdRef.current) {
         return;
-      }
-      if (activeSetting && shouldSeedSettingWorld) {
-        setSetting(activeSetting);
-        setEditorFieldsFromSetting(activeSetting);
       }
       setSoul(result.soul);
       setMessages(result.messages);
@@ -1174,14 +1203,18 @@ export function App() {
     if (!soul || busy) return;
     if (chatStartMode === "continue") {
       const existingConversation = conversations.find(
-        (conversation) => conversation.conversation_id === defaultConversationId,
+        (conversation) =>
+          conversation.conversation_id === defaultConversationId ||
+          conversation.source_savepoint_id === soul.character_id ||
+          (Boolean(soul.source_savepoint_id) &&
+            conversation.source_savepoint_id === soul.source_savepoint_id),
       );
-      setActiveConversationId(defaultConversationId);
-      setSessionContinuityLabel("Using persistent Soul continuity");
-      setCurrentSessionTitle(existingConversation?.title ?? `${soul.character_name} Continuity`);
-      setMessages(existingConversation ? await listConversationMessages(defaultConversationId) : []);
-      setView("chat");
-      return;
+      if (existingConversation) {
+        await handleSelectConversation(existingConversation);
+        setSessionContinuityLabel("Using existing isolated Session");
+        setView("chat");
+        return;
+      }
     }
 
     setBusy(true);
@@ -1198,7 +1231,7 @@ export function App() {
       setSouls(await listSouls());
       setConversations(await listConversations());
       setLastTurnDebug(null);
-      setSessionContinuityLabel("Isolated Session; source Soul remains unchanged");
+      setSessionContinuityLabel("Isolated Session; source savepoints remain unchanged");
       setCurrentSessionTitle(session.conversation.title);
       setStatus("Started isolated Session from the selected Soul.");
       logDev("info", "context", "new session cloned selected Soul", {
@@ -1497,22 +1530,26 @@ export function App() {
     }
   }
 
-  async function handleDeleteChat() {
+  async function handleDeleteChat(conversationId = currentConversationId) {
     if (!soul) return;
     const confirmed = window.confirm(
-      "Delete this local chat? Messages will be removed, but Soul memory and stats will remain.",
+      "Delete this local session? Messages, payload logs, and isolated session clones will be removed. Source savepoints stay intact.",
     );
     if (!confirmed) return;
 
     setBusy(true);
     try {
-      await deleteConversation(currentConversationId);
-      setActiveConversationId(null);
-      setConversations(await listConversations());
-      setMessages([]);
-      setContext(await compileContext(soul.character_id, currentConversationId));
+      await deleteConversation(conversationId);
+      const nextConversations = await listConversations();
+      setConversations(nextConversations);
+      if (conversationId === currentConversationId) {
+        setActiveConversationId(null);
+        setMessages([]);
+        setContext(null);
+        setView("library");
+      }
       setLastTurnDebug(null);
-      setStatus("Chat deleted; Soul memory kept");
+      setStatus("Session deleted; source savepoints kept");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1978,6 +2015,7 @@ export function App() {
             <ArrowLeft size={18} />
             <span>Library</span>
           </button>
+          <SoulAvatar soulName={soul?.character_name ?? "Mnemosyne"} asset={selectedAvatarAsset} />
           <div>
             <span className="eyebrow">
               {setting?.setting_name ?? "Local Setting"} / {provider} / {mode}
@@ -1998,6 +2036,16 @@ export function App() {
             <p className="session-state-label">{sessionContinuityLabel}</p>
           </div>
           <div className="chat-top-actions">
+            <button
+              className="ghost-action danger"
+              type="button"
+              title="Delete session"
+              onClick={() => handleDeleteChat()}
+              disabled={busy}
+            >
+              <Trash2 size={16} />
+              <span>Delete Session</span>
+            </button>
             <div className="token-pill">
               {context?.estimated_tokens ?? 0}
               <span>tok</span>
@@ -3005,19 +3053,27 @@ export function App() {
               <p className="muted">No named chats for this Soul yet.</p>
             ) : (
               visibleConversations.slice(0, 8).map((conversation) => (
-                <button
+                <div
                   key={conversation.conversation_id}
-                  type="button"
                   className="session-row"
-                  onClick={() => handleSelectConversation(conversation)}
-                  disabled={busy}
                 >
-                  <span>{conversation.title}</span>
-                  <small>
-                    {conversation.message_count} messages
-                    {conversation.last_message_preview ? ` / ${conversation.last_message_preview}` : ""}
-                  </small>
-                </button>
+                  <button type="button" onClick={() => handleSelectConversation(conversation)} disabled={busy}>
+                    <span>{conversation.title}</span>
+                    <small>
+                      {conversation.message_count} messages
+                      {conversation.last_message_preview ? ` / ${conversation.last_message_preview}` : ""}
+                    </small>
+                  </button>
+                  <button
+                    type="button"
+                    className="session-delete-button"
+                    title="Delete session"
+                    onClick={() => handleDeleteChat(conversation.conversation_id)}
+                    disabled={busy}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
               ))
             )}
           </section>
@@ -3579,6 +3635,46 @@ export function App() {
 
           <section className="context-preview">
             <h2>Context</h2>
+            <dl className="diagnostic-grid context-source-grid">
+              <div>
+                <dt>WORLD SNAPSHOT source</dt>
+                <dd>session_world / setting.world, legacy soul.world fallback only</dd>
+              </div>
+              <div>
+                <dt>CHARACTER SNAPSHOT source</dt>
+                <dd>soul.profile/global/trauma/arousal</dd>
+              </div>
+              <div>
+                <dt>RELEVANT MEMORIES source</dt>
+                <dd>soul.memory</dd>
+              </div>
+              <div>
+                <dt>RELATIONSHIPS source</dt>
+                <dd>soul.relationships</dd>
+              </div>
+              <div>
+                <dt>LATEST EXCHANGE source</dt>
+                <dd>visible conversation messages</dd>
+              </div>
+            </dl>
+            <div className="repair-actions" aria-label="Debug repair tools">
+              <button className="ghost-action" type="button" onClick={() => handleSoulRepair("world")} disabled={busy || !soul}>
+                <Trash2 size={16} />
+                <span>Clear World State</span>
+              </button>
+              <button className="ghost-action" type="button" onClick={() => handleSoulRepair("scenario")} disabled={busy || !soul}>
+                <Trash2 size={16} />
+                <span>Clear Scenario</span>
+              </button>
+              <button className="ghost-action" type="button" onClick={() => handleSoulRepair("events")} disabled={busy || !soul}>
+                <Trash2 size={16} />
+                <span>Clear Recent Events</span>
+              </button>
+              <button className="ghost-action danger" type="button" onClick={() => handleSoulRepair("memories")} disabled={busy || !soul}>
+                <Trash2 size={16} />
+                <span>Clear Memories</span>
+              </button>
+            </div>
             <pre>{context?.text ?? "No context compiled yet."}</pre>
           </section>
         </section>
@@ -4258,6 +4354,7 @@ function settingFromImport(raw: unknown, fallbackName: string): SettingSoul {
     setting_id: stringFrom(record.setting_id) || crypto.randomUUID(),
     setting_name:
       stringFrom(record.setting_name) || stringFrom(record.name) || fallbackSettingName,
+    scenario: stringFrom(record.scenario) || stringFrom(world.scenario),
     last_updated: Math.floor(Date.now() / 1000),
     turn_counter: Number(record.turn_counter) || 0,
     world: {

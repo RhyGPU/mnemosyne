@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-use crate::soul::{current_timestamp, MemoryEntry, MemorySourceType, Soul};
+use crate::soul::{current_timestamp, MemoryEntry, MemorySourceType, Soul, TruthStatus};
 
 pub trait Embedder {
     fn embed(&self, text: &str) -> Vec<f32>;
@@ -105,6 +105,8 @@ pub fn create_scored_memory(soul: &Soul, content: &str, tag: &str) -> MemoryEntr
         interpretation: None,
         confidence: None,
         objective_event_id: None,
+        truth_status: TruthStatus::Unknown,
+        architecture_verified: false,
     };
     let score = MemoryScorer::default().score(soul, &memory);
     let salience = (score * 100.0).round();

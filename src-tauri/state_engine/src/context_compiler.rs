@@ -3,7 +3,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::soul::{MemoryEntry, MemorySourceType, Soul};
+use crate::setting::SessionWorld;
+use crate::soul::{MemoryEntry, MemorySourceType, Soul, TruthStatus};
 
 const DEFAULT_TOKEN_BUDGET: usize = 2_500;
 const MIN_RECENT_MEMORY_SALIENCE: f32 = 65.0;
@@ -84,14 +85,36 @@ impl Default for ContextBudget {
 }
 
 pub fn compile_context_for_messages(soul: &Soul, messages: &[ContextMessage]) -> ContextPreview {
-    compile_context_with_budget(soul, messages, &ContextBudget::default())
+    compile_context_with_budget_and_world(soul, None, messages, &ContextBudget::default())
+}
+
+pub fn compile_context_for_session(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    messages: &[ContextMessage],
+) -> ContextPreview {
+    compile_context_with_budget_and_world(soul, session_world, messages, &ContextBudget::default())
 }
 
 pub fn compile_context_for_separate_user_message(
     soul: &Soul,
     messages: &[ContextMessage],
 ) -> ContextPreview {
-    compile_context_with_budget_and_options(soul, messages, &ContextBudget::default(), true)
+    compile_context_with_budget_and_options(soul, None, messages, &ContextBudget::default(), true)
+}
+
+pub fn compile_context_for_session_separate_user_message(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    messages: &[ContextMessage],
+) -> ContextPreview {
+    compile_context_with_budget_and_options(
+        soul,
+        session_world,
+        messages,
+        &ContextBudget::default(),
+        true,
+    )
 }
 
 pub fn compile_context_with_budget(
@@ -99,20 +122,31 @@ pub fn compile_context_with_budget(
     messages: &[ContextMessage],
     budget: &ContextBudget,
 ) -> ContextPreview {
-    compile_context_with_budget_and_options(soul, messages, budget, false)
+    compile_context_with_budget_and_world(soul, None, messages, budget)
+}
+
+pub fn compile_context_with_budget_and_world(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    messages: &[ContextMessage],
+    budget: &ContextBudget,
+) -> ContextPreview {
+    compile_context_with_budget_and_options(soul, session_world, messages, budget, false)
 }
 
 fn compile_context_with_budget_and_options(
     soul: &Soul,
+    session_world: Option<&SessionWorld>,
     messages: &[ContextMessage],
     budget: &ContextBudget,
     separate_user_message_follows: bool,
 ) -> ContextPreview {
     let mut truncated = false;
-    let section_builders = [
-        build_world_section(soul, budget),
+    let section_builders = vec![
+        build_world_section(soul, session_world, budget),
         build_profile_section(soul, budget),
         build_memory_section(soul, messages, budget),
+        build_verified_memory_layer_reply_section(soul, budget),
         build_relationship_section(soul, budget),
         build_recent_chat_section(messages, budget),
         build_latest_exchange_section(messages, budget, separate_user_message_follows),
@@ -244,7 +278,7 @@ fn build_memory_section(
     for scored in selected_recent {
         lines.push(format!(
             "Recent: [{} / salience {:.0}] {}",
-            memory_source_label(scored.memory),
+            memory_context_label(scored.memory),
             scored.memory.salience,
             scored.memory.content.trim()
         ));
@@ -261,31 +295,80 @@ fn build_memory_section(
     )
 }
 
-fn build_world_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
+fn build_verified_memory_layer_reply_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
+    let Some(reply) = soul
+        .debug_memory_layer_replies
+        .iter()
+        .find(|reply| {
+            reply.architecture_verified
+                && !reply.nonce.trim().is_empty()
+                && !reply.content.trim().is_empty()
+        })
+    else {
+        return BuiltSection {
+            text: String::new(),
+            truncated: false,
+        };
+    };
+
+    section_from_lines(
+        "[MEMORY LAYER REPLY - VERIFIED DEBUG]",
+        vec![
+            format!("nonce: {}", reply.nonce.trim()),
+            format!("content: {}", reply.content.trim()),
+        ],
+        budget.memory_tokens.min(budget.max_tokens),
+    )
+}
+
+fn build_world_section(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    budget: &ContextBudget,
+) -> BuiltSection {
+    let (source, setting_name, scenario, world) = if let Some(session_world) = session_world {
+        (
+            "session_world",
+            session_world.setting_name.as_str(),
+            session_world.scenario.as_str(),
+            session_world.world_log(),
+        )
+    } else {
+        (
+            "legacy character_soul.world",
+            "Legacy character world",
+            "",
+            soul.world.clone(),
+        )
+    };
     let mut lines = vec![
+        format!("Source: {source}"),
+        format!("World: {}", fallback(setting_name, "Unnamed World")),
         format!(
             "Location: {}",
-            fallback(&soul.world.location, "Unspecified")
+            fallback(&world.location, "Unspecified")
         ),
         format!(
             "Time elapsed: {}",
-            normalize_time_elapsed_display(fallback(&soul.world.time_elapsed, "Unknown"))
+            normalize_time_elapsed_display(fallback(&world.time_elapsed, "Unknown"))
         ),
     ];
+    if !scenario.trim().is_empty() {
+        lines.push(format!("Scenario: {}", scenario.trim()));
+    }
 
     lines.push(format_list(
         "Active plots",
-        &soul.world.active_plots,
+        &world.active_plots,
         "No active plot has been established.",
     ));
     lines.push(format_list(
         "Key objects",
-        &soul.world.key_objects,
+        &world.key_objects,
         "No key objects are being tracked.",
     ));
 
-    let mut recent_events = soul
-        .world
+    let mut recent_events = world
         .recent_events
         .iter()
         .rev()
@@ -740,6 +823,37 @@ fn memory_source_label(memory: &MemoryEntry) -> String {
         parts.push("uncertain".into());
     }
     parts.join(" / ")
+}
+
+fn memory_context_label(memory: &MemoryEntry) -> String {
+    let truth_status = memory.truth_status;
+    if memory.architecture_verified && truth_status.is_engine_verified() {
+        return truth_status.as_label().to_string();
+    }
+    if !memory.architecture_verified
+        && (truth_status != TruthStatus::Unknown || is_architecture_related_memory(&memory.content))
+    {
+        return format!("{} / unverified", truth_status.as_label());
+    }
+    memory_source_label(memory)
+}
+
+fn is_architecture_related_memory(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "memory layer",
+        "state updater",
+        "hidden system",
+        "backend",
+        "provider",
+        " api",
+        "system responded",
+        "direct state injection",
+        "model spoke",
+        "not fiction",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn is_generic_filler_memory(memory: &MemoryEntry) -> bool {
@@ -1408,6 +1522,86 @@ mod tests {
     }
 
     #[test]
+    fn relevant_memory_context_labels_unverified_architecture_claims() {
+        let mut soul = new_default_soul("Echo-0");
+        let mut claim = memory(
+            "claim",
+            "Echo-0 believes it contacted the memory layer.",
+            "identity_continuity",
+            92.0,
+            92.0,
+            1,
+        );
+        claim.truth_status = TruthStatus::CharacterBelief;
+        claim.architecture_verified = false;
+        soul.memory.recent.push(claim);
+
+        let preview = compile_context_for_messages(&soul, &[]);
+        let memories = section_text(&preview.text, "[RELEVANT MEMORIES]");
+
+        assert!(memories.contains("[character_belief / unverified"));
+        assert!(memories.contains("memory layer"));
+    }
+
+    #[test]
+    fn world_snapshot_uses_session_world_when_present() {
+        let mut soul = new_default_soul("Echo-0");
+        soul.world.location = "Wrong character-embedded room".into();
+        let mut world = crate::setting::session_world_from_legacy_world(
+            "Testing Room",
+            Some("testing-room".into()),
+            &crate::soul::WorldLog {
+                location: "Session lab".into(),
+                active_plots: vec!["Run Echo-0 verification".into()],
+                recent_events: vec!["Echo-0 entered the testing room.".into()],
+                key_objects: vec!["debug terminal".into()],
+                time_elapsed: "Session start".into(),
+            },
+        );
+        world.scenario = "Objective debug room.".into();
+
+        let preview = compile_context_for_session(&soul, Some(&world), &[]);
+        let world_section = section_text(&preview.text, "[WORLD SNAPSHOT]");
+
+        assert!(world_section.contains("Source: session_world"));
+        assert!(world_section.contains("World: Testing Room"));
+        assert!(world_section.contains("Session lab"));
+        assert!(world_section.contains("Objective debug room."));
+        assert!(!world_section.contains("Wrong character-embedded room"));
+    }
+
+    #[test]
+    fn legacy_world_snapshot_is_labeled_when_no_session_world_exists() {
+        let mut soul = new_default_soul("Echo-0");
+        soul.world.location = "Legacy embedded room".into();
+
+        let preview = compile_context_for_messages(&soul, &[]);
+        let world_section = section_text(&preview.text, "[WORLD SNAPSHOT]");
+
+        assert!(world_section.contains("Source: legacy character_soul.world"));
+        assert!(world_section.contains("Legacy embedded room"));
+    }
+
+    #[test]
+    fn verified_memory_layer_reply_appears_in_debug_section() {
+        let mut soul = new_default_soul("Echo-0");
+        soul.debug_memory_layer_replies.push(crate::soul::MemoryLayerReply {
+            nonce: "nonce-123".into(),
+            content: "Debug memory-layer nonce reply received.".into(),
+            created_at: 10,
+            architecture_verified: true,
+        });
+
+        let preview = compile_context_for_messages(&soul, &[]);
+
+        assert!(preview.text.contains("[MEMORY LAYER REPLY - VERIFIED DEBUG]"));
+        assert!(preview.text.contains("nonce: nonce-123"));
+        assert!(preview
+            .text
+            .contains("content: Debug memory-layer nonce reply received."));
+    }
+
+    #[test]
     fn imported_log_memories_are_deprioritized_until_referenced() {
         let mut soul = new_default_soul("Aurora");
         let mut imported = memory(
@@ -1572,6 +1766,8 @@ mod tests {
             interpretation: None,
             confidence: None,
             objective_event_id: None,
+            truth_status: TruthStatus::Unknown,
+            architecture_verified: false,
         }
     }
 

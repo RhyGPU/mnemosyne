@@ -30,6 +30,8 @@ pub struct Soul {
     pub arousal: ArousalState,
     pub memory: MemoryStore,
     #[serde(default)]
+    pub debug_memory_layer_replies: Vec<MemoryLayerReply>,
+    #[serde(default)]
     pub world: WorldLog,
 }
 
@@ -146,6 +148,39 @@ impl MemorySourceType {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TruthStatus {
+    Fiction,
+    SceneEvent,
+    CharacterBelief,
+    NarratorClaim,
+    UserClaimed,
+    VerifiedEngine,
+    ActualSystemEvent,
+    #[default]
+    Unknown,
+}
+
+impl TruthStatus {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            TruthStatus::Fiction => "fiction",
+            TruthStatus::SceneEvent => "scene_event",
+            TruthStatus::CharacterBelief => "character_belief",
+            TruthStatus::NarratorClaim => "narrator_claim",
+            TruthStatus::UserClaimed => "user_claimed",
+            TruthStatus::VerifiedEngine => "verified_engine",
+            TruthStatus::ActualSystemEvent => "actual_system_event",
+            TruthStatus::Unknown => "unknown",
+        }
+    }
+
+    pub fn is_engine_verified(self) -> bool {
+        matches!(self, TruthStatus::VerifiedEngine | TruthStatus::ActualSystemEvent)
+    }
+}
+
 const fn default_lived_experience() -> bool {
     true
 }
@@ -182,6 +217,20 @@ pub struct MemoryEntry {
     pub confidence: Option<f32>,
     #[serde(default)]
     pub objective_event_id: Option<String>,
+    #[serde(default)]
+    pub truth_status: TruthStatus,
+    #[serde(default)]
+    pub architecture_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryLayerReply {
+    pub nonce: String,
+    pub content: String,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub architecture_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -277,6 +326,7 @@ impl Soul {
                 recent: Vec::new(),
                 schemas: Vec::new(),
             },
+            debug_memory_layer_replies: Vec::new(),
             world: WorldLog::default(),
         }
     }
@@ -304,6 +354,7 @@ pub fn session_soul_from_savepoint(base: &Soul) -> Soul {
             .unwrap_or_else(|| base.character_id.clone()),
     );
     session.created_from_name = Some(base.character_name.clone());
+    session.debug_memory_layer_replies.clear();
     session.last_updated = now as i64;
     session
 }

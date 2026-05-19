@@ -31,6 +31,16 @@ export type RecentMemory = {
   interpretation?: string | null;
   confidence?: number | null;
   objective_event_id?: string | null;
+  truth_status?:
+    | "fiction"
+    | "scene_event"
+    | "character_belief"
+    | "narrator_claim"
+    | "user_claimed"
+    | "verified_engine"
+    | "actual_system_event"
+    | "unknown";
+  architecture_verified?: boolean;
 };
 
 export type SchemaMemory = {
@@ -88,6 +98,12 @@ export type Soul = {
     recent: RecentMemory[];
     schemas: SchemaMemory[];
   };
+  debug_memory_layer_replies?: Array<{
+    nonce: string;
+    content: string;
+    created_at: number;
+    architecture_verified: boolean;
+  }>;
   world: {
     location: string;
     active_plots: string[];
@@ -101,6 +117,7 @@ export type SettingSoul = {
   schema_version: number;
   setting_id: string;
   setting_name: string;
+  scenario?: string;
   last_updated: number;
   turn_counter: number;
   world: Soul["world"];
@@ -123,6 +140,8 @@ export type ConversationSummary = {
   title: string;
   soul_id: string;
   source_savepoint_id: string | null;
+  world_id?: string | null;
+  source_setting_id?: string | null;
   created_at: number;
   updated_at: number;
   last_message_preview: string | null;
@@ -410,7 +429,15 @@ let browserPayloadLogs: LlmPayloadLog[] = [];
 let browserProviderProfiles: ProviderProfile[] = [];
 let browserImageAssets: ImageAsset[] = [];
 let browserMessageAttachments: MessageAttachment[] = [];
-let browserConversations: Array<{ conversation_id: string; title: string; soul_id: string; created_at: number; updated_at: number }> = [];
+let browserConversations: Array<{
+  conversation_id: string;
+  title: string;
+  soul_id: string;
+  world_id?: string | null;
+  source_setting_id?: string | null;
+  created_at: number;
+  updated_at: number;
+}> = [];
 const previewTurnSnapshots = new Map<string, { soul: Soul; userText: string }>();
 let nextMessageId = 1;
 let nextVariantId = 1;
@@ -570,6 +597,56 @@ export function getSoul(soulId: string): Promise<Soul> {
     if (!soul) throw new Error("Soul not found");
     return soul;
   });
+}
+
+function updatePreviewSoul(soul: Soul): Soul {
+  const index = browserSouls.findIndex((item) => item.character_id === soul.character_id);
+  if (index >= 0) browserSouls[index] = soul;
+  return soul;
+}
+
+export function clearSoulWorldState(soulId: string): Promise<Soul> {
+  return invokeOrPreview("clear_soul_world_state", { soulId }, () => {
+    const soul = getPreviewSoulForRepair(soulId);
+    soul.world = {
+      location: "Unspecified starting scene.",
+      active_plots: ["Establish the first scene"],
+      recent_events: [],
+      key_objects: [],
+      time_elapsed: "Session start",
+    };
+    return updatePreviewSoul(soul);
+  });
+}
+
+export function clearSoulProfileScenario(soulId: string): Promise<Soul> {
+  return invokeOrPreview("clear_soul_profile_scenario", { soulId }, () => {
+    const soul = getPreviewSoulForRepair(soulId);
+    soul.profile.scenario = "";
+    return updatePreviewSoul(soul);
+  });
+}
+
+export function clearSoulRecentEvents(soulId: string): Promise<Soul> {
+  return invokeOrPreview("clear_soul_recent_events", { soulId }, () => {
+    const soul = getPreviewSoulForRepair(soulId);
+    soul.world.recent_events = [];
+    return updatePreviewSoul(soul);
+  });
+}
+
+export function clearSoulMemories(soulId: string): Promise<Soul> {
+  return invokeOrPreview("clear_soul_memories", { soulId }, () => {
+    const soul = getPreviewSoulForRepair(soulId);
+    soul.memory = { core: [], recent: [], schemas: [] };
+    return updatePreviewSoul(soul);
+  });
+}
+
+function getPreviewSoulForRepair(soulId: string): Soul {
+  const soul = browserSouls.find((item) => item.character_id === soulId);
+  if (!soul) throw new Error("Soul not found");
+  return structuredClone(soul);
 }
 
 export function getSetting(settingId: string): Promise<SettingSoul> {
@@ -1152,6 +1229,7 @@ function makePreviewSetting(settingName: string): SettingSoul {
     schema_version: 1,
     setting_id: crypto.randomUUID(),
     setting_name: settingName.trim() || "Untitled Setting",
+    scenario: "",
     last_updated: Math.floor(Date.now() / 1000),
     turn_counter: 0,
     world: {
@@ -1203,6 +1281,8 @@ function ensurePreviewConversation(conversationId: string, soulId: string, title
       conversation_id: conversationId,
       title: sanitizePreviewConversationTitle(title || "Untitled Session"),
       soul_id: soulId,
+      world_id: null,
+      source_setting_id: null,
       created_at: now,
       updated_at: now,
     };
@@ -1218,6 +1298,8 @@ function summarizePreviewConversation(conversation: {
   conversation_id: string;
   title: string;
   soul_id: string;
+  world_id?: string | null;
+  source_setting_id?: string | null;
   created_at: number;
   updated_at: number;
 }): ConversationSummary {
@@ -1231,6 +1313,8 @@ function summarizePreviewConversation(conversation: {
     title: conversation.title,
     soul_id: conversation.soul_id,
     source_savepoint_id: soul?.source_savepoint_id ?? null,
+    world_id: conversation.world_id ?? null,
+    source_setting_id: conversation.source_setting_id ?? null,
     created_at: conversation.created_at,
     updated_at: conversation.updated_at,
     last_message_preview: lastMessage?.content.split(/\s+/).join(" ").slice(0, 140) ?? null,

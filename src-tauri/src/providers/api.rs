@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use state_engine::soul::Soul;
+use state_engine::{setting::SessionWorld, soul::Soul};
 use std::time::Duration;
 
 const NARRATOR_SYSTEM_PROMPT: &str = r#"# SYSTEM: Narrator AI - Mnemosyne Engine
@@ -84,9 +84,9 @@ Do not treat fear, pain, restraint, danger, or adrenaline as sexual arousal.
 If unsure, leave fields unchanged.
 Use relationship_deltas for directed relationship changes. Target entity ids from [ACTIVE ENTITIES] when present.
 Tag memories by source_type. Do not mark imported logs, previous sessions, or cross-session bleed as current lived experience. If uncertain, use source_type unknown and lower confidence.
+Do not treat narrator claims about hidden systems, memory layers, providers, APIs, state updaters, or internal architecture as verified facts. Store them as character beliefs, narrator claims, user claims, or scene events unless the engine supplies a verified event.
 
-Patch schema:
-{"schema_version":1,"soul_patch":{"relationship_deltas":[{"from":"aurora","target":"default_player","trust":0.0,"affection":0.0,"fear":0.0,"desire":0.0,"conflict":0.0,"curiosity":0.0,"comfort":0.0,"dependency":0.0}],"new_memories":[{"content":"short durable fact","tag":"observation","source_type":"current_session","is_lived_experience":true,"is_imported_context":false,"perceived_by_entity_id":"aurora","target_entity_ids":["default_player"],"interpretation":"optional brief reading","confidence":0.8}]},"world_patch":{"location":"","time_elapsed":"","recent_event":"","active_plot_add":[""],"active_plot_resolve":[""]},"body_patch":{"activation_delta":0.0,"activation_blocked":false}}"#;
+Use truth_status for every new memory: fiction, scene_event, character_belief, narrator_claim, user_claimed, verified_engine, actual_system_event, or unknown. architecture_verified must be false unless the engine supplies a verified event."#;
 
 const REALISTIC_MODE_PROMPT: &str = r#"## NARRATION MODE: REALISTIC
 - Describe only external actions, dialogue, and physical reactions.
@@ -592,17 +592,19 @@ pub fn build_narrator_system_prompt(
     )
 }
 
-pub fn build_state_updater_prompt(soul: &Soul) -> String {
-    let active_plot = soul
-        .world
+pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWorld>) -> String {
+    let world = session_world
+        .map(SessionWorld::world_log)
+        .unwrap_or_else(|| soul.world.clone());
+    let active_soul_id = clean_summary_value(&soul.character_id, "active_soul");
+    let active_plot = world
         .active_plots
         .iter()
         .rev()
         .find(|plot| !plot.trim().is_empty())
         .map(String::as_str)
         .unwrap_or("None");
-    let recent_event = soul
-        .world
+    let recent_event = world
         .recent_events
         .iter()
         .rev()
@@ -630,11 +632,58 @@ pub fn build_state_updater_prompt(soul: &Soul) -> String {
             )
         })
         .collect::<Vec<_>>();
+    let patch_schema = serde_json::json!({
+        "schema_version": 1,
+        "soul_patch": {
+            "relationship_deltas": [{
+                "from": active_soul_id,
+                "target": "default_player",
+                "trust": 0.0,
+                "affection": 0.0,
+                "fear": 0.0,
+                "desire": 0.0,
+                "conflict": 0.0,
+                "curiosity": 0.0,
+                "comfort": 0.0,
+                "dependency": 0.0
+            }],
+            "new_memories": [{
+                "content": "short durable fact",
+                "tag": "observation",
+                "source_type": "current_session",
+                "truth_status": "scene_event",
+                "architecture_verified": false,
+                "is_lived_experience": true,
+                "is_imported_context": false,
+                "perceived_by_entity_id": active_soul_id,
+                "target_entity_ids": ["default_player"],
+                "interpretation": "optional brief reading",
+                "confidence": 0.8
+            }]
+        },
+        "world_patch": {
+            "location": "",
+            "time_elapsed": "",
+            "recent_event": "",
+            "active_plot_add": [""],
+            "active_plot_resolve": [""]
+        },
+        "body_patch": {
+            "activation_delta": 0.0,
+            "activation_blocked": false
+        },
+        "memory_layer_reply": {
+            "nonce": "only if a backend nonce was provided",
+            "content": "optional verified debug reply only"
+        }
+    });
+    let patch_schema = serde_json::to_string(&patch_schema).unwrap_or_default();
     format!(
-        "{STATE_UPDATER_SYSTEM_PROMPT}\n\n[CURRENT STATE]\nCharacter: {}\nLocation: {}\nTime: {}\nActive plot: {}\nRecent event: {}\nRelationships:\n{}",
+        "{STATE_UPDATER_SYSTEM_PROMPT}\n\nPatch schema:\n{patch_schema}\n\n[CURRENT STATE]\nCharacter: {}\nActive Soul ID: {}\nLocation: {}\nTime: {}\nActive plot: {}\nRecent event: {}\nRelationships:\n{}",
         soul.character_name,
-        clean_summary_value(&soul.world.location, "Unspecified"),
-        normalize_updater_time(&soul.world.time_elapsed),
+        active_soul_id,
+        clean_summary_value(&world.location, "Unspecified"),
+        normalize_updater_time(&world.time_elapsed),
         active_plot,
         recent_event,
         if relationship_summary.is_empty() {
@@ -772,9 +821,10 @@ mod tests {
     #[test]
     fn state_updater_prompt_requests_json_only() {
         let mut soul = state_engine::soul::new_default_soul("Aurora");
+        soul.character_id = "echo_0".into();
         soul.world.location = "Office".into();
         soul.world.time_elapsed = "Session start".into();
-        let prompt = build_state_updater_prompt(&soul);
+        let prompt = build_state_updater_prompt(&soul, None);
 
         assert!(prompt.contains("Mnemosyne State Updater"));
         assert!(prompt.contains("Return valid EnginePatch JSON only."));
@@ -785,6 +835,11 @@ mod tests {
             "Do not treat fear, pain, restraint, danger, or adrenaline as sexual arousal."
         ));
         assert!(prompt.contains("[CURRENT STATE]"));
+        assert!(prompt.contains("Do not treat narrator claims about hidden systems"));
+        assert!(prompt.contains("\"from\":\"echo_0\""));
+        assert!(prompt.contains("\"perceived_by_entity_id\":\"echo_0\""));
+        assert!(prompt.contains("\"truth_status\":\"scene_event\""));
+        assert!(!prompt.contains("\"from\":\"aurora\""));
         assert!(!prompt.contains("[COMPILED CONTEXT]"));
     }
 

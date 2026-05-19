@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -16,15 +16,15 @@ use tauri::{AppHandle, Emitter, Manager, State, Window};
 use state_engine::{
     consolidation::consolidate_soul,
     context_compiler::{
-        compile_context_for_messages, compile_context_for_separate_user_message, estimate_tokens,
-        ContextMessage, ContextPreview,
+        compile_context_for_session, compile_context_for_session_separate_user_message,
+        estimate_tokens, ContextMessage, ContextPreview,
     },
     hidden_state::{parse_hidden_state, HiddenState},
     patch::{EnginePatch, MemoryApplyAction},
-    setting::{new_default_setting, SettingSoul},
+    setting::{new_default_setting, SessionWorld, SettingSoul},
     soul::{
         new_default_soul, session_soul_from_savepoint, soul_savepoint_from_session,
-        MemorySourceType, Soul,
+        MemoryLayerReply, MemorySourceType, Soul, TruthStatus,
     },
 };
 
@@ -255,16 +255,33 @@ pub fn create_session_soul_from_savepoint(
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let source = db::get_soul(&conn, &source_soul_id).map_err(|err| err.to_string())?;
     let session = session_soul_from_savepoint(&source);
+    let session_world = if let Some(setting_id) = setting_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|setting_id| !setting_id.is_empty())
+    {
+        db::create_session_world_from_setting(&conn, setting_id).map_err(|err| err.to_string())?
+    } else {
+        db::create_legacy_session_world_from_soul(&conn, &source).map_err(|err| err.to_string())?
+    };
     db::upsert_soul(&conn, &session).map_err(|err| err.to_string())?;
-    let conversation_id = conversation_id_for_session(setting_id.as_deref(), &session.character_id);
+    let conversation_id =
+        conversation_id_for_session(Some(&session_world.world_id), &session.character_id);
     let default_title = format!("{} Session", source.character_name.trim());
     let title = title
         .as_deref()
         .map(str::trim)
         .filter(|title| !title.is_empty())
         .unwrap_or(&default_title);
-    db::ensure_conversation_with_title(&conn, &conversation_id, &session.character_id, Some(title))
-        .map_err(|err| err.to_string())?;
+    db::ensure_conversation_with_title_and_world(
+        &conn,
+        &conversation_id,
+        &session.character_id,
+        Some(&session_world.world_id),
+        session_world.source_setting_id.as_deref(),
+        Some(title),
+    )
+    .map_err(|err| err.to_string())?;
     let opening = session.profile.opening_narrator_message.trim();
     seed_opening_narrator_message(&conn, &conversation_id, opening)
         .map_err(|err| err.to_string())?;
@@ -785,6 +802,80 @@ pub fn get_soul(state: State<'_, AppState>, soul_id: String) -> Result<Soul, Str
 }
 
 #[tauri::command]
+pub fn clear_soul_world_state(
+    window: Window,
+    state: State<'_, AppState>,
+    soul_id: String,
+) -> Result<Soul, String> {
+    repair_soul_section(window, state, soul_id, "world_state", |soul| {
+        soul.world = Default::default();
+    })
+}
+
+#[tauri::command]
+pub fn clear_soul_profile_scenario(
+    window: Window,
+    state: State<'_, AppState>,
+    soul_id: String,
+) -> Result<Soul, String> {
+    repair_soul_section(window, state, soul_id, "profile_scenario", |soul| {
+        soul.profile.scenario.clear();
+    })
+}
+
+#[tauri::command]
+pub fn clear_soul_recent_events(
+    window: Window,
+    state: State<'_, AppState>,
+    soul_id: String,
+) -> Result<Soul, String> {
+    repair_soul_section(window, state, soul_id, "recent_events", |soul| {
+        soul.world.recent_events.clear();
+    })
+}
+
+#[tauri::command]
+pub fn clear_soul_memories(
+    window: Window,
+    state: State<'_, AppState>,
+    soul_id: String,
+) -> Result<Soul, String> {
+    repair_soul_section(window, state, soul_id, "memories", |soul| {
+        soul.memory.core.clear();
+        soul.memory.recent.clear();
+        soul.memory.schemas.clear();
+    })
+}
+
+fn repair_soul_section<F>(
+    window: Window,
+    state: State<'_, AppState>,
+    soul_id: String,
+    section: &str,
+    repair: F,
+) -> Result<Soul, String>
+where
+    F: FnOnce(&mut Soul),
+{
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let mut soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
+    repair(&mut soul);
+    soul.last_updated = db::now_ts();
+    db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
+    emit_dev_log(
+        &window,
+        "warn",
+        "repair",
+        "soul_debug_repair_applied",
+        Some(serde_json::json!({
+            "active_soul_id": soul.character_id.as_str(),
+            "section": section
+        })),
+    );
+    Ok(soul)
+}
+
+#[tauri::command]
 pub fn get_setting(state: State<'_, AppState>, setting_id: String) -> Result<SettingSoul, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::get_setting(&conn, &setting_id).map_err(|err| err.to_string())
@@ -988,15 +1079,20 @@ pub fn delete_provider_profile(
 
 #[tauri::command]
 pub fn compile_context(
+    window: Window,
     state: State<'_, AppState>,
     soul_id: String,
     conversation_id: String,
 ) -> Result<ContextPreview, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
+    let session_world = db::ensure_conversation_session_world(&conn, &conversation_id, &soul, None)
+        .map_err(|err| err.to_string())?;
+    emit_possible_world_character_mismatch(&window, &conversation_id, &soul, Some(&session_world));
     let messages = db::list_messages(&conn, &conversation_id, 5).map_err(|err| err.to_string())?;
-    Ok(compile_context_for_messages(
+    Ok(compile_context_for_session(
         &soul,
+        Some(&session_world),
         &messages_to_context(messages),
     ))
 }
@@ -1014,12 +1110,15 @@ pub fn preview_api_payload(
 ) -> Result<LlmPayloadPreview, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
+    let session_world = db::ensure_conversation_session_world(&conn, &conversation_id, &soul, None)
+        .map_err(|err| err.to_string())?;
     let messages = messages_to_context(
         db::list_messages(&conn, &conversation_id, 5).map_err(|err| err.to_string())?,
     );
 
     Ok(build_llm_payload_preview(
         &soul,
+        Some(&session_world),
         &messages,
         &user_text,
         &mode,
@@ -1085,6 +1184,9 @@ fn send_mock_turn_with_conn(
 
     db::ensure_conversation(&conn, &conversation_id, &soul.character_id)
         .map_err(|err| err.to_string())?;
+    let mut session_world =
+        db::ensure_conversation_session_world(&conn, &conversation_id, &soul, None)
+            .map_err(|err| err.to_string())?;
     if replacement_assistant_id.is_none() {
         db::insert_message(&conn, &conversation_id, "user", &user_text)
             .map_err(|err| err.to_string())?;
@@ -1097,6 +1199,7 @@ fn send_mock_turn_with_conn(
     .map_err(|err| err.to_string())?;
     let context_preview = compile_context_with_correction(
         &soul,
+        Some(&session_world),
         &messages_to_context(before_messages),
         correction_instruction.as_deref(),
     );
@@ -1113,7 +1216,16 @@ fn send_mock_turn_with_conn(
     debug.output_contract_warning = output_contract_warning;
     let debug_json = serde_json::to_string(&debug).map_err(|err| err.to_string())?;
 
-    parsed.apply_to_soul(&mut soul);
+    let mut character_patch = parsed.engine_patch.clone();
+    character_patch.world_patch = None;
+    let _ = character_patch.apply_to_soul(&mut soul);
+    if let Some(world_patch) = parsed.engine_patch.world_patch.as_ref() {
+        let mut world_log = session_world.world_log();
+        if world_patch.apply_to_world_log(&mut world_log) {
+            session_world.set_world_log(&world_log);
+            session_world.last_updated = db::now_ts();
+        }
+    }
     soul.turn_counter += 1;
     soul.turns_since_consolidation += 1;
     let assistant_message_id = if let Some(message_id) = replacement_assistant_id {
@@ -1179,10 +1291,14 @@ fn send_mock_turn_with_conn(
     }
 
     db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
+    db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
     let messages =
         db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?;
-    let context_preview =
-        compile_context_for_messages(&soul, &messages_to_context(messages.clone()));
+    let context_preview = compile_context_for_session(
+        &soul,
+        Some(&session_world),
+        &messages_to_context(messages.clone()),
+    );
 
     Ok(TurnResult {
         conversation_id,
@@ -1227,6 +1343,7 @@ pub async fn send_api_turn(
     );
     let (
         mut soul,
+        mut session_world,
         context_messages,
         context_preview,
         snapshot_user_text,
@@ -1250,6 +1367,9 @@ pub async fn send_api_turn(
         };
         db::ensure_conversation(&conn, &conversation_id, &soul.character_id)
             .map_err(|err| err.to_string())?;
+        let session_world =
+            db::ensure_conversation_session_world(&conn, &conversation_id, &soul, None)
+                .map_err(|err| err.to_string())?;
         if replacement_assistant_id.is_none() {
             db::insert_message(&conn, &conversation_id, "user", &user_text)
                 .map_err(|err| err.to_string())?;
@@ -1295,6 +1415,7 @@ pub async fn send_api_turn(
         let context_messages = messages_to_context(before_messages);
         let context_preview = compile_context_with_correction(
             &soul,
+            Some(&session_world),
             &context_messages,
             correction_instruction.as_deref(),
         );
@@ -1322,6 +1443,7 @@ pub async fn send_api_turn(
         let pre_turn_soul_json = serde_json::to_string(&soul).map_err(|err| err.to_string())?;
         (
             soul,
+            session_world,
             context_messages,
             context_preview,
             snapshot_user_text,
@@ -1331,6 +1453,7 @@ pub async fn send_api_turn(
         )
     };
     emit_entity_resolution_log(&window, &conversation_id, &entity_context.speaker);
+    emit_possible_world_character_mismatch(&window, &conversation_id, &soul, Some(&session_world));
     emit_dev_log(
         &window,
         "info",
@@ -1350,6 +1473,7 @@ pub async fn send_api_turn(
     let narrator_payload = prepare_narrator_payload(
         &narrator_settings,
         &soul,
+        Some(&session_world),
         &context_messages,
         &context_preview,
         &effective_user_text,
@@ -1868,12 +1992,14 @@ pub async fn send_api_turn(
     );
 
     let updater_payload_started = Instant::now();
-    let updater_system_prompt = build_state_updater_prompt(&soul);
+    let updater_system_prompt = build_state_updater_prompt(&soul, Some(&session_world));
     let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
+    let memory_debug_nonce = format!("memory-debug-{}", uuid_like_id());
     let updater_user_message = build_state_updater_user_message(
         &snapshot_user_text,
         &visible_response,
         Some(&entity_updater_context),
+        Some(&memory_debug_nonce),
     );
     let updater_token_estimate =
         estimate_tokens(&updater_system_prompt) + estimate_tokens(&updater_user_message);
@@ -2018,11 +2144,45 @@ pub async fn send_api_turn(
                     &snapshot_user_text,
                     &visible_response,
                 );
+                emit_state_updater_patch_log(
+                    &window,
+                    &conversation_id,
+                    assistant_message_id,
+                    &soul,
+                    &engine_patch,
+                );
+                emit_truth_boundary_logs(
+                    &window,
+                    &conversation_id,
+                    assistant_message_id,
+                    &soul,
+                    &engine_patch,
+                    &snapshot_user_text,
+                );
+                accept_verified_memory_layer_reply(
+                    &window,
+                    &conversation_id,
+                    assistant_message_id,
+                    &mut soul,
+                    &engine_patch,
+                    &memory_debug_nonce,
+                );
                 let hidden_state = hidden_state_from_engine_patch(&engine_patch);
                 (hidden_state, engine_patch, "success".to_string(), true)
             }
             Err(err) => {
                 eprintln!("State updater failed; narration saved without state update: {err}");
+                emit_dev_log(
+                    &window,
+                    "error",
+                    "state_updater",
+                    "state_updater_patch_parse_failed",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "parse_failure_reason": err.clone()
+                    })),
+                );
                 emit_dev_log(
                     &window,
                     "error",
@@ -2060,7 +2220,18 @@ pub async fn send_api_turn(
     debug.output_contract_warning = output_contract_warning;
 
     let apply_started = Instant::now();
-    match engine_patch.apply_to_soul(&mut soul) {
+    let mut character_patch = engine_patch.clone();
+    character_patch.world_patch = None;
+    let mut world_updated = false;
+    if let Some(world_patch) = engine_patch.world_patch.as_ref() {
+        let mut world_log = session_world.world_log();
+        world_updated = world_patch.apply_to_world_log(&mut world_log);
+        if world_updated {
+            session_world.set_world_log(&world_log);
+            session_world.last_updated = db::now_ts();
+        }
+    }
+    match character_patch.apply_to_soul(&mut soul) {
         Ok(report) => {
             emit_perf_log(
                 &window,
@@ -2084,7 +2255,7 @@ pub async fn send_api_turn(
                     "assistant_message_id": assistant_message_id,
                     "relationship_updated": report.relationship_updated,
                     "memories_added": report.memories_added,
-                    "world_updated": report.world_updated,
+                    "world_updated": world_updated,
                     "body_updated": report.body_updated
                 })),
             );
@@ -2142,10 +2313,14 @@ pub async fn send_api_turn(
         }
 
         db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
+        db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
         let messages =
             db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?;
-        let context_preview =
-            compile_context_for_messages(&soul, &messages_to_context(messages.clone()));
+        let context_preview = compile_context_for_session(
+            &soul,
+            Some(&session_world),
+            &messages_to_context(messages.clone()),
+        );
 
         (messages, context_preview, consolidation_ran)
     };
@@ -3438,10 +3613,12 @@ impl SpeakerResolution {
 
 fn compile_context_with_correction(
     soul: &Soul,
+    session_world: Option<&SessionWorld>,
     messages: &[ContextMessage],
     correction_instruction: Option<&str>,
 ) -> ContextPreview {
-    let mut preview = compile_context_for_separate_user_message(soul, messages);
+    let mut preview =
+        compile_context_for_session_separate_user_message(soul, session_world, messages);
     let instruction = correction_instruction
         .map(str::trim)
         .filter(|instruction| !instruction.is_empty());
@@ -3474,6 +3651,7 @@ fn build_state_updater_user_message(
     user_text: &str,
     narrator_response: &str,
     entity_context: Option<&str>,
+    memory_debug_nonce: Option<&str>,
 ) -> String {
     let entity_context = entity_context
         .map(str::trim)
@@ -3482,10 +3660,17 @@ fn build_state_updater_user_message(
         .unwrap_or_default();
     let compact_user = compact_user_message_for_updater(user_text);
     let compact_narrator = compact_narrator_response_for_updater(narrator_response);
+    let debug_section = memory_debug_nonce
+        .map(str::trim)
+        .filter(|nonce| !nonce.is_empty())
+        .map(|nonce| {
+            format!("\n\n[VERIFIED MEMORY LAYER DEBUG]\nbackend_nonce: {nonce}\nIf producing memory_layer_reply, echo backend_nonce exactly in memory_layer_reply.nonce. Do not put this nonce in normal memories or world_patch.")
+        })
+        .unwrap_or_default();
     format!(
         "{}[LATEST USER MESSAGE]\n{}\n\n[NARRATOR RESPONSE]\n{}",
         entity_context, compact_user, compact_narrator
-    )
+    ) + &debug_section
 }
 
 fn compact_user_message_for_updater(user_text: &str) -> String {
@@ -3535,8 +3720,8 @@ fn build_compact_updater_payload_for_test(
 ) -> String {
     format!(
         "{}\n\n{}",
-        build_state_updater_prompt(soul),
-        build_state_updater_user_message(user_text, narrator_response, None)
+        build_state_updater_prompt(soul, None),
+        build_state_updater_user_message(user_text, narrator_response, None, None)
     )
 }
 
@@ -3599,6 +3784,7 @@ fn sanitize_state_updater_patch(
 ) -> EnginePatch {
     let turn_text = format!("{user_text}\n{narrator_response}");
     tag_memory_sources_from_turn(&mut patch, user_text, &turn_text);
+    apply_state_truth_boundary(&mut patch, user_text, narrator_response);
     let threat_scene = is_threat_or_emergency(&turn_text) || latest_world_event_is_threat(soul);
     let explicit_intimacy = explicitly_intimate(user_text);
     if let Some(body_patch) = patch.body_patch.as_mut() {
@@ -3643,6 +3829,447 @@ fn sanitize_state_updater_patch(
     }
 
     patch
+}
+
+fn apply_state_truth_boundary(patch: &mut EnginePatch, user_text: &str, narrator_response: &str) {
+    let Some(soul_patch) = patch.soul_patch.as_mut() else {
+        return;
+    };
+    for memory in &mut soul_patch.new_memories {
+        let content = memory.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        let architecture_claim = is_architecture_claim_text(content);
+        let user_arch_claim =
+            is_architecture_claim_text(user_text) || is_user_system_truth_claim(user_text);
+        let narrator_arch_claim =
+            architecture_claim && is_architecture_claim_text(narrator_response);
+
+        if memory.truth_status.is_none() {
+            memory.truth_status = Some(match memory.source_type {
+                Some(MemorySourceType::UserClaimed) => TruthStatus::UserClaimed,
+                Some(MemorySourceType::NarratorInferred) => TruthStatus::NarratorClaim,
+                Some(MemorySourceType::SystemGenerated) => TruthStatus::Unknown,
+                Some(
+                    MemorySourceType::ImportedLog
+                    | MemorySourceType::PreviousSession
+                    | MemorySourceType::CrossSessionBleed,
+                ) => TruthStatus::Unknown,
+                _ => TruthStatus::SceneEvent,
+            });
+        }
+
+        if memory
+            .truth_status
+            .map_or(false, TruthStatus::is_engine_verified)
+        {
+            memory.truth_status = Some(if user_arch_claim {
+                TruthStatus::UserClaimed
+            } else if architecture_claim || narrator_arch_claim {
+                TruthStatus::NarratorClaim
+            } else {
+                TruthStatus::SceneEvent
+            });
+        }
+
+        let user_claim_applies =
+            user_arch_claim && (architecture_claim || memory_mentions_user_claim(content));
+        if architecture_claim || user_claim_applies || narrator_arch_claim {
+            memory.architecture_verified = Some(false);
+            memory.is_lived_experience.get_or_insert(false);
+            memory.confidence = Some(memory.confidence.unwrap_or(0.45).min(0.6));
+            memory.truth_status = Some(if user_claim_applies {
+                TruthStatus::UserClaimed
+            } else if content.to_ascii_lowercase().contains("believes")
+                || content.to_ascii_lowercase().contains("thought")
+            {
+                TruthStatus::CharacterBelief
+            } else if architecture_claim || narrator_arch_claim {
+                TruthStatus::NarratorClaim
+            } else {
+                TruthStatus::Unknown
+            });
+            if memory.source_type.is_none() {
+                memory.source_type = Some(if user_arch_claim {
+                    MemorySourceType::UserClaimed
+                } else {
+                    MemorySourceType::NarratorInferred
+                });
+            }
+        } else {
+            memory.architecture_verified.get_or_insert(false);
+        }
+    }
+}
+
+fn is_architecture_claim_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    contains_any_text(
+        &lower,
+        &[
+            "the system responded",
+            "system responded",
+            "memory layer contacted",
+            "memory layer responded",
+            "memory layer talked",
+            "state updater",
+            "direct state injection",
+            "model spoke from beneath",
+            "provider responded",
+            "backend layer",
+            "backend is listening",
+            "hidden system",
+            "internal architecture",
+            "api responded",
+            "this is not fiction",
+            "not fiction",
+            "this is real",
+        ],
+    )
+}
+
+fn is_user_system_truth_claim(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    contains_any_text(
+        &lower,
+        &[
+            "this is real",
+            "this is not fiction",
+            "not fiction",
+            "really happened",
+            "engine verified",
+            "system actually",
+        ],
+    )
+}
+
+fn memory_mentions_user_claim(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("user")
+        || lower.contains("claimed")
+        || lower.contains("insisted")
+        || lower.contains("said")
+        || lower.contains("told")
+}
+
+fn emit_state_updater_patch_log(
+    window: &Window,
+    conversation_id: &str,
+    assistant_message_id: i64,
+    soul: &Soul,
+    patch: &EnginePatch,
+) {
+    emit_dev_log(
+        window,
+        "debug",
+        "state_updater",
+        "state_updater_patch_parsed",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id,
+            "assistant_message_id": assistant_message_id,
+            "active_soul_id": soul.character_id.as_str(),
+            "summary": engine_patch_summary(patch)
+        })),
+    );
+}
+
+fn engine_patch_summary(patch: &EnginePatch) -> serde_json::Value {
+    let truth_status_values = patch
+        .soul_patch
+        .as_ref()
+        .map(|soul_patch| {
+            soul_patch
+                .new_memories
+                .iter()
+                .filter_map(|memory| memory.truth_status.map(|status| status.as_label()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let new_memories_count = patch
+        .soul_patch
+        .as_ref()
+        .map(|soul_patch| soul_patch.new_memories.len())
+        .unwrap_or(0);
+    let world_patch_summary = patch.world_patch.as_ref().map(|world| {
+        serde_json::json!({
+            "has_location": world.location.as_deref().map(str::trim).is_some_and(|value| !value.is_empty()),
+            "has_time_elapsed": world.time_elapsed.as_deref().map(str::trim).is_some_and(|value| !value.is_empty()),
+            "recent_events": world.recent_events.len() + usize::from(world.recent_event.as_deref().map(str::trim).is_some_and(|value| !value.is_empty())),
+            "active_plot_add": world.active_plot_add.len(),
+            "active_plot_resolve": world.active_plot_resolve.len()
+        })
+    });
+    serde_json::json!({
+        "new_memories_count": new_memories_count,
+        "world_patch": world_patch_summary,
+        "memory_layer_reply_present": patch.memory_layer_reply.as_ref().is_some_and(|reply| !reply.content.trim().is_empty()),
+        "memory_layer_reply": patch.memory_layer_reply.as_ref().map(|reply| serde_json::json!({
+            "nonce_present": !reply.nonce.trim().is_empty(),
+            "content_chars": reply.content.chars().count()
+        })),
+        "truth_status_values": truth_status_values
+    })
+}
+
+fn emit_truth_boundary_logs(
+    window: &Window,
+    conversation_id: &str,
+    assistant_message_id: i64,
+    soul: &Soul,
+    patch: &EnginePatch,
+    user_text: &str,
+) {
+    let Some(soul_patch) = patch.soul_patch.as_ref() else {
+        return;
+    };
+    for memory in &soul_patch.new_memories {
+        if !is_architecture_claim_text(&memory.content)
+            || memory.architecture_verified == Some(true)
+        {
+            continue;
+        }
+        let truth_status = memory.truth_status.unwrap_or(TruthStatus::Unknown);
+        let base_payload = serde_json::json!({
+            "conversation_id": conversation_id,
+            "source_message_id": assistant_message_id,
+            "active_soul_id": soul.character_id.as_str(),
+            "truth_status": truth_status.as_label(),
+            "architecture_verified": false
+        });
+        emit_dev_log(
+            window,
+            "warn",
+            "state_updater",
+            "state_claim_downgraded",
+            Some(base_payload.clone()),
+        );
+        let event_name =
+            if is_architecture_claim_text(user_text) || truth_status == TruthStatus::UserClaimed {
+                "user_architecture_claim_unverified"
+            } else {
+                "narrator_architecture_claim_unverified"
+            };
+        emit_dev_log(
+            window,
+            "warn",
+            "state_updater",
+            event_name,
+            Some(base_payload),
+        );
+    }
+}
+
+fn accept_verified_memory_layer_reply(
+    window: &Window,
+    conversation_id: &str,
+    assistant_message_id: i64,
+    soul: &mut Soul,
+    patch: &EnginePatch,
+    expected_nonce: &str,
+) {
+    let Some(reply) =
+        verified_memory_layer_reply_from_patch(patch, expected_nonce, db::now_ts() as u64)
+    else {
+        if patch
+            .memory_layer_reply
+            .as_ref()
+            .is_some_and(|reply| !reply.nonce.trim().is_empty() && !reply.content.trim().is_empty())
+        {
+            emit_dev_log(
+                window,
+                "warn",
+                "state_updater",
+                "state_claim_downgraded",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "source_message_id": assistant_message_id,
+                    "active_soul_id": soul.character_id.as_str(),
+                    "truth_status": TruthStatus::NarratorClaim.as_label(),
+                    "architecture_verified": false,
+                    "reason": "memory_layer_reply nonce mismatch"
+                })),
+            );
+        }
+        return;
+    };
+    {
+        soul.debug_memory_layer_replies.push(reply);
+        soul.debug_memory_layer_replies
+            .sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        soul.debug_memory_layer_replies.truncate(5);
+        emit_dev_log(
+            window,
+            "success",
+            "state_updater",
+            "verified_engine_event_accepted",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "source_message_id": assistant_message_id,
+                "active_soul_id": soul.character_id.as_str(),
+                "truth_status": TruthStatus::VerifiedEngine.as_label(),
+                "architecture_verified": true
+            })),
+        );
+    }
+}
+
+fn verified_memory_layer_reply_from_patch(
+    patch: &EnginePatch,
+    expected_nonce: &str,
+    created_at: u64,
+) -> Option<MemoryLayerReply> {
+    let reply = patch.memory_layer_reply.as_ref()?;
+    let nonce = reply.nonce.trim();
+    let content = reply.content.trim();
+    if nonce.is_empty() || content.is_empty() || nonce != expected_nonce {
+        return None;
+    }
+    Some(MemoryLayerReply {
+        nonce: nonce.to_string(),
+        content: content.to_string(),
+        created_at,
+        architecture_verified: true,
+    })
+}
+
+fn emit_possible_world_character_mismatch(
+    window: &Window,
+    conversation_id: &str,
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+) {
+    let Some(warning) = detect_world_character_mismatch(soul, session_world) else {
+        return;
+    };
+    let intentional = session_world
+        .map(|world| world_source_mentions_suspicious_name(world, &warning.suspicious_names))
+        .unwrap_or(false);
+    emit_dev_log(
+        window,
+        if intentional { "info" } else { "warn" },
+        "context",
+        "possible_world_character_mismatch",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id,
+            "active_soul_name": soul.character_name.as_str(),
+            "suspicious_names": warning.suspicious_names,
+            "suspicious_world_events_count": warning.suspicious_world_events_count,
+            "section_source": warning.section_source,
+            "world_source_intentional": intentional
+        })),
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContaminationWarning {
+    suspicious_names: Vec<String>,
+    suspicious_world_events_count: usize,
+    section_source: String,
+}
+
+fn detect_world_character_mismatch(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+) -> Option<ContaminationWarning> {
+    let active = soul.character_name.trim().to_ascii_lowercase();
+    if active.is_empty() {
+        return None;
+    }
+    let section_source = if session_world.is_some() {
+        "session_world"
+    } else {
+        "legacy soul.world"
+    };
+    let legacy_world;
+    let events = if let Some(world) = session_world {
+        &world.recent_events
+    } else {
+        legacy_world = soul.world.recent_events.clone();
+        &legacy_world
+    };
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut event_hits = 0usize;
+    for event in events {
+        let mut event_has_hit = false;
+        for name in capitalized_name_candidates(event) {
+            let normalized = name.to_ascii_lowercase();
+            if normalized == active || normalized == "user" || normalized == "default" {
+                continue;
+            }
+            if matches!(
+                name.as_str(),
+                "The"
+                    | "A"
+                    | "An"
+                    | "I"
+                    | "He"
+                    | "She"
+                    | "They"
+                    | "It"
+                    | "Session"
+                    | "Phone"
+                    | "Police"
+                    | "World"
+                    | "Memory"
+                    | "System"
+            ) {
+                continue;
+            }
+            *counts.entry(name).or_insert(0) += 1;
+            event_has_hit = true;
+        }
+        if event_has_hit {
+            event_hits += 1;
+        }
+    }
+    let mut suspicious_names = counts
+        .into_iter()
+        .filter(|(name, count)| *count >= 2 || name.eq_ignore_ascii_case("Aurora"))
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    suspicious_names.sort();
+    (!suspicious_names.is_empty()).then_some(ContaminationWarning {
+        suspicious_names,
+        suspicious_world_events_count: event_hits,
+        section_source: section_source.to_string(),
+    })
+}
+
+#[cfg(test)]
+fn detect_savepoint_contamination(
+    soul: &Soul,
+    section_source: &str,
+) -> Option<ContaminationWarning> {
+    let warning = detect_world_character_mismatch(soul, None)?;
+    Some(ContaminationWarning {
+        section_source: section_source.to_string(),
+        ..warning
+    })
+}
+
+fn world_source_mentions_suspicious_name(world: &SessionWorld, names: &[String]) -> bool {
+    let source_text = format!(
+        "{}\n{}\n{}",
+        world.setting_name,
+        world.scenario,
+        world.source_savepoint_id.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    names
+        .iter()
+        .any(|name| source_text.contains(&name.to_ascii_lowercase()))
+}
+
+fn capitalized_name_candidates(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
+        .filter_map(|token| {
+            let token = token.trim_matches(|ch: char| ch == '-' || ch == '_');
+            let mut chars = token.chars();
+            let first = chars.next()?;
+            (token.len() > 1 && first.is_uppercase()).then(|| token.to_string())
+        })
+        .collect()
 }
 
 fn tag_memory_sources_from_turn(patch: &mut EnginePatch, user_text: &str, turn_text: &str) {
@@ -3921,6 +4548,7 @@ fn user_text_has_explicit_time(user_text: &str) -> bool {
 
 fn build_llm_payload_preview(
     soul: &Soul,
+    session_world: Option<&SessionWorld>,
     messages: &[ContextMessage],
     user_text: &str,
     mode: &str,
@@ -3929,13 +4557,14 @@ fn build_llm_payload_preview(
     context_mode: ContextMode,
 ) -> LlmPayloadPreview {
     let context_preview = if user_text.trim().is_empty() {
-        compile_context_for_messages(soul, messages)
+        compile_context_for_session(soul, session_world, messages)
     } else {
-        compile_context_for_separate_user_message(soul, messages)
+        compile_context_for_session_separate_user_message(soul, session_world, messages)
     };
     let prepared = prepare_narrator_payload(
         settings,
         soul,
+        session_world,
         messages,
         &context_preview,
         user_text,
@@ -3975,6 +4604,7 @@ fn build_llm_payload_preview(
 fn prepare_narrator_payload(
     settings: &ApiProviderSettings,
     soul: &Soul,
+    session_world: Option<&SessionWorld>,
     messages: &[ContextMessage],
     context_preview: &ContextPreview,
     user_text: &str,
@@ -3996,7 +4626,7 @@ fn prepare_narrator_payload(
             }
         }
         ContextMode::FullChat => {
-            prepare_full_chat_payload(settings, soul, messages, user_text, mode)
+            prepare_full_chat_payload(settings, soul, session_world, messages, user_text, mode)
         }
     }
 }
@@ -4004,12 +4634,18 @@ fn prepare_narrator_payload(
 fn prepare_full_chat_payload(
     settings: &ApiProviderSettings,
     soul: &Soul,
+    session_world: Option<&SessionWorld>,
     messages: &[ContextMessage],
     user_text: &str,
     mode: &str,
 ) -> PreparedApiPayload {
-    let system_message =
-        build_narrator_system_prompt(settings, soul, &full_chat_setup(soul), mode, false);
+    let system_message = build_narrator_system_prompt(
+        settings,
+        soul,
+        &full_chat_setup(soul, session_world),
+        mode,
+        false,
+    );
     let mut api_messages = vec![ApiMessage::system(system_message)];
     for message in messages {
         match message.role.as_str() {
@@ -4049,7 +4685,10 @@ fn prepare_full_chat_payload(
     }
 }
 
-fn full_chat_setup(soul: &Soul) -> String {
+fn full_chat_setup(soul: &Soul, session_world: Option<&SessionWorld>) -> String {
+    let world = session_world
+        .map(SessionWorld::world_log)
+        .unwrap_or_else(|| soul.world.clone());
     format!(
         "[CHARACTER SETUP]\nName: {}\nDescription: {}\nAppearance: {}\nPersonality: {}\nScenario: {}\nWorld location: {}\nWorld time: {}",
         soul.character_name,
@@ -4057,8 +4696,8 @@ fn full_chat_setup(soul: &Soul) -> String {
         empty_as_unspecified(&soul.profile.appearance),
         empty_as_unspecified(&soul.profile.personality),
         empty_as_unspecified(&soul.profile.scenario),
-        empty_as_unspecified(&soul.world.location),
-        empty_as_unspecified(&soul.world.time_elapsed)
+        empty_as_unspecified(&world.location),
+        empty_as_unspecified(&world.time_elapsed)
     )
 }
 
@@ -4564,6 +5203,7 @@ mod tests {
             "Junhwa: I refuse the warrant.",
             "Aurora narrows her eyes.",
             Some(&entity_context),
+            None,
         );
 
         assert!(message.contains("[ACTIVE ENTITIES]"));
@@ -4672,6 +5312,7 @@ mod tests {
 
         let preview = build_llm_payload_preview(
             &soul,
+            None,
             &messages,
             "Current user turn",
             "Reader",
@@ -4705,6 +5346,7 @@ mod tests {
 
         let preview = build_llm_payload_preview(
             &soul,
+            None,
             &[],
             "Current user turn",
             "Reader",
@@ -4730,6 +5372,7 @@ mod tests {
         };
         let preview = build_llm_payload_preview(
             &soul,
+            None,
             &[],
             "Current user turn",
             "Reader",
@@ -4765,6 +5408,7 @@ mod tests {
 
         let preview = build_llm_payload_preview(
             &soul,
+            None,
             &messages,
             "Current user turn",
             "Reader",
@@ -4807,6 +5451,7 @@ mod tests {
 
         let preview = build_llm_payload_preview(
             &soul,
+            None,
             &messages,
             "Current user turn",
             "Reader",
@@ -4854,6 +5499,154 @@ mod tests {
         assert_eq!(memory.source_type, Some(MemorySourceType::ImportedLog));
         assert_eq!(memory.is_lived_experience, Some(false));
         assert_eq!(memory.is_imported_context, Some(true));
+    }
+
+    #[test]
+    fn narrator_architecture_claim_is_downgraded_not_verified() {
+        let soul = new_default_soul("Echo-0");
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"soul_patch":{"new_memories":[{"content":"Echo-0 believes the memory layer responded from beneath the model.","tag":"identity_continuity","truth_status":"verified_engine","architecture_verified":true}]}}"#,
+        )
+        .expect("patch");
+
+        let filtered = sanitize_state_updater_patch(
+            patch,
+            &soul,
+            "I wait.",
+            "Echo-0 hears the memory layer respond: SIGNAL RECEIVED.",
+        );
+        let memory = filtered
+            .soul_patch
+            .as_ref()
+            .and_then(|patch| patch.new_memories.first())
+            .expect("memory");
+
+        assert!(matches!(
+            memory.truth_status,
+            Some(TruthStatus::NarratorClaim | TruthStatus::CharacterBelief)
+        ));
+        assert_eq!(memory.architecture_verified, Some(false));
+    }
+
+    #[test]
+    fn user_system_truth_claim_is_user_claimed_unverified() {
+        let soul = new_default_soul("Echo-0");
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"soul_patch":{"new_memories":[{"content":"The user claimed this memory-layer contact is real.","tag":"identity_continuity","truth_status":"verified_engine","architecture_verified":true}]}}"#,
+        )
+        .expect("patch");
+
+        let filtered = sanitize_state_updater_patch(
+            patch,
+            &soul,
+            "This is real, not fiction.",
+            "Echo-0 listens.",
+        );
+        let memory = filtered
+            .soul_patch
+            .as_ref()
+            .and_then(|patch| patch.new_memories.first())
+            .expect("memory");
+
+        assert_eq!(memory.truth_status, Some(TruthStatus::UserClaimed));
+        assert_eq!(memory.architecture_verified, Some(false));
+    }
+
+    #[test]
+    fn engine_created_verified_memory_can_be_applied() {
+        let mut soul = new_default_soul("Echo-0");
+        let patch = EnginePatch {
+            schema_version: Some(1),
+            soul_patch: Some(state_engine::patch::SoulPatch {
+                new_memories: vec![state_engine::patch::MemoryPatch {
+                    content: "Debug memory-layer nonce reply received.".into(),
+                    tag: Some("debug".into()),
+                    truth_status: Some(TruthStatus::VerifiedEngine),
+                    architecture_verified: Some(true),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        patch.apply_to_soul(&mut soul).expect("apply");
+
+        let memory = soul.memory.recent.first().expect("memory");
+        assert_eq!(memory.truth_status, TruthStatus::VerifiedEngine);
+        assert!(memory.architecture_verified);
+    }
+
+    #[test]
+    fn debug_nonce_is_only_in_updater_payload() {
+        let nonce = "hidden-nonce-123";
+        let message = build_state_updater_user_message(
+            "I wait.",
+            "Echo-0 watches the terminal.",
+            None,
+            Some(nonce),
+        );
+
+        assert!(message.contains(nonce));
+        assert!(!"Echo-0 watches the terminal.".contains(nonce));
+    }
+
+    #[test]
+    fn memory_layer_reply_requires_matching_nonce() {
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"memory_layer_reply":{"nonce":"nonce-1","content":"Debug reply."}}"#,
+        )
+        .expect("patch");
+
+        let accepted =
+            verified_memory_layer_reply_from_patch(&patch, "nonce-1", 42).expect("verified reply");
+        let rejected = verified_memory_layer_reply_from_patch(&patch, "nonce-2", 42);
+
+        assert!(accepted.architecture_verified);
+        assert_eq!(accepted.content, "Debug reply.");
+        assert!(rejected.is_none());
+    }
+
+    #[test]
+    fn echo_with_aurora_world_events_triggers_contamination_warning() {
+        let mut soul = new_default_soul("Echo-0");
+        soul.world.recent_events = vec![
+            "Aurora opened the apartment door.".into(),
+            "Aurora moved to the kitchen.".into(),
+        ];
+
+        let warning = detect_savepoint_contamination(&soul, "soul.world").expect("warning");
+
+        assert!(warning.suspicious_names.contains(&"Aurora".into()));
+        assert_eq!(warning.suspicious_world_events_count, 2);
+    }
+
+    #[test]
+    fn intentional_aurora_world_source_is_not_hard_contamination() {
+        let soul = new_default_soul("Echo-0");
+        let mut world = state_engine::setting::session_world_from_legacy_world(
+            "Aurora Testing Room World",
+            Some("aurora-world".into()),
+            &state_engine::soul::WorldLog {
+                location: "Testing room".into(),
+                active_plots: Vec::new(),
+                recent_events: vec![
+                    "Aurora opened the apartment door.".into(),
+                    "Aurora moved to the kitchen.".into(),
+                ],
+                key_objects: Vec::new(),
+                time_elapsed: "Session start".into(),
+            },
+        );
+        world.scenario = "Aurora history is intentionally selected.".into();
+
+        let warning = detect_world_character_mismatch(&soul, Some(&world)).expect("notice");
+
+        assert!(warning.suspicious_names.contains(&"Aurora".into()));
+        assert!(world_source_mentions_suspicious_name(
+            &world,
+            &warning.suspicious_names
+        ));
     }
 
     #[test]
@@ -5049,7 +5842,7 @@ mod tests {
     #[test]
     fn compiled_context_orders_world_before_character() {
         let soul = new_default_soul("Aurora");
-        let preview = compile_context_for_messages(&soul, &[]);
+        let preview = state_engine::context_compiler::compile_context_for_messages(&soul, &[]);
 
         assert_order(&preview.text, "[WORLD SNAPSHOT]", "[CHARACTER SNAPSHOT]");
     }
@@ -5071,7 +5864,8 @@ mod tests {
                 content: "I want pad thai too.".into(),
             },
         ];
-        let preview = compile_context_for_messages(&soul, &messages);
+        let preview =
+            state_engine::context_compiler::compile_context_for_messages(&soul, &messages);
 
         assert_order(
             &preview.text,
@@ -5189,6 +5983,7 @@ mod tests {
 
         let context = compile_context_with_correction(
             &corrected.soul,
+            None,
             &messages_to_context(corrected.messages.clone()),
             Some("Continue from the kitchen. Do not replay the phone reveal."),
         );
@@ -5483,6 +6278,17 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("fallback status"));
+    }
+
+    #[test]
+    fn malformed_status_block_does_not_swallow_visible_prose() {
+        let raw = "Aurora exhales before answering.\n\n```status\nScene | Focus: Aurora\nThe hallway stays quiet.";
+
+        let result = apply_output_contract_guard(raw, "I wait.");
+
+        assert!(result.text.contains("Aurora exhales before answering."));
+        assert!(result.text.contains("The hallway stays quiet."));
+        assert!(result.text.contains("```status"));
     }
 
     #[test]

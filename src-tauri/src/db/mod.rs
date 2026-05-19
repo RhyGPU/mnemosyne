@@ -2,7 +2,12 @@ use std::path::PathBuf;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use state_engine::{setting::SettingSoul, soul::Soul};
+use state_engine::{
+    setting::{
+        session_world_from_legacy_world, session_world_from_setting, SessionWorld, SettingSoul,
+    },
+    soul::Soul,
+};
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +76,8 @@ pub struct ConversationSummary {
     pub title: String,
     pub soul_id: String,
     pub source_savepoint_id: Option<String>,
+    pub world_id: Option<String>,
+    pub source_setting_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_message_preview: Option<String>,
@@ -191,6 +198,18 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             setting_json TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS session_worlds (
+            world_id TEXT PRIMARY KEY,
+            source_setting_id TEXT,
+            source_savepoint_id TEXT,
+            world_kind TEXT NOT NULL DEFAULT 'session_world',
+            setting_name TEXT NOT NULL,
+            location TEXT NOT NULL DEFAULT '',
+            last_updated INTEGER NOT NULL,
+            world_json TEXT NOT NULL,
+            FOREIGN KEY (source_setting_id) REFERENCES settings(setting_id) ON DELETE SET NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_souls_kind_updated
         ON souls(soul_kind, last_updated DESC);
 
@@ -200,10 +219,14 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
             soul_id TEXT NOT NULL,
+            world_id TEXT,
+            source_setting_id TEXT,
             title TEXT NOT NULL DEFAULT 'Untitled Session',
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
-            FOREIGN KEY (soul_id) REFERENCES souls(character_id) ON DELETE CASCADE
+            FOREIGN KEY (soul_id) REFERENCES souls(character_id) ON DELETE CASCADE,
+            FOREIGN KEY (world_id) REFERENCES session_worlds(world_id) ON DELETE SET NULL,
+            FOREIGN KEY (source_setting_id) REFERENCES settings(setting_id) ON DELETE SET NULL
         );
 
         CREATE TABLE IF NOT EXISTS messages (
@@ -369,6 +392,8 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "title",
         "TEXT NOT NULL DEFAULT 'Untitled Session'",
     )?;
+    add_column_if_missing(conn, "conversations", "world_id", "TEXT")?;
+    add_column_if_missing(conn, "conversations", "source_setting_id", "TEXT")?;
     if added_soul_summary_columns {
         backfill_soul_summary_columns(conn)?;
     }
@@ -560,6 +585,127 @@ pub fn upsert_setting(
     Ok(summarize_setting(setting))
 }
 
+pub fn upsert_session_world(
+    conn: &Connection,
+    session_world: &SessionWorld,
+) -> rusqlite::Result<SessionWorld> {
+    let world_json = serde_json::to_string(session_world)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    conn.execute(
+        "
+        INSERT INTO session_worlds
+            (world_id, source_setting_id, source_savepoint_id, world_kind, setting_name, location, last_updated, world_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(world_id) DO UPDATE SET
+            source_setting_id = excluded.source_setting_id,
+            source_savepoint_id = excluded.source_savepoint_id,
+            world_kind = excluded.world_kind,
+            setting_name = excluded.setting_name,
+            location = excluded.location,
+            last_updated = excluded.last_updated,
+            world_json = excluded.world_json
+        ",
+        params![
+            session_world.world_id,
+            session_world.source_setting_id.as_deref(),
+            session_world.source_savepoint_id.as_deref(),
+            session_world.world_kind,
+            session_world.setting_name,
+            session_world.location,
+            session_world.last_updated,
+            world_json
+        ],
+    )?;
+    get_session_world(conn, &session_world.world_id)
+}
+
+pub fn get_session_world(conn: &Connection, world_id: &str) -> rusqlite::Result<SessionWorld> {
+    let world_json: String = conn.query_row(
+        "SELECT world_json FROM session_worlds WHERE world_id = ?1",
+        [world_id],
+        |row| row.get(0),
+    )?;
+    decode_session_world(&world_json)
+}
+
+pub fn link_conversation_world(
+    conn: &Connection,
+    conversation_id: &str,
+    world_id: &str,
+    source_setting_id: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE conversations SET world_id = ?1, source_setting_id = ?2, updated_at = ?3 WHERE id = ?4",
+        params![world_id, source_setting_id, now_ts(), conversation_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_conversation_session_world(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Option<SessionWorld>> {
+    let world_id: Option<String> = conn
+        .query_row(
+            "SELECT world_id FROM conversations WHERE id = ?1",
+            [conversation_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    world_id
+        .map(|world_id| get_session_world(conn, &world_id))
+        .transpose()
+}
+
+pub fn create_session_world_from_setting(
+    conn: &Connection,
+    setting_id: &str,
+) -> rusqlite::Result<SessionWorld> {
+    let setting = get_setting(conn, setting_id)?;
+    let session_world = session_world_from_setting(&setting);
+    upsert_session_world(conn, &session_world)
+}
+
+pub fn create_legacy_session_world_from_soul(
+    conn: &Connection,
+    soul: &Soul,
+) -> rusqlite::Result<SessionWorld> {
+    let source = soul
+        .source_savepoint_id
+        .clone()
+        .or_else(|| Some(soul.character_id.clone()));
+    let session_world =
+        session_world_from_legacy_world("Legacy Character World", source, &soul.world);
+    upsert_session_world(conn, &session_world)
+}
+
+pub fn ensure_conversation_session_world(
+    conn: &Connection,
+    conversation_id: &str,
+    soul: &Soul,
+    setting_id: Option<&str>,
+) -> rusqlite::Result<SessionWorld> {
+    if let Some(existing) = get_conversation_session_world(conn, conversation_id)? {
+        return Ok(existing);
+    }
+    let session_world = if let Some(setting_id) = setting_id
+        .map(str::trim)
+        .filter(|setting_id| !setting_id.is_empty())
+    {
+        create_session_world_from_setting(conn, setting_id)?
+    } else {
+        create_legacy_session_world_from_soul(conn, soul)?
+    };
+    link_conversation_world(
+        conn,
+        conversation_id,
+        &session_world.world_id,
+        session_world.source_setting_id.as_deref(),
+    )?;
+    Ok(session_world)
+}
+
 pub fn list_settings(conn: &Connection) -> rusqlite::Result<Vec<SettingSummary>> {
     let mut stmt = conn.prepare(
         "
@@ -672,15 +818,30 @@ pub fn ensure_conversation_with_title(
     soul_id: &str,
     title: Option<&str>,
 ) -> rusqlite::Result<ConversationSummary> {
+    ensure_conversation_with_title_and_world(conn, conversation_id, soul_id, None, None, title)
+}
+
+pub fn ensure_conversation_with_title_and_world(
+    conn: &Connection,
+    conversation_id: &str,
+    soul_id: &str,
+    world_id: Option<&str>,
+    source_setting_id: Option<&str>,
+    title: Option<&str>,
+) -> rusqlite::Result<ConversationSummary> {
     let now = now_ts();
     let title = sanitize_conversation_title(title.unwrap_or("Untitled Session"));
     conn.execute(
         "
-        INSERT INTO conversations (id, soul_id, title, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?4)
-        ON CONFLICT(id) DO UPDATE SET soul_id = excluded.soul_id, updated_at = excluded.updated_at
+        INSERT INTO conversations (id, soul_id, world_id, source_setting_id, title, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+        ON CONFLICT(id) DO UPDATE SET
+            soul_id = excluded.soul_id,
+            world_id = COALESCE(excluded.world_id, conversations.world_id),
+            source_setting_id = COALESCE(excluded.source_setting_id, conversations.source_setting_id),
+            updated_at = excluded.updated_at
         ",
-        params![conversation_id, soul_id, title, now],
+        params![conversation_id, soul_id, world_id, source_setting_id, title, now],
     )?;
     get_conversation_summary(conn, conversation_id)
 }
@@ -707,6 +868,8 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             c.title,
             c.soul_id,
             COALESCE(s.source_savepoint_id, NULL),
+            c.world_id,
+            c.source_setting_id,
             c.created_at,
             c.updated_at,
             (
@@ -727,16 +890,18 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
         ",
     )?;
     let rows = stmt.query_map([], |row| {
-        let preview: Option<String> = row.get(6)?;
+        let preview: Option<String> = row.get(8)?;
         Ok(ConversationSummary {
             conversation_id: row.get(0)?,
             title: row.get(1)?,
             soul_id: row.get(2)?,
             source_savepoint_id: row.get(3)?,
-            created_at: row.get(4)?,
-            updated_at: row.get(5)?,
+            world_id: row.get(4)?,
+            source_setting_id: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
             last_message_preview: preview.map(compact_preview),
-            message_count: row.get(7)?,
+            message_count: row.get(9)?,
         })
     })?;
     rows.collect()
@@ -748,7 +913,7 @@ pub fn get_conversation_summary(
 ) -> rusqlite::Result<ConversationSummary> {
     conn.query_row(
         "
-        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL)
+        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL), c.world_id, c.source_setting_id
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
         WHERE c.id = ?1
@@ -765,6 +930,8 @@ pub fn get_conversation_summary(
                 created_at: row.get(3)?,
                 updated_at: row.get(4)?,
                 source_savepoint_id: row.get(5)?,
+                world_id: row.get(6)?,
+                source_setting_id: row.get(7)?,
                 last_message_preview,
                 message_count,
             })
@@ -1390,7 +1557,46 @@ pub fn list_messages_before_id(
 }
 
 pub fn delete_conversation(conn: &Connection, conversation_id: &str) -> rusqlite::Result<bool> {
+    let linked: Option<(String, Option<String>, String)> = conn
+        .query_row(
+            "
+            SELECT c.soul_id, c.world_id, COALESCE(s.soul_kind, '')
+            FROM conversations c
+            LEFT JOIN souls s ON s.character_id = c.soul_id
+            WHERE c.id = ?1
+            ",
+            [conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
     let affected = conn.execute("DELETE FROM conversations WHERE id = ?1", [conversation_id])?;
+    if affected > 0 {
+        if let Some((soul_id, world_id, soul_kind)) = linked {
+            if normalized_soul_kind(&soul_kind) == "session_clone" {
+                let still_used: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM conversations WHERE soul_id = ?1",
+                    [&soul_id],
+                    |row| row.get(0),
+                )?;
+                if still_used == 0 {
+                    let _ = conn.execute("DELETE FROM souls WHERE character_id = ?1", [&soul_id]);
+                }
+            }
+            if let Some(world_id) = world_id {
+                let still_used: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM conversations WHERE world_id = ?1",
+                    [&world_id],
+                    |row| row.get(0),
+                )?;
+                if still_used == 0 {
+                    let _ = conn.execute(
+                        "DELETE FROM session_worlds WHERE world_id = ?1",
+                        [&world_id],
+                    );
+                }
+            }
+        }
+    }
     Ok(affected > 0)
 }
 
@@ -1770,6 +1976,12 @@ fn decode_setting(json: &str) -> rusqlite::Result<SettingSoul> {
     })
 }
 
+fn decode_session_world(json: &str) -> rusqlite::Result<SessionWorld> {
+    serde_json::from_str(json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+    })
+}
+
 fn summarize_setting(setting: &SettingSoul) -> SettingSummary {
     SettingSummary {
         setting_id: setting.setting_id.clone(),
@@ -1968,6 +2180,70 @@ mod tests {
         assert_eq!(
             checkpoint.source_savepoint_id.as_deref(),
             Some(savepoint.character_id.as_str())
+        );
+    }
+
+    #[test]
+    fn session_world_clones_setting_without_mutating_source() {
+        let conn = init_memory_connection().expect("db");
+        let mut setting = new_default_setting("Aurora Testing Room World");
+        setting.world.location = "Original lab".into();
+        setting.world.recent_events = vec!["Aurora calibrated the lab.".into()];
+        upsert_setting(&conn, &setting).expect("setting");
+
+        let mut session_world =
+            create_session_world_from_setting(&conn, &setting.setting_id).expect("session world");
+        session_world.location = "Mutated session lab".into();
+        session_world.recent_events.push("Echo-0 entered.".into());
+        upsert_session_world(&conn, &session_world).expect("upsert session world");
+
+        let source = get_setting(&conn, &setting.setting_id).expect("source setting");
+        assert_eq!(source.world.location, "Original lab");
+        assert_eq!(source.world.recent_events.len(), 1);
+        assert_eq!(
+            get_session_world(&conn, &session_world.world_id)
+                .expect("session world")
+                .location,
+            "Mutated session lab"
+        );
+    }
+
+    #[test]
+    fn conversations_can_share_one_session_world_reference() {
+        let conn = init_memory_connection().expect("db");
+        let soul_a = new_default_soul("Aurora");
+        let soul_b = new_default_soul("Echo-0");
+        upsert_soul(&conn, &soul_a).expect("soul a");
+        upsert_soul(&conn, &soul_b).expect("soul b");
+        let world = create_legacy_session_world_from_soul(&conn, &soul_a).expect("world");
+
+        ensure_conversation_with_title_and_world(
+            &conn,
+            "shared-a",
+            &soul_a.character_id,
+            Some(&world.world_id),
+            None,
+            Some("A"),
+        )
+        .expect("conversation a");
+        ensure_conversation_with_title_and_world(
+            &conn,
+            "shared-b",
+            &soul_b.character_id,
+            Some(&world.world_id),
+            None,
+            Some("B"),
+        )
+        .expect("conversation b");
+
+        let conversations = list_conversations(&conn).expect("conversations");
+        assert_eq!(
+            conversations
+                .iter()
+                .filter(|conversation| conversation.world_id.as_deref()
+                    == Some(world.world_id.as_str()))
+                .count(),
+            2
         );
     }
 

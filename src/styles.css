@@ -150,7 +150,7 @@ button {
 
 .chat-only-header {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   gap: 16px;
   align-items: center;
   position: sticky;
@@ -690,6 +690,11 @@ button:disabled {
   font-weight: 800;
 }
 
+.ghost-action.danger {
+  border-color: #d6a49a;
+  color: #7a231d;
+}
+
 .soul-row-main {
   display: inline-flex;
   align-items: center;
@@ -738,14 +743,28 @@ button:disabled {
 
 .session-row {
   display: grid;
-  gap: 3px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
   width: 100%;
   border: 1px solid #d9d3c3;
   border-radius: 6px;
   background: #fffdf8;
   color: #16201c;
-  padding: 9px 10px;
+  padding: 4px;
   text-align: left;
+}
+
+.session-row > button:first-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  min-height: 42px;
+  justify-items: start;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 5px 6px;
   cursor: pointer;
 }
 
@@ -758,6 +777,14 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-delete-button {
+  width: 34px;
+  height: 34px;
+  border: 1px solid #e3c4bd;
+  background: #fff7f5;
+  color: #7a231d;
 }
 
 .stat-grid {
@@ -1305,6 +1332,17 @@ button:disabled {
   color: #16201c;
   font-size: 0.92rem;
   font-weight: 800;
+}
+
+.context-source-grid {
+  margin-bottom: 10px;
+}
+
+.repair-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
 }
 
 .hidden-file {

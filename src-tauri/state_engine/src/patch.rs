@@ -4,7 +4,7 @@ use crate::{
     arousal::ArousalSignal,
     hidden_state::HiddenState,
     memory::create_scored_memory,
-    soul::{current_timestamp, MemorySourceType, Relationship, Soul},
+    soul::{current_timestamp, MemorySourceType, Relationship, Soul, TruthStatus},
 };
 
 pub const PATCH_PROTOCOL_VERSION: u32 = 1;
@@ -24,6 +24,7 @@ pub struct EnginePatch {
     pub world_patch: Option<WorldPatch>,
     pub body_patch: Option<BodyPatch>,
     pub sensory_patch: Option<SensoryPatch>,
+    pub memory_layer_reply: Option<MemoryLayerReplyPatch>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -71,6 +72,15 @@ pub struct MemoryPatch {
     pub interpretation: Option<String>,
     pub confidence: Option<f32>,
     pub objective_event_id: Option<String>,
+    pub truth_status: Option<TruthStatus>,
+    pub architecture_verified: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryLayerReplyPatch {
+    pub nonce: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -200,6 +210,10 @@ impl EnginePatch {
                 .sensory_patch
                 .as_ref()
                 .map_or(true, SensoryPatch::is_empty)
+            && self
+                .memory_layer_reply
+                .as_ref()
+                .map_or(true, MemoryLayerReplyPatch::is_empty)
     }
 
     fn should_decay_body(&self) -> bool {
@@ -270,6 +284,7 @@ impl From<&HiddenState> for EnginePatch {
             world_patch,
             body_patch,
             sensory_patch: None,
+            memory_layer_reply: None,
         }
     }
 }
@@ -370,6 +385,9 @@ impl SoulPatch {
                 .filter(|confidence| confidence.is_finite())
                 .or_else(|| matches!(source_type, MemorySourceType::Unknown).then_some(0.45));
             recent.objective_event_id = memory.cleaned_optional(&memory.objective_event_id);
+            recent.truth_status = memory.truth_status.unwrap_or_default();
+            recent.architecture_verified =
+                memory.architecture_verified.unwrap_or(false) && recent.truth_status.is_engine_verified();
             let mut action = MemoryApplyAction::Added;
             if is_generic_emotional_reaction(content, tag) {
                 recent.salience = (recent.salience * 0.55).min(40.0);
@@ -487,6 +505,12 @@ impl MemoryPatch {
             .iter()
             .filter_map(|target| clean_str(target).map(str::to_string))
             .collect()
+    }
+}
+
+impl MemoryLayerReplyPatch {
+    fn is_empty(&self) -> bool {
+        self.nonce.trim().is_empty() || self.content.trim().is_empty()
     }
 }
 
@@ -724,18 +748,22 @@ impl WorldPatch {
     }
 
     fn apply(&self, soul: &mut Soul) -> bool {
+        self.apply_to_world_log(&mut soul.world)
+    }
+
+    pub fn apply_to_world_log(&self, world: &mut crate::soul::WorldLog) -> bool {
         let mut changed = false;
         if let Some(location) = cleaned(&self.location) {
-            soul.world.location = location.to_string();
+            world.location = location.to_string();
             changed = true;
         }
         if let Some(time_elapsed) = cleaned(&self.time_elapsed) {
-            soul.world.time_elapsed = normalize_time_elapsed(time_elapsed);
+            world.time_elapsed = normalize_time_elapsed(time_elapsed);
             changed = true;
         }
 
         if let Some(event) = cleaned(&self.recent_event) {
-            push_recent_event(soul, event);
+            push_recent_event_to_world(world, event);
             changed = true;
         }
         for event in self
@@ -743,7 +771,7 @@ impl WorldPatch {
             .iter()
             .filter_map(|event| clean_str(event))
         {
-            push_recent_event(soul, event);
+            push_recent_event_to_world(world, event);
             changed = true;
         }
 
@@ -752,28 +780,28 @@ impl WorldPatch {
             .iter()
             .filter_map(|plot| clean_str(plot))
         {
-            changed |= push_unique(&mut soul.world.active_plots, plot);
+            changed |= push_unique(&mut world.active_plots, plot);
         }
         for plot in self
             .active_plot_resolve
             .iter()
             .filter_map(|plot| clean_str(plot))
         {
-            changed |= remove_value(&mut soul.world.active_plots, plot);
+            changed |= remove_value(&mut world.active_plots, plot);
         }
         for object in self
             .key_object_add
             .iter()
             .filter_map(|object| clean_str(object))
         {
-            changed |= push_unique(&mut soul.world.key_objects, object);
+            changed |= push_unique(&mut world.key_objects, object);
         }
         for object in self
             .key_object_remove
             .iter()
             .filter_map(|object| clean_str(object))
         {
-            changed |= remove_value(&mut soul.world.key_objects, object);
+            changed |= remove_value(&mut world.key_objects, object);
         }
 
         changed
@@ -918,11 +946,11 @@ fn clean_str(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
-fn push_recent_event(soul: &mut Soul, event: &str) {
-    soul.world.recent_events.push(event.to_string());
-    if soul.world.recent_events.len() > MAX_RECENT_EVENTS {
-        let remove_count = soul.world.recent_events.len() - MAX_RECENT_EVENTS;
-        soul.world.recent_events.drain(0..remove_count);
+fn push_recent_event_to_world(world: &mut crate::soul::WorldLog, event: &str) {
+    world.recent_events.push(event.to_string());
+    if world.recent_events.len() > MAX_RECENT_EVENTS {
+        let remove_count = world.recent_events.len() - MAX_RECENT_EVENTS;
+        world.recent_events.drain(0..remove_count);
     }
 }
 
