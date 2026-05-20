@@ -143,8 +143,9 @@ button {
 
 .chat-only-shell {
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
-  min-height: 100vh;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  height: 100vh;
+  overflow: hidden;
   background: #f6f4ef;
 }
 
@@ -195,15 +196,21 @@ button {
   padding: 12px 18px;
 }
 
+.chat-only-scroll {
+  width: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  direction: rtl;
+}
+
 .chat-only-body {
   display: flex;
   width: min(920px, 100%);
-  justify-self: center;
+  margin-inline: auto;
   flex-direction: column;
   gap: 16px;
-  min-height: 0;
   padding: 28px 18px 130px;
-  overflow-y: auto;
+  direction: ltr;
 }
 
 .chat-only-body .message {

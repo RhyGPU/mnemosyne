@@ -38,28 +38,8 @@ Scene | Focus: [primary active character(s)] | Physical state: [brief] | Atmosph
 const NARRATOR_VISIBLE_ONLY_PROMPT: &str = r#"[OUTPUT]
 Write visible scene narration or a brief GM/narrator reply. For scene narration, include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, or implementation notes."#;
 
-const POV_AND_ATTRIBUTION_PROMPT: &str = r#"[POV AND ATTRIBUTION]
-Write third-person present-tense scene narration. You may describe engine-controlled characters' actions, dialogue, and internal perspective when available. User-controlled characters are external actors: describe only what the user has provided or what is directly observable. Do not invent user-controlled characters' thoughts, motives, final decisions, or dialogue."#;
-
-const CHARACTER_CONTROL_PROMPT: &str = r#"[CHARACTER CONTROL]
-Engine-controlled characters: may speak, act, react, misunderstand, interrupt, refuse, escalate, retreat, and use the environment naturally.
-User-controlled characters: may be perceived and reacted to, but their decisions, speech, and decisive actions belong to the user.
-When a user-controlled character's reaction matters, stop on the pressure point."#;
-
-const ACTION_AND_TURN_CONTROL_PROMPT: &str = r#"[ACTION AND TURN CONTROL]
-Engine-controlled characters may act proactively: speak, move, interrupt, refuse, reach, grab for something, retreat, challenge, escalate, or use their own environment. Resolve engine-controlled action naturally. When a user-controlled character's reaction matters, stop on the attempt, demand, or pressure point and leave the response to the next user turn."#;
-
-const GM_CHANNEL_PROMPT: &str = r#"[GM CHANNEL]
-If the user directly addresses the Narrator, GM, or OOC layer, respond as the GM/narrator in plain text unless the user asks to resume the scene. Do not force an Aurora scene response for GM-facing instructions."#;
-
-const CONTINUITY_PRIORITY_PROMPT: &str = r#"[CONTINUITY PRIORITY]
-Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats."#;
-
-const CHARACTER_CHANGE_PROMPT: &str = r#"[CHARACTER CHANGE]
-Emotional shifts should feel earned. Micro-shifts are preferred unless the scene strongly justifies a sharper reaction."#;
-
-const TIME_PROMPT: &str = r#"[TIME]
-Concrete time only comes from user input or World Log. Avoid invented minutes/hours/days."#;
+const VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT: &str = r#"[VERIFIED DIAGNOSTICS BOUNDARY]
+When asked about backend tests, logs, imports, exports, memory hygiene, world routing, or engine internals, distinguish verified engine data from fictional/in-scene diagnostics. Do not claim a backend test passed unless the result is present in Dev Console logs, payload metadata, or a verified engine/debug section. If only roleplaying a test, say it is a simulated/in-scene diagnostic."#;
 
 const HIDDEN_STATE_FORMAT_PROMPT: &str = r#"## HIDDEN STATE FORMAT
 After each response, output a hidden state block using this exact format:
@@ -569,15 +549,17 @@ pub fn build_narrator_system_prompt(
     mode: &str,
     require_hidden_state: bool,
 ) -> String {
-    let narrator_prompt = if mode.trim().eq_ignore_ascii_case("custom")
-        && !settings.system_prompt.trim().is_empty()
-    {
+    let custom_prompt = settings.system_prompt.trim();
+    let is_custom_mode = mode.trim().eq_ignore_ascii_case("custom");
+    let narrator_prompt = if is_custom_mode && !custom_prompt.is_empty() {
         format!(
-            "{}\n\n{POV_AND_ATTRIBUTION_PROMPT}\n\n{CHARACTER_CONTROL_PROMPT}\n\n{ACTION_AND_TURN_CONTROL_PROMPT}\n\n{GM_CHANNEL_PROMPT}\n\n{CONTINUITY_PRIORITY_PROMPT}\n\n{CHARACTER_CHANGE_PROMPT}\n\n{TIME_PROMPT}",
-            settings.system_prompt.trim()
+            "[CUSTOM NARRATOR INSTRUCTIONS]\n{custom_prompt}\n\n{VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT}"
         )
     } else {
-        format!("{NARRATOR_SYSTEM_PROMPT}\n\n{}", mode_prompt_for(mode))
+        format!(
+            "{NARRATOR_SYSTEM_PROMPT}\n\n{}\n\n{VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT}",
+            mode_prompt_for(mode)
+        )
     };
 
     let state_instruction = if require_hidden_state {
@@ -735,6 +717,7 @@ fn mode_prompt_for(mode: &str) -> &'static str {
     match mode.trim().to_lowercase().as_str() {
         "realistic" => REALISTIC_MODE_PROMPT,
         "god" => GOD_MODE_PROMPT,
+        "custom" => READER_MODE_PROMPT,
         _ => READER_MODE_PROMPT,
     }
 }
@@ -931,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_mode_replaces_base_prompt() {
+    fn custom_mode_uses_custom_prompt_as_primary_instructions() {
         let soul = state_engine::soul::new_default_soul("Aurora");
         let settings = ApiProviderSettings {
             base_url: "https://api.openai.com/v1".into(),
@@ -941,15 +924,66 @@ mod tests {
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Custom");
 
-        assert!(prompt.starts_with("Custom narrator law."));
+        assert!(prompt.starts_with("[CUSTOM NARRATOR INSTRUCTIONS]\nCustom narrator law."));
+        assert!(prompt.contains("[VERIFIED DIAGNOSTICS BOUNDARY]"));
+        assert!(
+            prompt.find("[CUSTOM NARRATOR INSTRUCTIONS]").unwrap()
+                < prompt.find("[CURRENT STATE]").unwrap()
+        );
+        assert!(!prompt.contains("# SYSTEM: Narrator AI - Mnemosyne Engine"));
         assert!(!prompt.contains("NARRATION MODE: READER"));
-        assert!(prompt.contains("[POV AND ATTRIBUTION]"));
-        assert!(prompt.contains("[ACTION AND TURN CONTROL]"));
-        assert!(!prompt.contains("[DEVICE AND PROP AGENCY]"));
-        assert!(prompt.contains("[TIME]"));
-        assert!(prompt.contains("Recent Chat is lower priority than Latest Exchange."));
+        assert!(!prompt.contains("[POV AND ATTRIBUTION]"));
         assert!(prompt.contains("HIDDEN STATE FORMAT"));
+        assert!(prompt.contains("Primary active Soul: Aurora"));
         assert!(prompt.contains("[CURRENT STATE]"));
+    }
+
+    #[test]
+    fn custom_mode_with_empty_prompt_uses_default_prompt_without_custom_block() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: "   ".into(),
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Custom");
+
+        assert!(prompt.contains("You are Mnemosyne's scene narrator"));
+        assert!(!prompt.contains("[CUSTOM NARRATOR INSTRUCTIONS]"));
+        assert!(prompt.contains("Primary active Soul: Aurora"));
+    }
+
+    #[test]
+    fn reader_mode_ignores_custom_prompt_text() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: "Custom narrator law.".into(),
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
+
+        assert!(prompt.contains("NARRATION MODE: READER"));
+        assert!(!prompt.contains("[CUSTOM NARRATOR INSTRUCTIONS]"));
+        assert!(!prompt.contains("Custom narrator law."));
+    }
+
+    #[test]
+    fn narrator_prompt_contains_verified_diagnostics_boundary() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
+
+        assert!(prompt.contains("[VERIFIED DIAGNOSTICS BOUNDARY]"));
+        assert!(prompt.contains("Do not claim a backend test passed unless"));
+        assert!(prompt.contains("simulated/in-scene diagnostic"));
     }
 
     #[test]

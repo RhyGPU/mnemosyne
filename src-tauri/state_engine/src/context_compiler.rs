@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::setting::SessionWorld;
-use crate::soul::{MemoryEntry, MemorySourceType, Soul, TruthStatus};
+use crate::soul::{MemoryEntry, MemorySourceType, PlotStatus, Soul, TruthStatus};
 
 const DEFAULT_TOKEN_BUDGET: usize = 2_500;
 const MIN_RECENT_MEMORY_SALIENCE: f32 = 65.0;
@@ -22,6 +22,13 @@ const FILLER_MEMORY_PHRASES: &[&str] = &[
     "context cue",
     "recent chat is available",
     "fresh scene context",
+    "felt tense",
+    "looked at the user",
+    "listened carefully",
+    "looked carefully",
+    "watched the user",
+    "said nothing",
+    "remained quiet",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +42,8 @@ pub struct ContextPreview {
     pub text: String,
     pub estimated_tokens: usize,
     pub truncated: bool,
+    #[serde(default)]
+    pub memory_slot_debug: Vec<MemorySlotTrace>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +65,7 @@ pub struct ContextBudget {
 struct BuiltSection {
     text: String,
     truncated: bool,
+    memory_slot_debug: Vec<MemorySlotTrace>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +74,83 @@ struct ScoredMemory<'a> {
     score: f32,
     repetitive: bool,
     source_restricted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemorySlotTrace {
+    pub slot: String,
+    pub memory_id: String,
+    pub action: String,
+    pub reason: String,
+    pub source_type: String,
+    pub truth_status: String,
+    pub entity_match: bool,
+    pub plot_match: bool,
+    pub salience: f32,
+    pub final_score: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemorySlot {
+    Relationship,
+    CurrentPlot,
+    CharacterIdentity,
+    UnresolvedTension,
+    WorldLocation,
+    RecentEmotionalState,
+}
+
+impl MemorySlot {
+    fn all() -> [Self; 6] {
+        [
+            Self::Relationship,
+            Self::CurrentPlot,
+            Self::CharacterIdentity,
+            Self::UnresolvedTension,
+            Self::WorldLocation,
+            Self::RecentEmotionalState,
+        ]
+    }
+
+    fn header(self) -> &'static str {
+        match self {
+            Self::Relationship => "[RELATIONSHIP MEMORY]",
+            Self::CurrentPlot => "[CURRENT PLOT MEMORY]",
+            Self::CharacterIdentity => "[CHARACTER IDENTITY MEMORY]",
+            Self::UnresolvedTension => "[UNRESOLVED TENSION]",
+            Self::WorldLocation => "[WORLD / LOCATION MEMORY]",
+            Self::RecentEmotionalState => "[RECENT EMOTIONAL STATE]",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Relationship => "relationship_memories",
+            Self::CurrentPlot => "current_plot_memories",
+            Self::CharacterIdentity => "character_identity_memories",
+            Self::UnresolvedTension => "unresolved_tension_memories",
+            Self::WorldLocation => "world_location_memories",
+            Self::RecentEmotionalState => "recent_emotional_state_memories",
+        }
+    }
+
+    fn cap(self) -> usize {
+        match self {
+            Self::RecentEmotionalState => 1,
+            _ => 2,
+        }
+    }
+
+    fn fallback(self) -> &'static str {
+        match self {
+            Self::Relationship => "No relationship-specific durable memory selected.",
+            Self::CurrentPlot => "No current-plot memory selected.",
+            Self::CharacterIdentity => "No identity memory selected.",
+            Self::UnresolvedTension => "No unresolved tension selected.",
+            Self::WorldLocation => "No world/location memory selected.",
+            Self::RecentEmotionalState => "No recent emotional-state memory selected.",
+        }
+    }
 }
 
 impl Default for ContextBudget {
@@ -153,8 +240,10 @@ fn compile_context_with_budget_and_options(
     ];
 
     let mut sections = Vec::new();
+    let mut memory_slot_debug = Vec::new();
     for section in section_builders {
         truncated |= section.truncated;
+        memory_slot_debug.extend(section.memory_slot_debug);
         if !section.text.trim().is_empty() {
             sections.push(section.text);
         }
@@ -167,6 +256,7 @@ fn compile_context_with_budget_and_options(
         estimated_tokens: estimate_tokens(&text),
         text,
         truncated,
+        memory_slot_debug,
     }
 }
 
@@ -308,6 +398,7 @@ fn build_verified_memory_layer_reply_section(soul: &Soul, budget: &ContextBudget
         return BuiltSection {
             text: String::new(),
             truncated: false,
+            memory_slot_debug: Vec::new(),
         };
     };
 
@@ -460,6 +551,7 @@ fn build_recent_chat_section(messages: &[ContextMessage], budget: &ContextBudget
         return BuiltSection {
             text: String::new(),
             truncated: false,
+            memory_slot_debug: Vec::new(),
         };
     }
 
@@ -535,7 +627,11 @@ fn section_from_lines(header: &str, lines: Vec<String>, token_cap: usize) -> Bui
         }
     }
 
-    BuiltSection { text, truncated }
+    BuiltSection {
+        text,
+        truncated,
+        memory_slot_debug: Vec::new(),
+    }
 }
 
 fn compact_sections_to_budget(sections: &mut Vec<String>, max_tokens: usize) -> bool {
@@ -1475,6 +1571,14 @@ mod tests {
             schema_type: "observation".into(),
             summary: "observation recurring pattern across 3 memories.".into(),
             count: 3,
+            schema_id: "observation-schema".into(),
+            owner_soul_id: Some(soul.character_id.clone()),
+            target_entity_ids: Vec::new(),
+            trigger_tags: vec!["observation".into()],
+            salience: 20.0,
+            reinforcement_count: 3,
+            decay: 0.0,
+            last_reinforced_turn: soul.turn_counter,
         });
         soul.memory.recent.push(memory(
             "filler",
@@ -1556,6 +1660,7 @@ mod tests {
                 recent_events: vec!["Echo-0 entered the testing room.".into()],
                 key_objects: vec!["debug terminal".into()],
                 time_elapsed: "Session start".into(),
+                ..crate::soul::WorldLog::default()
             },
         );
         world.scenario = "Objective debug room.".into();

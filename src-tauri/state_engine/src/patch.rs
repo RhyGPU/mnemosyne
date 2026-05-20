@@ -4,6 +4,7 @@ use crate::{
     arousal::ArousalSignal,
     hidden_state::HiddenState,
     memory::create_scored_memory,
+    setting::SessionWorld,
     soul::{current_timestamp, MemorySourceType, Relationship, Soul, TruthStatus},
 };
 
@@ -158,6 +159,14 @@ pub enum PatchError {
 
 impl EnginePatch {
     pub fn apply_to_soul(&self, soul: &mut Soul) -> Result<PatchReport, PatchError> {
+        self.apply_to_session(soul, None)
+    }
+
+    pub fn apply_to_session(
+        &self,
+        soul: &mut Soul,
+        mut session_world: Option<&mut SessionWorld>,
+    ) -> Result<PatchReport, PatchError> {
         self.validate()?;
         if self.is_empty() {
             return Ok(PatchReport::default());
@@ -171,7 +180,11 @@ impl EnginePatch {
             report.memory_events = memory_report.events;
         }
         if let Some(world_patch) = &self.world_patch {
-            report.world_updated = world_patch.apply(soul);
+            report.world_updated = if let Some(session_world) = session_world.as_deref_mut() {
+                world_patch.apply_to_session_world(session_world)
+            } else {
+                world_patch.apply(soul)
+            };
         }
         if let Some(body_patch) = &self.body_patch {
             report.body_updated = body_patch.apply(soul);
@@ -806,6 +819,16 @@ impl WorldPatch {
 
         changed
     }
+
+    pub fn apply_to_session_world(&self, session_world: &mut SessionWorld) -> bool {
+        let mut world = session_world.world_log();
+        let changed = self.apply_to_world_log(&mut world);
+        if changed {
+            session_world.set_world_log(&world);
+            session_world.last_updated = current_timestamp() as i64;
+        }
+        changed
+    }
 }
 
 impl BodyPatch {
@@ -1321,6 +1344,65 @@ mod tests {
             .active_plots
             .contains(&"Open the locked gate".to_string()));
         assert!(soul.world.key_objects.contains(&"Rusty key".to_string()));
+    }
+
+    #[test]
+    fn apply_to_session_routes_world_patch_to_session_world() {
+        let mut soul = Soul::default_for_character("Echo-0");
+        soul.world.location = "Legacy room".into();
+        let mut session_world = crate::setting::session_world_from_legacy_world(
+            "Testing Room",
+            Some("world-source".into()),
+            &crate::soul::WorldLog {
+                location: "Session start room".into(),
+                active_plots: Vec::new(),
+                recent_events: Vec::new(),
+                key_objects: Vec::new(),
+                time_elapsed: "Session start".into(),
+                ..crate::soul::WorldLog::default()
+            },
+        );
+        let patch = EnginePatch {
+            world_patch: Some(WorldPatch {
+                location: Some("Session lab".into()),
+                recent_event: Some("Echo-0 crossed the lab.".into()),
+                active_plot_add: vec!["Verify routing".into()],
+                key_object_add: vec!["debug terminal".into()],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        let report = patch
+            .apply_to_session(&mut soul, Some(&mut session_world))
+            .expect("patch applies");
+
+        assert!(report.world_updated);
+        assert_eq!(soul.world.location, "Legacy room");
+        assert_eq!(session_world.location, "Session lab");
+        assert!(session_world
+            .recent_events
+            .contains(&"Echo-0 crossed the lab.".into()));
+        assert!(session_world.active_plots.contains(&"Verify routing".into()));
+        assert!(session_world.key_objects.contains(&"debug terminal".into()));
+    }
+
+    #[test]
+    fn apply_to_session_legacy_fallback_mutates_soul_world_without_session_world() {
+        let mut soul = Soul::default_for_character("Echo-0");
+        soul.world.location = "Legacy room".into();
+        let patch = EnginePatch {
+            world_patch: Some(WorldPatch {
+                location: Some("Legacy fallback room".into()),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        let report = patch.apply_to_session(&mut soul, None).expect("patch applies");
+
+        assert!(report.world_updated);
+        assert_eq!(soul.world.location, "Legacy fallback room");
     }
 
     #[test]

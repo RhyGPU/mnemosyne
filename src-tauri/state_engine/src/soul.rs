@@ -238,6 +238,69 @@ pub struct SchemaEntry {
     pub schema_type: String,
     pub summary: String,
     pub count: u64,
+    #[serde(default)]
+    pub schema_id: String,
+    #[serde(default)]
+    pub owner_soul_id: Option<String>,
+    #[serde(default)]
+    pub target_entity_ids: Vec<String>,
+    #[serde(default)]
+    pub trigger_tags: Vec<String>,
+    #[serde(default)]
+    pub salience: f32,
+    #[serde(default)]
+    pub reinforcement_count: u64,
+    #[serde(default)]
+    pub decay: f32,
+    #[serde(default)]
+    pub last_reinforced_turn: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlotStatus {
+    Dominant,
+    Background,
+    Resolved,
+    Stale,
+    #[default]
+    Unknown,
+}
+
+impl PlotStatus {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            PlotStatus::Dominant => "dominant",
+            PlotStatus::Background => "background",
+            PlotStatus::Resolved => "resolved",
+            PlotStatus::Stale => "stale",
+            PlotStatus::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlotEntry {
+    pub plot_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub status: PlotStatus,
+    #[serde(default)]
+    pub salience: f32,
+    #[serde(default)]
+    pub started_turn: u64,
+    #[serde(default)]
+    pub last_touched_turn: u64,
+    #[serde(default)]
+    pub related_entities: Vec<String>,
+    #[serde(default)]
+    pub related_world_id: Option<String>,
+    #[serde(default)]
+    pub unresolved_questions: Vec<String>,
+    #[serde(default)]
+    pub resolution_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -247,6 +310,14 @@ pub struct WorldLog {
     pub recent_events: Vec<String>,
     pub key_objects: Vec<String>,
     pub time_elapsed: String,
+    #[serde(default)]
+    pub dominant_current_plot: Option<PlotEntry>,
+    #[serde(default)]
+    pub background_plots: Vec<PlotEntry>,
+    #[serde(default)]
+    pub resolved_plots: Vec<PlotEntry>,
+    #[serde(default)]
+    pub stale_plot_decay: f32,
 }
 
 impl Default for WorldLog {
@@ -257,6 +328,10 @@ impl Default for WorldLog {
             recent_events: Vec::new(),
             key_objects: Vec::new(),
             time_elapsed: "Session start".into(),
+            dominant_current_plot: None,
+            background_plots: Vec::new(),
+            resolved_plots: Vec::new(),
+            stale_plot_decay: 0.12,
         }
     }
 }
@@ -520,6 +595,14 @@ mod tests {
             schema_type: "attachment_pattern".into(),
             summary: "Aurora remembers promises that felt stabilizing.".into(),
             count: 2,
+            schema_id: "attachment-pattern".into(),
+            owner_soul_id: Some(soul.character_id.clone()),
+            target_entity_ids: vec!["user".into()],
+            trigger_tags: vec!["promise".into()],
+            salience: 70.0,
+            reinforcement_count: 2,
+            decay: 0.0,
+            last_reinforced_turn: soul.turn_counter,
         });
         soul.relationships.get_mut("user").unwrap().trust = 130.0;
         soul.relationships.get_mut("user").unwrap().affection = 126.0;

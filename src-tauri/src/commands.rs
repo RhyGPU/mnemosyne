@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -11,6 +12,7 @@ use std::{
 
 use base64::{engine::general_purpose, Engine as _};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 use state_engine::{
@@ -126,6 +128,7 @@ pub struct LlmPayloadPreview {
     pub provider: String,
     pub mode: String,
     pub context_mode: String,
+    pub custom_prompt_status: String,
     pub model: String,
     pub base_url: String,
     pub system_message: String,
@@ -225,6 +228,49 @@ struct ReplayGuardResult {
 struct OutputContractResult {
     text: String,
     warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MneBundleManifest {
+    pub mne_version: u32,
+    pub bundle_id: String,
+    pub bundle_type: String,
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub author: Option<String>,
+    pub created_at: i64,
+    pub app: String,
+    pub schema_version: u32,
+    pub contents: MneBundleContents,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MneBundleContents {
+    #[serde(default)]
+    pub souls: Vec<String>,
+    #[serde(default)]
+    pub worlds: Vec<String>,
+    #[serde(default)]
+    pub images: Vec<String>,
+    #[serde(default)]
+    pub conversation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MneExportResult {
+    pub path: String,
+    pub manifest: MneBundleManifest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MneImportResult {
+    pub bundle_id: String,
+    pub bundle_type: String,
+    pub imported_soul_ids: Vec<String>,
+    pub imported_setting_ids: Vec<String>,
+    pub remapped_ids: HashMap<String, String>,
+    pub summary: String,
 }
 
 #[tauri::command]
@@ -377,6 +423,207 @@ pub fn save_setting_file(app: AppHandle, path: String, setting: SettingSoul) -> 
     let content = serde_json::to_string_pretty(&setting).map_err(|err| err.to_string())?;
     let path = resolve_export_path(&app, &path, "setting.json")?;
     fs::write(path, content).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn export_character_soul_mne(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    soul_id: String,
+    output_path: String,
+) -> Result<MneExportResult, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let mut soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
+    soul.soul_kind = "savepoint".into();
+    let soul_path = format!("souls/{}.json", safe_bundle_name(&soul.character_id));
+    let manifest = mne_manifest(
+        "character_soul",
+        &soul.character_name,
+        "Mnemosyne character Soul bundle",
+        vec![soul_path.clone()],
+        Vec::new(),
+        None,
+    );
+    let mut files = Vec::new();
+    files.push(json_bundle_file("manifest.json", &manifest)?);
+    files.push(json_bundle_file(&soul_path, &soul)?);
+    write_mne_bundle(&app, &output_path, &manifest, files)
+}
+
+#[tauri::command]
+pub fn export_world_setting_mne(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    setting_id: String,
+    output_path: String,
+) -> Result<MneExportResult, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let setting = db::get_setting(&conn, &setting_id).map_err(|err| err.to_string())?;
+    let world_path = format!("worlds/{}.json", safe_bundle_name(&setting.setting_id));
+    let manifest = mne_manifest(
+        "world_setting",
+        &setting.setting_name,
+        "Mnemosyne world/setting bundle",
+        Vec::new(),
+        vec![world_path.clone()],
+        None,
+    );
+    let files = vec![
+        json_bundle_file("manifest.json", &manifest)?,
+        json_bundle_file(&world_path, &setting)?,
+    ];
+    write_mne_bundle(&app, &output_path, &manifest, files)
+}
+
+#[tauri::command]
+pub fn export_scenario_bundle_mne(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    soul_id: String,
+    world_id: String,
+    output_path: String,
+) -> Result<MneExportResult, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let mut soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
+    soul.soul_kind = "savepoint".into();
+    let setting = db::get_setting(&conn, &world_id).map_err(|err| err.to_string())?;
+    let soul_path = format!("souls/{}.json", safe_bundle_name(&soul.character_id));
+    let world_path = format!("worlds/{}.json", safe_bundle_name(&setting.setting_id));
+    let title = format!("{} + {}", soul.character_name, setting.setting_name);
+    let manifest = mne_manifest(
+        "scenario_bundle",
+        &title,
+        "Mnemosyne scenario bundle",
+        vec![soul_path.clone()],
+        vec![world_path.clone()],
+        None,
+    );
+    let files = vec![
+        json_bundle_file("manifest.json", &manifest)?,
+        json_bundle_file(&soul_path, &soul)?,
+        json_bundle_file(&world_path, &setting)?,
+    ];
+    write_mne_bundle(&app, &output_path, &manifest, files)
+}
+
+#[tauri::command]
+pub fn export_current_session_checkpoint_mne(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    conversation_id: String,
+    output_path: String,
+) -> Result<MneExportResult, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let conversation =
+        db::get_conversation_summary(&conn, &conversation_id).map_err(|err| err.to_string())?;
+    let soul = db::get_soul(&conn, &conversation.soul_id).map_err(|err| err.to_string())?;
+    let session_world = db::get_conversation_session_world(&conn, &conversation_id)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
+    let messages =
+        db::list_messages(&conn, &conversation_id, 10_000).map_err(|err| err.to_string())?;
+    let soul_path = format!("souls/{}.json", safe_bundle_name(&soul.character_id));
+    let world_path = format!("worlds/{}.json", safe_bundle_name(&session_world.world_id));
+    let conversation_path = "conversation/conversation.json".to_string();
+    let manifest = mne_manifest(
+        "session_checkpoint",
+        &conversation.title,
+        "Mnemosyne session checkpoint bundle",
+        vec![soul_path.clone()],
+        vec![world_path.clone()],
+        Some(conversation_path.clone()),
+    );
+    let files = vec![
+        json_bundle_file("manifest.json", &manifest)?,
+        json_bundle_file(&soul_path, &soul)?,
+        json_bundle_file(&world_path, &session_world)?,
+        json_bundle_file(&conversation_path, &conversation)?,
+        json_bundle_file("conversation/messages.json", &messages)?,
+    ];
+    write_mne_bundle(&app, &output_path, &manifest, files)
+}
+
+#[tauri::command]
+pub fn import_mne_bundle(
+    state: State<'_, AppState>,
+    file_path: String,
+) -> Result<MneImportResult, String> {
+    let path = PathBuf::from(&file_path);
+    if path.extension().and_then(|ext| ext.to_str()) != Some("mne") {
+        return Err("Mnemosyne bundle import requires a .mne file".into());
+    }
+    let bytes = fs::read(&path).map_err(|err| err.to_string())?;
+    let entries = read_stored_zip(&bytes)?;
+    let manifest_bytes = entries
+        .get("manifest.json")
+        .ok_or_else(|| "Missing manifest.json".to_string())?;
+    let manifest: MneBundleManifest = serde_json::from_slice(manifest_bytes)
+        .map_err(|err| format!("Invalid manifest JSON: {err}"))?;
+    validate_mne_manifest(&manifest)?;
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    import_mne_entries(&conn, &entries, &manifest)
+}
+
+fn import_mne_entries(
+    conn: &Connection,
+    entries: &HashMap<String, Vec<u8>>,
+    manifest: &MneBundleManifest,
+) -> Result<MneImportResult, String> {
+    let mut result = MneImportResult {
+        bundle_id: manifest.bundle_id.clone(),
+        bundle_type: manifest.bundle_type.clone(),
+        ..MneImportResult::default()
+    };
+
+    for soul_path in &manifest.contents.souls {
+        validate_bundle_path(soul_path)?;
+        let soul_bytes = entries
+            .get(soul_path)
+            .ok_or_else(|| format!("Missing Soul file {soul_path}"))?;
+        let mut soul: Soul = serde_json::from_slice(soul_bytes)
+            .map_err(|err| format!("Invalid Soul JSON: {err}"))?;
+        let original_id = soul.character_id.clone();
+        if db::get_soul(&conn, &soul.character_id).is_ok() {
+            soul.character_id = uuid_like_id();
+            soul.source_soul_id = Some(original_id.clone());
+            result
+                .remapped_ids
+                .insert(original_id.clone(), soul.character_id.clone());
+        }
+        if manifest.bundle_type != "session_checkpoint" {
+            soul.soul_kind = "savepoint".into();
+            soul.source_savepoint_id = None;
+        }
+        soul.last_updated = db::now_ts();
+        db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
+        result.imported_soul_ids.push(soul.character_id);
+    }
+
+    for world_path in &manifest.contents.worlds {
+        validate_bundle_path(world_path)?;
+        let world_bytes = entries
+            .get(world_path)
+            .ok_or_else(|| format!("Missing World file {world_path}"))?;
+        let mut setting = setting_from_mne_world_bytes(world_bytes)?;
+        let original_id = setting.setting_id.clone();
+        if db::get_setting(&conn, &setting.setting_id).is_ok() {
+            setting.setting_id = uuid_like_id();
+            result
+                .remapped_ids
+                .insert(original_id.clone(), setting.setting_id.clone());
+        }
+        setting.last_updated = db::now_ts();
+        db::upsert_setting(&conn, &setting).map_err(|err| err.to_string())?;
+        result.imported_setting_ids.push(setting.setting_id);
+    }
+
+    result.summary = format!(
+        "Imported {} Soul(s), {} World/Setting savepoint(s) from {}",
+        result.imported_soul_ids.len(),
+        result.imported_setting_ids.len(),
+        manifest.title
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1086,7 +1333,7 @@ pub fn compile_context(
 ) -> Result<ContextPreview, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
-    let session_world = db::ensure_conversation_session_world(&conn, &conversation_id, &soul, None)
+    let session_world = load_session_world_for_context(&window, &conn, &conversation_id, &soul)
         .map_err(|err| err.to_string())?;
     emit_possible_world_character_mismatch(&window, &conversation_id, &soul, Some(&session_world));
     let messages = db::list_messages(&conn, &conversation_id, 5).map_err(|err| err.to_string())?;
@@ -1095,6 +1342,66 @@ pub fn compile_context(
         Some(&session_world),
         &messages_to_context(messages),
     ))
+}
+
+fn load_session_world_for_context(
+    window: &Window,
+    conn: &Connection,
+    conversation_id: &str,
+    soul: &Soul,
+) -> rusqlite::Result<SessionWorld> {
+    match db::get_conversation_session_world(conn, conversation_id)? {
+        Some(session_world) => {
+            emit_dev_log(
+                window,
+                "debug",
+                "context",
+                "session_world_loaded",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "session_world_id": session_world.world_id.as_str(),
+                    "source_setting_id": session_world.source_setting_id.as_deref()
+                })),
+            );
+            emit_dev_log(
+                window,
+                "debug",
+                "context",
+                "context_world_source_session_world",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "session_world_id": session_world.world_id.as_str()
+                })),
+            );
+            Ok(session_world)
+        }
+        None => {
+            emit_dev_log(
+                window,
+                "warn",
+                "context",
+                "session_world_missing",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "active_soul_id": soul.character_id.as_str()
+                })),
+            );
+            let session_world =
+                db::ensure_conversation_session_world(conn, conversation_id, soul, None)?;
+            emit_dev_log(
+                window,
+                "warn",
+                "context",
+                "context_world_source_legacy_soul_world",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "session_world_id": session_world.world_id.as_str(),
+                    "reason": "created from legacy soul.world fallback"
+                })),
+            );
+            Ok(session_world)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1216,16 +1523,9 @@ fn send_mock_turn_with_conn(
     debug.output_contract_warning = output_contract_warning;
     let debug_json = serde_json::to_string(&debug).map_err(|err| err.to_string())?;
 
-    let mut character_patch = parsed.engine_patch.clone();
-    character_patch.world_patch = None;
-    let _ = character_patch.apply_to_soul(&mut soul);
-    if let Some(world_patch) = parsed.engine_patch.world_patch.as_ref() {
-        let mut world_log = session_world.world_log();
-        if world_patch.apply_to_world_log(&mut world_log) {
-            session_world.set_world_log(&world_log);
-            session_world.last_updated = db::now_ts();
-        }
-    }
+    let _ = parsed
+        .engine_patch
+        .apply_to_session(&mut soul, Some(&mut session_world));
     soul.turn_counter += 1;
     soul.turns_since_consolidation += 1;
     let assistant_message_id = if let Some(message_id) = replacement_assistant_id {
@@ -1367,9 +1667,8 @@ pub async fn send_api_turn(
         };
         db::ensure_conversation(&conn, &conversation_id, &soul.character_id)
             .map_err(|err| err.to_string())?;
-        let session_world =
-            db::ensure_conversation_session_world(&conn, &conversation_id, &soul, None)
-                .map_err(|err| err.to_string())?;
+        let session_world = load_session_world_for_context(&window, &conn, &conversation_id, &soul)
+            .map_err(|err| err.to_string())?;
         if replacement_assistant_id.is_none() {
             db::insert_message(&conn, &conversation_id, "user", &user_text)
                 .map_err(|err| err.to_string())?;
@@ -2220,18 +2519,8 @@ pub async fn send_api_turn(
     debug.output_contract_warning = output_contract_warning;
 
     let apply_started = Instant::now();
-    let mut character_patch = engine_patch.clone();
-    character_patch.world_patch = None;
-    let mut world_updated = false;
-    if let Some(world_patch) = engine_patch.world_patch.as_ref() {
-        let mut world_log = session_world.world_log();
-        world_updated = world_patch.apply_to_world_log(&mut world_log);
-        if world_updated {
-            session_world.set_world_log(&world_log);
-            session_world.last_updated = db::now_ts();
-        }
-    }
-    match character_patch.apply_to_soul(&mut soul) {
+    let world_patch_present = engine_patch.world_patch.is_some();
+    match engine_patch.apply_to_session(&mut soul, Some(&mut session_world)) {
         Ok(report) => {
             emit_perf_log(
                 &window,
@@ -2255,10 +2544,25 @@ pub async fn send_api_turn(
                     "assistant_message_id": assistant_message_id,
                     "relationship_updated": report.relationship_updated,
                     "memories_added": report.memories_added,
-                    "world_updated": world_updated,
+                    "world_updated": report.world_updated,
+                    "world_patch_target": if world_patch_present { "session_world" } else { "none" },
                     "body_updated": report.body_updated
                 })),
             );
+            if world_patch_present && report.world_updated {
+                emit_dev_log(
+                    &window,
+                    "success",
+                    "state_updater",
+                    "world_patch_applied_to_session_world",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "session_world_id": session_world.world_id.as_str(),
+                        "source_setting_id": session_world.source_setting_id.as_deref()
+                    })),
+                );
+            }
             emit_relationship_delta_logs(&window, &conversation_id, &engine_patch);
             emit_memory_apply_logs(&window, &conversation_id, &report.memory_events);
         }
@@ -4585,6 +4889,7 @@ fn build_llm_payload_preview(
         provider: provider.trim().to_string(),
         mode: mode.trim().to_string(),
         context_mode: context_mode.label().into(),
+        custom_prompt_status: custom_prompt_status_for(mode, &system_message).into(),
         model: settings.model.trim().to_string(),
         base_url: settings.base_url.trim().to_string(),
         system_message,
@@ -4598,6 +4903,17 @@ fn build_llm_payload_preview(
             user: user_tokens,
             total: system_tokens + user_tokens + context_tokens,
         },
+    }
+}
+
+fn custom_prompt_status_for(mode: &str, system_message: &str) -> &'static str {
+    if !mode.trim().eq_ignore_ascii_case("custom") {
+        return "inactive";
+    }
+    if system_message.contains("[CUSTOM NARRATOR INSTRUCTIONS]") {
+        "included"
+    } else {
+        "empty"
     }
 }
 
@@ -4763,6 +5079,10 @@ fn render_llm_payload_history(logs: &[LlmPayloadLog]) -> String {
         lines.push(format!("Provider: {}", log.provider));
         lines.push(format!("Model: {}", log.model));
         lines.push(format!("Mode: {}", log.mode));
+        lines.push(format!(
+            "Custom prompt: {}",
+            custom_prompt_status_for(&log.mode, &log.system_message)
+        ));
         lines.push(format!("Context mode: {}", log.context_mode));
         lines.push(format!("Base URL: {}", log.base_url));
         lines.push(format!("Truncated: {}", log.truncated));
@@ -4935,6 +5255,302 @@ fn resolve_export_path(
     }
     dir.push(file_name);
     Ok(dir)
+}
+
+fn mne_manifest(
+    bundle_type: &str,
+    title: &str,
+    description: &str,
+    souls: Vec<String>,
+    worlds: Vec<String>,
+    conversation: Option<String>,
+) -> MneBundleManifest {
+    MneBundleManifest {
+        mne_version: 1,
+        bundle_id: uuid_like_id(),
+        bundle_type: bundle_type.into(),
+        title: title.trim().to_string(),
+        description: description.into(),
+        author: None,
+        created_at: db::now_ts(),
+        app: "Mnemosyne".into(),
+        schema_version: 1,
+        contents: MneBundleContents {
+            souls,
+            worlds,
+            images: Vec::new(),
+            conversation,
+        },
+    }
+}
+
+fn json_bundle_file<T: Serialize>(path: &str, value: &T) -> Result<(String, Vec<u8>), String> {
+    validate_bundle_path(path)?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(|err| err.to_string())?;
+    Ok((path.replace('\\', "/"), bytes))
+}
+
+fn write_mne_bundle(
+    app: &AppHandle,
+    output_path: &str,
+    manifest: &MneBundleManifest,
+    files: Vec<(String, Vec<u8>)>,
+) -> Result<MneExportResult, String> {
+    let path = resolve_export_path(app, output_path, "mne")?;
+    write_stored_zip(&path, &files)?;
+    Ok(MneExportResult {
+        path: path.to_string_lossy().to_string(),
+        manifest: manifest.clone(),
+    })
+}
+
+fn validate_mne_manifest(manifest: &MneBundleManifest) -> Result<(), String> {
+    if manifest.mne_version != 1 {
+        return Err(format!("Unsupported .mne version {}", manifest.mne_version));
+    }
+    if !matches!(
+        manifest.bundle_type.as_str(),
+        "character_soul" | "world_setting" | "scenario_bundle" | "session_checkpoint"
+    ) {
+        return Err("Unsupported .mne bundle_type".into());
+    }
+    for path in manifest
+        .contents
+        .souls
+        .iter()
+        .chain(manifest.contents.worlds.iter())
+        .chain(manifest.contents.images.iter())
+    {
+        validate_bundle_path(path)?;
+    }
+    if let Some(path) = manifest.contents.conversation.as_ref() {
+        validate_bundle_path(path)?;
+    }
+    Ok(())
+}
+
+fn validate_bundle_path(path: &str) -> Result<(), String> {
+    let normalized = path.replace('\\', "/");
+    if normalized.trim().is_empty()
+        || normalized.starts_with('/')
+        || normalized.contains("../")
+        || normalized == ".."
+        || normalized.contains('\0')
+        || Path::new(&normalized).is_absolute()
+    {
+        return Err("Invalid bundle path".into());
+    }
+    Ok(())
+}
+
+fn setting_from_mne_world_bytes(bytes: &[u8]) -> Result<SettingSoul, String> {
+    if let Ok(setting) = serde_json::from_slice::<SettingSoul>(bytes) {
+        return Ok(setting);
+    }
+    let session_world: SessionWorld =
+        serde_json::from_slice(bytes).map_err(|err| format!("Invalid World JSON: {err}"))?;
+    Ok(SettingSoul {
+        schema_version: session_world.schema_version,
+        setting_id: session_world
+            .source_setting_id
+            .clone()
+            .unwrap_or_else(|| session_world.world_id.clone()),
+        setting_name: session_world.setting_name.clone(),
+        scenario: session_world.scenario.clone(),
+        last_updated: db::now_ts(),
+        turn_counter: 0,
+        world: session_world.world_log(),
+    })
+}
+
+fn safe_bundle_name(value: &str) -> String {
+    safe_filename(value).trim_matches('.').to_string()
+}
+
+fn write_stored_zip(path: &Path, files: &[(String, Vec<u8>)]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let mut file = fs::File::create(path).map_err(|err| err.to_string())?;
+    let mut central = Vec::new();
+    for (name, data) in files {
+        validate_bundle_path(name)?;
+        let offset = file.stream_position().map_err(|err| err.to_string())? as u32;
+        let crc = crc32(data);
+        let name_bytes = name.as_bytes();
+        write_u32(&mut file, 0x0403_4b50)?;
+        write_u16(&mut file, 20)?;
+        write_u16(&mut file, 0)?;
+        write_u16(&mut file, 0)?;
+        write_u16(&mut file, 0)?;
+        write_u16(&mut file, 0)?;
+        write_u32(&mut file, crc)?;
+        write_u32(&mut file, data.len() as u32)?;
+        write_u32(&mut file, data.len() as u32)?;
+        write_u16(&mut file, name_bytes.len() as u16)?;
+        write_u16(&mut file, 0)?;
+        file.write_all(name_bytes).map_err(|err| err.to_string())?;
+        file.write_all(data).map_err(|err| err.to_string())?;
+        central.push((name.clone(), crc, data.len() as u32, offset));
+    }
+    let central_offset = file.stream_position().map_err(|err| err.to_string())? as u32;
+    for (name, crc, size, offset) in &central {
+        let name_bytes = name.as_bytes();
+        write_u32(&mut file, 0x0201_4b50)?;
+        write_u16(&mut file, 20)?;
+        write_u16(&mut file, 20)?;
+        write_u16(&mut file, 0)?;
+        write_u16(&mut file, 0)?;
+        write_u16(&mut file, 0)?;
+        write_u16(&mut file, 0)?;
+        write_u32(&mut file, *crc)?;
+        write_u32(&mut file, *size)?;
+        write_u32(&mut file, *size)?;
+        write_u16(&mut file, name_bytes.len() as u16)?;
+        write_u16(&mut file, 0)?;
+        write_u16(&mut file, 0)?;
+        write_u16(&mut file, 0)?;
+        write_u16(&mut file, 0)?;
+        write_u32(&mut file, 0)?;
+        write_u32(&mut file, *offset)?;
+        file.write_all(name_bytes).map_err(|err| err.to_string())?;
+    }
+    let central_size =
+        file.stream_position().map_err(|err| err.to_string())? as u32 - central_offset;
+    write_u32(&mut file, 0x0605_4b50)?;
+    write_u16(&mut file, 0)?;
+    write_u16(&mut file, 0)?;
+    write_u16(&mut file, central.len() as u16)?;
+    write_u16(&mut file, central.len() as u16)?;
+    write_u32(&mut file, central_size)?;
+    write_u32(&mut file, central_offset)?;
+    write_u16(&mut file, 0)?;
+    Ok(())
+}
+
+fn read_stored_zip(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
+    let eocd_pos = bytes
+        .windows(4)
+        .rposition(|window| window == [0x50, 0x4b, 0x05, 0x06])
+        .ok_or_else(|| "Invalid .mne zip: missing end of central directory".to_string())?;
+    let mut cursor = Cursor::new(&bytes[eocd_pos + 4..]);
+    let _disk = read_u16(&mut cursor)?;
+    let _central_disk = read_u16(&mut cursor)?;
+    let count = read_u16(&mut cursor)? as usize;
+    let _total = read_u16(&mut cursor)?;
+    let _central_size = read_u32(&mut cursor)? as usize;
+    let central_offset = read_u32(&mut cursor)? as usize;
+    let mut cursor = Cursor::new(bytes);
+    cursor
+        .seek(SeekFrom::Start(central_offset as u64))
+        .map_err(|err| err.to_string())?;
+    let mut entries = HashMap::new();
+    for _ in 0..count {
+        if read_u32(&mut cursor)? != 0x0201_4b50 {
+            return Err("Invalid .mne zip central directory".into());
+        }
+        cursor
+            .seek(SeekFrom::Current(6))
+            .map_err(|err| err.to_string())?;
+        let compression = read_u16(&mut cursor)?;
+        cursor
+            .seek(SeekFrom::Current(4))
+            .map_err(|err| err.to_string())?;
+        let crc = read_u32(&mut cursor)?;
+        let compressed_size = read_u32(&mut cursor)? as usize;
+        let uncompressed_size = read_u32(&mut cursor)? as usize;
+        let name_len = read_u16(&mut cursor)? as usize;
+        let extra_len = read_u16(&mut cursor)? as usize;
+        let comment_len = read_u16(&mut cursor)? as usize;
+        cursor
+            .seek(SeekFrom::Current(8))
+            .map_err(|err| err.to_string())?;
+        let local_offset = read_u32(&mut cursor)? as usize;
+        let mut name_bytes = vec![0; name_len];
+        cursor
+            .read_exact(&mut name_bytes)
+            .map_err(|err| err.to_string())?;
+        cursor
+            .seek(SeekFrom::Current((extra_len + comment_len) as i64))
+            .map_err(|err| err.to_string())?;
+        if compression != 0 {
+            return Err("Unsupported .mne zip compression".into());
+        }
+        if compressed_size != uncompressed_size {
+            return Err("Invalid .mne zip size mismatch".into());
+        }
+        let name = String::from_utf8(name_bytes).map_err(|err| err.to_string())?;
+        validate_bundle_path(&name)?;
+        let data = read_local_zip_entry(bytes, local_offset, compressed_size)?;
+        if crc32(&data) != crc {
+            return Err("Invalid .mne zip CRC".into());
+        }
+        entries.insert(name, data);
+    }
+    Ok(entries)
+}
+
+fn read_local_zip_entry(bytes: &[u8], offset: usize, size: usize) -> Result<Vec<u8>, String> {
+    let mut cursor = Cursor::new(bytes);
+    cursor
+        .seek(SeekFrom::Start(offset as u64))
+        .map_err(|err| err.to_string())?;
+    if read_u32(&mut cursor)? != 0x0403_4b50 {
+        return Err("Invalid .mne zip local header".into());
+    }
+    cursor
+        .seek(SeekFrom::Current(22))
+        .map_err(|err| err.to_string())?;
+    let name_len = read_u16(&mut cursor)? as u64;
+    let extra_len = read_u16(&mut cursor)? as u64;
+    cursor
+        .seek(SeekFrom::Current((name_len + extra_len) as i64))
+        .map_err(|err| err.to_string())?;
+    let mut data = vec![0; size];
+    cursor
+        .read_exact(&mut data)
+        .map_err(|err| err.to_string())?;
+    Ok(data)
+}
+
+fn write_u16<W: Write>(writer: &mut W, value: u16) -> Result<(), String> {
+    writer
+        .write_all(&value.to_le_bytes())
+        .map_err(|err| err.to_string())
+}
+
+fn write_u32<W: Write>(writer: &mut W, value: u32) -> Result<(), String> {
+    writer
+        .write_all(&value.to_le_bytes())
+        .map_err(|err| err.to_string())
+}
+
+fn read_u16<R: Read>(reader: &mut R) -> Result<u16, String> {
+    let mut bytes = [0; 2];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|err| err.to_string())?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32<R: Read>(reader: &mut R) -> Result<u32, String> {
+    let mut bytes = [0; 4];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|err| err.to_string())?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 fn safe_filename(value: &str) -> String {
@@ -5636,6 +6252,7 @@ mod tests {
                 ],
                 key_objects: Vec::new(),
                 time_elapsed: "Session start".into(),
+                ..state_engine::soul::WorldLog::default()
             },
         );
         world.scenario = "Aurora history is intentionally selected.".into();
@@ -5647,6 +6264,124 @@ mod tests {
             &world,
             &warning.suspicious_names
         ));
+    }
+
+    #[test]
+    fn mne_zip_exports_valid_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.mne");
+        let manifest = mne_manifest(
+            "character_soul",
+            "Echo-0",
+            "test",
+            vec!["souls/echo.json".into()],
+            Vec::new(),
+            None,
+        );
+        let files = vec![
+            json_bundle_file("manifest.json", &manifest).expect("manifest"),
+            (
+                "souls/echo.json".into(),
+                b"{\"character_id\":\"echo\"}".to_vec(),
+            ),
+        ];
+
+        write_stored_zip(&path, &files).expect("write zip");
+        let bytes = fs::read(&path).expect("read zip");
+        let entries = read_stored_zip(&bytes).expect("read entries");
+        let decoded: MneBundleManifest =
+            serde_json::from_slice(entries.get("manifest.json").expect("manifest")).expect("json");
+
+        assert_eq!(decoded.mne_version, 1);
+        assert_eq!(decoded.bundle_type, "character_soul");
+        assert!(entries.contains_key("souls/echo.json"));
+    }
+
+    #[test]
+    fn import_mne_character_soul_as_savepoint_and_remap_conflict() {
+        let conn = db::init_memory_connection().expect("db");
+        let mut soul = new_default_soul("Echo-0");
+        soul.character_id = "echo-original".into();
+        db::upsert_soul(&conn, &soul).expect("existing soul");
+        soul.soul_kind = "session_clone".into();
+        let manifest = mne_manifest(
+            "character_soul",
+            "Echo-0",
+            "test",
+            vec!["souls/echo.json".into()],
+            Vec::new(),
+            None,
+        );
+        let mut entries = HashMap::new();
+        entries.insert(
+            "souls/echo.json".into(),
+            serde_json::to_vec(&soul).expect("soul json"),
+        );
+
+        let result = import_mne_entries(&conn, &entries, &manifest).expect("import");
+
+        assert_eq!(result.imported_soul_ids.len(), 1);
+        assert_ne!(result.imported_soul_ids[0], "echo-original");
+        assert!(result.remapped_ids.contains_key("echo-original"));
+        let imported = db::get_soul(&conn, &result.imported_soul_ids[0]).expect("imported");
+        assert_eq!(imported.soul_kind, "savepoint");
+    }
+
+    #[test]
+    fn import_mne_world_setting_and_scenario_bundle() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Echo-0");
+        let mut setting = new_default_setting("Testing Room");
+        setting.world.location = "Verification lab".into();
+        let manifest = mne_manifest(
+            "scenario_bundle",
+            "Echo + Lab",
+            "test",
+            vec!["souls/echo.json".into()],
+            vec!["worlds/lab.json".into()],
+            None,
+        );
+        let mut entries = HashMap::new();
+        entries.insert(
+            "souls/echo.json".into(),
+            serde_json::to_vec(&soul).expect("soul json"),
+        );
+        entries.insert(
+            "worlds/lab.json".into(),
+            serde_json::to_vec(&setting).expect("setting json"),
+        );
+
+        let result = import_mne_entries(&conn, &entries, &manifest).expect("import");
+
+        assert_eq!(result.imported_soul_ids.len(), 1);
+        assert_eq!(result.imported_setting_ids.len(), 1);
+        let imported_world =
+            db::get_setting(&conn, &result.imported_setting_ids[0]).expect("world");
+        assert_eq!(imported_world.world.location, "Verification lab");
+    }
+
+    #[test]
+    fn mne_import_rejects_invalid_bundle_files() {
+        let manifest = mne_manifest(
+            "character_soul",
+            "Bad",
+            "test",
+            vec!["../souls/bad.json".into()],
+            Vec::new(),
+            None,
+        );
+        assert!(validate_mne_manifest(&manifest).is_err());
+
+        let mut unsupported = manifest.clone();
+        unsupported.contents.souls = Vec::new();
+        unsupported.mne_version = 99;
+        assert!(validate_mne_manifest(&unsupported).is_err());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing_manifest.mne");
+        write_stored_zip(&path, &[("souls/echo.json".into(), b"{}".to_vec())]).expect("zip");
+        let entries = read_stored_zip(&fs::read(path).expect("read")).expect("entries");
+        assert!(!entries.contains_key("manifest.json"));
     }
 
     #[test]
@@ -6182,6 +6917,7 @@ mod tests {
         assert!(exported.contains("## Payload 2"));
         assert!(exported.contains("Model: model-a"));
         assert!(exported.contains("Mode: God"));
+        assert!(exported.contains("Custom prompt: inactive"));
         assert!(exported.contains("Base URL: https://api.example/v1"));
         assert!(exported.contains("System A with clothing context"));
         assert!(exported.contains("Context B"));
@@ -6235,6 +6971,53 @@ mod tests {
         assert!(exported.contains("Provider: narrator_brief"));
         assert!(exported.contains("Provider: state_updater"));
         assert!(exported.contains("Context mode: brief"));
+    }
+
+    #[test]
+    fn payload_history_reports_custom_prompt_status() {
+        let logs = vec![
+            LlmPayloadLog {
+                id: 1,
+                conversation_id: "history".into(),
+                message_id: Some(10),
+                provider: "narrator_brief".into(),
+                mode: "Custom".into(),
+                context_mode: "brief".into(),
+                model: "model".into(),
+                base_url: "https://api.example/v1".into(),
+                system_message: "[CUSTOM NARRATOR INSTRUCTIONS]\nSpeak softly.".into(),
+                user_message: "User".into(),
+                context_text: "Context".into(),
+                estimated_system_tokens: 1,
+                estimated_user_tokens: 1,
+                estimated_total_tokens: 2,
+                truncated: false,
+                created_at: 100,
+            },
+            LlmPayloadLog {
+                id: 2,
+                conversation_id: "history".into(),
+                message_id: Some(11),
+                provider: "narrator_brief".into(),
+                mode: "Custom".into(),
+                context_mode: "brief".into(),
+                model: "model".into(),
+                base_url: "https://api.example/v1".into(),
+                system_message: "Default Custom fallback".into(),
+                user_message: "User".into(),
+                context_text: "Context".into(),
+                estimated_system_tokens: 1,
+                estimated_user_tokens: 1,
+                estimated_total_tokens: 2,
+                truncated: false,
+                created_at: 101,
+            },
+        ];
+
+        let exported = render_llm_payload_history(&logs);
+
+        assert!(exported.contains("Custom prompt: included"));
+        assert!(exported.contains("Custom prompt: empty"));
     }
 
     #[test]

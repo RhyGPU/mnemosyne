@@ -1,5 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 export type Relationship = {
   trust: number;
@@ -148,6 +149,38 @@ export type ConversationSummary = {
   message_count: number;
 };
 
+export type MneBundleManifest = {
+  mne_version: number;
+  bundle_id: string;
+  bundle_type: "character_soul" | "world_setting" | "scenario_bundle" | "session_checkpoint" | string;
+  title: string;
+  description: string;
+  author?: string | null;
+  created_at: number;
+  app: string;
+  schema_version: number;
+  contents: {
+    souls: string[];
+    worlds: string[];
+    images: string[];
+    conversation?: string | null;
+  };
+};
+
+export type MneExportResult = {
+  path: string;
+  manifest: MneBundleManifest;
+};
+
+export type MneImportResult = {
+  bundle_id: string;
+  bundle_type: string;
+  imported_soul_ids: string[];
+  imported_setting_ids: string[];
+  remapped_ids: Record<string, string>;
+  summary: string;
+};
+
 export type SessionStartResult = {
   soul: Soul;
   conversation: ConversationSummary;
@@ -284,6 +317,7 @@ export type LlmPayloadPreview = {
   provider: string;
   mode: string;
   context_mode: ContextMode;
+  custom_prompt_status: string;
   model: string;
   base_url: string;
   system_message: string;
@@ -389,6 +423,9 @@ Scene | Focus: [primary active character(s)] | Physical state: [brief] | Atmosph
 
 const NARRATOR_VISIBLE_ONLY_PROMPT = `[OUTPUT]
 Write visible scene narration or a brief GM/narrator reply. For scene narration, include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, or implementation notes.`;
+
+const VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT = `[VERIFIED DIAGNOSTICS BOUNDARY]
+When asked about backend tests, logs, imports, exports, memory hygiene, world routing, or engine internals, distinguish verified engine data from fictional/in-scene diagnostics. Do not claim a backend test passed unless the result is present in Dev Console logs, payload metadata, or a verified engine/debug section. If only roleplaying a test, say it is a simulated/in-scene diagnostic.`;
 
 const MODE_PROMPTS: Record<string, string> = {
   Realistic: `## NARRATION MODE: REALISTIC
@@ -655,6 +692,74 @@ export function getSetting(settingId: string): Promise<SettingSoul> {
     if (!setting) throw new Error("Setting not found");
     return setting;
   });
+}
+
+export function exportCharacterSoulMne(soulId: string, outputPath: string): Promise<MneExportResult> {
+  return invokeOrPreview("export_character_soul_mne", { soulId, outputPath }, () => {
+    const soul = browserSouls.find((item) => item.character_id === soulId);
+    if (!soul) throw new Error("Soul not found");
+    return makePreviewMneExport(outputPath, "character_soul", soul.character_name, [`souls/${soulId}.json`], []);
+  });
+}
+
+export function exportWorldSettingMne(settingId: string, outputPath: string): Promise<MneExportResult> {
+  return invokeOrPreview("export_world_setting_mne", { settingId, outputPath }, () => {
+    const setting = browserSettings.find((item) => item.setting_id === settingId);
+    if (!setting) throw new Error("Setting not found");
+    return makePreviewMneExport(outputPath, "world_setting", setting.setting_name, [], [`worlds/${settingId}.json`]);
+  });
+}
+
+export function exportScenarioBundleMne(
+  soulId: string,
+  worldId: string,
+  outputPath: string,
+): Promise<MneExportResult> {
+  return invokeOrPreview("export_scenario_bundle_mne", { soulId, worldId, outputPath }, () => {
+    const soul = browserSouls.find((item) => item.character_id === soulId);
+    const setting = browserSettings.find((item) => item.setting_id === worldId);
+    if (!soul || !setting) throw new Error("Soul or Setting not found");
+    return makePreviewMneExport(outputPath, "scenario_bundle", `${soul.character_name} + ${setting.setting_name}`, [`souls/${soulId}.json`], [`worlds/${worldId}.json`]);
+  });
+}
+
+export function exportCurrentSessionCheckpointMne(
+  conversationId: string,
+  outputPath: string,
+): Promise<MneExportResult> {
+  return invokeOrPreview("export_current_session_checkpoint_mne", { conversationId, outputPath }, () =>
+    makePreviewMneExport(outputPath, "session_checkpoint", conversationId, [], []),
+  );
+}
+
+export function isDesktopApp() {
+  return hasTauriRuntime();
+}
+
+export async function pickMneBundlePath(): Promise<string | null> {
+  if (!hasTauriRuntime()) {
+    return null;
+  }
+  const selected = await open({
+    title: "Import Mnemosyne bundle",
+    multiple: false,
+    filters: [{ name: "Mnemosyne bundle", extensions: ["mne"] }],
+  });
+  if (selected === null) {
+    return null;
+  }
+  return Array.isArray(selected) ? selected[0] ?? null : selected;
+}
+
+export function importMneBundle(filePath: string): Promise<MneImportResult> {
+  return invokeOrPreview("import_mne_bundle", { filePath }, () => ({
+    bundle_id: crypto.randomUUID(),
+    bundle_type: "preview",
+    imported_soul_ids: [],
+    imported_setting_ids: [],
+    remapped_ids: {},
+    summary: "Preview import is only available in the desktop app",
+  }));
 }
 
 export function deleteSoul(soulId: string): Promise<boolean> {
@@ -1085,6 +1190,7 @@ export function previewApiPayload(
         provider,
         mode,
         context_mode: contextMode,
+        custom_prompt_status: customPromptStatusFor(mode, systemMessage),
         model: settings.model.trim(),
         base_url: settings.base_url.trim(),
         system_message: systemMessage,
@@ -1329,6 +1435,35 @@ function summarizeSetting(setting: SettingSoul): SettingSummary {
     last_updated: setting.last_updated,
     turn_counter: setting.turn_counter,
     location: setting.world.location,
+  };
+}
+
+function makePreviewMneExport(
+  path: string,
+  bundleType: MneBundleManifest["bundle_type"],
+  title: string,
+  souls: string[],
+  worlds: string[],
+): MneExportResult {
+  return {
+    path,
+    manifest: {
+      mne_version: 1,
+      bundle_id: crypto.randomUUID(),
+      bundle_type: bundleType,
+      title,
+      description: "Preview Mnemosyne bundle",
+      author: null,
+      created_at: Math.floor(Date.now() / 1000),
+      app: "Mnemosyne",
+      schema_version: 1,
+      contents: {
+        souls,
+        worlds,
+        images: [],
+        conversation: null,
+      },
+    },
   };
 }
 
@@ -1754,6 +1889,8 @@ function renderPreviewPayloadHistory(logs: LlmPayloadLog[]): string {
     lines.push(`Provider: ${log.provider}`);
     lines.push(`Model: ${log.model}`);
     lines.push(`Mode: ${log.mode}`);
+    lines.push(`Custom prompt: ${customPromptStatusFor(log.mode, log.system_message)}`);
+    lines.push(`Context mode: ${log.context_mode}`);
     lines.push(`Base URL: ${log.base_url}`);
     lines.push(
       `Estimated tokens: system ${log.estimated_system_tokens}, user ${log.estimated_user_tokens}, total ${log.estimated_total_tokens}`,
@@ -2344,6 +2481,20 @@ function buildUserTextWithCorrection(userText: string, correctionInstruction?: s
   return `${userText}\n\n[FIX INSTRUCTION - APPLY TO THIS RESPONSE ONLY]\n${instruction}`;
 }
 
+function modePromptFor(mode: string) {
+  switch (mode) {
+    case "Realistic":
+      return MODE_PROMPTS.Realistic;
+    case "God":
+      return MODE_PROMPTS.God;
+    case "Reader":
+    case "Custom":
+      return MODE_PROMPTS.Reader;
+    default:
+      return MODE_PROMPTS.Reader;
+  }
+}
+
 function buildNarratorSystemPrompt(
   customPrompt: string,
   mode: string,
@@ -2352,33 +2503,18 @@ function buildNarratorSystemPrompt(
   requireHiddenState = true,
 ) {
   const trimmedCustom = customPrompt.trim();
-  const base =
-    mode === "Custom" && trimmedCustom
-      ? `${trimmedCustom}\n\n[POV AND ATTRIBUTION]
-Write third-person present-tense scene narration. You may describe engine-controlled characters' actions, dialogue, and internal perspective when available. User-controlled characters are external actors: describe only what the user has provided or what is directly observable. Do not invent user-controlled characters' thoughts, motives, final decisions, or dialogue.
-
-[CHARACTER CONTROL]
-Engine-controlled characters: may speak, act, react, misunderstand, interrupt, refuse, escalate, retreat, and use the environment naturally.
-User-controlled characters: may be perceived and reacted to, but their decisions, speech, and decisive actions belong to the user.
-When a user-controlled character's reaction matters, stop on the pressure point.
-
-[ACTION AND TURN CONTROL]
-Engine-controlled characters may act proactively: speak, move, interrupt, refuse, reach, grab for something, retreat, challenge, escalate, or use their own environment. Resolve engine-controlled action naturally. When a user-controlled character's reaction matters, stop on the attempt, demand, or pressure point and leave the response to the next user turn.
-
-[GM CHANNEL]
-If the user directly addresses the Narrator, GM, or OOC layer, respond as the GM/narrator in plain text unless the user asks to resume the scene. Do not force an Aurora scene response for GM-facing instructions.
-
-[CONTINUITY PRIORITY]
-Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
-
-[CHARACTER CHANGE]
-Emotional shifts should feel earned. Micro-shifts are preferred unless the scene strongly justifies a sharper reaction.
-
-[TIME]
-Concrete time only comes from user input or World Log. Avoid invented minutes/hours/days.`
-      : `${NARRATOR_SYSTEM_PROMPT}\n\n${MODE_PROMPTS[mode] ?? MODE_PROMPTS.Reader}`;
+  const isCustomMode = mode === "Custom";
+  const narratorCore =
+    isCustomMode && trimmedCustom
+      ? `[CUSTOM NARRATOR INSTRUCTIONS]\n${trimmedCustom}\n\n${VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT}`
+      : `${NARRATOR_SYSTEM_PROMPT}\n\n${modePromptFor(mode)}\n\n${VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT}`;
   const stateInstruction = requireHiddenState ? HIDDEN_STATE_FORMAT_PROMPT : NARRATOR_VISIBLE_ONLY_PROMPT;
-  return `${base}\n\n${stateInstruction}\n\nPrimary active Soul: ${soul.character_name}\n\n${context}`;
+  return `${narratorCore}\n\n${stateInstruction}\n\nPrimary active Soul: ${soul.character_name}\n\n${context}`;
+}
+
+function customPromptStatusFor(mode: string, systemMessage: string) {
+  if (mode.trim().toLowerCase() !== "custom") return "inactive";
+  return systemMessage.includes("[CUSTOM NARRATOR INSTRUCTIONS]") ? "included" : "empty";
 }
 
 function parsePreviewHiddenState(raw: string): {

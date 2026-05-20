@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::{
     schema::CURRENT_SCHEMA_VERSION,
-    soul::{current_timestamp, WorldLog},
+    soul::{current_timestamp, PlotEntry, WorldLog},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,6 +49,14 @@ pub struct SessionWorld {
     pub key_objects: Vec<String>,
     pub time_elapsed: String,
     #[serde(default)]
+    pub dominant_current_plot: Option<PlotEntry>,
+    #[serde(default)]
+    pub background_plots: Vec<PlotEntry>,
+    #[serde(default)]
+    pub resolved_plots: Vec<PlotEntry>,
+    #[serde(default)]
+    pub stale_plot_decay: f32,
+    #[serde(default)]
     pub scenario: String,
     pub created_at: i64,
     pub last_updated: i64,
@@ -66,6 +74,10 @@ impl SessionWorld {
             recent_events: self.recent_events.clone(),
             key_objects: self.key_objects.clone(),
             time_elapsed: self.time_elapsed.clone(),
+            dominant_current_plot: self.dominant_current_plot.clone(),
+            background_plots: self.background_plots.clone(),
+            resolved_plots: self.resolved_plots.clone(),
+            stale_plot_decay: self.stale_plot_decay,
         }
     }
 
@@ -75,6 +87,10 @@ impl SessionWorld {
         self.recent_events = world.recent_events.clone();
         self.key_objects = world.key_objects.clone();
         self.time_elapsed = world.time_elapsed.clone();
+        self.dominant_current_plot = world.dominant_current_plot.clone();
+        self.background_plots = world.background_plots.clone();
+        self.resolved_plots = world.resolved_plots.clone();
+        self.stale_plot_decay = world.stale_plot_decay;
     }
 }
 
@@ -92,6 +108,10 @@ pub fn session_world_from_setting(setting: &SettingSoul) -> SessionWorld {
         recent_events: setting.world.recent_events.clone(),
         key_objects: setting.world.key_objects.clone(),
         time_elapsed: setting.world.time_elapsed.clone(),
+        dominant_current_plot: setting.world.dominant_current_plot.clone(),
+        background_plots: setting.world.background_plots.clone(),
+        resolved_plots: setting.world.resolved_plots.clone(),
+        stale_plot_decay: setting.world.stale_plot_decay,
         scenario: setting.scenario.clone(),
         created_at: now,
         last_updated: now,
@@ -116,6 +136,10 @@ pub fn session_world_from_legacy_world(
         recent_events: world.recent_events.clone(),
         key_objects: world.key_objects.clone(),
         time_elapsed: world.time_elapsed.clone(),
+        dominant_current_plot: world.dominant_current_plot.clone(),
+        background_plots: world.background_plots.clone(),
+        resolved_plots: world.resolved_plots.clone(),
+        stale_plot_decay: world.stale_plot_decay,
         scenario: String::new(),
         created_at: now,
         last_updated: now,

@@ -14,6 +14,7 @@ pub struct AppState {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let path = connection_path(&app.handle())?;
             let conn = init_connection(&path)?;
@@ -32,6 +33,11 @@ pub fn run() {
             commands::load_setting_file,
             commands::save_soul_file,
             commands::save_setting_file,
+            commands::export_character_soul_mne,
+            commands::export_world_setting_mne,
+            commands::export_scenario_bundle_mne,
+            commands::export_current_session_checkpoint_mne,
+            commands::import_mne_bundle,
             commands::list_souls,
             commands::list_souls_debug,
             commands::list_conversations,

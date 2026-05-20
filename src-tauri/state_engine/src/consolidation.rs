@@ -98,6 +98,14 @@ fn merge_schema(soul: &mut Soul, tag: &str, memories: &[MemoryEntry]) {
             schema_type: tag.to_string(),
             summary,
             count: memories.len() as u64,
+            schema_id: format!("schema-{}-{}", tag, crate::soul::current_timestamp()),
+            owner_soul_id: Some(soul.character_id.clone()),
+            target_entity_ids: Vec::new(),
+            trigger_tags: vec![tag.to_string()],
+            salience: 60.0,
+            reinforcement_count: memories.len() as u64,
+            decay: 0.0,
+            last_reinforced_turn: soul.turn_counter,
         });
     }
 }

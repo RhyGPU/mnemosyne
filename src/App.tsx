@@ -18,7 +18,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ApiProviderSettings,
   AssistantMessageVariant,
@@ -52,12 +52,19 @@ import {
   deleteSetting,
   deleteSoul,
   exportLlmPayloadHistory,
+  exportCharacterSoulMne,
+  exportCurrentSessionCheckpointMne,
+  exportScenarioBundleMne,
+  exportWorldSettingMne,
   exportVisibleChatLog,
   getSetting,
   getImageAsset,
   getImageAssetDataUrl,
   getSoul,
   importImageAssetFromFile,
+  importMneBundle,
+  isDesktopApp,
+  pickMneBundlePath,
   listConversations,
   listProviderProfiles,
   listAssistantMessageVariants,
@@ -87,6 +94,7 @@ const CONSOLIDATION_INTERVAL_TURNS = 10;
 const NARRATOR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:narrator_provider_profile_id";
 const UPDATER_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:state_updater_provider_profile_id";
 const USE_NARRATOR_FOR_UPDATER_STORAGE_KEY = "mnemosyne:use_narrator_provider_for_updater";
+const CUSTOM_NARRATOR_PROMPT_STORAGE_KEY = "mnemosyne:custom_narrator_prompt";
 const DISCLAIMER_STORAGE_KEY = "mnemosyne_disclaimer_accepted_v1";
 const DISCLAIMER_VERSION = 1;
 const DEV_LOG_LIMIT = 1000;
@@ -252,7 +260,7 @@ export function App() {
     base_url: "https://api.openai.com/v1",
     api_key: "",
     model: "",
-    system_prompt: "",
+    system_prompt: loadStoredCustomNarratorPrompt(),
   });
   const [stateUpdaterSettings, setStateUpdaterSettings] = useState<ApiProviderSettings>({
     base_url: "https://api.openai.com/v1",
@@ -295,6 +303,7 @@ export function App() {
   const activeGenerationRef = useRef<ActiveGeneration | null>(null);
   const devConsoleBodyRef = useRef<HTMLDivElement>(null);
   const chatOnlyBodyRef = useRef<HTMLElement>(null);
+  const chatBottomRef = useRef<HTMLDivElement>(null);
   const defaultConversationId = useMemo(
     () =>
       soul && setting
@@ -367,14 +376,24 @@ export function App() {
     body.scrollTop = body.scrollHeight;
   }, [devLogs, devConsoleOpen, devConsolePaused]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (view !== "chat") return;
     const body = chatOnlyBodyRef.current;
     if (!body) return;
-    const frame = window.requestAnimationFrame(() => {
+    let secondFrame = 0;
+    const scrollToBottom = () => {
       body.scrollTop = body.scrollHeight;
+      chatBottomRef.current?.scrollIntoView({ block: "end" });
+    };
+    scrollToBottom();
+    const frame = window.requestAnimationFrame(() => {
+      scrollToBottom();
+      secondFrame = window.requestAnimationFrame(scrollToBottom);
     });
-    return () => window.cancelAnimationFrame(frame);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.cancelAnimationFrame(secondFrame);
+    };
   }, [view, currentConversationId, messages.length]);
 
   useEffect(() => {
@@ -391,6 +410,10 @@ export function App() {
       useNarratorProviderForUpdater ? "true" : "false",
     );
   }, [useNarratorProviderForUpdater]);
+
+  useEffect(() => {
+    localStorage.setItem(CUSTOM_NARRATOR_PROMPT_STORAGE_KEY, apiSettings.system_prompt);
+  }, [apiSettings.system_prompt]);
 
   useEffect(() => {
     if (!soul || view !== "chat") return;
@@ -1789,6 +1812,95 @@ export function App() {
     }
   }
 
+  async function handleExportSoulMne() {
+    if (!soul) return;
+    setBusy(true);
+    try {
+      const result = await exportCharacterSoulMne(
+        soul.character_id,
+        `${soul.character_name.replace(/\s+/g, "_")}.mne`,
+      );
+      setStatus(`Soul .mne exported: ${result.path}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleExportSettingMne() {
+    if (!setting) return;
+    setBusy(true);
+    try {
+      const nextSetting = applySettingFields(setting);
+      await upsertSetting(nextSetting);
+      setSetting(nextSetting);
+      const result = await exportWorldSettingMne(
+        nextSetting.setting_id,
+        `${nextSetting.setting_name.replace(/\s+/g, "_")}.mne`,
+      );
+      setSettings(await listSettings());
+      setStatus(`World .mne exported: ${result.path}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleExportScenarioMne() {
+    if (!soul || !setting) return;
+    setBusy(true);
+    try {
+      const result = await exportScenarioBundleMne(
+        soul.character_id,
+        setting.setting_id,
+        `${soul.character_name.replace(/\s+/g, "_")}_${setting.setting_name.replace(/\s+/g, "_")}.mne`,
+      );
+      setStatus(`Scenario .mne exported: ${result.path}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleExportCurrentSessionMne() {
+    if (!currentConversationId) return;
+    setBusy(true);
+    try {
+      const result = await exportCurrentSessionCheckpointMne(
+        currentConversationId,
+        `${currentSessionTitle.replace(/\s+/g, "_") || "session_checkpoint"}.mne`,
+      );
+      setStatus(`Session checkpoint .mne exported: ${result.path}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleImportMne() {
+    let filePath = await pickMneBundlePath();
+    if (!filePath && !isDesktopApp()) {
+      const manualPath = window.prompt("Path to .mne bundle");
+      filePath = manualPath?.trim() || null;
+    }
+    if (!filePath) return;
+    setBusy(true);
+    try {
+      const result = await importMneBundle(filePath);
+      setSouls(await listSouls());
+      setSettings(await listSettings());
+      setStatus(result.summary);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleSaveSetting() {
     if (!setting) return;
     setBusy(true);
@@ -2046,6 +2158,16 @@ export function App() {
               <Trash2 size={16} />
               <span>Delete Session</span>
             </button>
+            <button
+              className="ghost-action"
+              type="button"
+              title="Export current session checkpoint as .mne"
+              onClick={handleExportCurrentSessionMne}
+              disabled={busy || !currentConversationId}
+            >
+              <FileDown size={16} />
+              <span>Session .mne</span>
+            </button>
             <div className="token-pill">
               {context?.estimated_tokens ?? 0}
               <span>tok</span>
@@ -2054,7 +2176,8 @@ export function App() {
           </div>
         </header>
 
-        <section className="chat-only-body" ref={chatOnlyBodyRef}>
+        <section className="chat-only-scroll" ref={chatOnlyBodyRef}>
+          <div className="chat-only-body">
           {activeMessages.length === 0 ? (
             <div className="empty-state">
               <MessageSquareText size={34} />
@@ -2171,6 +2294,8 @@ export function App() {
               );
             })
           )}
+          <div ref={chatBottomRef} aria-hidden="true" />
+          </div>
         </section>
 
         <form className="chat-only-composer" onSubmit={handleSubmit}>
@@ -2233,7 +2358,7 @@ export function App() {
               ref={settingImportInputRef}
               className="hidden-file"
               type="file"
-              accept="application/json,.json,.setting,.mne"
+              accept="application/json,.json,.setting"
               onChange={handleImportSettingFile}
             />
             <button title="New Setting" onClick={handleCreateSetting} disabled={busy}>
@@ -2251,6 +2376,10 @@ export function App() {
             <button title="Export Setting" onClick={handleSaveSetting} disabled={!setting || busy}>
               <FileDown size={18} />
               <span>Export</span>
+            </button>
+            <button title="Export World as .mne" onClick={handleExportSettingMne} disabled={!setting || busy}>
+              <FileDown size={18} />
+              <span>.mne</span>
             </button>
             <button
               title="Persist current Setting"
@@ -2387,7 +2516,7 @@ export function App() {
               ref={importInputRef}
               className="hidden-file"
               type="file"
-              accept="application/json,.json,.soul,.mne"
+              accept="application/json,.json,.soul"
               onChange={handleImportSoulFile}
             />
             <button title="New Soul" onClick={handleCreateSoul} disabled={busy}>
@@ -2409,6 +2538,18 @@ export function App() {
             <button title="Export Current Soul without modifying the app library" onClick={handleSaveSoul} disabled={!soul || busy}>
               <FileDown size={18} />
               <span>Export JSON</span>
+            </button>
+            <button title="Export Soul as .mne" onClick={handleExportSoulMne} disabled={!soul || busy}>
+              <FileDown size={18} />
+              <span>Export .mne</span>
+            </button>
+            <button title="Export Soul + World as .mne" onClick={handleExportScenarioMne} disabled={!soul || !setting || busy}>
+              <FileDown size={18} />
+              <span>Scenario .mne</span>
+            </button>
+            <button title="Import .mne bundle" onClick={handleImportMne} disabled={busy}>
+              <FileUp size={18} />
+              <span>Import .mne</span>
             </button>
             <button title="Run consolidation" onClick={handleConsolidate} disabled={!soul || busy}>
               <RefreshCcw size={18} />
@@ -2849,7 +2990,7 @@ export function App() {
                   </label>
                   {mode === "Custom" ? (
                     <label className="field custom-prompt-field">
-                      <span>Custom Prompt</span>
+                      <span>Custom Narrator Prompt</span>
                       <textarea
                         value={apiSettings.system_prompt}
                         onChange={(event) =>
@@ -2858,6 +2999,7 @@ export function App() {
                             system_prompt: event.target.value,
                           }))
                         }
+                        placeholder="Replaces default narrator + mode prompts when filled. Use Custom mode. Leave empty for default Reader narration."
                         disabled={busy}
                       />
                     </label>
@@ -3587,6 +3729,13 @@ export function App() {
                 <dd>{llmPayload?.mode ?? mode}</dd>
               </div>
               <div>
+                <dt>Custom Prompt</dt>
+                <dd>
+                  {llmPayload?.custom_prompt_status ??
+                    (mode === "Custom" ? (apiSettings.system_prompt.trim() ? "included" : "empty") : "inactive")}
+                </dd>
+              </div>
+              <div>
                 <dt>Context Mode</dt>
                 <dd>{llmPayload?.context_mode === "full_chat" ? "Full Chat" : "Mnemosyne Brief"}</dd>
               </div>
@@ -3698,6 +3847,14 @@ function hasAcceptedDisclaimerVersion() {
     return parsed.accepted === true && (parsed.disclaimer_version ?? 0) >= DISCLAIMER_VERSION;
   } catch {
     return false;
+  }
+}
+
+function loadStoredCustomNarratorPrompt() {
+  try {
+    return localStorage.getItem(CUSTOM_NARRATOR_PROMPT_STORAGE_KEY) ?? "";
+  } catch {
+    return "";
   }
 }
 
@@ -3825,6 +3982,7 @@ Total: ${payload.estimated_tokens.total}
 === PROVIDER ===
 Provider: ${payload.provider}
 Mode: ${payload.mode}
+Custom Prompt: ${payload.custom_prompt_status}
 Context Mode: ${payload.context_mode}
 Truncated: ${payload.truncated}
 Model: ${payload.model || "-"}
