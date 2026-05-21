@@ -229,6 +229,7 @@ export type ChatMessage = {
   content: string;
   created_at: number;
   attachments?: MessageAttachment[];
+  pending?: boolean;
 };
 
 export type ImageAsset = {
@@ -325,6 +326,12 @@ export type TurnDebug = {
   affection_delta: number | null;
   new_location: string | null;
   present_characters: string[];
+  request_id?: string | null;
+  turn_id?: string | null;
+  state_patch_id?: string | null;
+  simulated_response?: boolean;
+  fallback_used?: boolean;
+  fallback_reason?: string | null;
 };
 
 export type ContextPreview = {
