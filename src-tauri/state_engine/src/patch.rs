@@ -1267,7 +1267,53 @@ fn normalized_operation(operation: &str) -> String {
         .replace(' ', "_")
 }
 
+pub const MOCK_WORLD_FRAME_RUPTURE: &str =
+    "The conversation continued without a major rupture";
+pub const PENDING_USER_INPUT_PREFIX: &str = "pending_user_input:";
+
+/// Returns true when an event records user input as completed world truth before narration.
+pub fn is_premature_user_turn_event(event: &str, pending_user_text: Option<&str>) -> bool {
+    let event = event.trim();
+    if event.is_empty() {
+        return true;
+    }
+    if event
+        .to_ascii_lowercase()
+        .starts_with(PENDING_USER_INPUT_PREFIX)
+    {
+        return true;
+    }
+    if event.contains(MOCK_WORLD_FRAME_RUPTURE) {
+        return true;
+    }
+    let user = pending_user_text.map(str::trim).unwrap_or("");
+    if user.is_empty() {
+        return false;
+    }
+    if event == user {
+        return true;
+    }
+    let suffix = format!(": {user}");
+    event.ends_with(&suffix) || event.ends_with(&format!("{suffix}."))
+}
+
+pub fn purge_premature_recent_events_from_world(
+    world: &mut WorldLog,
+    pending_user_text: Option<&str>,
+) {
+    world
+        .recent_events
+        .retain(|event| !is_premature_user_turn_event(event, pending_user_text));
+    world.recent_event_records.retain(|record| {
+        !record.is_active || !is_premature_user_turn_event(&record.content, pending_user_text)
+    });
+    sync_recent_event_strings_from_records(world);
+}
+
 fn apply_recent_event_with_consistency_guard(world: &mut WorldLog, event: &str) -> bool {
+    if is_premature_user_turn_event(event, None) {
+        return false;
+    }
     if is_retcon_or_correction_text(event) {
         return apply_retcon_correction_note(world, event);
     }
@@ -1423,6 +1469,9 @@ fn apply_recent_event_record_with_guard(
     recent_event_id: Option<String>,
     event: &str,
 ) -> bool {
+    if is_premature_user_turn_event(event, None) {
+        return false;
+    }
     if is_retcon_or_correction_text(event) {
         return apply_retcon_correction_note(world, event);
     }
@@ -2214,6 +2263,16 @@ mod tests {
     }
 
     #[test]
+    fn premature_recent_event_rejected_at_patch_apply() {
+        let mut world = WorldLog::default();
+        let applied = apply_recent_event_with_consistency_guard(
+            &mut world,
+            "The conversation continued without a major rupture: I knock on the door",
+        );
+        assert!(!applied);
+        assert!(world.recent_events.is_empty());
+    }
+
     fn apply_to_session_legacy_fallback_mutates_soul_world_without_session_world() {
         let mut soul = Soul::default_for_character("Echo-0");
         soul.world.location = "Legacy room".into();

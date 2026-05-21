@@ -4211,7 +4211,7 @@ function seedStreamingTurn(
   const seeded = replacementAssistantId
     ? messages.map((message) =>
         message.id === replacementAssistantId && message.role === "assistant"
-          ? { ...message, content: "" }
+          ? { ...message, content: "", pending: true }
           : message,
       )
     : [
@@ -4229,6 +4229,7 @@ function seedStreamingTurn(
           role: "assistant" as const,
           content: "",
           created_at: now,
+          pending: true,
         },
       ];
 
@@ -4242,6 +4243,7 @@ function seedStreamingTurn(
       role: "assistant",
       content: "",
       created_at: now,
+      pending: true,
     });
   }
 
@@ -4334,6 +4336,7 @@ function hasSavedAssistantForGeneration(messages: ChatMessage[], activeGeneratio
     );
     return Boolean(
       replacement &&
+        !replacement.pending &&
         replacement.content.trim() &&
         replacement.content !== activeGeneration.replacementOriginalContent,
     );
@@ -4343,6 +4346,8 @@ function hasSavedAssistantForGeneration(messages: ChatMessage[], activeGeneratio
     (message) =>
       message.role === "assistant" &&
       message.id > 0 &&
+      !message.pending &&
+      message.content.trim() &&
       !activeGeneration.knownAssistantIds.has(message.id),
   );
 }

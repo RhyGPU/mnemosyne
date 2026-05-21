@@ -32,13 +32,13 @@ impl MockProvider {
         let context_hint = context_hint(context);
         let response = render_visible_response(soul, trimmed, mode, template, relationship_hint);
         let memory = render_memory(soul, trimmed, template, context_hint);
-        let world_event = render_world_event(trimmed, template);
+        let world_event = render_world_event(trimmed);
         let hidden_state = HiddenState {
             memory: Some(memory),
             tag: Some(template.tag.into()),
             trust_delta: Some(template.trust_delta),
             affection_delta: Some(template.affection_delta),
-            world_event: Some(world_event),
+            world_event,
             new_location: None,
             present_characters: Some(vec![soul.character_name.clone()]),
             arousal_delta: None,
@@ -196,8 +196,16 @@ fn render_memory(
     )
 }
 
-fn render_world_event(user_text: &str, template: MockTemplate) -> String {
-    format!("{}: {}", template.world_frame, user_text)
+fn render_world_event(user_text: &str) -> Option<String> {
+    let user = user_text.trim();
+    if user.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} {}",
+        state_engine::patch::PENDING_USER_INPUT_PREFIX,
+        user
+    ))
 }
 
 fn relationship_hint(soul: &Soul) -> &'static str {
