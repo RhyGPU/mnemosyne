@@ -327,6 +327,8 @@ pub struct WorldLog {
     pub object_states: Vec<ObjectState>,
     pub time_elapsed: String,
     #[serde(default)]
+    pub scene_state: SceneState,
+    #[serde(default)]
     pub dominant_current_plot: Option<PlotEntry>,
     #[serde(default)]
     pub background_plots: Vec<PlotEntry>,
@@ -346,10 +348,49 @@ impl Default for WorldLog {
             key_objects: Vec::new(),
             object_states: Vec::new(),
             time_elapsed: "Session start".into(),
+            scene_state: SceneState::default(),
             dominant_current_plot: None,
             background_plots: Vec::new(),
             resolved_plots: Vec::new(),
             stale_plot_decay: 0.12,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SceneState {
+    #[serde(default)]
+    pub scene_state_id: String,
+    #[serde(default)]
+    pub current_scene: String,
+    #[serde(default)]
+    pub resolved_active_plot: String,
+    #[serde(default)]
+    pub scene_branch: String,
+    #[serde(default)]
+    pub focus: String,
+    #[serde(default)]
+    pub participants: Vec<String>,
+    #[serde(default)]
+    pub last_user_action: String,
+    #[serde(default)]
+    pub pressure_point: String,
+    #[serde(default)]
+    pub continuity_note: String,
+}
+
+impl Default for SceneState {
+    fn default() -> Self {
+        Self {
+            scene_state_id: String::new(),
+            current_scene: String::new(),
+            resolved_active_plot: String::new(),
+            scene_branch: String::new(),
+            focus: String::new(),
+            participants: Vec::new(),
+            last_user_action: String::new(),
+            pressure_point: String::new(),
+            continuity_note: String::new(),
         }
     }
 }
@@ -377,10 +418,26 @@ pub struct ObjectState {
     #[serde(default)]
     pub object_observation_id: Option<String>,
     pub object_id: String,
+    #[serde(default = "unknown_object_field")]
+    pub object_kind: String,
     #[serde(default)]
     pub owner_entity_id: Option<String>,
     #[serde(default)]
     pub location: String,
+    #[serde(default = "unknown_object_field")]
+    pub status: String,
+    #[serde(default)]
+    pub open_state: Option<String>,
+    #[serde(default)]
+    pub lock_state: Option<String>,
+    #[serde(default)]
+    pub sealed: Option<bool>,
+    #[serde(default)]
+    pub contents_known: Option<bool>,
+    #[serde(default)]
+    pub contents_summary: Option<String>,
+    #[serde(default)]
+    pub properties: HashMap<String, String>,
     #[serde(default = "unknown_object_field")]
     pub power_state: String,
     #[serde(default = "unknown_object_field")]
@@ -404,8 +461,16 @@ impl Default for ObjectState {
         Self {
             object_observation_id: None,
             object_id: String::new(),
+            object_kind: unknown_object_field(),
             owner_entity_id: None,
             location: String::new(),
+            status: unknown_object_field(),
+            open_state: None,
+            lock_state: None,
+            sealed: None,
+            contents_known: None,
+            contents_summary: None,
+            properties: HashMap::new(),
             power_state: unknown_object_field(),
             notification_mode: unknown_object_field(),
             vibrate_enabled: None,

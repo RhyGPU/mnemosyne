@@ -1401,57 +1401,80 @@ export function App() {
     );
   }
 
-  async function handleRegenerateFromMessage(message: ChatMessage) {
-    if (busy || stateUpdating || !soul || message.role !== "assistant") return;
-    if (message.id !== latestAssistantMessageId) {
-      setStatus("Regenerating older messages requires branch rewind and will be added later.");
-      return;
-    }
+  function assistantForUserMessage(message: ChatMessage) {
     const messageIndex = activeMessages.findIndex((item) => item.id === message.id);
-    const previousUserMessage = activeMessages
-      .slice(0, messageIndex)
-      .reverse()
-      .find((item) => item.role === "user");
-
-    if (!previousUserMessage) {
-      setStatus("No user prompt found for this response");
-      return;
-    }
-
-    await executeTurn(previousUserMessage.content, "Regenerating response", message.id);
+    if (messageIndex < 0 || message.role !== "user") return undefined;
+    const firstFollowingTurnMessage = activeMessages
+      .slice(messageIndex + 1)
+      .find((item) => item.role === "assistant" || item.role === "user");
+    return firstFollowingTurnMessage?.role === "assistant" ? firstFollowingTurnMessage : undefined;
   }
 
-  async function handleFixWithInstruction(message: ChatMessage) {
-    if (busy || stateUpdating || !soul || message.role !== "assistant") return;
-    if (message.id !== latestAssistantMessageId) {
-      setStatus("Regenerating older messages requires branch rewind and will be added later.");
+  function canGenerateFromUserMessage(message: ChatMessage) {
+    if (message.role !== "user") return false;
+    const messageIndex = activeMessages.findIndex((item) => item.id === message.id);
+    if (messageIndex < 0) return false;
+    const laterUserExists = activeMessages
+      .slice(messageIndex + 1)
+      .some((item) => item.role === "user");
+    if (laterUserExists) return false;
+    const assistant = assistantForUserMessage(message);
+    return !assistant || assistant.id === latestAssistantMessageId;
+  }
+
+  async function executeTurnFromUserMessage(
+    message: ChatMessage,
+    statusLabel: string,
+    correctionInstruction?: string,
+  ) {
+    if (busy || stateUpdating || !soul || message.role !== "user") return;
+    if (!canGenerateFromUserMessage(message)) {
+      setStatus("Regenerating older turns requires branch rewind and will be added later.");
       return;
     }
-    const messageIndex = activeMessages.findIndex((item) => item.id === message.id);
-    const previousUserMessage = activeMessages
-      .slice(0, messageIndex)
-      .reverse()
-      .find((item) => item.role === "user");
-    if (!previousUserMessage) {
-      setStatus("No user prompt found for this response");
+    const assistant = assistantForUserMessage(message);
+    if (assistant) {
+      await executeTurn(message.content, statusLabel, assistant.id, correctionInstruction);
+      return;
+    }
+
+    try {
+      if (message.id > 0) {
+        await deleteMessage(message.conversation_id, message.id);
+        setMessages(await listConversationMessages(message.conversation_id));
+      }
+      await executeTurn(message.content, statusLabel, undefined, correctionInstruction);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleRegenerateFromUserMessage(message: ChatMessage) {
+    await executeTurnFromUserMessage(message, "Regenerating response");
+  }
+
+  async function handleFixFromUserMessage(message: ChatMessage) {
+    if (busy || stateUpdating || !soul || message.role !== "user") return;
+    if (!canGenerateFromUserMessage(message)) {
+      setStatus("Regenerating older turns requires branch rewind and will be added later.");
       return;
     }
     const instruction = window
       .prompt(
         "Correction instruction for next response:",
-        "Continue from the kitchen. Do not replay the phone reveal.",
+        "Continue from the current user message. Do not replay the wrong branch.",
       )
       ?.trim();
     if (!instruction) return;
-    await executeTurn(previousUserMessage.content, "Applying fix instruction", message.id, instruction);
+    await executeTurnFromUserMessage(message, "Applying fix instruction", instruction);
   }
 
   async function handleDeleteChatMessage(message: ChatMessage) {
     if (busy || stateUpdating) return;
     const confirmed = window.confirm(
       message.role === "assistant"
-        ? "Delete this generated response? Soul memory is not rewound."
-        : "Delete this user message? Soul memory and later responses are not rewound.",
+        ? "Delete this generated response and all later turns in this session? This rewinds visible chat state from here."
+        : "Delete this user message and all later turns in this session? This rewinds visible chat state from here.",
     );
     if (!confirmed) return;
 
@@ -1460,10 +1483,15 @@ export function App() {
       await deleteMessage(message.conversation_id, message.id);
       const nextMessages = await listConversationMessages(message.conversation_id);
       setMessages(nextMessages);
+      setConversations(await listConversations());
       if (soul) {
         setContext(await compileContext(soul.character_id, message.conversation_id));
       }
-      setStatus(message.role === "assistant" ? "Generated response deleted" : "User message deleted");
+      setStatus(
+        nextMessages.length
+          ? "Turn deleted; later visible chat was rewound"
+          : "Turn deleted; this session is now empty but still exists",
+      );
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1553,6 +1581,8 @@ export function App() {
 
   async function handleDeleteChat(conversationId = currentConversationId) {
     if (!soul) return;
+    const deletingActiveConversation = conversationId === currentConversationId;
+    const sourceSoulId = soul.source_soul_id ?? soul.source_savepoint_id ?? null;
     const confirmed = window.confirm(
       "Delete this local session? Messages, payload logs, and isolated session clones will be removed. Source savepoints stay intact.",
     );
@@ -1563,11 +1593,28 @@ export function App() {
       await deleteConversation(conversationId);
       const nextConversations = await listConversations();
       setConversations(nextConversations);
-      if (conversationId === currentConversationId) {
+      if (deletingActiveConversation) {
+        const sourceSoul = sourceSoulId ? await getSoul(sourceSoulId).catch(() => null) : null;
+        if (sourceSoul) {
+          setSoul(sourceSoul);
+          setCreatorFieldsFromSoul(sourceSoul);
+        }
+        const nextVisibleConversation = nextConversations.find((conversation) => {
+          const activeSoul = sourceSoul ?? soul;
+          return (
+            conversation.soul_id === activeSoul.character_id ||
+            conversation.source_savepoint_id === activeSoul.character_id ||
+            (Boolean(activeSoul.source_savepoint_id) &&
+              conversation.source_savepoint_id === activeSoul.source_savepoint_id)
+          );
+        });
         setActiveConversationId(null);
         setMessages([]);
         setContext(null);
         setView("library");
+        if (nextVisibleConversation) {
+          setSessionContinuityLabel("Select an existing session to continue");
+        }
       }
       setLastTurnDebug(null);
       setStatus("Session deleted; source savepoints kept");
@@ -2182,7 +2229,8 @@ export function App() {
             activeMessages.map((message) => {
               const variants = variantsByMessage[message.id] ?? [];
               const selectedIndex = selectedVariantIndex(variants);
-              const canGenerate = message.id === latestAssistantMessageId;
+              const canSelectVariant = message.id === latestAssistantMessageId;
+              const canGenerateFromUser = canGenerateFromUserMessage(message);
               const olderGenerationTitle =
                 "Regenerating older messages requires branch rewind and will be added later.";
 
@@ -2192,28 +2240,11 @@ export function App() {
                     <span>{message.role === "user" ? "User" : "Narrator"}</span>
                     {message.role === "assistant" ? (
                       <div className="message-tools">
-                        <button
-                          className="message-tool-action"
-                          title={canGenerate ? "Regenerate response" : olderGenerationTitle}
-                          onClick={() => handleRegenerateFromMessage(message)}
-                          disabled={turnInProgress || !canGenerate}
-                        >
-                          <RefreshCcw size={14} />
-                          <span>Regenerate</span>
-                        </button>
-                        <button
-                          className="message-tool-action"
-                          title={canGenerate ? "Fix response with instruction" : olderGenerationTitle}
-                          onClick={() => handleFixWithInstruction(message)}
-                          disabled={turnInProgress || !canGenerate}
-                        >
-                          <span>Fix</span>
-                        </button>
                         <div className="variant-switcher" aria-label="Response variants">
                           <button
                             title="Previous variant"
                             onClick={() => handleSelectVariant(message, -1)}
-                            disabled={turnInProgress || variants.length <= 1 || selectedIndex <= 0}
+                            disabled={turnInProgress || !canSelectVariant || variants.length <= 1 || selectedIndex <= 0}
                           >
                             <ArrowLeft size={13} />
                           </button>
@@ -2224,7 +2255,10 @@ export function App() {
                             title="Next variant"
                             onClick={() => handleSelectVariant(message, 1)}
                             disabled={
-                              turnInProgress || variants.length <= 1 || selectedIndex >= variants.length - 1
+                              turnInProgress ||
+                              !canSelectVariant ||
+                              variants.length <= 1 ||
+                              selectedIndex >= variants.length - 1
                             }
                           >
                             <ArrowLeft size={13} className="next-variant-icon" />
@@ -2240,6 +2274,23 @@ export function App() {
                       </div>
                     ) : (
                       <div className="message-tools">
+                        <button
+                          className="message-tool-action"
+                          title={canGenerateFromUser ? "Regenerate response from this user message" : olderGenerationTitle}
+                          onClick={() => handleRegenerateFromUserMessage(message)}
+                          disabled={turnInProgress || !canGenerateFromUser}
+                        >
+                          <RefreshCcw size={14} />
+                          <span>Regenerate</span>
+                        </button>
+                        <button
+                          className="message-tool-action"
+                          title={canGenerateFromUser ? "Fix response with instruction" : olderGenerationTitle}
+                          onClick={() => handleFixFromUserMessage(message)}
+                          disabled={turnInProgress || !canGenerateFromUser}
+                        >
+                          <span>Fix</span>
+                        </button>
                         <button
                           title="Edit this message"
                           onClick={() => handleEditUserMessage(message)}

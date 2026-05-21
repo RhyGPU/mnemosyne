@@ -19,7 +19,8 @@ use state_engine::{
     consolidation::consolidate_soul,
     context_compiler::{
         compile_context_for_session, compile_context_for_session_separate_user_message,
-        estimate_tokens, ContextMessage, ContextPreview, MemorySlotTrace,
+        compile_context_for_session_separate_user_message_with_pending, estimate_tokens,
+        ContextMessage, ContextPreview, MemorySlotTrace,
     },
     hidden_state::{parse_hidden_state, HiddenState},
     patch::{is_retcon_or_correction_text, EnginePatch, MemoryApplyAction},
@@ -1652,6 +1653,7 @@ fn send_mock_turn_with_conn(
         Some(&session_world),
         &messages_to_context(before_messages),
         correction_instruction.as_deref(),
+        Some(&snapshot_user_text),
     );
     let provider = MockProvider::default();
     let raw_response = provider.complete(&soul, &context_preview.text, &snapshot_user_text, &mode);
@@ -1924,6 +1926,7 @@ pub async fn send_api_turn(
             Some(&session_world),
             &context_messages,
             correction_instruction.as_deref(),
+            Some(&snapshot_user_text),
         );
         emit_perf_log(
             &window,
@@ -2516,6 +2519,8 @@ pub async fn send_api_turn(
         })),
     );
 
+    let skip_state_updater_for_ooc = is_pure_ooc_meta_turn(&snapshot_user_text)
+        && !is_retcon_or_correction_text(&snapshot_user_text);
     let updater_payload_started = Instant::now();
     let updater_system_prompt = build_state_updater_prompt(&soul, Some(&session_world));
     let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
@@ -2549,9 +2554,17 @@ pub async fn send_api_turn(
     }
     emit_dev_log(
         &window,
-        "info",
+        if skip_state_updater_for_ooc {
+            "debug"
+        } else {
+            "info"
+        },
         "state_updater",
-        "State updater started",
+        if skip_state_updater_for_ooc {
+            "state_updater_skipped_ooc_meta"
+        } else {
+            "State updater started"
+        },
         Some(serde_json::json!({
             "conversation_id": conversation_id.as_str(),
             "assistant_message_id": assistant_message_id,
@@ -2615,15 +2628,19 @@ pub async fn send_api_turn(
         }
     };
     let updater_call_started = Instant::now();
-    let updater_response_result = provider
-        .complete_prompt_with_timeout(
-            &state_updater_settings,
-            &updater_system_prompt,
-            &updater_user_message,
-            0.0,
-            Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS),
-        )
-        .await;
+    let updater_response_result = if skip_state_updater_for_ooc {
+        Ok("{}".to_string())
+    } else {
+        provider
+            .complete_prompt_with_timeout(
+                &state_updater_settings,
+                &updater_system_prompt,
+                &updater_user_message,
+                0.0,
+                Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS),
+            )
+            .await
+    };
     let updater_call_elapsed = updater_call_started.elapsed();
     if updater_call_elapsed >= Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS) {
         emit_dev_log(
@@ -3388,12 +3405,14 @@ fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContract
     let mut normalized = body.trim().to_string();
     let gm_reply = is_gm_facing_user_message(user_text) || is_plain_gm_reply(&normalized);
 
-    if let Some(status) = status_blocks.last() {
+    if let Some(status) = status_blocks.last().filter(|_| !gm_reply) {
         let status = normalize_status_block(status);
         if !normalized.is_empty() {
             normalized.push_str("\n\n");
         }
         normalized.push_str(&status);
+    } else if gm_reply && !status_blocks.is_empty() {
+        warnings.push("status block stripped for GM/OOC reply");
     } else if !gm_reply && !normalized.is_empty() {
         normalized.push_str(
             "\n\n```status\nScene | Focus: Unknown | Physical state: Not specified | Atmosphere: Not specified\n```",
@@ -3657,8 +3676,12 @@ fn is_gm_facing_user_message(user_text: &str) -> bool {
     let trimmed = lower.trim_start();
     trimmed.starts_with("gm:")
         || trimmed.starts_with("narrator:")
-        || trimmed.starts_with("ooc:")
+        || starts_with_ooc_marker(trimmed)
         || trimmed.starts_with("[ooc]")
+        || trimmed.starts_with("[occ]")
+        || trimmed.starts_with("(ooc)")
+        || trimmed.starts_with("(occ)")
+        || trimmed.starts_with("out of character:")
         || lower.contains("talking to the narrator")
         || lower.contains("talking to the gm")
         || lower.contains("addressing the narrator")
@@ -3670,8 +3693,43 @@ fn is_plain_gm_reply(response: &str) -> bool {
     let trimmed = lower.trim_start();
     trimmed.starts_with("gm:")
         || trimmed.starts_with("narrator:")
-        || trimmed.starts_with("ooc:")
+        || starts_with_ooc_marker(trimmed)
         || trimmed.starts_with("[ooc]")
+        || trimmed.starts_with("[occ]")
+        || trimmed.starts_with("(ooc)")
+        || trimmed.starts_with("(occ)")
+        || trimmed.starts_with("out of character:")
+        || trimmed.starts_with("correction:")
+        || trimmed.starts_with("you're right")
+        || trimmed.starts_with("you are right")
+        || trimmed.starts_with("as gm")
+        || trimmed.starts_with("as narrator")
+}
+
+fn starts_with_ooc_marker(trimmed_lower: &str) -> bool {
+    trimmed_lower.starts_with("ooc:")
+        || trimmed_lower.starts_with("occ:")
+        || trimmed_lower.starts_with("ooc ")
+        || trimmed_lower.starts_with("occ ")
+}
+
+fn is_pure_ooc_meta_turn(user_text: &str) -> bool {
+    let lower = user_text.to_ascii_lowercase();
+    let trimmed = lower.trim_start();
+    if !is_gm_facing_user_message(user_text) {
+        return false;
+    }
+    !contains_any_text(
+        trimmed,
+        &[
+            "resume scene",
+            "continue scene",
+            "back in character",
+            "in character:",
+            "ic:",
+            "as aurora",
+        ],
+    )
 }
 
 fn detect_replay(new_response: &str, replay_sources: &[ReplaySource]) -> ReplayGuardResult {
@@ -4314,8 +4372,11 @@ fn label_can_create_entity(label: &str) -> bool {
                 | "system"
                 | "assistant"
                 | "narrator"
+                | "gm"
                 | "ooc"
+                | "occ"
                 | "out_of_character"
+                | "out_of_context"
                 | "out_of_character_note"
         )
 }
@@ -4323,7 +4384,7 @@ fn label_can_create_entity(label: &str) -> bool {
 fn is_ooc_channel_label(label: &str) -> bool {
     matches!(
         normalize_match_key(label).as_str(),
-        "ooc" | "out_of_character" | "out_of_character_note"
+        "ooc" | "occ" | "out_of_character" | "out_of_context" | "out_of_character_note"
     )
 }
 
@@ -4489,9 +4550,14 @@ fn compile_context_with_correction(
     session_world: Option<&SessionWorld>,
     messages: &[ContextMessage],
     correction_instruction: Option<&str>,
+    pending_user_text: Option<&str>,
 ) -> ContextPreview {
-    let mut preview =
-        compile_context_for_session_separate_user_message(soul, session_world, messages);
+    let mut preview = compile_context_for_session_separate_user_message_with_pending(
+        soul,
+        session_world,
+        messages,
+        pending_user_text,
+    );
     let instruction = correction_instruction
         .map(str::trim)
         .filter(|instruction| !instruction.is_empty());
@@ -4658,6 +4724,11 @@ fn sanitize_state_updater_patch(
     let turn_text = format!("{user_text}\n{narrator_response}");
     tag_memory_sources_from_turn(&mut patch, user_text, &turn_text);
     apply_state_truth_boundary(&mut patch, user_text, narrator_response);
+    let pure_ooc_meta = is_pure_ooc_meta_turn(user_text);
+    let retcon_or_correction = is_retcon_or_correction_text(user_text);
+    if pure_ooc_meta {
+        suppress_ooc_scene_state(&mut patch, retcon_or_correction);
+    }
     let threat_scene = is_threat_or_emergency(&turn_text) || latest_world_event_is_threat(soul);
     let explicit_intimacy = explicitly_intimate(user_text);
     if let Some(body_patch) = patch.body_patch.as_mut() {
@@ -4677,7 +4748,7 @@ fn sanitize_state_updater_patch(
         patch.body_patch = None;
     }
 
-    if patch.world_patch.is_none() && is_retcon_or_correction_text(user_text) {
+    if patch.world_patch.is_none() && retcon_or_correction {
         patch.world_patch = Some(Default::default());
     }
     if let Some(world_patch) = patch.world_patch.as_mut() {
@@ -4699,7 +4770,21 @@ fn sanitize_state_updater_patch(
             }
         }
         cleanup_stale_active_plots(soul, world_patch, &turn_text);
-        if is_retcon_or_correction_text(user_text) {
+        if pure_ooc_meta && !retcon_or_correction {
+            world_patch.recent_event = None;
+            world_patch.recent_events.clear();
+            world_patch.active_plot_add.clear();
+            world_patch.active_plot_resolve.clear();
+            world_patch.key_object_add.clear();
+            world_patch.key_object_remove.clear();
+            world_patch.event_operations.clear();
+            world_patch.object_observation_operations.clear();
+            world_patch.corrected_object_states.clear();
+            world_patch.scene_state = None;
+        }
+        if retcon_or_correction {
+            world_patch.recent_event = None;
+            world_patch.recent_events.clear();
             world_patch.retcon_scope.get_or_insert("latest_turn".into());
             world_patch.correction_note.get_or_insert_with(|| {
                 "Retcon: phone did not buzz because notifications were off / no vibration / screen wake disabled.".into()
@@ -4711,6 +4796,29 @@ fn sanitize_state_updater_patch(
     }
 
     patch
+}
+
+fn suppress_ooc_scene_state(patch: &mut EnginePatch, retcon_or_correction: bool) {
+    if let Some(soul_patch) = patch.soul_patch.as_mut() {
+        soul_patch.new_memories.retain(|memory| {
+            retcon_or_correction
+                && (memory
+                    .tag
+                    .as_deref()
+                    .map_or(false, |tag| tag.to_ascii_lowercase().contains("correction"))
+                    || memory.truth_status == Some(TruthStatus::ActualSystemEvent)
+                    || memory.truth_status == Some(TruthStatus::VerifiedEngine))
+        });
+        if !retcon_or_correction {
+            soul_patch.memory_operations.clear();
+            soul_patch.relationship_delta = None;
+            soul_patch.relationship_deltas.clear();
+        }
+    }
+    if !retcon_or_correction {
+        patch.body_patch = None;
+        patch.sensory_patch = None;
+    }
 }
 
 fn apply_state_truth_boundary(patch: &mut EnginePatch, user_text: &str, narrator_response: &str) {
@@ -4877,6 +4985,7 @@ fn engine_patch_summary(patch: &EnginePatch) -> serde_json::Value {
         serde_json::json!({
             "has_location": world.location.as_deref().map(str::trim).is_some_and(|value| !value.is_empty()),
             "has_time_elapsed": world.time_elapsed.as_deref().map(str::trim).is_some_and(|value| !value.is_empty()),
+            "has_scene_state": world.scene_state.as_ref().is_some_and(|scene| !scene.is_empty()),
             "recent_events": world.recent_events.len() + usize::from(world.recent_event.as_deref().map(str::trim).is_some_and(|value| !value.is_empty())),
             "active_plot_add": world.active_plot_add.len(),
             "active_plot_resolve": world.active_plot_resolve.len()
@@ -6339,6 +6448,22 @@ mod tests {
     }
 
     #[test]
+    fn occ_label_does_not_create_entity() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert");
+        db::ensure_conversation(&conn, "occ", &soul.character_id).expect("conversation");
+
+        let context =
+            resolve_speaker_for_turn(&conn, "occ", &soul, "OCC: pause the scene for a note.")
+                .expect("resolve");
+
+        assert_eq!(context.speaker.entity_id, "default_player");
+        let entities = db::list_entities(&conn, "occ").expect("entities");
+        assert!(!entities.iter().any(|entity| entity.entity_id == "occ"));
+    }
+
+    #[test]
     fn typo_speaker_label_resolves_to_active_entity() {
         let conn = db::init_memory_connection().expect("db");
         let soul = new_default_soul("Aurora");
@@ -7078,7 +7203,7 @@ mod tests {
         assert!(!payload.contains("[COMPILED CONTEXT]"));
         assert!(!payload.contains("[WORLD SNAPSHOT]"));
         assert!(!payload.contains("Old unrelated cohabitation"));
-        assert!(estimate_tokens(&payload) < 1_200);
+        assert!(estimate_tokens(&payload) < STATE_UPDATER_TARGET_TOKENS);
         assert!(payload.contains("Time: Late evening, just after midnight."));
     }
 
@@ -7145,6 +7270,28 @@ mod tests {
     }
 
     #[test]
+    fn pure_ooc_meta_turn_drops_scene_state_patch() {
+        let soul = new_default_soul("Aurora");
+        let patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"soul_patch":{"relationship_deltas":[{"target":"default_player","trust":2.0}],"new_memories":[{"content":"User asked an OOC debugging question.","tag":"observation"}]},"world_patch":{"recent_event":"Aurora heard an OOC debugging question.","scene_state":{"current_scene":"OOC diagnostic"},"active_plot_add":["Debug OOC"]},"body_patch":{"activation_delta":4.0}}"#,
+        )
+        .expect("valid patch");
+
+        let filtered = sanitize_state_updater_patch(
+            patch,
+            &soul,
+            "OCC: why did the scene branch wrong?",
+            "GM: This is an out-of-character diagnostic.",
+        );
+
+        assert!(filtered.world_patch.is_none());
+        assert!(filtered.body_patch.is_none());
+        let soul_patch = filtered.soul_patch.expect("soul patch");
+        assert!(soul_patch.new_memories.is_empty());
+        assert!(soul_patch.relationship_deltas.is_empty());
+    }
+
+    #[test]
     fn active_plot_replaces_default_after_major_shift() {
         let mut soul = new_default_soul("Aurora");
         soul.world.active_plots = vec!["Establish the first scene".into()];
@@ -7171,11 +7318,16 @@ mod tests {
     }
 
     #[test]
-    fn compiled_context_orders_world_before_character() {
+    fn compiled_context_orders_latest_and_scene_state_before_world() {
         let soul = new_default_soul("Aurora");
         let preview = state_engine::context_compiler::compile_context_for_messages(&soul, &[]);
 
-        assert_order(&preview.text, "[WORLD SNAPSHOT]", "[CHARACTER SNAPSHOT]");
+        assert_order(
+            &preview.text,
+            "[LATEST EXCHANGE, HIGH PRIORITY]",
+            "[RESOLVED SCENE STATE]",
+        );
+        assert_order(&preview.text, "[RESOLVED SCENE STATE]", "[WORLD SNAPSHOT]");
     }
 
     #[test]
@@ -7200,8 +7352,8 @@ mod tests {
 
         assert_order(
             &preview.text,
-            "[RECENT CHAT, LOWER PRIORITY]",
             "[LATEST EXCHANGE, HIGH PRIORITY]",
+            "[RECENT CHAT, LOWER PRIORITY]",
         );
         assert!(preview
             .text
@@ -7317,6 +7469,7 @@ mod tests {
             None,
             &messages_to_context(corrected.messages.clone()),
             Some("Continue from the kitchen. Do not replay the phone reveal."),
+            Some("I show her the phone."),
         );
         assert!(context
             .text
@@ -7767,6 +7920,22 @@ mod tests {
 
         assert!(!result.text.contains("```status"));
         assert!(result.text.starts_with("GM:"));
+    }
+
+    #[test]
+    fn output_contract_strips_status_from_ooc_reply() {
+        let result = apply_output_contract_guard(
+            "OOC: Correct, that was a continuity error.\n\n```status\nScene | Focus: Aurora | Physical state: idle | Atmosphere: tense\n```",
+            "OCC: Is that contradiction real?",
+        );
+
+        assert!(result.text.starts_with("OOC: Correct"));
+        assert!(!result.text.contains("```status"));
+        assert!(result
+            .warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("status block stripped for GM/OOC reply"));
     }
 
     #[test]

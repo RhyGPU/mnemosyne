@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::{
     schema::CURRENT_SCHEMA_VERSION,
-    soul::{current_timestamp, ObjectState, PlotEntry, WorldLog},
+    soul::{current_timestamp, ObjectState, PlotEntry, SceneState, WorldLog},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -53,6 +53,8 @@ pub struct SessionWorld {
     pub object_states: Vec<ObjectState>,
     pub time_elapsed: String,
     #[serde(default)]
+    pub scene_state: SceneState,
+    #[serde(default)]
     pub dominant_current_plot: Option<PlotEntry>,
     #[serde(default)]
     pub background_plots: Vec<PlotEntry>,
@@ -80,6 +82,7 @@ impl SessionWorld {
             key_objects: self.key_objects.clone(),
             object_states: self.object_states.clone(),
             time_elapsed: self.time_elapsed.clone(),
+            scene_state: self.scene_state.clone(),
             dominant_current_plot: self.dominant_current_plot.clone(),
             background_plots: self.background_plots.clone(),
             resolved_plots: self.resolved_plots.clone(),
@@ -95,6 +98,7 @@ impl SessionWorld {
         self.key_objects = world.key_objects.clone();
         self.object_states = world.object_states.clone();
         self.time_elapsed = world.time_elapsed.clone();
+        self.scene_state = world.scene_state.clone();
         self.dominant_current_plot = world.dominant_current_plot.clone();
         self.background_plots = world.background_plots.clone();
         self.resolved_plots = world.resolved_plots.clone();
@@ -118,6 +122,7 @@ pub fn session_world_from_setting(setting: &SettingSoul) -> SessionWorld {
         key_objects: setting.world.key_objects.clone(),
         object_states: setting.world.object_states.clone(),
         time_elapsed: setting.world.time_elapsed.clone(),
+        scene_state: setting.world.scene_state.clone(),
         dominant_current_plot: setting.world.dominant_current_plot.clone(),
         background_plots: setting.world.background_plots.clone(),
         resolved_plots: setting.world.resolved_plots.clone(),
@@ -148,6 +153,7 @@ pub fn session_world_from_legacy_world(
         key_objects: world.key_objects.clone(),
         object_states: world.object_states.clone(),
         time_elapsed: world.time_elapsed.clone(),
+        scene_state: world.scene_state.clone(),
         dominant_current_plot: world.dominant_current_plot.clone(),
         background_plots: world.background_plots.clone(),
         resolved_plots: world.resolved_plots.clone(),

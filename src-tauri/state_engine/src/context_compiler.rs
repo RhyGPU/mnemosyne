@@ -193,6 +193,7 @@ pub fn compile_context_for_separate_user_message(
         &ContextBudget::default(),
         true,
         false,
+        None,
     )
 }
 
@@ -208,6 +209,24 @@ pub fn compile_context_for_session_separate_user_message(
         &ContextBudget::default(),
         true,
         false,
+        None,
+    )
+}
+
+pub fn compile_context_for_session_separate_user_message_with_pending(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    messages: &[ContextMessage],
+    pending_user_text: Option<&str>,
+) -> ContextPreview {
+    compile_context_with_budget_and_options(
+        soul,
+        session_world,
+        messages,
+        &ContextBudget::default(),
+        true,
+        false,
+        pending_user_text,
     )
 }
 
@@ -225,7 +244,7 @@ pub fn compile_context_with_budget_and_world(
     messages: &[ContextMessage],
     budget: &ContextBudget,
 ) -> ContextPreview {
-    compile_context_with_budget_and_options(soul, session_world, messages, budget, false, false)
+    compile_context_with_budget_and_options(soul, session_world, messages, budget, false, false, None)
 }
 
 pub fn compile_context_for_session_with_debug_replies(
@@ -240,6 +259,7 @@ pub fn compile_context_for_session_with_debug_replies(
         &ContextBudget::default(),
         false,
         true,
+        None,
     )
 }
 
@@ -250,18 +270,21 @@ fn compile_context_with_budget_and_options(
     budget: &ContextBudget,
     separate_user_message_follows: bool,
     include_debug_replies: bool,
+    pending_user_text: Option<&str>,
 ) -> ContextPreview {
     let mut truncated = false;
     let mut section_builders = vec![
-        build_world_section(soul, session_world, budget),
-        build_profile_section(soul, budget),
-        build_memory_section(soul, messages, budget),
-        build_relationship_section(soul, budget),
-        build_recent_chat_section(messages, budget),
+        build_pending_user_section(pending_user_text, budget),
         build_latest_exchange_section(messages, budget, separate_user_message_follows),
+        build_scene_state_section(soul, session_world, budget),
+        build_profile_section(soul, budget),
+        build_relationship_section(soul, budget),
+        build_world_section(soul, session_world, budget),
+        build_memory_section(soul, messages, budget),
+        build_recent_chat_section(messages, budget),
     ];
     if include_debug_replies {
-        section_builders.insert(3, build_verified_memory_layer_reply_section(soul, budget));
+        section_builders.insert(4, build_verified_memory_layer_reply_section(soul, budget));
     }
 
     let mut sections = Vec::new();
@@ -283,6 +306,70 @@ fn compile_context_with_budget_and_options(
         truncated,
         memory_slot_debug,
     }
+}
+
+fn build_pending_user_section(
+    pending_user_text: Option<&str>,
+    budget: &ContextBudget,
+) -> BuiltSection {
+    let Some(text) = pending_user_text.and_then(clean) else {
+        return BuiltSection {
+            text: String::new(),
+            truncated: false,
+            memory_slot_debug: Vec::new(),
+        };
+    };
+    section_from_lines(
+        "[CURRENT USER INPUT - HIGHEST PRIORITY]",
+        vec![
+            "Resolve this input before older plot lists, memories, or personality tendencies.".into(),
+            excerpt(&sanitize_message_content(text), LATEST_USER_EXCHANGE_CHARS),
+        ],
+        budget.latest_exchange_tokens.min(budget.max_tokens),
+    )
+}
+
+fn build_scene_state_section(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    budget: &ContextBudget,
+) -> BuiltSection {
+    let (source, world) = if let Some(session_world) = session_world {
+        ("session_world.scene_state", session_world.world_log())
+    } else {
+        ("legacy character_soul.world.scene_state", soul.world.clone())
+    };
+    let scene = &world.scene_state;
+    let resolved_plot = clean(&scene.resolved_active_plot)
+        .or_else(|| {
+            world
+                .dominant_current_plot
+                .as_ref()
+                .and_then(|plot| clean(&plot.title))
+        })
+        .unwrap_or("No single resolved active plot yet.");
+    let mut lines = vec![
+        format!("Source: {source}"),
+        format!("Resolved active plot: {resolved_plot}"),
+        format!(
+            "Current scene: {}",
+            clean(&scene.current_scene).unwrap_or("Use latest exchange as current scene.")
+        ),
+    ];
+    push_if_present(&mut lines, "Scene branch", scene.scene_branch.trim());
+    push_if_present(&mut lines, "Focus", scene.focus.trim());
+    if !scene.participants.is_empty() {
+        lines.push(format!("Participants: {}", scene.participants.join(", ")));
+    }
+    push_if_present(&mut lines, "Last user action", scene.last_user_action.trim());
+    push_if_present(&mut lines, "Pressure point", scene.pressure_point.trim());
+    push_if_present(&mut lines, "Continuity note", scene.continuity_note.trim());
+
+    section_from_lines(
+        "[RESOLVED SCENE STATE]",
+        lines,
+        budget.scene_state_tokens.min(budget.max_tokens),
+    )
 }
 
 fn build_profile_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
@@ -585,10 +672,16 @@ fn slot_matches_memory(
                 &[
                     "unresolved", "tension", "betray", "promise", "commitment", "boundary",
                     "conflict", "guilt", "concern", "afraid", "owed", "not resolved",
-                    "argued",
+                    "argued", "argument", "accused", "accusation", "defensive", "ambivalent",
+                    "ambivalence", "mixed feelings", "torn", "hurt", "resent", "jealous",
+                    "risk", "emotional risk", "pressure", "misunderstanding", "ignored",
+                    "not answering", "not texting", "not calling", "contradiction",
+                    "uncertain whether", "afraid that", "trust risk",
                 ],
             ) || tag.contains("conflict")
                 || tag.contains("boundary")
+                || tag.contains("tension")
+                || tag.contains("ambivalence")
         }
         MemorySlot::WorldLocation => {
             contains_any(
@@ -770,7 +863,7 @@ fn build_world_section(
     }
 
     lines.push(format_list(
-        "Active plots",
+        "Active plots (candidate/background list; resolved scene state wins conflicts)",
         &world.active_plots,
         "No active plot has been established.",
     ));
@@ -829,13 +922,36 @@ fn build_world_section(
         .filter(|object| !object.object_id.trim().is_empty())
         .take(6)
         .map(|object| {
-            let mut parts = vec![
-                format!("power {}", fallback(&object.power_state, "unknown")),
-                format!(
+            let mut parts = vec![format!("kind {}", fallback(&object.object_kind, "unknown"))];
+            if let Some(status) = clean(&object.status) {
+                if status != "unknown" {
+                    parts.push(format!("status {status}"));
+                }
+            }
+            if let Some(open_state) = object.open_state.as_deref().and_then(clean) {
+                parts.push(format!("open {open_state}"));
+            }
+            if let Some(lock_state) = object.lock_state.as_deref().and_then(clean) {
+                parts.push(format!("lock {lock_state}"));
+            }
+            if let Some(sealed) = object.sealed {
+                parts.push(format!("sealed {}", bool_label(sealed)));
+            }
+            if let Some(contents_known) = object.contents_known {
+                parts.push(format!("contents_known {}", bool_label(contents_known)));
+            }
+            if let Some(contents_summary) = object.contents_summary.as_deref().and_then(clean) {
+                parts.push(format!("contents {contents_summary}"));
+            }
+            if object.object_kind.eq_ignore_ascii_case("phone")
+                || object.object_id.to_ascii_lowercase().contains("phone")
+            {
+                parts.push(format!("power {}", fallback(&object.power_state, "unknown")));
+                parts.push(format!(
                     "notifications {}",
                     fallback(&object.notification_mode, "unknown")
-                ),
-            ];
+                ));
+            }
             if let Some(vibrate) = object.vibrate_enabled {
                 parts.push(format!("vibrate {}", bool_label(vibrate)));
             }
@@ -1054,7 +1170,9 @@ fn compact_sections_to_budget(sections: &mut Vec<String>, max_tokens: usize) -> 
         "[CHARACTER SNAPSHOT]",
         "[WORLD SNAPSHOT]",
         "[RELATIONSHIPS]",
+        "[RESOLVED SCENE STATE]",
         "[LATEST EXCHANGE, HIGH PRIORITY]",
+        "[CURRENT USER INPUT - HIGHEST PRIORITY]",
     ];
 
     while estimate_tokens(&sections.join("\n\n")) > max_tokens {
@@ -1095,7 +1213,10 @@ fn trim_last_line(section: &mut String) -> bool {
 }
 
 fn trim_to_priority_minimum(sections: &mut Vec<String>, max_tokens: usize) {
-    sections.retain(|section| section.starts_with("[LATEST EXCHANGE, HIGH PRIORITY]"));
+    sections.retain(|section| {
+        section.starts_with("[CURRENT USER INPUT - HIGHEST PRIORITY]")
+            || section.starts_with("[LATEST EXCHANGE, HIGH PRIORITY]")
+    });
 
     while estimate_tokens(&sections.join("\n\n")) > max_tokens {
         if sections.iter_mut().rev().any(trim_last_line) {
@@ -1633,22 +1754,27 @@ mod tests {
     }
 
     #[test]
-    fn world_snapshot_appears_before_character_snapshot() {
-        let soul = soul_with_phone_scene();
-        let preview = compile_context_for_messages(&soul, &phone_continuity_messages());
-
-        assert_order(&preview.text, "[WORLD SNAPSHOT]", "[CHARACTER SNAPSHOT]");
-    }
-
-    #[test]
-    fn latest_exchange_appears_after_lower_priority_recent_chat() {
+    fn latest_exchange_and_scene_state_appear_before_world_snapshot() {
         let soul = soul_with_phone_scene();
         let preview = compile_context_for_messages(&soul, &phone_continuity_messages());
 
         assert_order(
             &preview.text,
-            "[RECENT CHAT, LOWER PRIORITY]",
             "[LATEST EXCHANGE, HIGH PRIORITY]",
+            "[RESOLVED SCENE STATE]",
+        );
+        assert_order(&preview.text, "[RESOLVED SCENE STATE]", "[WORLD SNAPSHOT]");
+    }
+
+    #[test]
+    fn latest_exchange_appears_before_lower_priority_recent_chat() {
+        let soul = soul_with_phone_scene();
+        let preview = compile_context_for_messages(&soul, &phone_continuity_messages());
+
+        assert_order(
+            &preview.text,
+            "[LATEST EXCHANGE, HIGH PRIORITY]",
+            "[RECENT CHAT, LOWER PRIORITY]",
         );
     }
 
@@ -1692,6 +1818,25 @@ mod tests {
             !latest_exchange.contains("lonely too"),
             "latest exchange should not repeat the separate user message: {latest_exchange}"
         );
+    }
+
+    #[test]
+    fn pending_user_input_gets_highest_priority_section() {
+        let soul = soul_with_phone_scene();
+        let preview = compile_context_for_session_separate_user_message_with_pending(
+            &soul,
+            None,
+            &phone_continuity_messages(),
+            Some("I pat her head instead of replaying the door."),
+        );
+
+        assert_order(
+            &preview.text,
+            "[CURRENT USER INPUT - HIGHEST PRIORITY]",
+            "[LATEST EXCHANGE, HIGH PRIORITY]",
+        );
+        assert!(section_text(&preview.text, "[CURRENT USER INPUT - HIGHEST PRIORITY]")
+            .contains("I pat her head"));
     }
 
     #[test]
@@ -2180,6 +2325,31 @@ mod tests {
         let referenced_memories = section_text(&referenced.text, "[UNRESOLVED TENSION]");
         assert!(referenced_memories.contains("imported_log / not lived"));
         assert!(referenced_memories.contains("previous Aurora argued"));
+    }
+
+    #[test]
+    fn unresolved_tension_detects_ambivalence_and_emotional_risk() {
+        let mut soul = new_default_soul("Aurora");
+        soul.memory.recent.push(memory(
+            "tension",
+            "Aurora is ambivalent after being accused of ignoring calls, creating trust risk.",
+            "relationship",
+            70.0,
+            70.0,
+            2,
+        ));
+
+        let preview = compile_context_for_messages(
+            &soul,
+            &[ContextMessage {
+                role: "user".into(),
+                content: "She says not answering is different from ignoring.".into(),
+            }],
+        );
+        let tension = section_text(&preview.text, "[UNRESOLVED TENSION]");
+
+        assert!(tension.contains("ambivalent"));
+        assert!(tension.contains("trust risk"));
     }
 
     #[test]

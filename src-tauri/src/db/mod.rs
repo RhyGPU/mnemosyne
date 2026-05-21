@@ -3287,6 +3287,93 @@ mod tests {
     }
 
     #[test]
+    fn deleting_one_conversation_preserves_sibling_conversations() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+        ensure_conversation(&conn, "chat-a", &soul.character_id).expect("conversation a");
+        ensure_conversation(&conn, "chat-b", &soul.character_id).expect("conversation b");
+        insert_message(&conn, "chat-a", "user", "A").expect("message a");
+        insert_message(&conn, "chat-b", "user", "B").expect("message b");
+
+        assert!(delete_conversation(&conn, "chat-a").expect("delete chat a"));
+
+        assert!(get_conversation_summary(&conn, "chat-a").is_err());
+        assert_eq!(
+            get_conversation_summary(&conn, "chat-b")
+                .expect("chat b remains")
+                .conversation_id,
+            "chat-b"
+        );
+        assert_eq!(
+            list_messages(&conn, "chat-b", 5).expect("messages").len(),
+            1
+        );
+        assert!(get_soul(&conn, &soul.character_id).is_ok());
+    }
+
+    #[test]
+    fn deleting_one_session_clone_chat_preserves_other_sessions_from_same_source() {
+        let conn = init_memory_connection().expect("db");
+        let source = new_default_soul("Aurora");
+        upsert_soul(&conn, &source).expect("source");
+        let session_a = session_soul_from_savepoint(&source);
+        let session_b = session_soul_from_savepoint(&source);
+        upsert_soul(&conn, &session_a).expect("session a");
+        upsert_soul(&conn, &session_b).expect("session b");
+        ensure_conversation(&conn, "session-a", &session_a.character_id).expect("conversation a");
+        ensure_conversation(&conn, "session-b", &session_b.character_id).expect("conversation b");
+        insert_message(&conn, "session-a", "user", "A").expect("message a");
+        insert_message(&conn, "session-b", "user", "B").expect("message b");
+
+        assert!(delete_conversation(&conn, "session-a").expect("delete session a"));
+
+        assert!(get_conversation_summary(&conn, "session-a").is_err());
+        assert!(get_soul(&conn, &session_a.character_id).is_err());
+        assert!(get_soul(&conn, &source.character_id).is_ok());
+        assert!(get_soul(&conn, &session_b.character_id).is_ok());
+        assert_eq!(
+            get_conversation_summary(&conn, "session-b")
+                .expect("session b remains")
+                .conversation_id,
+            "session-b"
+        );
+        assert_eq!(
+            list_messages(&conn, "session-b", 5)
+                .expect("messages")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn downstream_message_rewind_keeps_empty_conversation_visible() {
+        let conn = init_memory_connection().expect("db");
+        let source = new_default_soul("Aurora");
+        let session = session_soul_from_savepoint(&source);
+        upsert_soul(&conn, &source).expect("source");
+        upsert_soul(&conn, &session).expect("session");
+        ensure_conversation(&conn, "rewind-session", &session.character_id).expect("conversation");
+        let first =
+            insert_message_and_get_id(&conn, "rewind-session", "user", "First").expect("first");
+        insert_message(&conn, "rewind-session", "assistant", "Second").expect("second");
+
+        deactivate_downstream_from_message(&conn, "rewind-session", first).expect("rewind");
+
+        assert!(list_messages(&conn, "rewind-session", 10)
+            .expect("active messages")
+            .is_empty());
+        let conversation =
+            get_conversation_summary(&conn, "rewind-session").expect("conversation remains");
+        assert_eq!(conversation.conversation_id, "rewind-session");
+        assert_eq!(conversation.message_count, 0);
+        assert!(list_conversations(&conn)
+            .expect("conversation list")
+            .iter()
+            .any(|conversation| conversation.conversation_id == "rewind-session"));
+    }
+
+    #[test]
     fn settings_persist_select_and_delete_independently() {
         let conn = init_memory_connection().expect("db");
         let mut setting = new_default_setting("Carver City");

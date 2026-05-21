@@ -6,7 +6,7 @@ use crate::{
     memory::create_scored_memory,
     setting::SessionWorld,
     soul::{
-        current_timestamp, MemorySourceType, ObjectState, Relationship, Soul, TruthStatus,
+        current_timestamp, MemorySourceType, ObjectState, Relationship, SceneState, Soul, TruthStatus,
         WorldEventRecord, WorldLog,
     },
 };
@@ -98,6 +98,7 @@ pub struct MemoryLayerReplyPatch {
 pub struct WorldPatch {
     pub location: Option<String>,
     pub time_elapsed: Option<String>,
+    pub scene_state: Option<SceneStatePatch>,
     pub recent_event: Option<String>,
     pub recent_events: Vec<String>,
     pub active_plot_add: Vec<String>,
@@ -110,6 +111,20 @@ pub struct WorldPatch {
     pub invalidated_recent_event_ids: Vec<String>,
     pub correction_note: Option<String>,
     pub retcon_scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SceneStatePatch {
+    pub scene_state_id: Option<String>,
+    pub current_scene: Option<String>,
+    pub resolved_active_plot: Option<String>,
+    pub scene_branch: Option<String>,
+    pub focus: Option<String>,
+    pub participants: Vec<String>,
+    pub last_user_action: Option<String>,
+    pub pressure_point: Option<String>,
+    pub continuity_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -168,6 +183,43 @@ impl ObjectObservationOperationPatch {
                 .map_or(true, |value| value.trim().is_empty())
             && self
                 .target_object_observation_id
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+    }
+}
+
+impl SceneStatePatch {
+    pub fn is_empty(&self) -> bool {
+        self.scene_state_id
+            .as_deref()
+            .map_or(true, |value| value.trim().is_empty())
+            && self
+                .current_scene
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self
+                .resolved_active_plot
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self
+                .scene_branch
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self
+                .focus
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self.participants.iter().all(|value| value.trim().is_empty())
+            && self
+                .last_user_action
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self
+                .pressure_point
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self
+                .continuity_note
                 .as_deref()
                 .map_or(true, |value| value.trim().is_empty())
     }
@@ -896,9 +948,13 @@ impl WorldPatch {
             .as_deref()
             .map_or(true, |location| location.trim().is_empty())
             && self
-                .time_elapsed
-                .as_deref()
-                .map_or(true, |time| time.trim().is_empty())
+            .time_elapsed
+            .as_deref()
+            .map_or(true, |time| time.trim().is_empty())
+            && self
+                .scene_state
+                .as_ref()
+                .map_or(true, SceneStatePatch::is_empty)
             && self
                 .recent_event
                 .as_deref()
@@ -993,6 +1049,9 @@ impl WorldPatch {
         if let Some(time_elapsed) = cleaned(&self.time_elapsed) {
             world.time_elapsed = normalize_time_elapsed(time_elapsed);
             changed = true;
+        }
+        if let Some(scene_state) = self.scene_state.as_ref() {
+            changed |= apply_scene_state_patch(&mut world.scene_state, scene_state);
         }
 
         for operation in &self.event_operations {
@@ -1218,8 +1277,45 @@ fn apply_recent_event_with_consistency_guard(world: &mut WorldLog, event: &str) 
     {
         return false;
     }
-    push_recent_event_to_world(world, event);
-    true
+    push_recent_event_to_world(world, event)
+}
+
+fn apply_scene_state_patch(scene_state: &mut SceneState, patch: &SceneStatePatch) -> bool {
+    let before = scene_state.clone();
+    if let Some(value) = patch.scene_state_id.as_deref().and_then(clean_str) {
+        scene_state.scene_state_id = value.to_string();
+    }
+    if let Some(value) = patch.current_scene.as_deref().and_then(clean_str) {
+        scene_state.current_scene = value.to_string();
+    }
+    if let Some(value) = patch.resolved_active_plot.as_deref().and_then(clean_str) {
+        scene_state.resolved_active_plot = value.to_string();
+    }
+    if let Some(value) = patch.scene_branch.as_deref().and_then(clean_str) {
+        scene_state.scene_branch = value.to_string();
+    }
+    if let Some(value) = patch.focus.as_deref().and_then(clean_str) {
+        scene_state.focus = value.to_string();
+    }
+    let participants = patch
+        .participants
+        .iter()
+        .filter_map(|participant| clean_str(participant))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !participants.is_empty() {
+        scene_state.participants = participants;
+    }
+    if let Some(value) = patch.last_user_action.as_deref().and_then(clean_str) {
+        scene_state.last_user_action = value.to_string();
+    }
+    if let Some(value) = patch.pressure_point.as_deref().and_then(clean_str) {
+        scene_state.pressure_point = value.to_string();
+    }
+    if let Some(value) = patch.continuity_note.as_deref().and_then(clean_str) {
+        scene_state.continuity_note = value.to_string();
+    }
+    *scene_state != before
 }
 
 fn apply_world_event_operation(world: &mut WorldLog, operation: &WorldEventOperationPatch) -> bool {
@@ -1336,8 +1432,7 @@ fn apply_recent_event_record_with_guard(
     {
         return false;
     }
-    push_recent_event_record_to_world(world, recent_event_id, event);
-    true
+    push_recent_event_record_to_world(world, recent_event_id, event)
 }
 
 fn apply_retcon_correction_note(world: &mut WorldLog, note: &str) -> bool {
@@ -1545,15 +1640,29 @@ fn clear_recent_events_matching(
     changed
 }
 
-fn push_recent_event_to_world(world: &mut WorldLog, event: &str) {
-    push_recent_event_record_to_world(world, None, event);
+fn push_recent_event_to_world(world: &mut WorldLog, event: &str) -> bool {
+    push_recent_event_record_to_world(world, None, event)
 }
 
 fn push_recent_event_record_to_world(
     world: &mut WorldLog,
     recent_event_id: Option<String>,
     event: &str,
-) {
+) -> bool {
+    let normalized = normalize_recent_event_for_dedupe(event);
+    if normalized.is_empty()
+        || world
+            .recent_event_records
+            .iter()
+            .filter(|record| record.is_active)
+            .any(|record| normalize_recent_event_for_dedupe(&record.content) == normalized)
+        || world
+            .recent_events
+            .iter()
+            .any(|existing| normalize_recent_event_for_dedupe(existing) == normalized)
+    {
+        return false;
+    }
     let recent_event_id = recent_event_id
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| stable_recent_event_id(event, world.recent_event_records.len()));
@@ -1574,6 +1683,17 @@ fn push_recent_event_record_to_world(
         let remove_count = world.recent_event_records.len() - MAX_RECENT_EVENTS;
         world.recent_event_records.drain(0..remove_count);
     }
+    true
+}
+
+fn normalize_recent_event_for_dedupe(event: &str) -> String {
+    event
+        .trim()
+        .trim_matches(|character: char| character.is_ascii_punctuation())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn sync_recent_event_strings_from_records(world: &mut WorldLog) {
@@ -1973,6 +2093,83 @@ mod tests {
             .active_plots
             .contains(&"Open the locked gate".to_string()));
         assert!(soul.world.key_objects.contains(&"Rusty key".to_string()));
+    }
+
+    #[test]
+    fn world_patch_deduplicates_recent_events() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            world_patch: Some(WorldPatch {
+                recent_event: Some("Aurora closed the door.".into()),
+                recent_events: vec![
+                    "Aurora closed the door".into(),
+                    "  Aurora closed the door.  ".into(),
+                ],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert_eq!(soul.world.recent_events.len(), 1);
+        assert_eq!(soul.world.recent_event_records.len(), 1);
+    }
+
+    #[test]
+    fn world_patch_updates_resolved_scene_state() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            world_patch: Some(WorldPatch {
+                scene_state: Some(SceneStatePatch {
+                    current_scene: Some("Aurora is at the apartment door.".into()),
+                    resolved_active_plot: Some("Door argument".into()),
+                    scene_branch: Some("Door stayed closed".into()),
+                    last_user_action: Some("User challenged the contradiction OOC.".into()),
+                    ..SceneStatePatch::default()
+                }),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert_eq!(soul.world.scene_state.resolved_active_plot, "Door argument");
+        assert_eq!(soul.world.scene_state.scene_branch, "Door stayed closed");
+    }
+
+    #[test]
+    fn typed_object_state_supports_doors_without_phone_fields() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            world_patch: Some(WorldPatch {
+                object_observation_operations: vec![ObjectObservationOperationPatch {
+                    operation: "update_object_state".into(),
+                    object_state: Some(ObjectState {
+                        object_id: "apartment_door".into(),
+                        object_kind: "door".into(),
+                        open_state: Some("closed".into()),
+                        lock_state: Some("locked".into()),
+                        status: "closed and locked".into(),
+                        ..ObjectState::default()
+                    }),
+                    ..ObjectObservationOperationPatch::default()
+                }],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        let door = soul.world.object_states.first().expect("door state");
+        assert_eq!(door.object_kind, "door");
+        assert_eq!(door.open_state.as_deref(), Some("closed"));
+        assert_eq!(door.notification_mode, "unknown");
     }
 
     #[test]

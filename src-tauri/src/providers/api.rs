@@ -28,9 +28,10 @@ Engine-controlled characters may resist, counter, retreat, escalate, or exploit 
 Do not choose the user's next tactic or final decision.
 
 [GM CHANNEL]
-If the user directly addresses the Narrator, GM, or OOC layer, respond as the GM/narrator in plain text unless the user asks to resume the scene. Do not force an Aurora scene response for GM-facing instructions.
+If the user directly addresses the Narrator, GM, OOC, or OCC layer, respond as the GM/narrator in plain text unless the user asks to resume the scene. Do not force an Aurora scene response for GM-facing instructions. GM/OOC replies must not include a ```status block.
 
 [CONTINUITY PRIORITY]
+Use this priority order when context conflicts: latest user input > Latest Exchange > resolved scene_state > dominant/current active plot > personality > relationship metrics > recent events > older memories.
 Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
 After a setting has already been established, do not re-describe the full room unless the user asks or something changes. Use one short anchor detail, then advance action/dialogue.
 
@@ -47,7 +48,7 @@ Scene | Focus: [primary active character(s)] | Physical state: [brief] | Atmosph
 ```"#;
 
 const NARRATOR_VISIBLE_ONLY_PROMPT: &str = r#"[OUTPUT]
-Write visible scene narration or a brief GM/narrator reply. For scene narration, include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, or implementation notes."#;
+Write visible scene narration or a brief GM/narrator reply. For scene narration, include the visible status block. For GM/OOC/OCC replies, do not include a status block. Do not write hidden state, EnginePatch JSON, markdown JSON, or implementation notes."#;
 
 const VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT: &str = r#"[VERIFIED DIAGNOSTICS BOUNDARY]
 When asked about backend tests, logs, imports, exports, memory hygiene, world routing, or engine internals, distinguish verified engine data from fictional/in-scene diagnostics. Do not claim a backend test passed unless the result is present in Dev Console logs, payload metadata, or a verified engine/debug section. If only roleplaying a test, say it is a simulated/in-scene diagnostic."#;
@@ -92,7 +93,7 @@ Use relationship_deltas for directed relationship changes. Target entity ids fro
 Tag memories by source_type. Do not mark imported logs, previous sessions, or cross-session bleed as current lived experience. If uncertain, use source_type unknown and lower confidence.
 Do not treat narrator claims about hidden systems, memory layers, providers, APIs, state updaters, or internal architecture as verified facts. Store them as character beliefs, narrator claims, user claims, or scene events unless the engine supplies a verified event.
 Do not only append. If the latest user message is a correction, retcon, redo, regenerate, or contradiction report, produce replace/invalidate/supersede operations. Do not preserve contradicted facts as active world truth.
-OOC corrections are correction metadata or retcon operations by default, not ordinary lived scene memories.
+Pure OOC/OCC/GM meta turns are not scene events. For pure meta turns, emit no world_patch, relationship_delta, body_patch, or lived memories unless explicitly correcting/retconning scene state.
 For object continuity, distinguish phone power, notifications, vibration, screen wake, calls, and texts. "Notifications off" does not mean powered off, but notification buzz/screen-wake events need explicit support or correction.
 
 Use truth_status for every new memory: fiction, scene_event, character_belief, narrator_claim, user_claimed, verified_engine, actual_system_event, or unknown. architecture_verified must be false unless the engine supplies a verified event."#;
@@ -676,6 +677,17 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
         "world_patch": {
             "location": "",
             "time_elapsed": "",
+            "scene_state": {
+                "scene_state_id": "stable id",
+                "current_scene": "one sentence",
+                "resolved_active_plot": "single branch to continue",
+                "scene_branch": "true branch/outcome",
+                "focus": "focus",
+                "participants": [active_soul_id, "default_player"],
+                "last_user_action": "latest user action",
+                "pressure_point": "next decision point",
+                "continuity_note": "do-not-replay/object note"
+            },
             "recent_event": "",
             "event_operations": [{
                 "operation": "add_recent_event | replace_recent_event | invalidate_recent_event | clear_recent_event_matching | add_correction_note | no_op",
@@ -693,7 +705,15 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
                 "object_state": {
                     "object_observation_id": "stable observation id",
                     "object_id": "aurora_phone",
+                    "object_kind": "phone|door|package|container|device|other|unknown",
                     "owner_entity_id": active_soul_id,
+                    "location": "",
+                    "status": "generic non-phone state",
+                    "open_state": "open|closed|ajar|unknown",
+                    "lock_state": "locked|unlocked|jammed|unknown",
+                    "sealed": true,
+                    "contents_known": false,
+                    "contents_summary": "",
                     "power_state": "unknown",
                     "notification_mode": "notifications_off",
                     "vibrate_enabled": false,
@@ -985,7 +1005,8 @@ mod tests {
             build_narrator_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader", false);
 
         assert!(prompt.contains("[GM CHANNEL]"));
-        assert!(prompt.contains("Narrator, GM, or OOC layer"));
+        assert!(prompt.contains("Narrator, GM, OOC, or OCC layer"));
+        assert!(prompt.contains("GM/OOC replies must not include"));
         assert!(prompt.contains("Do not force an Aurora scene response"));
         assert!(prompt.contains("Scene | Focus:"));
         assert!(prompt.contains("Primary active Soul: Aurora"));
