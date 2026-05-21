@@ -136,6 +136,80 @@ pub struct LlmPayloadLog {
     pub state_rebuild_generation: Option<i64>,
     #[serde(default)]
     pub latest_assistant_variant_id: Option<i64>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub raw_provider_response: Option<String>,
+    #[serde(default)]
+    pub normalized_response: Option<String>,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+    #[serde(default)]
+    pub provider_error: Option<String>,
+    #[serde(default)]
+    pub fallback_used: bool,
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
+    #[serde(default)]
+    pub provider_request_id: Option<String>,
+    #[serde(default)]
+    pub provider_response_id: Option<String>,
+}
+
+impl Default for LlmPayloadLog {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            conversation_id: String::new(),
+            message_id: None,
+            provider: String::new(),
+            mode: String::new(),
+            context_mode: String::new(),
+            model: String::new(),
+            base_url: String::new(),
+            system_message: String::new(),
+            user_message: String::new(),
+            context_text: String::new(),
+            estimated_system_tokens: 0,
+            estimated_user_tokens: 0,
+            estimated_total_tokens: 0,
+            truncated: false,
+            created_at: 0,
+            branch_id: None,
+            active_turn_id: None,
+            parent_turn_id: None,
+            state_patch_ids_applied: Vec::new(),
+            discarded_patch_ids_skipped: Vec::new(),
+            state_rebuild_generation: None,
+            latest_assistant_variant_id: None,
+            request_id: None,
+            turn_id: None,
+            raw_provider_response: None,
+            normalized_response: None,
+            finish_reason: None,
+            provider_error: None,
+            fallback_used: false,
+            fallback_reason: None,
+            provider_request_id: None,
+            provider_response_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LlmPayloadResponseUpdate {
+    pub request_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub raw_provider_response: Option<String>,
+    pub normalized_response: Option<String>,
+    pub finish_reason: Option<String>,
+    pub provider_error: Option<String>,
+    pub fallback_used: bool,
+    pub fallback_reason: Option<String>,
+    pub provider_request_id: Option<String>,
+    pub provider_response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -569,6 +643,21 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "latest_assistant_variant_id",
         "INTEGER",
     )?;
+    add_column_if_missing(conn, "llm_payload_logs", "request_id", "TEXT")?;
+    add_column_if_missing(conn, "llm_payload_logs", "turn_id", "TEXT")?;
+    add_column_if_missing(conn, "llm_payload_logs", "raw_provider_response", "TEXT")?;
+    add_column_if_missing(conn, "llm_payload_logs", "normalized_response", "TEXT")?;
+    add_column_if_missing(conn, "llm_payload_logs", "finish_reason", "TEXT")?;
+    add_column_if_missing(conn, "llm_payload_logs", "provider_error", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "llm_payload_logs",
+        "fallback_used",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "llm_payload_logs", "fallback_reason", "TEXT")?;
+    add_column_if_missing(conn, "llm_payload_logs", "provider_request_id", "TEXT")?;
+    add_column_if_missing(conn, "llm_payload_logs", "provider_response_id", "TEXT")?;
     if added_soul_summary_columns {
         backfill_soul_summary_columns(conn)?;
     }
@@ -1638,8 +1727,8 @@ pub fn insert_llm_payload_log(conn: &Connection, log: &LlmPayloadLog) -> rusqlit
     conn.execute(
         "
         INSERT INTO llm_payload_logs
-            (conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+            (conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id, request_id, turn_id, raw_provider_response, normalized_response, finish_reason, provider_error, fallback_used, fallback_reason, provider_request_id, provider_response_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
         ",
         params![
             log.conversation_id,
@@ -1664,9 +1753,68 @@ pub fn insert_llm_payload_log(conn: &Connection, log: &LlmPayloadLog) -> rusqlit
             serde_json::to_string(&log.discarded_patch_ids_skipped).unwrap_or_else(|_| "[]".into()),
             log.state_rebuild_generation,
             log.latest_assistant_variant_id,
+            log.request_id,
+            log.turn_id,
+            log.raw_provider_response,
+            log.normalized_response,
+            log.finish_reason,
+            log.provider_error,
+            if log.fallback_used { 1 } else { 0 },
+            log.fallback_reason,
+            log.provider_request_id,
+            log.provider_response_id,
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+pub fn update_llm_payload_log_response(
+    conn: &Connection,
+    log_id: i64,
+    update: &LlmPayloadResponseUpdate,
+) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "
+        UPDATE llm_payload_logs
+        SET request_id = COALESCE(?1, request_id),
+            turn_id = COALESCE(?2, turn_id),
+            raw_provider_response = COALESCE(?3, raw_provider_response),
+            normalized_response = COALESCE(?4, normalized_response),
+            finish_reason = COALESCE(?5, finish_reason),
+            provider_error = COALESCE(?6, provider_error),
+            fallback_used = ?7,
+            fallback_reason = COALESCE(?8, fallback_reason),
+            provider_request_id = COALESCE(?9, provider_request_id),
+            provider_response_id = COALESCE(?10, provider_response_id)
+        WHERE id = ?11
+        ",
+        params![
+            update.request_id,
+            update.turn_id,
+            update.raw_provider_response,
+            update.normalized_response,
+            update.finish_reason,
+            update.provider_error,
+            if update.fallback_used { 1 } else { 0 },
+            update.fallback_reason,
+            update.provider_request_id,
+            update.provider_response_id,
+            log_id,
+        ],
+    )?;
+    Ok(affected > 0)
+}
+
+pub fn update_assistant_variant_debug_json(
+    conn: &Connection,
+    variant_id: i64,
+    debug_json: &str,
+) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE assistant_message_variants SET debug_json = ?1 WHERE id = ?2",
+        params![debug_json, variant_id],
+    )?;
+    Ok(affected > 0)
 }
 
 pub fn set_llm_payload_log_message_id(
@@ -1720,7 +1868,7 @@ pub fn list_llm_payload_logs(
 ) -> rusqlite::Result<Vec<LlmPayloadLog>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id
+        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id, request_id, turn_id, raw_provider_response, normalized_response, finish_reason, provider_error, fallback_used, fallback_reason, provider_request_id, provider_response_id
         FROM llm_payload_logs
         WHERE conversation_id = ?1
         ORDER BY id ASC
@@ -1733,7 +1881,7 @@ pub fn list_llm_payload_logs(
 pub fn get_llm_payload_log(conn: &Connection, log_id: i64) -> rusqlite::Result<LlmPayloadLog> {
     conn.query_row(
         "
-        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id
+        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id, request_id, turn_id, raw_provider_response, normalized_response, finish_reason, provider_error, fallback_used, fallback_reason, provider_request_id, provider_response_id
         FROM llm_payload_logs
         WHERE id = ?1
         ",
@@ -2036,6 +2184,16 @@ fn llm_payload_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmPayl
         discarded_patch_ids_skipped: serde_json::from_str(&skipped_json).unwrap_or_default(),
         state_rebuild_generation: row.get(21).ok(),
         latest_assistant_variant_id: row.get(22).ok(),
+        request_id: row.get(23).ok(),
+        turn_id: row.get(24).ok(),
+        raw_provider_response: row.get(25).ok(),
+        normalized_response: row.get(26).ok(),
+        finish_reason: row.get(27).ok(),
+        provider_error: row.get(28).ok(),
+        fallback_used: row.get::<_, i64>(29).unwrap_or(0) != 0,
+        fallback_reason: row.get(30).ok(),
+        provider_request_id: row.get(31).ok(),
+        provider_response_id: row.get(32).ok(),
     })
 }
 
@@ -2999,6 +3157,7 @@ mod tests {
                 discarded_patch_ids_skipped: Vec::new(),
                 state_rebuild_generation: None,
                 latest_assistant_variant_id: None,
+                ..Default::default()
             },
         )
         .expect("insert log");

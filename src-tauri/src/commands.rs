@@ -22,7 +22,10 @@ use state_engine::{
         estimate_tokens, ContextMessage, ContextPreview, MemorySlotTrace,
     },
     hidden_state::{parse_hidden_state, HiddenState},
-    patch::{is_retcon_or_correction_text, EnginePatch, MemoryApplyAction},
+    patch::{
+        is_premature_user_turn_event, is_retcon_or_correction_text,
+        purge_premature_recent_events_from_world, EnginePatch, MemoryApplyAction,
+    },
     setting::{new_default_setting, SessionWorld, SettingSoul},
     soul::{
         new_default_soul, session_soul_from_savepoint, soul_savepoint_from_session,
@@ -51,7 +54,31 @@ const FULL_CHAT_TOKEN_BUDGET: usize = 6_000;
 const NARRATOR_BRIEF_TARGET_TOKENS: usize = 2_500;
 const STATE_UPDATER_TARGET_TOKENS: usize = 1_600;
 const STATE_UPDATER_TIMEOUT_SECONDS: u64 = 25;
+const NARRATOR_PROVIDER_ERROR_VISIBLE: &str =
+    "[Provider error: narrator response could not be generated.]";
+const MOCK_OBSERVATION_READER_LINE: &str =
+    "She listens, not fully relaxed, but present enough to stay in the exchange. \"Keep going.\"";
 static DEV_LOG_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NarratorMessageOrigin {
+    Api,
+    Mock,
+    Opening,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct NarratorTurnTrace {
+    request_id: String,
+    conversation_id: String,
+    branch_id: Option<String>,
+    turn_id: Option<String>,
+    user_message_id: Option<i64>,
+    assistant_message_id: Option<i64>,
+    state_patch_id: Option<String>,
+    provider_request_id: Option<String>,
+    provider_response_id: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ImageFileInfo {
@@ -91,6 +118,18 @@ pub struct TurnDebug {
     pub affection_delta: Option<f32>,
     pub new_location: Option<String>,
     pub present_characters: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_patch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub simulated_response: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, Clone)]
@@ -1652,6 +1691,7 @@ fn send_mock_turn_with_conn(
         Some(&session_world),
         &messages_to_context(before_messages),
         correction_instruction.as_deref(),
+        Some(snapshot_user_text.as_str()),
     );
     let provider = MockProvider::default();
     let raw_response = provider.complete(&soul, &context_preview.text, &snapshot_user_text, &mode);
@@ -1659,64 +1699,35 @@ fn send_mock_turn_with_conn(
     let (visible_response, replay_guard, output_contract_warning) =
         guard_narrator_visible_response(&parsed.visible_text, &snapshot_user_text, &[]);
     let mut debug = debug_from_hidden_state("Mock", &parsed.hidden_state, true, false);
+    debug.simulated_response = true;
     debug.replay_detected = replay_guard.replay_detected;
     debug.replay_score = replay_guard.replay_score;
     debug.replay_reason = replay_guard.replay_reason;
     debug.replay_compared_against_message_id = replay_guard.compared_against_message_id;
     debug.output_contract_warning = output_contract_warning;
-    let debug_json = serde_json::to_string(&debug).map_err(|err| err.to_string())?;
+    debug.narrator_response_saved = true;
+    debug.state_updater_status = "mock_simulated".into();
 
-    let assistant_message_id = if let Some(message_id) = replacement_assistant_id {
-        message_id
-    } else {
-        db::insert_message_and_get_id(&conn, &conversation_id, "assistant", &visible_response)
-            .map_err(|err| err.to_string())?
-    };
-
-    let selected_variant_id = if replacement_assistant_id.is_some() {
-        db::create_assistant_message_variant(
-            &conn,
-            &conversation_id,
-            assistant_message_id,
-            &visible_response,
-            None,
-            Some(
-                if correction_instruction
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|instruction| !instruction.is_empty())
-                    .is_some()
-                {
-                    "fix"
-                } else {
-                    "regenerate"
-                },
-            ),
-            true,
-            Some(&pre_turn_soul_json),
-            Some(&debug_json),
-        )
-        .map_err(|err| err.to_string())?
-        .id
-    } else {
-        db::seed_initial_assistant_message_variant(
-            &conn,
-            &conversation_id,
-            assistant_message_id,
-            &visible_response,
-            Some("original"),
-            Some(&pre_turn_soul_json),
-            Some(&debug_json),
-        )
-        .map_err(|err| err.to_string())?
-        .id
-    };
+    let (assistant_message_id, selected_variant_id) = save_visible_narrator_response(
+        &conn,
+        &conversation_id,
+        &visible_response,
+        replacement_assistant_id,
+        correction_instruction.as_deref(),
+        &pre_turn_soul_json,
+        &snapshot_user_text,
+        0,
+        NarratorMessageOrigin::Mock,
+        Some(&debug),
+    )?;
 
     if let Some(branch) = ledger_branch.as_ref() {
         if replacement_assistant_id.is_some() {
             db::discard_active_commits_for_assistant(conn, &conversation_id, assistant_message_id)
                 .map_err(|err| err.to_string())?;
         }
+        let mut ledger_patch = parsed.engine_patch.clone();
+        sanitize_mock_patch_for_ledger(&mut ledger_patch);
         db::record_turn_commit_with_patch(
             conn,
             &conversation_id,
@@ -1725,7 +1736,7 @@ fn send_mock_turn_with_conn(
             ledger_user_message_id,
             assistant_message_id,
             selected_variant_id,
-            &parsed.engine_patch,
+            &ledger_patch,
             replacement_assistant_id.is_some(),
         )
         .map_err(|err| err.to_string())?;
@@ -1798,6 +1809,18 @@ pub async fn send_api_turn(
     let turn_started = Instant::now();
     let mut stage_started = Instant::now();
     let context_mode = ContextMode::from_label(context_mode.as_deref());
+    let request_id = uuid_like_id();
+    let mut turn_trace = NarratorTurnTrace {
+        request_id: request_id.clone(),
+        conversation_id: conversation_id.clone(),
+        branch_id: None,
+        turn_id: None,
+        user_message_id: None,
+        assistant_message_id: None,
+        state_patch_id: None,
+        provider_request_id: None,
+        provider_response_id: None,
+    };
     emit_dev_log(
         &window,
         "info",
@@ -1805,6 +1828,7 @@ pub async fn send_api_turn(
         "User message submitted",
         Some(serde_json::json!({
             "conversation_id": conversation_id.as_str(),
+            "request_id": request_id.as_str(),
             "context_mode": context_mode.label(),
             "mode": mode.as_str(),
             "replacement_assistant_id": replacement_assistant_id,
@@ -1864,11 +1888,20 @@ pub async fn send_api_turn(
                 parent_turn_id.as_deref(),
             )
             .map_err(|err| err.to_string())?;
-            (rebuilt.soul, rebuilt.session_world, parent_turn_id)
+            let mut session_world = rebuilt.session_world;
+            purge_premature_recent_events_from_session_world(
+                &mut session_world,
+                snapshot_user_text.as_str(),
+            );
+            (rebuilt.soul, session_world, parent_turn_id)
         } else {
-            let session_world =
+            let mut session_world =
                 load_session_world_for_context(&window, &conn, &conversation_id, &fallback_soul)
                     .map_err(|err| err.to_string())?;
+            purge_premature_recent_events_from_session_world(
+                &mut session_world,
+                snapshot_user_text.as_str(),
+            );
             (fallback_soul, session_world, None)
         };
         let ledger_user_message_id = if replacement_assistant_id.is_none() {
@@ -1924,7 +1957,15 @@ pub async fn send_api_turn(
             Some(&session_world),
             &context_messages,
             correction_instruction.as_deref(),
+            Some(snapshot_user_text.as_str()),
         );
+        turn_trace.user_message_id = ledger_user_message_id;
+        turn_trace.branch_id = ledger_branch
+            .as_ref()
+            .map(|branch| branch.branch_id.clone());
+        if ledger_branch.is_some() {
+            turn_trace.turn_id = Some(format!("turn_{request_id}"));
+        }
         emit_perf_log(
             &window,
             &conversation_id,
@@ -1967,9 +2008,11 @@ pub async fn send_api_turn(
         &window,
         "info",
         "context",
-        "Narrator context compiled",
+        "narrator_context_compiled",
         Some(serde_json::json!({
             "conversation_id": conversation_id.as_str(),
+            "request_id": request_id.as_str(),
+            "branch_id": turn_trace.branch_id.as_deref(),
             "context_mode": context_mode.label(),
             "context_tokens": context_preview.estimated_tokens,
             "context_truncated": context_preview.truncated,
@@ -2048,6 +2091,16 @@ pub async fn send_api_turn(
                 discarded_patch_ids_skipped: Vec::new(),
                 state_rebuild_generation: None,
                 latest_assistant_variant_id: None,
+                request_id: Some(request_id.clone()),
+                turn_id: turn_trace.turn_id.clone(),
+                raw_provider_response: None,
+                normalized_response: None,
+                finish_reason: None,
+                provider_error: None,
+                fallback_used: false,
+                fallback_reason: None,
+                provider_request_id: None,
+                provider_response_id: None,
             },
         )
         .map_err(|err| err.to_string())?
@@ -2075,8 +2128,19 @@ pub async fn send_api_turn(
             "conversation_id": conversation_id.as_str()
         })),
     );
+    emit_dev_log(
+        &window,
+        "info",
+        "narrator",
+        "narrator_provider_started",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "request_id": request_id.as_str(),
+            "payload_log_id": payload_log_id
+        })),
+    );
     let narrator_call_started = Instant::now();
-    let raw_response = match provider
+    let provider_completion = match provider
         .complete_streaming_messages(
             &narrator_settings,
             narrator_payload.messages.clone(),
@@ -2097,13 +2161,15 @@ pub async fn send_api_turn(
         )
         .await
     {
-        Ok(response) => {
+        Ok(completion) => {
             emit_perf_log(
                 &window,
                 &conversation_id,
                 "narrator API call",
                 narrator_call_started.elapsed(),
             );
+            turn_trace.provider_response_id = completion.provider_response_id.clone();
+            turn_trace.provider_request_id = completion.provider_request_id.clone();
             emit_dev_log(
                 &window,
                 "success",
@@ -2111,26 +2177,57 @@ pub async fn send_api_turn(
                 "Narrator streaming finished",
                 Some(serde_json::json!({
                     "conversation_id": conversation_id.as_str(),
+                    "request_id": request_id.as_str(),
                     "chunks": stream_chunk_count.load(Ordering::Relaxed),
-                    "bytes": stream_byte_count.load(Ordering::Relaxed)
+                    "bytes": stream_byte_count.load(Ordering::Relaxed),
+                    "provider_response_id": completion.provider_response_id.as_deref()
                 })),
             );
-            response
+            emit_dev_log(
+                &window,
+                "success",
+                "narrator",
+                "narrator_provider_finished",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "request_id": request_id.as_str(),
+                    "finish_reason": completion.finish_reason.as_deref(),
+                    "provider_response_id": completion.provider_response_id.as_deref()
+                })),
+            );
+            completion
         }
         Err(err) => {
+            let _ = state
+                .conn
+                .lock()
+                .map_err(|err| err.to_string())
+                .and_then(|conn| {
+                    db::update_llm_payload_log_response(
+                        &conn,
+                        payload_log_id,
+                        &db::LlmPayloadResponseUpdate {
+                            provider_error: Some(err.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|err| err.to_string())
+                });
             emit_dev_log(
                 &window,
                 "error",
                 "narrator",
-                "Narrator provider failed",
+                "narrator_provider_failed",
                 Some(serde_json::json!({
                     "conversation_id": conversation_id.as_str(),
+                    "request_id": request_id.as_str(),
                     "error": err.clone()
                 })),
             );
             return Err(err);
         }
     };
+    let raw_response = provider_completion.raw_text.clone();
     let parsed = match parse_hidden_state(&raw_response) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -2252,6 +2349,9 @@ pub async fn send_api_turn(
                             discarded_patch_ids_skipped: Vec::new(),
                             state_rebuild_generation: None,
                             latest_assistant_variant_id: None,
+                            request_id: Some(request_id.clone()),
+                            turn_id: turn_trace.turn_id.clone(),
+                            ..Default::default()
                         },
                     )
                     .map_err(|err| err.to_string())
@@ -2276,7 +2376,7 @@ pub async fn send_api_turn(
             .complete_streaming_messages(&narrator_settings, retry_messages, |_| Ok(()))
             .await
         {
-            Ok(retry_raw_response) => match parse_hidden_state(&retry_raw_response) {
+            Ok(retry_completion) => match parse_hidden_state(&retry_completion.raw_text) {
                 Ok(retry_parsed) => {
                     let pruned_retry_visible =
                         prune_repeated_scene_setup(&retry_parsed.visible_text, &replay_sources);
@@ -2459,7 +2559,98 @@ pub async fn send_api_turn(
         return Err("Narrator provider returned an empty visible response".into());
     }
 
+    let _ = state
+        .conn
+        .lock()
+        .map_err(|err| err.to_string())
+        .and_then(|conn| {
+            db::update_llm_payload_log_response(
+                &conn,
+                payload_log_id,
+                &db::LlmPayloadResponseUpdate {
+                    raw_provider_response: Some(raw_response.clone()),
+                    normalized_response: Some(visible_response.clone()),
+                    finish_reason: provider_completion.finish_reason.clone(),
+                    provider_request_id: provider_completion.provider_request_id.clone(),
+                    provider_response_id: provider_completion.provider_response_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| err.to_string())
+        });
+
+    if is_known_mock_template_prose(&visible_response) {
+        let _ = state
+            .conn
+            .lock()
+            .map_err(|err| err.to_string())
+            .and_then(|conn| {
+                db::update_llm_payload_log_response(
+                    &conn,
+                    payload_log_id,
+                    &db::LlmPayloadResponseUpdate {
+                        fallback_used: true,
+                        fallback_reason: Some("generic_mock_prose_detected".into()),
+                        normalized_response: Some(NARRATOR_PROVIDER_ERROR_VISIBLE.into()),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|err| err.to_string())
+            });
+        emit_dev_log(
+            &window,
+            "error",
+            "narrator",
+            "narrator_provider_failed",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "request_id": request_id.as_str(),
+                "reason": "generic_mock_prose_detected"
+            })),
+        );
+        emit_dev_log(
+            &window,
+            "warn",
+            "narrator",
+            "fallback_response_used",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "request_id": request_id.as_str(),
+                "fallback_reason": "generic_mock_prose_detected"
+            })),
+        );
+        return Err(
+            "Narrator response matched mock-template prose and was rejected for integrity".into(),
+        );
+    }
+
     let save_narrator_started = Instant::now();
+    let mut integrity_ok = true;
+    let pre_save_debug = TurnDebug {
+        provider: "API".into(),
+        hidden_state_found: false,
+        fallback_hidden_state_generated: false,
+        narrator_response_saved: true,
+        assistant_message_id: None,
+        selected_variant_id: None,
+        state_updater_status: "pending".into(),
+        replay_detected: debug_replay_detected,
+        replay_score: debug_replay_score,
+        replay_reason: debug_replay_reason.clone(),
+        replay_compared_against_message_id: debug_replay_compared_against_message_id,
+        output_contract_warning: output_contract_warning.clone(),
+        tag: None,
+        trust_delta: None,
+        affection_delta: None,
+        new_location: None,
+        present_characters: Vec::new(),
+        request_id: Some(request_id.clone()),
+        turn_id: turn_trace.turn_id.clone(),
+        state_patch_id: None,
+        simulated_response: false,
+        fallback_used: false,
+        fallback_reason: None,
+    };
     let (assistant_message_id, selected_variant_id) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         save_visible_narrator_response(
@@ -2471,8 +2662,11 @@ pub async fn send_api_turn(
             &pre_turn_soul_json,
             &snapshot_user_text,
             payload_log_id,
+            NarratorMessageOrigin::Api,
+            Some(&pre_save_debug),
         )?
     };
+    turn_trace.assistant_message_id = Some(assistant_message_id);
     emit_perf_log(
         &window,
         &conversation_id,
@@ -2507,14 +2701,77 @@ pub async fn send_api_turn(
         &window,
         "success",
         "narrator",
-        "Narrator response saved",
+        "narrator_response_saved",
         Some(serde_json::json!({
             "conversation_id": conversation_id.as_str(),
+            "request_id": request_id.as_str(),
             "assistant_message_id": assistant_message_id,
             "selected_variant_id": selected_variant_id,
             "visible_chars": visible_response.chars().count()
         })),
     );
+
+    let mut visible_response_for_updater = visible_response.clone();
+    if let Ok(saved_message) = state
+        .conn
+        .lock()
+        .map_err(|err| err.to_string())
+        .and_then(|conn| {
+            db::get_message(&conn, &conversation_id, assistant_message_id)
+                .map_err(|err| err.to_string())
+        })
+    {
+        if !responses_match_for_integrity(&saved_message.content, &visible_response) {
+            integrity_ok = false;
+            emit_dev_log(
+                &window,
+                "error",
+                "narrator",
+                "response_integrity_mismatch",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "request_id": request_id.as_str(),
+                    "assistant_message_id": assistant_message_id
+                })),
+            );
+        } else {
+            visible_response_for_updater = saved_message.content;
+        }
+    }
+
+    if !integrity_ok {
+        let mut failed_debug = pre_save_debug;
+        failed_debug.state_updater_status = "integrity_mismatch".into();
+        failed_debug.assistant_message_id = Some(assistant_message_id);
+        failed_debug.selected_variant_id = selected_variant_id;
+        if let Some(variant_id) = selected_variant_id {
+            let _ = state
+                .conn
+                .lock()
+                .map_err(|err| err.to_string())
+                .and_then(|conn| {
+                    db::update_assistant_variant_debug_json(
+                        &conn,
+                        variant_id,
+                        &serde_json::to_string(&failed_debug).map_err(|err| err.to_string())?,
+                    )
+                    .map_err(|err| err.to_string())
+                });
+        }
+        let messages = {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?
+        };
+        return Ok(TurnResult {
+            conversation_id: conversation_id.clone(),
+            soul,
+            visible_response: visible_response_for_updater,
+            context_preview,
+            messages,
+            consolidation_ran: false,
+            debug: failed_debug,
+        });
+    }
 
     let updater_payload_started = Instant::now();
     let updater_system_prompt = build_state_updater_prompt(&soul, Some(&session_world));
@@ -2522,7 +2779,7 @@ pub async fn send_api_turn(
     let memory_debug_nonce = format!("memory-debug-{}", uuid_like_id());
     let updater_user_message = build_state_updater_user_message(
         &snapshot_user_text,
-        &visible_response,
+        &visible_response_for_updater,
         Some(&entity_updater_context),
         Some(&memory_debug_nonce),
     );
@@ -2591,6 +2848,9 @@ pub async fn send_api_turn(
                     discarded_patch_ids_skipped: Vec::new(),
                     state_rebuild_generation: None,
                     latest_assistant_variant_id: selected_variant_id,
+                    request_id: Some(request_id.clone()),
+                    turn_id: turn_trace.turn_id.clone(),
+                    ..Default::default()
                 },
             )
             .map_err(|err| err.to_string())
@@ -2670,11 +2930,16 @@ pub async fn send_api_turn(
     let (hidden_state, engine_patch, state_updater_status, hidden_state_found) =
         match updater_result {
             Ok(patch) => {
-                let engine_patch = sanitize_state_updater_patch(
+                let mut engine_patch = sanitize_state_updater_patch(
                     patch,
                     &soul,
                     &snapshot_user_text,
-                    &visible_response,
+                    &visible_response_for_updater,
+                );
+                strip_premature_world_events_from_updater_patch(
+                    &mut engine_patch,
+                    &snapshot_user_text,
+                    &visible_response_for_updater,
                 );
                 emit_state_updater_patch_log(
                     &window,
@@ -2750,6 +3015,8 @@ pub async fn send_api_turn(
     debug.replay_reason = debug_replay_reason;
     debug.replay_compared_against_message_id = debug_replay_compared_against_message_id;
     debug.output_contract_warning = output_contract_warning;
+    debug.request_id = Some(request_id.clone());
+    debug.turn_id = turn_trace.turn_id.clone();
 
     let apply_started = Instant::now();
     let world_patch_present = engine_patch.world_patch.is_some();
@@ -2806,7 +3073,7 @@ pub async fn send_api_turn(
             db::discard_active_commits_for_assistant(&conn, &conversation_id, assistant_message_id)
                 .map_err(|err| err.to_string())?;
         }
-        let (_commit, _patch_record) = db::record_turn_commit_with_patch(
+        let (_commit, patch_record) = db::record_turn_commit_with_patch(
             &conn,
             &conversation_id,
             branch_id,
@@ -2818,6 +3085,22 @@ pub async fn send_api_turn(
             replacement_assistant_id.is_some(),
         )
         .map_err(|err| err.to_string())?;
+        turn_trace.state_patch_id = Some(patch_record.patch_id.clone());
+        debug.state_patch_id = turn_trace.state_patch_id.clone();
+        emit_dev_log(
+            &window,
+            "success",
+            "ledger",
+            "turn_commit_recorded",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "request_id": request_id.as_str(),
+                "turn_id": turn_trace.turn_id.as_deref(),
+                "state_patch_id": turn_trace.state_patch_id.as_deref(),
+                "assistant_message_id": assistant_message_id,
+                "user_message_id": ledger_user_message_id
+            })),
+        );
         let rebuilt = db::rebuild_session_state(&conn, &conversation_id, branch_id)
             .map_err(|err| err.to_string())?;
         soul = rebuilt.soul;
@@ -2994,10 +3277,23 @@ pub async fn send_api_turn(
         turn_started.elapsed(),
     );
 
+    if let Some(variant_id) = selected_variant_id {
+        if let Ok(debug_json) = serde_json::to_string(&debug) {
+            let _ = state
+                .conn
+                .lock()
+                .map_err(|err| err.to_string())
+                .and_then(|conn| {
+                    db::update_assistant_variant_debug_json(&conn, variant_id, &debug_json)
+                        .map_err(|err| err.to_string())
+                });
+        }
+    }
+
     Ok(TurnResult {
         conversation_id,
         soul,
-        visible_response,
+        visible_response: visible_response_for_updater,
         context_preview,
         messages,
         consolidation_ran,
@@ -3015,58 +3311,92 @@ fn save_visible_narrator_response(
     pre_turn_soul_json: &str,
     snapshot_user_text: &str,
     payload_log_id: i64,
+    origin: NarratorMessageOrigin,
+    debug: Option<&TurnDebug>,
 ) -> Result<(i64, Option<i64>), String> {
+    if origin == NarratorMessageOrigin::Api && is_known_mock_template_prose(visible_response) {
+        return Err(
+            "Refusing to save mock-template narrator prose on the API provider path".into(),
+        );
+    }
+
     let assistant_message_id = if let Some(message_id) = replacement_assistant_id {
         message_id
     } else {
         db::insert_message_and_get_id(conn, conversation_id, "assistant", visible_response)
             .map_err(|err| err.to_string())?
     };
-    db::set_llm_payload_log_message_id(conn, payload_log_id, assistant_message_id)
-        .map_err(|err| err.to_string())?;
 
-    let pending_debug = TurnDebug {
-        provider: "API".into(),
-        hidden_state_found: false,
-        fallback_hidden_state_generated: false,
-        narrator_response_saved: true,
-        assistant_message_id: Some(assistant_message_id),
-        selected_variant_id: None,
-        state_updater_status: "pending".into(),
-        replay_detected: false,
-        replay_score: 0.0,
-        replay_reason: None,
-        replay_compared_against_message_id: None,
-        output_contract_warning: None,
-        tag: None,
-        trust_delta: None,
-        affection_delta: None,
-        new_location: None,
-        present_characters: Vec::new(),
+    if payload_log_id > 0 {
+        db::set_llm_payload_log_message_id(conn, payload_log_id, assistant_message_id)
+            .map_err(|err| err.to_string())?;
+    }
+
+    let (variant_source, variant_label) = match origin {
+        NarratorMessageOrigin::Api => (
+            if correction_instruction
+                .map(str::trim)
+                .filter(|instruction| !instruction.is_empty())
+                .is_some()
+            {
+                "fix"
+            } else if replacement_assistant_id.is_some() {
+                "regenerate"
+            } else {
+                "api_provider"
+            },
+            None,
+        ),
+        NarratorMessageOrigin::Mock => ("mock_provider", None),
+        NarratorMessageOrigin::Opening => ("opening_seed", Some("opening")),
     };
-    let pending_debug_json =
-        serde_json::to_string(&pending_debug).map_err(|err| err.to_string())?;
-    let variant = if replacement_assistant_id.is_some() {
+
+    let debug_json = if let Some(debug) = debug {
+        serde_json::to_string(debug).map_err(|err| err.to_string())?
+    } else {
+        let pending_debug = TurnDebug {
+            provider: match origin {
+                NarratorMessageOrigin::Api => "API".into(),
+                NarratorMessageOrigin::Mock => "Mock".into(),
+                NarratorMessageOrigin::Opening => "Opening".into(),
+            },
+            hidden_state_found: false,
+            fallback_hidden_state_generated: false,
+            narrator_response_saved: true,
+            assistant_message_id: Some(assistant_message_id),
+            selected_variant_id: None,
+            state_updater_status: "pending".into(),
+            replay_detected: false,
+            replay_score: 0.0,
+            replay_reason: None,
+            replay_compared_against_message_id: None,
+            output_contract_warning: None,
+            tag: None,
+            trust_delta: None,
+            affection_delta: None,
+            new_location: None,
+            present_characters: Vec::new(),
+            request_id: None,
+            turn_id: None,
+            state_patch_id: None,
+            simulated_response: origin == NarratorMessageOrigin::Mock,
+            fallback_used: false,
+            fallback_reason: None,
+        };
+        serde_json::to_string(&pending_debug).map_err(|err| err.to_string())?
+    };
+
+    let variant = if replacement_assistant_id.is_some() || origin == NarratorMessageOrigin::Api {
         db::create_assistant_message_variant(
             conn,
             conversation_id,
             assistant_message_id,
             visible_response,
-            None,
-            Some(
-                if correction_instruction
-                    .map(str::trim)
-                    .filter(|instruction| !instruction.is_empty())
-                    .is_some()
-                {
-                    "fix"
-                } else {
-                    "regenerate"
-                },
-            ),
+            variant_label,
+            Some(variant_source),
             true,
             Some(pre_turn_soul_json),
-            Some(&pending_debug_json),
+            Some(&debug_json),
         )
         .map_err(|err| err.to_string())?
     } else {
@@ -3075,9 +3405,9 @@ fn save_visible_narrator_response(
             conversation_id,
             assistant_message_id,
             visible_response,
-            Some("original"),
+            Some(variant_source),
             Some(pre_turn_soul_json),
-            Some(&pending_debug_json),
+            Some(&debug_json),
         )
         .map_err(|err| err.to_string())?
     };
@@ -4489,9 +4819,14 @@ fn compile_context_with_correction(
     session_world: Option<&SessionWorld>,
     messages: &[ContextMessage],
     correction_instruction: Option<&str>,
+    pending_user_text: Option<&str>,
 ) -> ContextPreview {
-    let mut preview =
-        compile_context_for_session_separate_user_message(soul, session_world, messages);
+    let mut preview = state_engine::context_compiler::compile_context_for_session_separate_user_message_with_pending(
+        soul,
+        session_world,
+        messages,
+        pending_user_text,
+    );
     let instruction = correction_instruction
         .map(str::trim)
         .filter(|instruction| !instruction.is_empty());
@@ -5678,6 +6013,41 @@ fn render_llm_payload_history(logs: &[LlmPayloadLog]) -> String {
         lines.push(String::new());
         lines.push("### CONTEXT".into());
         lines.push(log.context_text.clone());
+        if log.request_id.is_some()
+            || log.raw_provider_response.is_some()
+            || log.normalized_response.is_some()
+        {
+            lines.push(String::new());
+            lines.push("### RESPONSE METADATA".into());
+            if let Some(request_id) = log.request_id.as_deref() {
+                lines.push(format!("Request ID: {request_id}"));
+            }
+            if let Some(turn_id) = log.turn_id.as_deref() {
+                lines.push(format!("Turn ID: {turn_id}"));
+            }
+            if let Some(finish_reason) = log.finish_reason.as_deref() {
+                lines.push(format!("Finish reason: {finish_reason}"));
+            }
+            if log.fallback_used {
+                lines.push(format!(
+                    "Fallback used: true ({})",
+                    log.fallback_reason.as_deref().unwrap_or("unspecified")
+                ));
+            }
+            if let Some(error) = log.provider_error.as_deref() {
+                lines.push(format!("Provider error: {error}"));
+            }
+            if let Some(raw) = log.raw_provider_response.as_deref() {
+                lines.push(String::new());
+                lines.push("### RAW PROVIDER RESPONSE".into());
+                lines.push(raw.to_string());
+            }
+            if let Some(normalized) = log.normalized_response.as_deref() {
+                lines.push(String::new());
+                lines.push("### NORMALIZED RESPONSE".into());
+                lines.push(normalized.to_string());
+            }
+        }
     }
     lines.push(String::new());
     lines.join("\n")
@@ -6236,13 +6606,110 @@ fn debug_from_hidden_state(
         affection_delta: hidden_state.affection_delta,
         new_location: hidden_state.new_location.clone(),
         present_characters: hidden_state.present_characters.clone().unwrap_or_default(),
+        request_id: None,
+        turn_id: None,
+        state_patch_id: None,
+        simulated_response: provider.eq_ignore_ascii_case("mock"),
+        fallback_used: false,
+        fallback_reason: None,
     }
+}
+
+fn is_known_mock_template_prose(text: &str) -> bool {
+    let normalized = text.trim();
+    if normalized.is_empty() {
+        return false;
+    }
+    if normalized.contains(MOCK_OBSERVATION_READER_LINE) {
+        return true;
+    }
+    if normalized.contains("She acknowledges the turn with measured focus") {
+        return true;
+    }
+    if normalized.contains("A neutral exchange is recorded; no major state axis shifts") {
+        return true;
+    }
+    false
+}
+
+fn sanitize_mock_patch_for_ledger(patch: &mut EnginePatch) {
+    if let Some(world_patch) = patch.world_patch.as_mut() {
+        if world_patch
+            .recent_event
+            .as_deref()
+            .is_some_and(|event| is_premature_user_turn_event(event, None))
+        {
+            world_patch.recent_event = None;
+        }
+        world_patch
+            .recent_events
+            .retain(|event| !is_premature_user_turn_event(event, None));
+        world_patch.event_operations.retain(|operation| {
+            operation
+                .content
+                .as_deref()
+                .map_or(true, |content| !is_premature_user_turn_event(content, None))
+        });
+        if world_patch.is_empty_for_commands() {
+            patch.world_patch = None;
+        }
+    }
+}
+
+fn purge_premature_recent_events_from_session_world(
+    session_world: &mut SessionWorld,
+    pending_user_text: &str,
+) {
+    let mut world = session_world.world_log();
+    purge_premature_recent_events_from_world(&mut world, Some(pending_user_text));
+    session_world.set_world_log(&world);
+}
+
+fn strip_premature_world_events_from_updater_patch(
+    patch: &mut EnginePatch,
+    user_text: &str,
+    narrator_response: &str,
+) {
+    let pending = Some(user_text);
+    if let Some(world_patch) = patch.world_patch.as_mut() {
+        if world_patch
+            .recent_event
+            .as_deref()
+            .is_some_and(|event| is_premature_user_turn_event(event, pending))
+        {
+            world_patch.recent_event = None;
+        }
+        world_patch
+            .recent_events
+            .retain(|event| !is_premature_user_turn_event(event, pending));
+        world_patch.event_operations.retain(|operation| {
+            operation.content.as_deref().map_or(true, |content| {
+                !is_premature_user_turn_event(content, pending)
+            })
+        });
+        if world_patch.is_empty_for_commands() {
+            patch.world_patch = None;
+        }
+    }
+    let _ = narrator_response;
+}
+
+fn normalize_response_for_integrity(text: &str) -> String {
+    text.trim().replace("\r\n", "\n")
+}
+
+fn responses_match_for_integrity(left: &str, right: &str) -> bool {
+    normalize_response_for_integrity(left) == normalize_response_for_integrity(right)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use state_engine::{context_compiler::estimate_tokens, hidden_state::HiddenState};
+    use state_engine::{
+        context_compiler::estimate_tokens,
+        hidden_state::HiddenState,
+        patch::{EnginePatch, WorldPatch},
+    };
 
     #[test]
     fn opening_narrator_message_seeds_visible_assistant_without_payload_logs() {
@@ -7317,6 +7784,7 @@ mod tests {
             None,
             &messages_to_context(corrected.messages.clone()),
             Some("Continue from the kitchen. Do not replay the phone reveal."),
+            None,
         );
         assert!(context
             .text
@@ -7340,9 +7808,7 @@ mod tests {
         let payload_log_id = db::insert_llm_payload_log(
             &conn,
             &LlmPayloadLog {
-                id: 0,
                 conversation_id: "dual-pass".into(),
-                message_id: None,
                 provider: "narrator_brief".into(),
                 mode: "Reader".into(),
                 context_mode: "brief".into(),
@@ -7354,15 +7820,8 @@ mod tests {
                 estimated_system_tokens: 3,
                 estimated_user_tokens: 3,
                 estimated_total_tokens: 6,
-                truncated: false,
                 created_at: 100,
-                branch_id: None,
-                active_turn_id: None,
-                parent_turn_id: None,
-                state_patch_ids_applied: Vec::new(),
-                discarded_patch_ids_skipped: Vec::new(),
-                state_rebuild_generation: None,
-                latest_assistant_variant_id: None,
+                ..Default::default()
             },
         )
         .expect("payload log");
@@ -7376,6 +7835,8 @@ mod tests {
             &serde_json::to_string(&soul).expect("soul json"),
             "The siren starts.",
             payload_log_id,
+            NarratorMessageOrigin::Api,
+            None,
         )
         .expect("save narrator");
         assert!(parse_engine_patch_json("not json").is_err());
@@ -7500,6 +7961,7 @@ mod tests {
                 discarded_patch_ids_skipped: Vec::new(),
                 state_rebuild_generation: None,
                 latest_assistant_variant_id: None,
+                ..Default::default()
             },
             LlmPayloadLog {
                 id: 2,
@@ -7525,6 +7987,7 @@ mod tests {
                 discarded_patch_ids_skipped: Vec::new(),
                 state_rebuild_generation: None,
                 latest_assistant_variant_id: None,
+                ..Default::default()
             },
         ];
 
@@ -7569,6 +8032,7 @@ mod tests {
                 discarded_patch_ids_skipped: Vec::new(),
                 state_rebuild_generation: None,
                 latest_assistant_variant_id: None,
+                ..Default::default()
             },
             LlmPayloadLog {
                 id: 2,
@@ -7594,6 +8058,7 @@ mod tests {
                 discarded_patch_ids_skipped: Vec::new(),
                 state_rebuild_generation: None,
                 latest_assistant_variant_id: None,
+                ..Default::default()
             },
         ];
 
@@ -7631,6 +8096,7 @@ mod tests {
                 discarded_patch_ids_skipped: Vec::new(),
                 state_rebuild_generation: None,
                 latest_assistant_variant_id: None,
+                ..Default::default()
             },
             LlmPayloadLog {
                 id: 2,
@@ -7656,6 +8122,7 @@ mod tests {
                 discarded_patch_ids_skipped: Vec::new(),
                 state_rebuild_generation: None,
                 latest_assistant_variant_id: None,
+                ..Default::default()
             },
         ];
 
@@ -7905,6 +8372,221 @@ mod tests {
         assert!(!pruned.contains("oversized shirt arranged"));
         assert!(pruned.contains("catches the forearm"));
         assert!(pruned.contains("break the grip"));
+    }
+
+    #[test]
+    fn api_save_rejects_mock_template_prose() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "mock-reject", &soul.character_id).expect("conversation");
+        let err = save_visible_narrator_response(
+            &conn,
+            "mock-reject",
+            MOCK_OBSERVATION_READER_LINE,
+            None,
+            None,
+            &serde_json::to_string(&soul).expect("soul json"),
+            "I knock on the door",
+            0,
+            NarratorMessageOrigin::Api,
+            None,
+        )
+        .expect_err("mock prose should be rejected on API path");
+        assert!(err.contains("mock-template"));
+    }
+
+    #[test]
+    fn saved_visible_equals_normalized_provider_response() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "normalized", &soul.character_id).expect("conversation");
+        let normalized = "Aurora opens the door with a measured pause.";
+        let (assistant_message_id, _) = save_visible_narrator_response(
+            &conn,
+            "normalized",
+            normalized,
+            None,
+            None,
+            &serde_json::to_string(&soul).expect("soul json"),
+            "I knock on the door",
+            0,
+            NarratorMessageOrigin::Api,
+            None,
+        )
+        .expect("save");
+        let message =
+            db::get_message(&conn, "normalized", assistant_message_id).expect("assistant message");
+        assert!(responses_match_for_integrity(&message.content, normalized));
+    }
+
+    #[test]
+    fn state_updater_receives_same_text_as_saved_assistant_message() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "updater-text", &soul.character_id).expect("conversation");
+        let saved_text = "Aurora steps aside and lets the hallway air in.";
+        let (assistant_message_id, _) = save_visible_narrator_response(
+            &conn,
+            "updater-text",
+            saved_text,
+            None,
+            None,
+            &serde_json::to_string(&soul).expect("soul json"),
+            "I knock on the door",
+            0,
+            NarratorMessageOrigin::Api,
+            None,
+        )
+        .expect("save");
+        let message = db::get_message(&conn, "updater-text", assistant_message_id)
+            .expect("assistant message");
+        let updater_user =
+            build_state_updater_user_message("I knock on the door", saved_text, None, None);
+        assert!(updater_user.contains(&message.content));
+        assert!(responses_match_for_integrity(&message.content, saved_text));
+    }
+
+    #[test]
+    fn payload_includes_raw_and_normalized_provider_response() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "payload-response", &soul.character_id)
+            .expect("conversation");
+        let log_id = db::insert_llm_payload_log(
+            &conn,
+            &LlmPayloadLog {
+                conversation_id: "payload-response".into(),
+                ..Default::default()
+            },
+        )
+        .expect("log");
+        db::update_llm_payload_log_response(
+            &conn,
+            log_id,
+            &db::LlmPayloadResponseUpdate {
+                raw_provider_response: Some("raw narrator body".into()),
+                normalized_response: Some("visible narrator body".into()),
+                finish_reason: Some("stop".into()),
+                ..Default::default()
+            },
+        )
+        .expect("update");
+        let log = db::get_llm_payload_log(&conn, log_id).expect("log");
+        assert_eq!(
+            log.raw_provider_response.as_deref(),
+            Some("raw narrator body")
+        );
+        assert_eq!(
+            log.normalized_response.as_deref(),
+            Some("visible narrator body")
+        );
+        let exported = render_llm_payload_history(&[log]);
+        assert!(exported.contains("RAW PROVIDER RESPONSE"));
+        assert!(exported.contains("NORMALIZED RESPONSE"));
+    }
+
+    #[test]
+    fn mock_assistant_variant_source_is_mock_provider() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "mock-variant", &soul.character_id).expect("conversation");
+        let (_, variant_id) = save_visible_narrator_response(
+            &conn,
+            "mock-variant",
+            "Simulated narrator line for local mock mode.",
+            None,
+            None,
+            &serde_json::to_string(&soul).expect("soul json"),
+            "I knock on the door",
+            0,
+            NarratorMessageOrigin::Mock,
+            None,
+        )
+        .expect("save");
+        let variants =
+            db::list_assistant_message_variants(&conn, "mock-variant", 1).expect("variants");
+        let selected = variants
+            .iter()
+            .find(|variant| variant.id == variant_id)
+            .expect("selected variant");
+        assert_eq!(selected.source.as_deref(), Some("mock_provider"));
+    }
+
+    #[test]
+    fn placeholder_not_finalized_before_provider_response() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "placeholder", &soul.character_id).expect("conversation");
+        db::insert_message_and_get_id(&conn, "placeholder", "user", "I knock on the door")
+            .expect("user");
+        let assistants = db::list_messages(&conn, "placeholder", 10).expect("messages");
+        assert!(
+            !assistants.iter().any(|message| message.role == "assistant"),
+            "assistant row must not exist before provider response is saved"
+        );
+    }
+
+    #[test]
+    fn provider_failure_does_not_save_generic_prose() {
+        assert!(!is_known_mock_template_prose(
+            NARRATOR_PROVIDER_ERROR_VISIBLE
+        ));
+        assert!(is_known_mock_template_prose(MOCK_OBSERVATION_READER_LINE));
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "provider-fail", &soul.character_id).expect("conversation");
+        let err = save_visible_narrator_response(
+            &conn,
+            "provider-fail",
+            MOCK_OBSERVATION_READER_LINE,
+            None,
+            None,
+            &serde_json::to_string(&soul).expect("soul json"),
+            "I knock on the door",
+            0,
+            NarratorMessageOrigin::Api,
+            None,
+        )
+        .expect_err("mock prose must not persist on API path");
+        assert!(err.contains("mock-template"));
+        let messages = db::list_messages(&conn, "provider-fail", 10).expect("messages");
+        assert!(
+            !messages.iter().any(|message| message.role == "assistant"),
+            "failed API save must not leave assistant rows"
+        );
+    }
+
+    #[test]
+    fn mock_ledger_commit_does_not_materialize_user_world_event() {
+        let mut patch = EnginePatch {
+            world_patch: Some(WorldPatch {
+                recent_event: Some(
+                    "The conversation continued without a major rupture: I knock on the door"
+                        .into(),
+                ),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        sanitize_mock_patch_for_ledger(&mut patch);
+        let world_patch = patch.world_patch.as_ref();
+        assert!(
+            world_patch.is_none()
+                || (world_patch
+                    .and_then(|patch| patch.recent_event.as_deref())
+                    .is_none()
+                    && world_patch
+                        .map(|patch| patch.recent_events.is_empty())
+                        .unwrap_or(true)),
+            "mock ledger sanitize must not keep user-turn world events"
+        );
     }
 
     fn assert_order(text: &str, first: &str, second: &str) {

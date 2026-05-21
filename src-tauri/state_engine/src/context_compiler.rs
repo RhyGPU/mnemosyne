@@ -3,6 +3,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::patch::is_premature_user_turn_event;
 use crate::setting::SessionWorld;
 use crate::soul::{MemoryEntry, MemorySourceType, PlotStatus, Soul, TruthStatus};
 
@@ -193,6 +194,7 @@ pub fn compile_context_for_separate_user_message(
         &ContextBudget::default(),
         true,
         false,
+        None,
     )
 }
 
@@ -201,6 +203,15 @@ pub fn compile_context_for_session_separate_user_message(
     session_world: Option<&SessionWorld>,
     messages: &[ContextMessage],
 ) -> ContextPreview {
+    compile_context_for_session_separate_user_message_with_pending(soul, session_world, messages, None)
+}
+
+pub fn compile_context_for_session_separate_user_message_with_pending(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    messages: &[ContextMessage],
+    pending_user_text: Option<&str>,
+) -> ContextPreview {
     compile_context_with_budget_and_options(
         soul,
         session_world,
@@ -208,6 +219,7 @@ pub fn compile_context_for_session_separate_user_message(
         &ContextBudget::default(),
         true,
         false,
+        pending_user_text,
     )
 }
 
@@ -225,7 +237,7 @@ pub fn compile_context_with_budget_and_world(
     messages: &[ContextMessage],
     budget: &ContextBudget,
 ) -> ContextPreview {
-    compile_context_with_budget_and_options(soul, session_world, messages, budget, false, false)
+    compile_context_with_budget_and_options(soul, session_world, messages, budget, false, false, None)
 }
 
 pub fn compile_context_for_session_with_debug_replies(
@@ -240,6 +252,7 @@ pub fn compile_context_for_session_with_debug_replies(
         &ContextBudget::default(),
         false,
         true,
+        None,
     )
 }
 
@@ -250,10 +263,11 @@ fn compile_context_with_budget_and_options(
     budget: &ContextBudget,
     separate_user_message_follows: bool,
     include_debug_replies: bool,
+    pending_user_text: Option<&str>,
 ) -> ContextPreview {
     let mut truncated = false;
     let mut section_builders = vec![
-        build_world_section(soul, session_world, budget),
+        build_world_section(soul, session_world, budget, pending_user_text),
         build_profile_section(soul, budget),
         build_memory_section(soul, messages, budget),
         build_relationship_section(soul, budget),
@@ -737,6 +751,7 @@ fn build_world_section(
     soul: &Soul,
     session_world: Option<&SessionWorld>,
     budget: &ContextBudget,
+    pending_user_text: Option<&str>,
 ) -> BuiltSection {
     let (source, setting_name, scenario, world) = if let Some(session_world) = session_world {
         (
@@ -872,6 +887,7 @@ fn build_world_section(
         .rev()
         .take(8)
         .filter_map(|event| clean(event))
+        .filter(|event| !is_premature_user_turn_event(event, pending_user_text))
         .map(|event| format!("- {event}"))
         .collect::<Vec<_>>();
     recent_events.reverse();
@@ -1679,6 +1695,27 @@ mod tests {
     }
 
     #[test]
+    fn first_turn_no_premature_recent_event_in_context() {
+        let soul = new_default_soul("Aurora");
+        let mut session_world =
+            crate::setting::session_world_from_setting(&crate::setting::new_default_setting(
+                "Aurora Apartment",
+            ));
+        session_world.recent_events = vec![
+            "The conversation continued without a major rupture: I knock on the door".into(),
+        ];
+        let preview = compile_context_for_session_separate_user_message_with_pending(
+            &soul,
+            Some(&session_world),
+            &[],
+            Some("I knock on the door"),
+        );
+        assert!(!preview.text.contains("I knock on the door"));
+        assert!(!preview
+            .text
+            .contains("The conversation continued without a major rupture"));
+    }
+
     fn latest_exchange_omits_current_user_when_separate_message_follows() {
         let soul = soul_with_phone_scene();
         let preview =

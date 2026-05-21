@@ -184,6 +184,14 @@ pub struct PreparedApiPayload {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ProviderCompletion {
+    pub raw_text: String,
+    pub finish_reason: Option<String>,
+    pub provider_request_id: Option<String>,
+    pub provider_response_id: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ApiRequestMessage {
     role: String,
@@ -376,7 +384,7 @@ impl ApiProvider {
         system_prompt: &str,
         user_text: &str,
         on_chunk: F,
-    ) -> Result<String, String>
+    ) -> Result<ProviderCompletion, String>
     where
         F: FnMut(&str) -> Result<(), String>,
     {
@@ -396,7 +404,7 @@ impl ApiProvider {
         settings: &ApiProviderSettings,
         messages: Vec<ApiMessage>,
         mut on_chunk: F,
-    ) -> Result<String, String>
+    ) -> Result<ProviderCompletion, String>
     where
         F: FnMut(&str) -> Result<(), String>,
     {
@@ -416,7 +424,7 @@ impl ApiProvider {
         settings: &ApiProviderSettings,
         messages: Vec<ApiRequestMessage>,
         on_chunk: &mut F,
-    ) -> Result<String, String>
+    ) -> Result<ProviderCompletion, String>
     where
         F: FnMut(&str) -> Result<(), String>,
     {
@@ -460,6 +468,8 @@ impl ApiProvider {
         let mut full_text = String::new();
         let mut pending = String::new();
         let mut emitted_visible_len = 0;
+        let mut provider_response_id = None;
+        let mut finish_reason = None;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|err| format!("API stream failed: {err}"))?;
@@ -468,6 +478,14 @@ impl ApiProvider {
             while let Some(line_end) = pending.find('\n') {
                 let line = pending[..line_end].trim().to_string();
                 pending.drain(..=line_end);
+                if let Some(meta) = parse_sse_metadata(&line) {
+                    if provider_response_id.is_none() {
+                        provider_response_id = meta.response_id;
+                    }
+                    if meta.finish_reason.is_some() {
+                        finish_reason = meta.finish_reason;
+                    }
+                }
                 if let Some(delta) = parse_sse_delta(&line)? {
                     full_text.push_str(&delta);
                     let visible_len = visible_stream_prefix_len(&full_text);
@@ -484,6 +502,14 @@ impl ApiProvider {
         }
 
         if !pending.trim().is_empty() {
+            if let Some(meta) = parse_sse_metadata(pending.trim()) {
+                if provider_response_id.is_none() {
+                    provider_response_id = meta.response_id;
+                }
+                if meta.finish_reason.is_some() {
+                    finish_reason = meta.finish_reason;
+                }
+            }
             if let Some(delta) = parse_sse_delta(pending.trim())? {
                 full_text.push_str(&delta);
                 let visible_len = visible_stream_prefix_len(&full_text);
@@ -501,8 +527,45 @@ impl ApiProvider {
             return Err("API stream did not include assistant content".into());
         }
 
-        Ok(full_text.trim().to_string())
+        Ok(ProviderCompletion {
+            raw_text: full_text.trim().to_string(),
+            finish_reason,
+            provider_request_id: None,
+            provider_response_id,
+        })
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SseStreamMetadata {
+    response_id: Option<String>,
+    finish_reason: Option<String>,
+}
+
+fn parse_sse_metadata(line: &str) -> Option<SseStreamMetadata> {
+    let payload = line.strip_prefix("data:")?.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let response_id = value
+        .get("id")
+        .and_then(|id| id.as_str())
+        .map(str::to_string);
+    let finish_reason = value
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(|reason| reason.as_str())
+        .filter(|reason| !reason.is_empty())
+        .map(str::to_string);
+    if response_id.is_none() && finish_reason.is_none() {
+        return None;
+    }
+    Some(SseStreamMetadata {
+        response_id,
+        finish_reason,
+    })
 }
 
 fn visible_stream_prefix_len(text: &str) -> usize {
