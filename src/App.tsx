@@ -74,6 +74,7 @@ import {
   listenDevLog,
   previewApiPayload,
   renameConversation,
+  restoreInactiveMessages,
   runConsolidation,
   saveSessionAsNewSoul,
   saveSettingFile,
@@ -1439,10 +1440,6 @@ export function App() {
     }
 
     try {
-      if (message.id > 0) {
-        await deleteMessage(message.conversation_id, message.id);
-        setMessages(await listConversationMessages(message.conversation_id));
-      }
       await executeTurn(message.content, statusLabel, undefined, correctionInstruction);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -1473,8 +1470,8 @@ export function App() {
     if (busy || stateUpdating) return;
     const confirmed = window.confirm(
       message.role === "assistant"
-        ? "Delete this generated response and all later turns in this session? This rewinds visible chat state from here."
-        : "Delete this user message and all later turns in this session? This rewinds visible chat state from here.",
+        ? "Hide this generated response and all later turns in this session? This is recoverable with Restore hidden turns."
+        : "Hide this user message and all later turns in this session? This is recoverable with Restore hidden turns.",
     );
     if (!confirmed) return;
 
@@ -1489,9 +1486,27 @@ export function App() {
       }
       setStatus(
         nextMessages.length
-          ? "Turn deleted; later visible chat was rewound"
-          : "Turn deleted; this session is now empty but still exists",
+          ? "Turn hidden; later visible chat was rewound"
+          : "Turn hidden; this session is now empty but can be restored",
       );
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRestoreHiddenTurns() {
+    if (busy || !currentConversationId) return;
+    setBusy(true);
+    try {
+      const nextMessages = await restoreInactiveMessages(currentConversationId);
+      setMessages(nextMessages);
+      setConversations(await listConversations());
+      if (soul) {
+        setContext(await compileContext(soul.character_id, currentConversationId));
+      }
+      setStatus(nextMessages.length ? "Hidden turns restored" : "No hidden turns found");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1582,9 +1597,8 @@ export function App() {
   async function handleDeleteChat(conversationId = currentConversationId) {
     if (!soul) return;
     const deletingActiveConversation = conversationId === currentConversationId;
-    const sourceSoulId = soul.source_soul_id ?? soul.source_savepoint_id ?? null;
     const confirmed = window.confirm(
-      "Delete this local session? Messages, payload logs, and isolated session clones will be removed. Source savepoints stay intact.",
+      "Archive this local session? It stays recoverable; messages, payload logs, and session clones are kept.",
     );
     if (!confirmed) return;
 
@@ -1594,30 +1608,13 @@ export function App() {
       const nextConversations = await listConversations();
       setConversations(nextConversations);
       if (deletingActiveConversation) {
-        const sourceSoul = sourceSoulId ? await getSoul(sourceSoulId).catch(() => null) : null;
-        if (sourceSoul) {
-          setSoul(sourceSoul);
-          setCreatorFieldsFromSoul(sourceSoul);
-        }
-        const nextVisibleConversation = nextConversations.find((conversation) => {
-          const activeSoul = sourceSoul ?? soul;
-          return (
-            conversation.soul_id === activeSoul.character_id ||
-            conversation.source_savepoint_id === activeSoul.character_id ||
-            (Boolean(activeSoul.source_savepoint_id) &&
-              conversation.source_savepoint_id === activeSoul.source_savepoint_id)
-          );
-        });
-        setActiveConversationId(null);
-        setMessages([]);
-        setContext(null);
-        setView("library");
-        if (nextVisibleConversation) {
-          setSessionContinuityLabel("Select an existing session to continue");
-        }
+        const archived = nextConversations.find(
+          (conversation) => conversation.conversation_id === conversationId,
+        );
+        if (archived) setCurrentSessionTitle(archived.title);
       }
       setLastTurnDebug(null);
-      setStatus("Session deleted; source savepoints kept");
+      setStatus("Session archived; data kept and recoverable");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -2193,12 +2190,22 @@ export function App() {
             <button
               className="ghost-action danger"
               type="button"
-              title="Delete session"
+              title="Archive session"
               onClick={() => handleDeleteChat()}
               disabled={busy}
             >
               <Trash2 size={16} />
-              <span>Delete Session</span>
+              <span>Archive Session</span>
+            </button>
+            <button
+              className="ghost-action"
+              type="button"
+              title="Restore turns hidden by delete/rewind"
+              onClick={handleRestoreHiddenTurns}
+              disabled={busy || !currentConversationId}
+            >
+              <RefreshCcw size={16} />
+              <span>Restore Turns</span>
             </button>
             <button
               className="ghost-action"
@@ -3255,7 +3262,7 @@ export function App() {
                   <button
                     type="button"
                     className="session-delete-button"
-                    title="Delete session"
+                    title="Archive session"
                     onClick={() => handleDeleteChat(conversation.conversation_id)}
                     disabled={busy}
                   >

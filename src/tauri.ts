@@ -1097,18 +1097,15 @@ export function imageAssetSrc(asset?: ImageAsset | null): string {
 
 export function deleteConversation(conversationId: string): Promise<boolean> {
   return invokeOrPreview("delete_conversation", { conversationId }, () => {
-    const beforeCount = browserMessages.length;
-    browserMessages = browserMessages.filter(
-      (message) => message.conversation_id !== conversationId,
+    const conversation = browserConversations.find(
+      (item) => item.conversation_id === conversationId,
     );
-    browserAssistantVariants = browserAssistantVariants.filter(
-      (variant) => variant.conversation_id !== conversationId,
-    );
-    browserPayloadLogs = browserPayloadLogs.filter((log) => log.conversation_id !== conversationId);
-    browserConversations = browserConversations.filter(
-      (conversation) => conversation.conversation_id !== conversationId,
-    );
-    return browserMessages.length !== beforeCount;
+    if (!conversation) return false;
+    if (!conversation.title.startsWith("[Archived] ")) {
+      conversation.title = `[Archived] ${conversation.title}`;
+    }
+    conversation.updated_at = Math.floor(Date.now() / 1000);
+    return true;
   });
 }
 
@@ -1123,6 +1120,14 @@ export function deleteMessage(conversationId: string, messageId: number): Promis
     );
     return browserMessages.length !== beforeCount;
   });
+}
+
+export function restoreInactiveMessages(conversationId: string): Promise<ChatMessage[]> {
+  return invokeOrPreview("restore_inactive_messages", { conversationId }, () =>
+    browserMessages
+      .filter((message) => message.conversation_id === conversationId)
+      .map(hydratePreviewMessage),
+  );
 }
 
 export function updateUserMessage(

@@ -64,7 +64,6 @@ static DEV_LOG_COUNTER: AtomicU64 = AtomicU64::new(1);
 enum NarratorMessageOrigin {
     Api,
     Mock,
-    Opening,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1207,15 +1206,27 @@ pub fn delete_message(
     message_id: i64,
 ) -> Result<bool, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::deactivate_downstream_from_message(&conn, &conversation_id, message_id)
+        .map_err(|err| err.to_string())?;
     if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
-        db::deactivate_downstream_from_message(&conn, &conversation_id, message_id)
-            .map_err(|err| err.to_string())?;
         db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
             .map_err(|err| err.to_string())?;
-        Ok(true)
-    } else {
-        db::delete_message(&conn, &conversation_id, message_id).map_err(|err| err.to_string())
     }
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn restore_inactive_messages(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Vec<ChatMessage>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::restore_inactive_messages(&conn, &conversation_id).map_err(|err| err.to_string())?;
+    if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
+        db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+    }
+    db::list_messages(&conn, &conversation_id, 500).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -3346,7 +3357,6 @@ fn save_visible_narrator_response(
             None,
         ),
         NarratorMessageOrigin::Mock => ("mock_provider", None),
-        NarratorMessageOrigin::Opening => ("opening_seed", Some("opening")),
     };
 
     let debug_json = if let Some(debug) = debug {
@@ -3356,7 +3366,6 @@ fn save_visible_narrator_response(
             provider: match origin {
                 NarratorMessageOrigin::Api => "API".into(),
                 NarratorMessageOrigin::Mock => "Mock".into(),
-                NarratorMessageOrigin::Opening => "Opening".into(),
             },
             hidden_state_found: false,
             fallback_hidden_state_generated: false,

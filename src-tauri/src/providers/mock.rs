@@ -32,7 +32,7 @@ impl MockProvider {
         let context_hint = context_hint(context);
         let response = render_visible_response(soul, trimmed, mode, template, relationship_hint);
         let memory = render_memory(soul, trimmed, template, context_hint);
-        let world_event = render_world_event(trimmed);
+        let world_event = render_world_event(trimmed, template);
         let hidden_state = HiddenState {
             memory: Some(memory),
             tag: Some(template.tag.into()),
@@ -196,14 +196,15 @@ fn render_memory(
     )
 }
 
-fn render_world_event(user_text: &str) -> Option<String> {
+fn render_world_event(user_text: &str, template: MockTemplate) -> Option<String> {
     let user = user_text.trim();
     if user.is_empty() {
         return None;
     }
     Some(format!(
-        "{} {}",
+        "{} {} User turn: {}.",
         state_engine::patch::PENDING_USER_INPUT_PREFIX,
+        template.world_frame,
         user
     ))
 }

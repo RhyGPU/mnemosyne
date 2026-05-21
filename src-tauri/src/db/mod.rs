@@ -1931,46 +1931,25 @@ pub fn list_messages_before_id(
 }
 
 pub fn delete_conversation(conn: &Connection, conversation_id: &str) -> rusqlite::Result<bool> {
-    let linked: Option<(String, Option<String>, String)> = conn
+    let title: Option<String> = conn
         .query_row(
-            "
-            SELECT c.soul_id, c.world_id, COALESCE(s.soul_kind, '')
-            FROM conversations c
-            LEFT JOIN souls s ON s.character_id = c.soul_id
-            WHERE c.id = ?1
-            ",
+            "SELECT title FROM conversations WHERE id = ?1",
             [conversation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| row.get(0),
         )
         .optional()?;
-    let affected = conn.execute("DELETE FROM conversations WHERE id = ?1", [conversation_id])?;
-    if affected > 0 {
-        if let Some((soul_id, world_id, soul_kind)) = linked {
-            if normalized_soul_kind(&soul_kind) == "session_clone" {
-                let still_used: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM conversations WHERE soul_id = ?1",
-                    [&soul_id],
-                    |row| row.get(0),
-                )?;
-                if still_used == 0 {
-                    let _ = conn.execute("DELETE FROM souls WHERE character_id = ?1", [&soul_id]);
-                }
-            }
-            if let Some(world_id) = world_id {
-                let still_used: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM conversations WHERE world_id = ?1",
-                    [&world_id],
-                    |row| row.get(0),
-                )?;
-                if still_used == 0 {
-                    let _ = conn.execute(
-                        "DELETE FROM session_worlds WHERE world_id = ?1",
-                        [&world_id],
-                    );
-                }
-            }
-        }
-    }
+    let Some(title) = title else {
+        return Ok(false);
+    };
+    let archived_title = if title.starts_with("[Archived] ") {
+        title
+    } else {
+        format!("[Archived] {title}")
+    };
+    let affected = conn.execute(
+        "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
+        params![archived_title, now_ts(), conversation_id],
+    )?;
     Ok(affected > 0)
 }
 
@@ -1990,6 +1969,59 @@ pub fn delete_message(
         )?;
     }
     Ok(affected > 0)
+}
+
+pub fn restore_inactive_messages(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "
+        UPDATE turn_commits
+        SET is_active = 1, is_discarded = 0, active_variant = 1
+        WHERE conversation_id = ?1
+          AND (
+            user_message_id IN (
+                SELECT id FROM messages WHERE conversation_id = ?1 AND is_active = 0
+            )
+            OR assistant_message_id IN (
+                SELECT id FROM messages WHERE conversation_id = ?1 AND is_active = 0
+            )
+          )
+          AND (
+            selected_variant_id IS NULL
+            OR selected_variant_id IN (
+                SELECT id
+                FROM assistant_message_variants
+                WHERE conversation_id = ?1 AND is_selected != 0
+            )
+          )
+        ",
+        [conversation_id],
+    )?;
+    conn.execute(
+        "
+        UPDATE state_patches
+        SET is_active = 1
+        WHERE patch_id IN (
+            SELECT state_patch_id
+            FROM turn_commits
+            WHERE conversation_id = ?1 AND is_active != 0 AND state_patch_id IS NOT NULL
+        )
+        ",
+        [conversation_id],
+    )?;
+    let affected = conn.execute(
+        "UPDATE messages SET is_active = 1 WHERE conversation_id = ?1 AND is_active = 0",
+        [conversation_id],
+    )?;
+    if affected > 0 {
+        conn.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now_ts(), conversation_id],
+        )?;
+    }
+    Ok(affected)
 }
 
 pub fn list_messages(
@@ -3480,7 +3512,7 @@ mod tests {
     }
 
     #[test]
-    fn deletion_cascades_souls_and_conversations() {
+    fn conversation_delete_archives_without_destroying_chat_data() {
         let conn = init_memory_connection().expect("db");
         let soul = new_default_soul("Aurora");
         upsert_soul(&conn, &soul).expect("upsert");
@@ -3488,10 +3520,10 @@ mod tests {
         insert_message(&conn, "mock", "user", "Hello").expect("user");
 
         assert!(delete_conversation(&conn, "mock").expect("delete conversation"));
-        assert_eq!(list_messages(&conn, "mock", 5).expect("messages").len(), 0);
+        let archived = get_conversation_summary(&conn, "mock").expect("archived conversation");
+        assert!(archived.title.starts_with("[Archived] "));
+        assert_eq!(list_messages(&conn, "mock", 5).expect("messages").len(), 1);
 
-        ensure_conversation(&conn, "mock", &soul.character_id).expect("conversation");
-        insert_message(&conn, "mock", "assistant", "Hi").expect("assistant");
         assert!(delete_soul(&conn, &soul.character_id).expect("delete soul"));
         assert!(list_souls(&conn).expect("souls").is_empty());
 
@@ -3513,7 +3545,10 @@ mod tests {
 
         assert!(delete_conversation(&conn, "chat-a").expect("delete chat a"));
 
-        assert!(get_conversation_summary(&conn, "chat-a").is_err());
+        assert!(get_conversation_summary(&conn, "chat-a")
+            .expect("chat a archived")
+            .title
+            .starts_with("[Archived] "));
         assert_eq!(
             get_conversation_summary(&conn, "chat-b")
                 .expect("chat b remains")
@@ -3543,8 +3578,11 @@ mod tests {
 
         assert!(delete_conversation(&conn, "session-a").expect("delete session a"));
 
-        assert!(get_conversation_summary(&conn, "session-a").is_err());
-        assert!(get_soul(&conn, &session_a.character_id).is_err());
+        assert!(get_conversation_summary(&conn, "session-a")
+            .expect("session a archived")
+            .title
+            .starts_with("[Archived] "));
+        assert!(get_soul(&conn, &session_a.character_id).is_ok());
         assert!(get_soul(&conn, &source.character_id).is_ok());
         assert!(get_soul(&conn, &session_b.character_id).is_ok());
         assert_eq!(
@@ -3586,6 +3624,30 @@ mod tests {
             .expect("conversation list")
             .iter()
             .any(|conversation| conversation.conversation_id == "rewind-session"));
+    }
+
+    #[test]
+    fn restore_inactive_messages_makes_rewound_chat_visible_again() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "restore-session", &soul.character_id).expect("conversation");
+        let first =
+            insert_message_and_get_id(&conn, "restore-session", "user", "First").expect("first");
+        insert_message(&conn, "restore-session", "assistant", "Second").expect("second");
+
+        deactivate_downstream_from_message(&conn, "restore-session", first).expect("rewind");
+        assert!(list_messages(&conn, "restore-session", 10)
+            .expect("active messages")
+            .is_empty());
+
+        let restored =
+            restore_inactive_messages(&conn, "restore-session").expect("restore inactive");
+        assert_eq!(restored, 2);
+        let messages = list_messages(&conn, "restore-session", 10).expect("restored messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "First");
+        assert_eq!(messages[1].content, "Second");
     }
 
     #[test]

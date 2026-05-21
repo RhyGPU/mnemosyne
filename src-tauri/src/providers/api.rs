@@ -717,24 +717,17 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
                 "trust": 0.0,
                 "affection": 0.0,
                 "fear": 0.0,
-                "desire": 0.0,
-                "conflict": 0.0,
-                "curiosity": 0.0,
-                "comfort": 0.0,
-                "dependency": 0.0
+                "conflict": 0.0
             }],
             "new_memories": [{
+                "memory_id": "stable_memory_id",
                 "content": "short durable fact",
                 "tag": "observation",
                 "source_type": "current_session",
                 "truth_status": "scene_event",
                 "architecture_verified": false,
-                "is_lived_experience": true,
-                "is_imported_context": false,
                 "perceived_by_entity_id": active_soul_id,
-                "target_entity_ids": ["default_player"],
-                "interpretation": "optional brief reading",
-                "confidence": 0.8
+                "target_entity_ids": ["default_player"]
             }]
         },
         "world_patch": {
@@ -749,18 +742,14 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
                 "participants": [active_soul_id, "default_player"],
                 "last_user_action": "latest user action",
                 "pressure_point": "next decision point",
-                "continuity_note": "do-not-replay/object note"
+                "continuity_note": "object/retcon note"
             },
-            "recent_event": "",
             "event_operations": [{
                 "operation": "add_recent_event | replace_recent_event | invalidate_recent_event | clear_recent_event_matching | add_correction_note | no_op",
                 "recent_event_id": "stable id for a new event",
                 "target_recent_event_id": "stable id to replace/invalidate",
-                "content": "short objective event or correction note",
-                "match_text": "only for clear_recent_event_matching"
+                "content": "short objective event or correction note"
             }],
-            "active_plot_add": [""],
-            "active_plot_resolve": [""],
             "object_observation_operations": [{
                 "operation": "update_object_state | replace_object_state | invalidate_object_observation | no_op",
                 "object_observation_id": "stable observation id",
@@ -774,15 +763,10 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
                     "status": "generic non-phone state",
                     "open_state": "open|closed|ajar|unknown",
                     "lock_state": "locked|unlocked|jammed|unknown",
-                    "sealed": true,
-                    "contents_known": false,
-                    "contents_summary": "",
                     "power_state": "unknown",
                     "notification_mode": "notifications_off",
                     "vibrate_enabled": false,
                     "screen_wake_enabled": false,
-                    "can_receive_calls": true,
-                    "can_receive_texts": true,
                     "last_observed_state": "notifications off",
                     "confidence": 0.8
                 }
