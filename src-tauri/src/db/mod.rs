@@ -206,7 +206,7 @@ pub struct LlmPayloadResponseUpdate {
     pub normalized_response: Option<String>,
     pub finish_reason: Option<String>,
     pub provider_error: Option<String>,
-    pub fallback_used: bool,
+    pub fallback_used: Option<bool>,
     pub fallback_reason: Option<String>,
     pub provider_request_id: Option<String>,
     pub provider_response_id: Option<String>,
@@ -1782,7 +1782,7 @@ pub fn update_llm_payload_log_response(
             normalized_response = COALESCE(?4, normalized_response),
             finish_reason = COALESCE(?5, finish_reason),
             provider_error = COALESCE(?6, provider_error),
-            fallback_used = ?7,
+            fallback_used = COALESCE(?7, fallback_used),
             fallback_reason = COALESCE(?8, fallback_reason),
             provider_request_id = COALESCE(?9, provider_request_id),
             provider_response_id = COALESCE(?10, provider_response_id)
@@ -1795,7 +1795,9 @@ pub fn update_llm_payload_log_response(
             update.normalized_response,
             update.finish_reason,
             update.provider_error,
-            if update.fallback_used { 1 } else { 0 },
+            update
+                .fallback_used
+                .map(|fallback_used| if fallback_used { 1 } else { 0 }),
             update.fallback_reason,
             update.provider_request_id,
             update.provider_response_id,
@@ -3170,6 +3172,60 @@ mod tests {
         let serialized = serde_json::to_string(&logs[0]).unwrap();
         assert!(!serialized.contains("secret"));
         assert!(!serialized.contains("api_key"));
+    }
+
+    #[test]
+    fn payload_response_update_preserves_fallback_used_when_omitted() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+        ensure_conversation(&conn, "fallback-flag", &soul.character_id).expect("conversation");
+
+        let log_id = insert_llm_payload_log(
+            &conn,
+            &LlmPayloadLog {
+                conversation_id: "fallback-flag".into(),
+                ..Default::default()
+            },
+        )
+        .expect("insert log");
+
+        update_llm_payload_log_response(
+            &conn,
+            log_id,
+            &LlmPayloadResponseUpdate {
+                fallback_used: Some(true),
+                fallback_reason: Some("generic_mock_prose_detected".into()),
+                ..Default::default()
+            },
+        )
+        .expect("mark fallback");
+
+        update_llm_payload_log_response(
+            &conn,
+            log_id,
+            &LlmPayloadResponseUpdate {
+                raw_provider_response: Some("raw narrator body".into()),
+                normalized_response: Some("visible narrator body".into()),
+                finish_reason: Some("stop".into()),
+                provider_request_id: Some("req-retry".into()),
+                provider_response_id: Some("resp-retry".into()),
+                ..Default::default()
+            },
+        )
+        .expect("response update without fallback flag");
+
+        let log = get_llm_payload_log(&conn, log_id).expect("log");
+        assert!(log.fallback_used);
+        assert_eq!(
+            log.fallback_reason.as_deref(),
+            Some("generic_mock_prose_detected")
+        );
+        assert_eq!(
+            log.raw_provider_response.as_deref(),
+            Some("raw narrator body")
+        );
+        assert_eq!(log.provider_response_id.as_deref(), Some("resp-retry"));
     }
 
     #[test]

@@ -2227,7 +2227,8 @@ pub async fn send_api_turn(
             return Err(err);
         }
     };
-    let raw_response = provider_completion.raw_text.clone();
+    let mut active_provider_completion = provider_completion;
+    let raw_response = active_provider_completion.raw_text.clone();
     let parsed = match parse_hidden_state(&raw_response) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -2414,6 +2415,7 @@ pub async fn send_api_turn(
                         );
                     } else {
                         visible_response = retry_visible_response;
+                        active_provider_completion = retry_completion;
                         if let Some(log_id) = retry_payload_log_id {
                             payload_log_id = log_id;
                         }
@@ -2567,14 +2569,10 @@ pub async fn send_api_turn(
             db::update_llm_payload_log_response(
                 &conn,
                 payload_log_id,
-                &db::LlmPayloadResponseUpdate {
-                    raw_provider_response: Some(raw_response.clone()),
-                    normalized_response: Some(visible_response.clone()),
-                    finish_reason: provider_completion.finish_reason.clone(),
-                    provider_request_id: provider_completion.provider_request_id.clone(),
-                    provider_response_id: provider_completion.provider_response_id.clone(),
-                    ..Default::default()
-                },
+                &llm_payload_response_update_from_completion(
+                    &active_provider_completion,
+                    &visible_response,
+                ),
             )
             .map_err(|err| err.to_string())
         });
@@ -2589,7 +2587,7 @@ pub async fn send_api_turn(
                     &conn,
                     payload_log_id,
                     &db::LlmPayloadResponseUpdate {
-                        fallback_used: true,
+                        fallback_used: Some(true),
                         fallback_reason: Some("generic_mock_prose_detected".into()),
                         normalized_response: Some(NARRATOR_PROVIDER_ERROR_VISIBLE.into()),
                         ..Default::default()
@@ -6702,6 +6700,20 @@ fn responses_match_for_integrity(left: &str, right: &str) -> bool {
     normalize_response_for_integrity(left) == normalize_response_for_integrity(right)
 }
 
+fn llm_payload_response_update_from_completion(
+    completion: &crate::providers::api::ProviderCompletion,
+    normalized_response: &str,
+) -> db::LlmPayloadResponseUpdate {
+    db::LlmPayloadResponseUpdate {
+        raw_provider_response: Some(completion.raw_text.clone()),
+        normalized_response: Some(normalized_response.to_string()),
+        finish_reason: completion.finish_reason.clone(),
+        provider_request_id: completion.provider_request_id.clone(),
+        provider_response_id: completion.provider_response_id.clone(),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8447,6 +8459,48 @@ mod tests {
             build_state_updater_user_message("I knock on the door", saved_text, None, None);
         assert!(updater_user.contains(&message.content));
         assert!(responses_match_for_integrity(&message.content, saved_text));
+    }
+
+    #[test]
+    fn anti_replay_accepted_retry_payload_metadata_uses_retry_completion() {
+        use crate::providers::api::ProviderCompletion;
+
+        let initial = ProviderCompletion {
+            raw_text: "initial raw".into(),
+            finish_reason: Some("length".into()),
+            provider_request_id: Some("req-initial".into()),
+            provider_response_id: Some("resp-initial".into()),
+        };
+        let retry = ProviderCompletion {
+            raw_text: "retry raw body".into(),
+            finish_reason: Some("stop".into()),
+            provider_request_id: Some("req-retry".into()),
+            provider_response_id: Some("resp-retry".into()),
+        };
+        let update =
+            llm_payload_response_update_from_completion(&retry, "Retry visible narration.");
+        assert_eq!(
+            update.raw_provider_response.as_deref(),
+            Some("retry raw body")
+        );
+        assert_eq!(
+            update.normalized_response.as_deref(),
+            Some("Retry visible narration.")
+        );
+        assert_eq!(update.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(update.provider_request_id.as_deref(), Some("req-retry"));
+        assert_eq!(update.provider_response_id.as_deref(), Some("resp-retry"));
+
+        let initial_update =
+            llm_payload_response_update_from_completion(&initial, "Initial visible narration.");
+        assert_ne!(
+            initial_update.provider_response_id,
+            update.provider_response_id
+        );
+        assert_ne!(
+            initial_update.raw_provider_response,
+            update.raw_provider_response
+        );
     }
 
     #[test]
