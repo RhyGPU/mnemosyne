@@ -152,6 +152,12 @@ mod tests {
                 interpretation: None,
                 confidence: None,
                 objective_event_id: None,
+                truth_status: crate::soul::TruthStatus::Unknown,
+                architecture_verified: false,
+                is_active: true,
+                invalidated_by_patch_id: None,
+                superseded_by_memory_id: None,
+                is_retconned: false,
             });
         }
         soul.memory.recent.push(MemoryEntry {
@@ -174,6 +180,12 @@ mod tests {
             interpretation: None,
             confidence: None,
             objective_event_id: None,
+            truth_status: crate::soul::TruthStatus::Unknown,
+            architecture_verified: false,
+            is_active: true,
+            invalidated_by_patch_id: None,
+            superseded_by_memory_id: None,
+            is_retconned: false,
         });
         soul.memory.recent.push(MemoryEntry {
             id: "weak".into(),
@@ -194,6 +206,12 @@ mod tests {
             interpretation: None,
             confidence: None,
             objective_event_id: None,
+            truth_status: crate::soul::TruthStatus::Unknown,
+            architecture_verified: false,
+            is_active: true,
+            invalidated_by_patch_id: None,
+            superseded_by_memory_id: None,
+            is_retconned: false,
         });
 
         consolidate_soul(&mut soul);

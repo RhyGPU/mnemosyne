@@ -63,8 +63,6 @@ import {
   getSoul,
   importImageAssetFromFile,
   importMneBundle,
-  isDesktopApp,
-  pickMneBundlePath,
   listConversations,
   listProviderProfiles,
   listAssistantMessageVariants,
@@ -1882,11 +1880,8 @@ export function App() {
   }
 
   async function handleImportMne() {
-    let filePath = await pickMneBundlePath();
-    if (!filePath && !isDesktopApp()) {
-      const manualPath = window.prompt("Path to .mne bundle");
-      filePath = manualPath?.trim() || null;
-    }
+    const manualPath = window.prompt("Path to .mne bundle");
+    const filePath = manualPath?.trim() || null;
     if (!filePath) return;
     setBusy(true);
     try {
@@ -3772,6 +3767,20 @@ export function App() {
             <pre>{llmPayload?.system_message ?? "No LLM payload compiled yet."}</pre>
             <h3>Context, already included inside System Message</h3>
             <pre>{llmPayload?.context ?? "No context compiled yet."}</pre>
+            {llmPayload?.memory_slot_debug?.length ? (
+              <>
+                <h3>Memory Slot Debug</h3>
+                <pre>
+                  {llmPayload.memory_slot_debug
+                    .filter((trace) => trace.action === "selected")
+                    .map(
+                      (trace) =>
+                        `${trace.slot}: ${trace.memory_id} / ${trace.reason} / score ${Math.round(trace.final_score)} / ${trace.source_type} / ${trace.truth_status}`,
+                    )
+                    .join("\n")}
+                </pre>
+              </>
+            ) : null}
             {llmPayload?.context_mode === "full_chat" ? (
               <>
                 <h3>Full Chat Messages Sent</h3>
@@ -3794,8 +3803,8 @@ export function App() {
                 <dd>soul.profile/global/trauma/arousal</dd>
               </div>
               <div>
-                <dt>RELEVANT MEMORIES source</dt>
-                <dd>soul.memory</dd>
+                <dt>MEMORY SLOTS source</dt>
+                <dd>soul.memory, slot-scored by entity/plot/source/truth</dd>
               </div>
               <div>
                 <dt>RELATIONSHIPS source</dt>
@@ -3963,11 +3972,21 @@ function formatLlmPayloadDebugBlock(payload: LlmPayloadPreview) {
           .map((message) => `${message.role}: ${message.content}`)
           .join("\n\n")}`
       : "";
+  const memorySlotDebug = payload.memory_slot_debug?.length
+    ? `\n\n=== MEMORY SLOT DEBUG ===\n${payload.memory_slot_debug
+        .filter((trace) => trace.action === "selected")
+        .map(
+          (trace) =>
+            `${trace.slot}: ${trace.memory_id} / ${trace.reason} / score ${Math.round(trace.final_score)} / ${trace.source_type} / ${trace.truth_status}`,
+        )
+        .join("\n")}`
+    : "";
   return `=== SYSTEM MESSAGE ===
 ${payload.system_message}
 
 === CONTEXT, already included inside SYSTEM MESSAGE ===
 ${payload.context}
+${memorySlotDebug}
 ${chatMessages}
 
 === USER MESSAGE ===

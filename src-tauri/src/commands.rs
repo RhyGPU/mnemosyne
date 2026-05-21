@@ -19,10 +19,10 @@ use state_engine::{
     consolidation::consolidate_soul,
     context_compiler::{
         compile_context_for_session, compile_context_for_session_separate_user_message,
-        estimate_tokens, ContextMessage, ContextPreview,
+        estimate_tokens, ContextMessage, ContextPreview, MemorySlotTrace,
     },
     hidden_state::{parse_hidden_state, HiddenState},
-    patch::{EnginePatch, MemoryApplyAction},
+    patch::{is_retcon_or_correction_text, EnginePatch, MemoryApplyAction},
     setting::{new_default_setting, SessionWorld, SettingSoul},
     soul::{
         new_default_soul, session_soul_from_savepoint, soul_savepoint_from_session,
@@ -49,8 +49,8 @@ const CONSOLIDATION_INTERVAL_TURNS: u64 = 10;
 const NO_LLM_PAYLOAD_LOGS_MESSAGE: &str = "No LLM payload logs found for this conversation.";
 const FULL_CHAT_TOKEN_BUDGET: usize = 6_000;
 const NARRATOR_BRIEF_TARGET_TOKENS: usize = 2_500;
-const STATE_UPDATER_TARGET_TOKENS: usize = 1_200;
-const STATE_UPDATER_TIMEOUT_SECONDS: u64 = 12;
+const STATE_UPDATER_TARGET_TOKENS: usize = 1_600;
+const STATE_UPDATER_TIMEOUT_SECONDS: u64 = 25;
 static DEV_LOG_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy)]
@@ -137,6 +137,7 @@ pub struct LlmPayloadPreview {
     pub messages: Vec<ApiMessage>,
     pub truncated: bool,
     pub estimated_tokens: LlmPayloadTokenEstimate,
+    pub memory_slot_debug: Vec<MemorySlotTrace>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +329,8 @@ pub fn create_session_soul_from_savepoint(
         Some(title),
     )
     .map_err(|err| err.to_string())?;
+    db::create_session_branch(&conn, &conversation_id, &session, &session_world)
+        .map_err(|err| err.to_string())?;
     let opening = session.profile.opening_narrator_message.trim();
     seed_opening_narrator_message(&conn, &conversation_id, opening)
         .map_err(|err| err.to_string())?;
@@ -1165,7 +1168,15 @@ pub fn delete_message(
     message_id: i64,
 ) -> Result<bool, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    db::delete_message(&conn, &conversation_id, message_id).map_err(|err| err.to_string())
+    if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
+        db::deactivate_downstream_from_message(&conn, &conversation_id, message_id)
+            .map_err(|err| err.to_string())?;
+        db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+        Ok(true)
+    } else {
+        db::delete_message(&conn, &conversation_id, message_id).map_err(|err| err.to_string())
+    }
 }
 
 #[tauri::command]
@@ -1184,6 +1195,17 @@ pub fn update_user_message(
         .map_err(|err| err.to_string())?;
     if !updated {
         return Err("User message not found".into());
+    }
+    if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
+        db::deactivate_downstream_from_message(&conn, &conversation_id, message_id)
+            .map_err(|err| err.to_string())?;
+        conn.execute(
+            "UPDATE messages SET is_active = 1 WHERE conversation_id = ?1 AND id = ?2",
+            rusqlite::params![conversation_id, message_id],
+        )
+        .map_err(|err| err.to_string())?;
+        db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
     }
     db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())
 }
@@ -1209,6 +1231,14 @@ pub fn select_assistant_message_variant(
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::select_assistant_message_variant(&conn, &conversation_id, message_id, variant_id)
         .map_err(|err| err.to_string())?;
+    if db::has_session_branch(&conn, &conversation_id).map_err(|err| err.to_string())? {
+        if let Some(branch_id) = db::activate_variant_commit(&conn, &conversation_id, variant_id)
+            .map_err(|err| err.to_string())?
+        {
+            db::rebuild_session_state(&conn, &conversation_id, &branch_id)
+                .map_err(|err| err.to_string())?;
+        }
+    }
     Ok(VariantSelectionResult {
         variants: db::list_assistant_message_variants(&conn, &conversation_id, message_id)
             .map_err(|err| err.to_string())?,
@@ -1226,6 +1256,18 @@ pub fn delete_assistant_message_variant(
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::delete_assistant_message_variant(&conn, &conversation_id, message_id, variant_id)
         .map_err(|err| err.to_string())?;
+    if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
+        if let Some(commit) = db::get_turn_commit_by_assistant(&conn, &conversation_id, message_id)
+            .map_err(|err| err.to_string())?
+        {
+            if commit.selected_variant_id == Some(variant_id) {
+                db::discard_active_commits_for_assistant(&conn, &conversation_id, message_id)
+                    .map_err(|err| err.to_string())?;
+            }
+        }
+        db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+    }
     Ok(VariantSelectionResult {
         variants: db::list_assistant_message_variants(&conn, &conversation_id, message_id)
             .map_err(|err| err.to_string())?,
@@ -1249,6 +1291,19 @@ pub fn get_llm_payload_log(
 ) -> Result<LlmPayloadLog, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::get_llm_payload_log(&conn, log_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn get_branch_patch_debug(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<db::BranchPatchDebug, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let branch =
+        db::get_active_session_branch(&conn, &conversation_id).map_err(|err| err.to_string())?;
+    let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+        .map_err(|err| err.to_string())?;
+    Ok(rebuilt.debug)
 }
 
 #[tauri::command]
@@ -1332,16 +1387,71 @@ pub fn compile_context(
     conversation_id: String,
 ) -> Result<ContextPreview, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    let soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
-    let session_world = load_session_world_for_context(&window, &conn, &conversation_id, &soul)
-        .map_err(|err| err.to_string())?;
+    let (soul, session_world) = if let Ok(branch) =
+        db::get_active_session_branch(&conn, &conversation_id)
+    {
+        let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+        emit_dev_log(
+            &window,
+            "debug",
+            "ledger",
+            "branch_state_rebuilt",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "branch_id": rebuilt.debug.branch_id,
+                "applied_patch_count": rebuilt.debug.applied_patches.len(),
+                "skipped_discarded_patch_count": rebuilt.debug.skipped_discarded_patches.len(),
+                "rebuild_generation": rebuilt.debug.rebuild_generation
+            })),
+        );
+        (rebuilt.soul, rebuilt.session_world)
+    } else {
+        let soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
+        let session_world = load_session_world_for_context(&window, &conn, &conversation_id, &soul)
+            .map_err(|err| err.to_string())?;
+        (soul, session_world)
+    };
     emit_possible_world_character_mismatch(&window, &conversation_id, &soul, Some(&session_world));
     let messages = db::list_messages(&conn, &conversation_id, 5).map_err(|err| err.to_string())?;
-    Ok(compile_context_for_session(
-        &soul,
-        Some(&session_world),
-        &messages_to_context(messages),
-    ))
+    let preview =
+        compile_context_for_session(&soul, Some(&session_world), &messages_to_context(messages));
+    emit_memory_slot_debug_logs(&window, &conversation_id, &soul.character_id, &preview);
+    Ok(preview)
+}
+
+fn emit_memory_slot_debug_logs(
+    window: &Window,
+    conversation_id: &str,
+    active_soul_id: &str,
+    preview: &ContextPreview,
+) {
+    for trace in preview
+        .memory_slot_debug
+        .iter()
+        .filter(|trace| trace.action == "selected")
+        .take(24)
+    {
+        emit_dev_log(
+            window,
+            "debug",
+            "context",
+            "memory_slot_selected",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "active_soul_id": active_soul_id,
+                "slot": trace.slot,
+                "memory_id": trace.memory_id,
+                "reason": trace.reason,
+                "source_type": trace.source_type,
+                "truth_status": trace.truth_status,
+                "entity_match": trace.entity_match,
+                "plot_match": trace.plot_match,
+                "salience": trace.salience,
+                "final_score": trace.final_score
+            })),
+        );
+    }
 }
 
 fn load_session_world_for_context(
@@ -1494,10 +1604,43 @@ fn send_mock_turn_with_conn(
     let mut session_world =
         db::ensure_conversation_session_world(&conn, &conversation_id, &soul, None)
             .map_err(|err| err.to_string())?;
-    if replacement_assistant_id.is_none() {
-        db::insert_message(&conn, &conversation_id, "user", &user_text)
-            .map_err(|err| err.to_string())?;
-    }
+    let ledger_branch = db::get_active_session_branch(conn, &conversation_id).ok();
+    let old_commit = replacement_assistant_id.and_then(|message_id| {
+        db::get_turn_commit_by_assistant(conn, &conversation_id, message_id)
+            .ok()
+            .flatten()
+    });
+    let ledger_parent_turn_id = if let Some(branch) = ledger_branch.as_ref() {
+        let parent_turn_id = if replacement_assistant_id.is_some() {
+            old_commit
+                .as_ref()
+                .and_then(|commit| commit.parent_turn_id.clone())
+        } else {
+            branch.active_turn_id.clone()
+        };
+        let rebuilt = db::rebuild_session_state_until(
+            conn,
+            &conversation_id,
+            &branch.branch_id,
+            parent_turn_id.as_deref(),
+        )
+        .map_err(|err| err.to_string())?;
+        soul = rebuilt.soul;
+        session_world = rebuilt.session_world;
+        parent_turn_id
+    } else {
+        None
+    };
+    let ledger_user_message_id = if replacement_assistant_id.is_none() {
+        Some(
+            db::insert_message_and_get_id(conn, &conversation_id, "user", &user_text)
+                .map_err(|err| err.to_string())?,
+        )
+    } else {
+        old_commit
+            .as_ref()
+            .and_then(|commit| commit.user_message_id)
+    };
 
     let before_messages = match replacement_assistant_id {
         Some(message_id) => db::list_messages_before_id(&conn, &conversation_id, message_id, 5),
@@ -1523,11 +1666,6 @@ fn send_mock_turn_with_conn(
     debug.output_contract_warning = output_contract_warning;
     let debug_json = serde_json::to_string(&debug).map_err(|err| err.to_string())?;
 
-    let _ = parsed
-        .engine_patch
-        .apply_to_session(&mut soul, Some(&mut session_world));
-    soul.turn_counter += 1;
-    soul.turns_since_consolidation += 1;
     let assistant_message_id = if let Some(message_id) = replacement_assistant_id {
         message_id
     } else {
@@ -1535,7 +1673,7 @@ fn send_mock_turn_with_conn(
             .map_err(|err| err.to_string())?
     };
 
-    if replacement_assistant_id.is_some() {
+    let selected_variant_id = if replacement_assistant_id.is_some() {
         db::create_assistant_message_variant(
             &conn,
             &conversation_id,
@@ -1558,7 +1696,8 @@ fn send_mock_turn_with_conn(
             Some(&pre_turn_soul_json),
             Some(&debug_json),
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| err.to_string())?
+        .id
     } else {
         db::seed_initial_assistant_message_variant(
             &conn,
@@ -1569,7 +1708,37 @@ fn send_mock_turn_with_conn(
             Some(&pre_turn_soul_json),
             Some(&debug_json),
         )
+        .map_err(|err| err.to_string())?
+        .id
+    };
+
+    if let Some(branch) = ledger_branch.as_ref() {
+        if replacement_assistant_id.is_some() {
+            db::discard_active_commits_for_assistant(conn, &conversation_id, assistant_message_id)
+                .map_err(|err| err.to_string())?;
+        }
+        db::record_turn_commit_with_patch(
+            conn,
+            &conversation_id,
+            &branch.branch_id,
+            ledger_parent_turn_id.as_deref(),
+            ledger_user_message_id,
+            assistant_message_id,
+            selected_variant_id,
+            &parsed.engine_patch,
+            replacement_assistant_id.is_some(),
+        )
         .map_err(|err| err.to_string())?;
+        let rebuilt = db::rebuild_session_state(conn, &conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+        soul = rebuilt.soul;
+        session_world = rebuilt.session_world;
+    } else {
+        let _ = parsed
+            .engine_patch
+            .apply_to_session(&mut soul, Some(&mut session_world));
+        soul.turn_counter += 1;
+        soul.turns_since_consolidation += 1;
     }
 
     if replacement_assistant_id.is_none() {
@@ -1585,7 +1754,8 @@ fn send_mock_turn_with_conn(
         .map_err(|err| err.to_string())?;
     }
 
-    let consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
+    let consolidation_ran =
+        ledger_branch.is_none() && soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
     if consolidation_ran {
         consolidate_soul(&mut soul);
     }
@@ -1650,9 +1820,13 @@ pub async fn send_api_turn(
         pre_turn_soul_json,
         entity_context,
         replay_sources,
+        ledger_branch_id,
+        ledger_parent_turn_id,
+        ledger_user_message_id,
     ) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
-        let (soul, snapshot_user_text) = if let Some(message_id) = replacement_assistant_id {
+        let (fallback_soul, snapshot_user_text) = if let Some(message_id) = replacement_assistant_id
+        {
             let snapshot = db::get_turn_snapshot(&conn, &conversation_id, message_id)
                 .map_err(|err| err.to_string())?
                 .ok_or_else(|| "No turn snapshot found for assistant response".to_string())?;
@@ -1665,12 +1839,40 @@ pub async fn send_api_turn(
                 user_text.clone(),
             )
         };
-        db::ensure_conversation(&conn, &conversation_id, &soul.character_id)
+        db::ensure_conversation(&conn, &conversation_id, &fallback_soul.character_id)
             .map_err(|err| err.to_string())?;
-        let session_world = load_session_world_for_context(&window, &conn, &conversation_id, &soul)
+        let ledger_branch = db::get_active_session_branch(&conn, &conversation_id).ok();
+        let old_commit = replacement_assistant_id.and_then(|message_id| {
+            db::get_turn_commit_by_assistant(&conn, &conversation_id, message_id)
+                .ok()
+                .flatten()
+        });
+        let (soul, session_world, ledger_parent_turn_id) = if let Some(branch) =
+            ledger_branch.as_ref()
+        {
+            let parent_turn_id = if replacement_assistant_id.is_some() {
+                old_commit
+                    .as_ref()
+                    .and_then(|commit| commit.parent_turn_id.clone())
+            } else {
+                branch.active_turn_id.clone()
+            };
+            let rebuilt = db::rebuild_session_state_until(
+                &conn,
+                &conversation_id,
+                &branch.branch_id,
+                parent_turn_id.as_deref(),
+            )
             .map_err(|err| err.to_string())?;
-        if replacement_assistant_id.is_none() {
-            db::insert_message(&conn, &conversation_id, "user", &user_text)
+            (rebuilt.soul, rebuilt.session_world, parent_turn_id)
+        } else {
+            let session_world =
+                load_session_world_for_context(&window, &conn, &conversation_id, &fallback_soul)
+                    .map_err(|err| err.to_string())?;
+            (fallback_soul, session_world, None)
+        };
+        let ledger_user_message_id = if replacement_assistant_id.is_none() {
+            let id = db::insert_message_and_get_id(&conn, &conversation_id, "user", &user_text)
                 .map_err(|err| err.to_string())?;
             emit_perf_log(
                 &window,
@@ -1679,7 +1881,12 @@ pub async fn send_api_turn(
                 stage_started.elapsed(),
             );
             stage_started = Instant::now();
-        }
+            Some(id)
+        } else {
+            old_commit
+                .as_ref()
+                .and_then(|commit| commit.user_message_id)
+        };
         let entity_context =
             resolve_speaker_for_turn(&conn, &conversation_id, &soul, &snapshot_user_text)
                 .map_err(|err| err.to_string())?;
@@ -1696,7 +1903,7 @@ pub async fn send_api_turn(
             None => db::list_messages(&conn, &conversation_id, history_limit),
         }
         .map_err(|err| err.to_string())?;
-        let mut replay_sources = recent_assistant_replay_sources(&before_messages, 2);
+        let mut replay_sources = recent_assistant_replay_sources(&before_messages, 3);
         if let Some(message_id) = replacement_assistant_id {
             if let Ok(message) = db::get_message(&conn, &conversation_id, message_id) {
                 if message.role == "assistant" {
@@ -1707,7 +1914,7 @@ pub async fn send_api_turn(
                             content: message.content,
                         },
                     );
-                    replay_sources.truncate(2);
+                    replay_sources.truncate(3);
                 }
             }
         }
@@ -1749,6 +1956,9 @@ pub async fn send_api_turn(
             pre_turn_soul_json,
             entity_context,
             replay_sources,
+            ledger_branch.map(|branch| branch.branch_id),
+            ledger_parent_turn_id,
+            ledger_user_message_id,
         )
     };
     emit_entity_resolution_log(&window, &conversation_id, &entity_context.speaker);
@@ -1831,6 +2041,13 @@ pub async fn send_api_turn(
                 )),
                 truncated: narrator_payload.truncated,
                 created_at: db::now_ts(),
+                branch_id: ledger_branch_id.clone(),
+                active_turn_id: ledger_parent_turn_id.clone(),
+                parent_turn_id: ledger_parent_turn_id.clone(),
+                state_patch_ids_applied: Vec::new(),
+                discarded_patch_ids_skipped: Vec::new(),
+                state_rebuild_generation: None,
+                latest_assistant_variant_id: None,
             },
         )
         .map_err(|err| err.to_string())?
@@ -2028,6 +2245,13 @@ pub async fn send_api_turn(
                             )),
                             truncated: narrator_payload.truncated,
                             created_at: db::now_ts(),
+                            branch_id: ledger_branch_id.clone(),
+                            active_turn_id: ledger_parent_turn_id.clone(),
+                            parent_turn_id: ledger_parent_turn_id.clone(),
+                            state_patch_ids_applied: Vec::new(),
+                            discarded_patch_ids_skipped: Vec::new(),
+                            state_rebuild_generation: None,
+                            latest_assistant_variant_id: None,
                         },
                     )
                     .map_err(|err| err.to_string())
@@ -2054,9 +2278,11 @@ pub async fn send_api_turn(
         {
             Ok(retry_raw_response) => match parse_hidden_state(&retry_raw_response) {
                 Ok(retry_parsed) => {
+                    let pruned_retry_visible =
+                        prune_repeated_scene_setup(&retry_parsed.visible_text, &replay_sources);
                     let (retry_visible_response, retry_guard, retry_output_warning) =
                         guard_narrator_visible_response(
-                            &retry_parsed.visible_text,
+                            &pruned_retry_visible,
                             &snapshot_user_text,
                             &replay_sources,
                         );
@@ -2358,6 +2584,13 @@ pub async fn send_api_turn(
                     estimated_total_tokens: updater_token_estimate,
                     truncated: false,
                     created_at: db::now_ts(),
+                    branch_id: ledger_branch_id.clone(),
+                    active_turn_id: ledger_parent_turn_id.clone(),
+                    parent_turn_id: ledger_parent_turn_id.clone(),
+                    state_patch_ids_applied: Vec::new(),
+                    discarded_patch_ids_skipped: Vec::new(),
+                    state_rebuild_generation: None,
+                    latest_assistant_variant_id: selected_variant_id,
                 },
             )
             .map_err(|err| err.to_string())
@@ -2520,74 +2753,169 @@ pub async fn send_api_turn(
 
     let apply_started = Instant::now();
     let world_patch_present = engine_patch.world_patch.is_some();
-    match engine_patch.apply_to_session(&mut soul, Some(&mut session_world)) {
-        Ok(report) => {
-            emit_perf_log(
-                &window,
-                &conversation_id,
-                "apply EnginePatch",
-                apply_started.elapsed(),
-            );
-            emit_perf_log(
-                &window,
-                &conversation_id,
-                "memory hygiene",
-                apply_started.elapsed(),
-            );
-            emit_dev_log(
-                &window,
-                "success",
-                "state_updater",
-                "EnginePatch applied",
-                Some(serde_json::json!({
-                    "conversation_id": conversation_id.as_str(),
-                    "assistant_message_id": assistant_message_id,
-                    "relationship_updated": report.relationship_updated,
-                    "memories_added": report.memories_added,
-                    "world_updated": report.world_updated,
-                    "world_patch_target": if world_patch_present { "session_world" } else { "none" },
-                    "body_updated": report.body_updated
-                })),
-            );
-            if world_patch_present && report.world_updated {
+    if let Some(world_patch) = engine_patch.world_patch.as_ref() {
+        let world_snapshot = session_world.world_log();
+        for notice in world_patch.object_consistency_notices(&world_snapshot) {
+            if notice.rejected {
                 emit_dev_log(
                     &window,
-                    "success",
+                    "warn",
                     "state_updater",
-                    "world_patch_applied_to_session_world",
+                    "world_object_contradiction_detected",
                     Some(serde_json::json!({
                         "conversation_id": conversation_id.as_str(),
                         "assistant_message_id": assistant_message_id,
                         "session_world_id": session_world.world_id.as_str(),
-                        "source_setting_id": session_world.source_setting_id.as_deref()
+                        "object_id": notice.object_id.as_deref(),
+                        "reason": notice.reason.as_str(),
+                        "event_preview": head_tail_excerpt_chars(&notice.event, 120, 0, 120)
+                    })),
+                );
+                emit_dev_log(
+                    &window,
+                    "warn",
+                    "state_updater",
+                    "world_event_rejected_or_downgraded",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "session_world_id": session_world.world_id.as_str(),
+                        "object_id": notice.object_id.as_deref(),
+                        "reason": notice.reason.as_str()
+                    })),
+                );
+                emit_dev_log(
+                    &window,
+                    "warn",
+                    "ledger",
+                    "state_conflict_detected",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "conflict": "world_object_contradiction",
+                        "object_id": notice.object_id.as_deref(),
+                        "reason": notice.reason.as_str()
                     })),
                 );
             }
-            emit_relationship_delta_logs(&window, &conversation_id, &engine_patch);
-            emit_memory_apply_logs(&window, &conversation_id, &report.memory_events);
-        }
-        Err(err) => {
-            emit_perf_log(
-                &window,
-                &conversation_id,
-                "apply EnginePatch",
-                apply_started.elapsed(),
-            );
-            emit_dev_log(
-                &window,
-                "error",
-                "state_updater",
-                "EnginePatch skipped by validation",
-                Some(serde_json::json!({
-                    "conversation_id": conversation_id.as_str(),
-                    "assistant_message_id": assistant_message_id,
-                    "error": format!("{err:?}")
-                })),
-            )
         }
     }
-    soul.turn_counter += 1;
-    soul.turns_since_consolidation += 1;
+    let ledger_rebuild_debug = if let Some(branch_id) = ledger_branch_id.as_deref() {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        if replacement_assistant_id.is_some() {
+            db::discard_active_commits_for_assistant(&conn, &conversation_id, assistant_message_id)
+                .map_err(|err| err.to_string())?;
+        }
+        let (_commit, _patch_record) = db::record_turn_commit_with_patch(
+            &conn,
+            &conversation_id,
+            branch_id,
+            ledger_parent_turn_id.as_deref(),
+            ledger_user_message_id,
+            assistant_message_id,
+            selected_variant_id,
+            &engine_patch,
+            replacement_assistant_id.is_some(),
+        )
+        .map_err(|err| err.to_string())?;
+        let rebuilt = db::rebuild_session_state(&conn, &conversation_id, branch_id)
+            .map_err(|err| err.to_string())?;
+        soul = rebuilt.soul;
+        session_world = rebuilt.session_world;
+        let rebuild_debug = rebuilt.debug.clone();
+        emit_perf_log(
+            &window,
+            &conversation_id,
+            "apply EnginePatch from ledger",
+            apply_started.elapsed(),
+        );
+        emit_dev_log(
+            &window,
+            "success",
+            "ledger",
+            "branch_state_rebuilt",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "branch_id": rebuild_debug.branch_id,
+                "active_turn_id": rebuild_debug.active_turn_id,
+                "applied_patches": rebuild_debug.applied_patches,
+                "skipped_discarded_patches": rebuild_debug.skipped_discarded_patches,
+                "invalidated_patches": rebuild_debug.invalidated_patches,
+                "rebuild_generation": rebuild_debug.rebuild_generation
+            })),
+        );
+        Some(rebuild_debug)
+    } else {
+        match engine_patch.apply_to_session(&mut soul, Some(&mut session_world)) {
+            Ok(report) => {
+                emit_perf_log(
+                    &window,
+                    &conversation_id,
+                    "apply EnginePatch",
+                    apply_started.elapsed(),
+                );
+                emit_perf_log(
+                    &window,
+                    &conversation_id,
+                    "memory hygiene",
+                    apply_started.elapsed(),
+                );
+                emit_dev_log(
+                    &window,
+                    "success",
+                    "state_updater",
+                    "EnginePatch applied",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "relationship_updated": report.relationship_updated,
+                        "memories_added": report.memories_added,
+                        "world_updated": report.world_updated,
+                        "world_patch_target": if world_patch_present { "session_world" } else { "none" },
+                        "body_updated": report.body_updated
+                    })),
+                );
+                if world_patch_present && report.world_updated {
+                    emit_dev_log(
+                        &window,
+                        "success",
+                        "state_updater",
+                        "world_patch_applied_to_session_world",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "assistant_message_id": assistant_message_id,
+                            "session_world_id": session_world.world_id.as_str(),
+                            "source_setting_id": session_world.source_setting_id.as_deref()
+                        })),
+                    );
+                }
+                emit_relationship_delta_logs(&window, &conversation_id, &engine_patch);
+                emit_memory_apply_logs(&window, &conversation_id, &report.memory_events);
+            }
+            Err(err) => {
+                emit_perf_log(
+                    &window,
+                    &conversation_id,
+                    "apply EnginePatch",
+                    apply_started.elapsed(),
+                );
+                emit_dev_log(
+                    &window,
+                    "error",
+                    "state_updater",
+                    "EnginePatch skipped by validation",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "error": format!("{err:?}")
+                    })),
+                )
+            }
+        }
+        soul.turn_counter += 1;
+        soul.turns_since_consolidation += 1;
+        None
+    };
 
     let refresh_started = Instant::now();
     let (messages, context_preview, consolidation_ran) = {
@@ -2610,8 +2938,20 @@ pub async fn send_api_turn(
                 );
             }
         }
+        if let Some(debug) = ledger_rebuild_debug.as_ref() {
+            for log_id in [Some(payload_log_id), updater_log_id].into_iter().flatten() {
+                let _ = db::set_llm_payload_log_ledger_metadata(
+                    &conn,
+                    log_id,
+                    debug,
+                    ledger_parent_turn_id.as_deref(),
+                    selected_variant_id,
+                );
+            }
+        }
 
-        let consolidation_ran = soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
+        let consolidation_ran = ledger_branch_id.is_none()
+            && soul.turns_since_consolidation >= CONSOLIDATION_INTERVAL_TURNS;
         if consolidation_ran {
             consolidate_soul(&mut soul);
         }
@@ -3038,7 +3378,10 @@ fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContract
         warnings.push("EnginePatch JSON stripped");
     }
 
-    let (body, status_blocks) = remove_status_blocks(&without_engine_patch);
+    let (body, status_blocks, status_recovered) = remove_status_blocks(&without_engine_patch);
+    if status_recovered {
+        warnings.push("malformed status fence recovered");
+    }
     if status_blocks.len() > 1 {
         warnings.push("multiple status blocks normalized");
     }
@@ -3064,30 +3407,34 @@ fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContract
     }
 }
 
-fn remove_status_blocks(content: &str) -> (String, Vec<String>) {
+fn remove_status_blocks(content: &str) -> (String, Vec<String>, bool) {
     let mut body = String::new();
     let mut status_blocks = Vec::new();
-    let mut current_status = String::new();
+    let mut current_status_lines = Vec::new();
     let mut in_status = false;
+    let mut recovered = false;
 
     for line in content.lines() {
         let trimmed = line.trim();
         if !in_status && trimmed.eq_ignore_ascii_case("```status") {
             in_status = true;
-            current_status.clear();
-            current_status.push_str("```status\n");
+            current_status_lines.clear();
             continue;
         }
 
         if in_status {
             if trimmed == "```" {
-                current_status.push_str("```");
-                status_blocks.push(current_status.trim_end().to_string());
-                current_status.clear();
+                recovered |=
+                    finish_status_candidate(&mut body, &mut status_blocks, &current_status_lines);
+                current_status_lines.clear();
                 in_status = false;
+            } else if trimmed.eq_ignore_ascii_case("```status") {
+                recovered = true;
+                recovered |=
+                    finish_status_candidate(&mut body, &mut status_blocks, &current_status_lines);
+                current_status_lines.clear();
             } else {
-                current_status.push_str(line);
-                current_status.push('\n');
+                current_status_lines.push(line.to_string());
             }
             continue;
         }
@@ -3096,11 +3443,56 @@ fn remove_status_blocks(content: &str) -> (String, Vec<String>) {
         body.push('\n');
     }
 
-    if in_status && !current_status.trim().is_empty() {
-        status_blocks.push(current_status.trim_end().to_string());
+    if in_status && !current_status_lines.is_empty() {
+        recovered = true;
+        recovered |= finish_status_candidate(&mut body, &mut status_blocks, &current_status_lines);
     }
 
-    (body.trim_end().to_string(), status_blocks)
+    (body.trim_end().to_string(), status_blocks, recovered)
+}
+
+fn finish_status_candidate(
+    body: &mut String,
+    status_blocks: &mut Vec<String>,
+    lines: &[String],
+) -> bool {
+    let mut prose_lines = Vec::new();
+    let mut status_lines = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "```" || trimmed.eq_ignore_ascii_case("```status") {
+            continue;
+        }
+        if is_status_summary_line(trimmed) {
+            status_lines.push(line.trim_end().to_string());
+        } else {
+            prose_lines.push(line.trim_end().to_string());
+        }
+    }
+
+    if !prose_lines.is_empty() {
+        if !body.trim().is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&prose_lines.join("\n"));
+        body.push('\n');
+    }
+    if !status_lines.is_empty() {
+        status_blocks.push(format!("```status\n{}\n```", status_lines.join("\n")));
+    }
+
+    !prose_lines.is_empty() || status_lines.len() > 1
+}
+
+fn is_status_summary_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("scene |")
+        || lower.starts_with("scene:")
+        || lower.starts_with("focus:")
+        || lower.starts_with("physical state:")
+        || lower.starts_with("atmosphere:")
+        || (lower.contains("scene | focus:")
+            && (lower.contains("physical state:") || lower.contains("atmosphere:")))
 }
 
 fn normalize_status_block(status_block: &str) -> String {
@@ -3306,12 +3698,17 @@ fn compare_replay_against_source(new_response: &str, source: &ReplaySource) -> R
     let paragraph_score = paragraph_replay_score(new_response, &source.content);
     let sentence_score = sentence_overlap_score(&new_clean, &previous_clean);
     let shingle_score = shingle_overlap_score(&new_clean, &previous_clean, 10);
+    let setup_score = scene_setup_replay_score(new_response, &source.content);
     let (score, reason) = [
         (paragraph_score, "paragraph nearly identical"),
         (sentence_score, "sentence overlap exceeded threshold"),
         (
             shingle_score,
             "repeated wording shingles exceeded threshold",
+        ),
+        (
+            setup_score,
+            "repeated scene setup, object list, or opening beat",
         ),
     ]
     .into_iter()
@@ -3323,7 +3720,8 @@ fn compare_replay_against_source(new_response: &str, source: &ReplaySource) -> R
     .unwrap_or((0.0, "no overlap"));
     let replay_detected = score > 0.35
         || (paragraph_score >= 0.90
-            && repeated_long_paragraph_exists(new_response, &source.content));
+            && repeated_long_paragraph_exists(new_response, &source.content))
+        || setup_score >= 0.42;
 
     ReplayGuardResult {
         replay_detected,
@@ -3333,8 +3731,152 @@ fn compare_replay_against_source(new_response: &str, source: &ReplaySource) -> R
     }
 }
 
+fn scene_setup_replay_score(new_response: &str, previous_response: &str) -> f32 {
+    let new_setup = scene_setup_markers(new_response);
+    let previous_setup = scene_setup_markers(previous_response);
+    if new_setup.len() < 3 || previous_setup.len() < 3 {
+        return 0.0;
+    }
+    let overlap = new_setup.intersection(&previous_setup).count();
+    let object_score = overlap as f32 / new_setup.len().min(previous_setup.len()) as f32;
+    let opening_score = opening_beat_overlap_score(new_response, previous_response);
+    object_score.max(opening_score)
+}
+
+fn scene_setup_markers(response: &str) -> HashSet<&'static str> {
+    let setup = normalize_for_replay(&first_replay_chars(response, 1_200));
+    let mut markers = HashSet::new();
+    for (marker, needles) in SCENE_SETUP_MARKERS {
+        if needles.iter().any(|needle| setup.contains(needle)) {
+            markers.insert(*marker);
+        }
+    }
+    markers
+}
+
+const SCENE_SETUP_MARKERS: &[(&str, &[&str])] = &[
+    (
+        "door_state",
+        &[
+            "unlocked door",
+            "door unlocked",
+            "door state",
+            "open door",
+            "closed door",
+        ],
+    ),
+    ("neon", &["neon"]),
+    ("rain", &["rain", "rain streak", "rain slick", "rain-slick"]),
+    ("room", &["room", "apartment", "cell", "lab"]),
+    ("wine_glass", &["wine glass", "glass of wine"]),
+    ("phone", &["phone", "handset", "screen"]),
+    ("barefoot", &["barefoot", "bare feet"]),
+    (
+        "oversized_shirt",
+        &["oversized shirt", "shirt hanging", "loose shirt"],
+    ),
+    ("clothing", &["clothing", "shirt", "sleeve", "hem"]),
+    (
+        "physical_arrangement",
+        &["couch", "bed", "table", "doorway", "window"],
+    ),
+];
+
+fn first_replay_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn opening_beat_overlap_score(new_response: &str, previous_response: &str) -> f32 {
+    let new_opening = normalize_for_replay(&first_replay_chars(new_response, 500));
+    let previous_opening = normalize_for_replay(&first_replay_chars(previous_response, 500));
+    if new_opening.is_empty() || previous_opening.is_empty() {
+        return 0.0;
+    }
+    word_jaccard_similarity(&new_opening, &previous_opening)
+}
+
+fn prune_repeated_scene_setup(response: &str, replay_sources: &[ReplaySource]) -> String {
+    let repeated_markers = replay_sources
+        .iter()
+        .flat_map(|source| scene_setup_markers(&source.content))
+        .collect::<HashSet<_>>();
+    if repeated_markers.len() < 3 {
+        return response.to_string();
+    }
+
+    let mut pruned = String::new();
+    let mut removed = false;
+    for segment in split_replay_segments(response) {
+        let normalized = normalize_for_replay(segment);
+        let marker_hits = repeated_markers
+            .iter()
+            .filter(|marker| marker_appears_in_text(marker, &normalized))
+            .count();
+        let setup_inventory = marker_hits >= 3
+            || (marker_hits >= 2
+                && contains_any_normalized(
+                    &normalized,
+                    &[
+                        "room", "door", "clothing", "object", "glass", "phone", "rain", "neon",
+                    ],
+                ));
+        if setup_inventory {
+            removed = true;
+            continue;
+        }
+        pruned.push_str(segment);
+    }
+
+    let pruned = pruned.trim();
+    if removed && pruned.chars().count() >= 40 {
+        pruned.to_string()
+    } else {
+        response.to_string()
+    }
+}
+
+fn split_replay_segments(response: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0usize;
+    for (index, character) in response.char_indices() {
+        if matches!(character, '.' | '!' | '?' | '\n') {
+            let end = index + character.len_utf8();
+            if let Some(segment) = response.get(start..end) {
+                if !segment.trim().is_empty() {
+                    segments.push(segment);
+                }
+            }
+            start = end;
+        }
+    }
+    if start < response.len() {
+        if let Some(segment) = response.get(start..) {
+            if !segment.trim().is_empty() {
+                segments.push(segment);
+            }
+        }
+    }
+    segments
+}
+
+fn marker_appears_in_text(marker: &str, normalized_text: &str) -> bool {
+    SCENE_SETUP_MARKERS
+        .iter()
+        .find(|(candidate, _)| *candidate == marker)
+        .map(|(_, needles)| {
+            needles
+                .iter()
+                .any(|needle| normalized_text.contains(needle))
+        })
+        .unwrap_or(false)
+}
+
+fn contains_any_normalized(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
 fn normalize_for_replay(content: &str) -> String {
-    let (without_status, _) = remove_status_blocks(&strip_hidden_state_blocks(content));
+    let (without_status, _, _) = remove_status_blocks(&strip_hidden_state_blocks(content));
     let (without_patch, _) = strip_engine_patch_payloads(&without_status);
     without_patch
         .to_lowercase()
@@ -3435,7 +3977,7 @@ fn repeated_long_paragraph_exists(new_response: &str, previous_response: &str) -
 }
 
 fn replay_paragraphs(content: &str) -> Vec<String> {
-    let (without_status, _) = remove_status_blocks(&strip_hidden_state_blocks(content));
+    let (without_status, _, _) = remove_status_blocks(&strip_hidden_state_blocks(content));
     without_status
         .split("\n\n")
         .map(normalize_for_replay)
@@ -3462,7 +4004,7 @@ fn messages_with_repair_instruction(messages: &[ApiMessage]) -> Vec<ApiMessage> 
         .find(|message| message.role == "user")
     {
         last_user.content = format!(
-            "{}\n\n[REPAIR INSTRUCTION - HIGH PRIORITY]\nThe previous draft repeated earlier narration. Continue from the latest user input and do not reuse previous wording.",
+            "{}\n\n[REPAIR INSTRUCTION - HIGH PRIORITY]\nThe previous draft repeated earlier narration. Do not restate the room setup, clothing, object list, door state, or previous physical arrangement unless changed. Use at most one short anchor detail, then advance the scene from the latest user input. Do not reuse previous wording, opening beats, or setup inventory.",
             last_user.content.trim()
         );
     }
@@ -3546,6 +4088,16 @@ fn resolve_speaker_label(
     entities: &mut [EntityRecord],
     label: &str,
 ) -> rusqlite::Result<SpeakerResolution> {
+    if is_ooc_channel_label(label) {
+        return Ok(SpeakerResolution {
+            label: Some(label.to_string()),
+            entity_id: "default_player".into(),
+            display_name: "User".into(),
+            status: SpeakerResolutionStatus::NoLabel,
+            candidates: Vec::new(),
+        });
+    }
+
     if let Some(entity) = exact_entity_match(entities, label) {
         return Ok(SpeakerResolution {
             label: Some(label.to_string()),
@@ -3754,8 +4306,25 @@ fn label_can_create_entity(label: &str) -> bool {
         && normalized.len() <= 40
         && !matches!(
             normalized.as_str(),
-            "i" | "me" | "we" | "he" | "she" | "they" | "system" | "assistant" | "narrator"
+            "i" | "me"
+                | "we"
+                | "he"
+                | "she"
+                | "they"
+                | "system"
+                | "assistant"
+                | "narrator"
+                | "ooc"
+                | "out_of_character"
+                | "out_of_character_note"
         )
+}
+
+fn is_ooc_channel_label(label: &str) -> bool {
+    matches!(
+        normalize_match_key(label).as_str(),
+        "ooc" | "out_of_character" | "out_of_character_note"
+    )
 }
 
 fn normalize_entity_id(label: &str) -> String {
@@ -4108,6 +4677,9 @@ fn sanitize_state_updater_patch(
         patch.body_patch = None;
     }
 
+    if patch.world_patch.is_none() && is_retcon_or_correction_text(user_text) {
+        patch.world_patch = Some(Default::default());
+    }
     if let Some(world_patch) = patch.world_patch.as_mut() {
         if let Some(time) = world_patch.time_elapsed.as_mut() {
             *time = normalize_time_for_updater(time);
@@ -4127,6 +4699,12 @@ fn sanitize_state_updater_patch(
             }
         }
         cleanup_stale_active_plots(soul, world_patch, &turn_text);
+        if is_retcon_or_correction_text(user_text) {
+            world_patch.retcon_scope.get_or_insert("latest_turn".into());
+            world_patch.correction_note.get_or_insert_with(|| {
+                "Retcon: phone did not buzz because notifications were off / no vibration / screen wake disabled.".into()
+            });
+        }
         if world_patch.is_empty_for_commands() {
             patch.world_patch = None;
         }
@@ -4903,6 +5481,7 @@ fn build_llm_payload_preview(
             user: user_tokens,
             total: system_tokens + user_tokens + context_tokens,
         },
+        memory_slot_debug: context_preview.memory_slot_debug.clone(),
     }
 }
 
@@ -5740,6 +6319,23 @@ mod tests {
             .entities
             .iter()
             .any(|entity| entity.entity_id == "rhy" && entity.display_name == "Rhy"));
+    }
+
+    #[test]
+    fn ooc_label_does_not_create_entity() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert");
+        db::ensure_conversation(&conn, "ooc", &soul.character_id).expect("conversation");
+
+        let context =
+            resolve_speaker_for_turn(&conn, "ooc", &soul, "OOC: that contradicts the setting.")
+                .expect("resolve");
+
+        assert_eq!(context.speaker.entity_id, "default_player");
+        assert_eq!(context.speaker.status, SpeakerResolutionStatus::NoLabel);
+        let entities = db::list_entities(&conn, "ooc").expect("entities");
+        assert!(!entities.iter().any(|entity| entity.entity_id == "ooc"));
     }
 
     #[test]
@@ -6760,6 +7356,13 @@ mod tests {
                 estimated_total_tokens: 6,
                 truncated: false,
                 created_at: 100,
+                branch_id: None,
+                active_turn_id: None,
+                parent_turn_id: None,
+                state_patch_ids_applied: Vec::new(),
+                discarded_patch_ids_skipped: Vec::new(),
+                state_rebuild_generation: None,
+                latest_assistant_variant_id: None,
             },
         )
         .expect("payload log");
@@ -6890,6 +7493,13 @@ mod tests {
                 estimated_total_tokens: 12,
                 truncated: false,
                 created_at: 100,
+                branch_id: None,
+                active_turn_id: None,
+                parent_turn_id: None,
+                state_patch_ids_applied: Vec::new(),
+                discarded_patch_ids_skipped: Vec::new(),
+                state_rebuild_generation: None,
+                latest_assistant_variant_id: None,
             },
             LlmPayloadLog {
                 id: 2,
@@ -6908,6 +7518,13 @@ mod tests {
                 estimated_total_tokens: 14,
                 truncated: false,
                 created_at: 101,
+                branch_id: None,
+                active_turn_id: None,
+                parent_turn_id: None,
+                state_patch_ids_applied: Vec::new(),
+                discarded_patch_ids_skipped: Vec::new(),
+                state_rebuild_generation: None,
+                latest_assistant_variant_id: None,
             },
         ];
 
@@ -6945,6 +7562,13 @@ mod tests {
                 estimated_total_tokens: 2,
                 truncated: false,
                 created_at: 100,
+                branch_id: None,
+                active_turn_id: None,
+                parent_turn_id: None,
+                state_patch_ids_applied: Vec::new(),
+                discarded_patch_ids_skipped: Vec::new(),
+                state_rebuild_generation: None,
+                latest_assistant_variant_id: None,
             },
             LlmPayloadLog {
                 id: 2,
@@ -6963,6 +7587,13 @@ mod tests {
                 estimated_total_tokens: 2,
                 truncated: false,
                 created_at: 101,
+                branch_id: None,
+                active_turn_id: None,
+                parent_turn_id: None,
+                state_patch_ids_applied: Vec::new(),
+                discarded_patch_ids_skipped: Vec::new(),
+                state_rebuild_generation: None,
+                latest_assistant_variant_id: None,
             },
         ];
 
@@ -6993,6 +7624,13 @@ mod tests {
                 estimated_total_tokens: 2,
                 truncated: false,
                 created_at: 100,
+                branch_id: None,
+                active_turn_id: None,
+                parent_turn_id: None,
+                state_patch_ids_applied: Vec::new(),
+                discarded_patch_ids_skipped: Vec::new(),
+                state_rebuild_generation: None,
+                latest_assistant_variant_id: None,
             },
             LlmPayloadLog {
                 id: 2,
@@ -7011,6 +7649,13 @@ mod tests {
                 estimated_total_tokens: 2,
                 truncated: false,
                 created_at: 101,
+                branch_id: None,
+                active_turn_id: None,
+                parent_turn_id: None,
+                state_patch_ids_applied: Vec::new(),
+                discarded_patch_ids_skipped: Vec::new(),
+                state_rebuild_generation: None,
+                latest_assistant_variant_id: None,
             },
         ];
 
@@ -7072,6 +7717,45 @@ mod tests {
         assert!(result.text.contains("Aurora exhales before answering."));
         assert!(result.text.contains("The hallway stays quiet."));
         assert!(result.text.contains("```status"));
+    }
+
+    #[test]
+    fn malformed_status_fence_recovers_prose_and_keeps_one_status_block() {
+        let raw = "```status\nAurora goes still beneath the user's hand, breath catching once before she looks up.\nThe old doorway beat should not be replayed.\n```status\nScene | Focus: Aurora | Physical state: Still | Atmosphere: Quiet pressure\n```";
+
+        let result = apply_output_contract_guard(raw, "I pat her head.");
+
+        assert!(result
+            .text
+            .contains("Aurora goes still beneath the user's hand"));
+        assert!(result
+            .text
+            .contains("old doorway beat should not be replayed"));
+        assert_eq!(result.text.matches("```status").count(), 1);
+        assert!(result
+            .text
+            .ends_with("```status\nScene | Focus: Aurora | Physical state: Still | Atmosphere: Quiet pressure\n```"));
+        assert!(result
+            .warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("malformed status fence recovered"));
+    }
+
+    #[test]
+    fn status_fence_with_only_prose_gets_visible_fallback_status() {
+        let raw = "```status\nAurora leans into the pat for one quiet beat, then catches herself before choosing whether to pull away.\n```";
+
+        let result = apply_output_contract_guard(raw, "I pat her head.");
+
+        assert!(result.text.starts_with("Aurora leans into the pat"));
+        assert_eq!(result.text.matches("```status").count(), 1);
+        assert!(result.text.contains("Scene | Focus: Unknown"));
+        assert!(result
+            .warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("malformed status fence recovered"));
     }
 
     #[test]
@@ -7146,6 +7830,81 @@ mod tests {
 
         assert!(!result.replay_detected);
         assert!(result.replay_score <= 0.35);
+    }
+
+    #[test]
+    fn anti_replay_detects_repeated_room_setup_and_object_list() {
+        let source = ReplaySource {
+            message_id: 11,
+            content: "The unlocked door throws a bar of neon across the rain-streaked room. A wine glass waits beside the phone while Aurora stands barefoot in an oversized shirt near the couch.".into(),
+        };
+        let repeated = "The unlocked door is still open to the neon and rain. The room holds the same wine glass, the phone, the couch, and Aurora barefoot in the oversized shirt before anything else moves.";
+
+        let result = detect_replay(repeated, &[source]);
+
+        assert!(result.replay_detected);
+        assert_eq!(result.compared_against_message_id, Some(11));
+        assert!(result
+            .replay_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("scene setup"));
+    }
+
+    #[test]
+    fn anti_replay_compares_against_three_recent_assistant_sources() {
+        let sources = vec![
+            ReplaySource {
+                message_id: 1,
+                content: "A distinct first prior response.".into(),
+            },
+            ReplaySource {
+                message_id: 2,
+                content: "Another unrelated prior response.".into(),
+            },
+            ReplaySource {
+                message_id: 3,
+                content: "The unlocked door, neon rain, wine glass, phone, barefoot Aurora, and oversized shirt freeze the old setup.".into(),
+            },
+        ];
+        let repeated =
+            "The unlocked door and neon rain frame the wine glass, phone, barefoot Aurora, and oversized shirt again.";
+
+        let result = detect_replay(repeated, &sources);
+
+        assert!(result.replay_detected);
+        assert_eq!(result.compared_against_message_id, Some(3));
+    }
+
+    #[test]
+    fn anti_replay_repair_instruction_blocks_setup_inventory() {
+        let messages = vec![
+            ApiMessage::system("system".to_string()),
+            ApiMessage::user("I step through the doorway.".to_string()),
+        ];
+
+        let repaired = messages_with_repair_instruction(&messages);
+        let instruction = last_user_message_content(&repaired);
+
+        assert!(instruction.contains("Do not restate the room setup"));
+        assert!(instruction.contains("clothing, object list, door state"));
+        assert!(instruction.contains("advance the scene from the latest user input"));
+    }
+
+    #[test]
+    fn anti_replay_prunes_repeated_setup_from_retry_but_keeps_advancement() {
+        let sources = vec![ReplaySource {
+            message_id: 14,
+            content: "The unlocked door opens onto neon rain. The room still has the wine glass, phone, couch, barefoot Aurora, and oversized shirt.".into(),
+        }];
+        let retry = "The unlocked door opens onto neon rain, with the wine glass, phone, couch, barefoot Aurora, and oversized shirt arranged exactly as before. Aurora twists under the user's block, catches the forearm against her jaw, and drives a shoulder forward to break the grip.";
+
+        let pruned = prune_repeated_scene_setup(retry, &sources);
+
+        assert!(!pruned.contains("wine glass"));
+        assert!(!pruned.contains("oversized shirt arranged"));
+        assert!(pruned.contains("catches the forearm"));
+        assert!(pruned.contains("break the grip"));
     }
 
     fn assert_order(text: &str, first: &str, second: &str) {

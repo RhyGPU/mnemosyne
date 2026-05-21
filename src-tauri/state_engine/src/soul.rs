@@ -185,6 +185,10 @@ const fn default_lived_experience() -> bool {
     true
 }
 
+const fn default_memory_active() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MemoryEntry {
     pub id: String,
@@ -221,6 +225,14 @@ pub struct MemoryEntry {
     pub truth_status: TruthStatus,
     #[serde(default)]
     pub architecture_verified: bool,
+    #[serde(default = "default_memory_active")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub invalidated_by_patch_id: Option<String>,
+    #[serde(default)]
+    pub superseded_by_memory_id: Option<String>,
+    #[serde(default)]
+    pub is_retconned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -308,7 +320,11 @@ pub struct WorldLog {
     pub location: String,
     pub active_plots: Vec<String>,
     pub recent_events: Vec<String>,
+    #[serde(default)]
+    pub recent_event_records: Vec<WorldEventRecord>,
     pub key_objects: Vec<String>,
+    #[serde(default)]
+    pub object_states: Vec<ObjectState>,
     pub time_elapsed: String,
     #[serde(default)]
     pub dominant_current_plot: Option<PlotEntry>,
@@ -326,7 +342,9 @@ impl Default for WorldLog {
             location: "Unspecified starting scene.".into(),
             active_plots: vec!["Establish the first scene".into()],
             recent_events: Vec::new(),
+            recent_event_records: Vec::new(),
             key_objects: Vec::new(),
+            object_states: Vec::new(),
             time_elapsed: "Session start".into(),
             dominant_current_plot: None,
             background_plots: Vec::new(),
@@ -334,6 +352,78 @@ impl Default for WorldLog {
             stale_plot_decay: 0.12,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorldEventRecord {
+    pub recent_event_id: String,
+    pub content: String,
+    #[serde(default = "default_world_event_active")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub invalidated_by_patch_id: Option<String>,
+    #[serde(default)]
+    pub superseded_by_event_id: Option<String>,
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+const fn default_world_event_active() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObjectState {
+    #[serde(default)]
+    pub object_observation_id: Option<String>,
+    pub object_id: String,
+    #[serde(default)]
+    pub owner_entity_id: Option<String>,
+    #[serde(default)]
+    pub location: String,
+    #[serde(default = "unknown_object_field")]
+    pub power_state: String,
+    #[serde(default = "unknown_object_field")]
+    pub notification_mode: String,
+    #[serde(default)]
+    pub vibrate_enabled: Option<bool>,
+    #[serde(default)]
+    pub screen_wake_enabled: Option<bool>,
+    #[serde(default)]
+    pub can_receive_calls: Option<bool>,
+    #[serde(default)]
+    pub can_receive_texts: Option<bool>,
+    #[serde(default)]
+    pub last_observed_state: String,
+    #[serde(default = "default_object_confidence")]
+    pub confidence: f32,
+}
+
+impl Default for ObjectState {
+    fn default() -> Self {
+        Self {
+            object_observation_id: None,
+            object_id: String::new(),
+            owner_entity_id: None,
+            location: String::new(),
+            power_state: unknown_object_field(),
+            notification_mode: unknown_object_field(),
+            vibrate_enabled: None,
+            screen_wake_enabled: None,
+            can_receive_calls: None,
+            can_receive_texts: None,
+            last_observed_state: String::new(),
+            confidence: default_object_confidence(),
+        }
+    }
+}
+
+fn unknown_object_field() -> String {
+    "unknown".into()
+}
+
+fn default_object_confidence() -> f32 {
+    0.5
 }
 
 impl Soul {
@@ -590,6 +680,12 @@ mod tests {
             interpretation: None,
             confidence: None,
             objective_event_id: None,
+            truth_status: TruthStatus::Unknown,
+            architecture_verified: false,
+            is_active: true,
+            invalidated_by_patch_id: None,
+            superseded_by_memory_id: None,
+            is_retconned: false,
         });
         soul.memory.schemas.push(SchemaEntry {
             schema_type: "attachment_pattern".into(),

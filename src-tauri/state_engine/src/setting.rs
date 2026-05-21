@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::{
     schema::CURRENT_SCHEMA_VERSION,
-    soul::{current_timestamp, PlotEntry, WorldLog},
+    soul::{current_timestamp, ObjectState, PlotEntry, WorldLog},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -46,7 +46,11 @@ pub struct SessionWorld {
     pub location: String,
     pub active_plots: Vec<String>,
     pub recent_events: Vec<String>,
+    #[serde(default)]
+    pub recent_event_records: Vec<crate::soul::WorldEventRecord>,
     pub key_objects: Vec<String>,
+    #[serde(default)]
+    pub object_states: Vec<ObjectState>,
     pub time_elapsed: String,
     #[serde(default)]
     pub dominant_current_plot: Option<PlotEntry>,
@@ -72,7 +76,9 @@ impl SessionWorld {
             location: self.location.clone(),
             active_plots: self.active_plots.clone(),
             recent_events: self.recent_events.clone(),
+            recent_event_records: self.recent_event_records.clone(),
             key_objects: self.key_objects.clone(),
+            object_states: self.object_states.clone(),
             time_elapsed: self.time_elapsed.clone(),
             dominant_current_plot: self.dominant_current_plot.clone(),
             background_plots: self.background_plots.clone(),
@@ -85,7 +91,9 @@ impl SessionWorld {
         self.location = world.location.clone();
         self.active_plots = world.active_plots.clone();
         self.recent_events = world.recent_events.clone();
+        self.recent_event_records = world.recent_event_records.clone();
         self.key_objects = world.key_objects.clone();
+        self.object_states = world.object_states.clone();
         self.time_elapsed = world.time_elapsed.clone();
         self.dominant_current_plot = world.dominant_current_plot.clone();
         self.background_plots = world.background_plots.clone();
@@ -106,7 +114,9 @@ pub fn session_world_from_setting(setting: &SettingSoul) -> SessionWorld {
         location: setting.world.location.clone(),
         active_plots: setting.world.active_plots.clone(),
         recent_events: setting.world.recent_events.clone(),
+        recent_event_records: setting.world.recent_event_records.clone(),
         key_objects: setting.world.key_objects.clone(),
+        object_states: setting.world.object_states.clone(),
         time_elapsed: setting.world.time_elapsed.clone(),
         dominant_current_plot: setting.world.dominant_current_plot.clone(),
         background_plots: setting.world.background_plots.clone(),
@@ -134,7 +144,9 @@ pub fn session_world_from_legacy_world(
         location: world.location.clone(),
         active_plots: world.active_plots.clone(),
         recent_events: world.recent_events.clone(),
+        recent_event_records: world.recent_event_records.clone(),
         key_objects: world.key_objects.clone(),
+        object_states: world.object_states.clone(),
         time_elapsed: world.time_elapsed.clone(),
         dominant_current_plot: world.dominant_current_plot.clone(),
         background_plots: world.background_plots.clone(),

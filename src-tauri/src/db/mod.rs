@@ -1,14 +1,20 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use state_engine::{
+    patch::EnginePatch,
     setting::{
         session_world_from_legacy_world, session_world_from_setting, SessionWorld, SettingSoul,
     },
     soul::Soul,
 };
 use tauri::{AppHandle, Manager};
+
+static LEDGER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SoulSummary {
@@ -116,6 +122,20 @@ pub struct LlmPayloadLog {
     pub estimated_total_tokens: usize,
     pub truncated: bool,
     pub created_at: i64,
+    #[serde(default)]
+    pub branch_id: Option<String>,
+    #[serde(default)]
+    pub active_turn_id: Option<String>,
+    #[serde(default)]
+    pub parent_turn_id: Option<String>,
+    #[serde(default)]
+    pub state_patch_ids_applied: Vec<String>,
+    #[serde(default)]
+    pub discarded_patch_ids_skipped: Vec<String>,
+    #[serde(default)]
+    pub state_rebuild_generation: Option<i64>,
+    #[serde(default)]
+    pub latest_assistant_variant_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -150,6 +170,67 @@ pub struct TurnSnapshot {
     pub assistant_message_id: i64,
     pub user_text: String,
     pub soul_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionBranch {
+    pub branch_id: String,
+    pub conversation_id: String,
+    pub base_soul_json: String,
+    pub base_session_world_json: String,
+    pub active_turn_id: Option<String>,
+    pub rebuild_generation: i64,
+    pub is_active: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnCommit {
+    pub turn_id: String,
+    pub conversation_id: String,
+    pub branch_id: String,
+    pub parent_turn_id: Option<String>,
+    pub user_message_id: Option<i64>,
+    pub assistant_message_id: Option<i64>,
+    pub state_patch_id: Option<String>,
+    pub selected_variant_id: Option<i64>,
+    pub created_at: i64,
+    pub active_variant: bool,
+    pub is_active: bool,
+    pub is_discarded: bool,
+    pub is_regenerated_variant: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatePatchRecord {
+    pub patch_id: String,
+    pub turn_id: String,
+    pub parent_state_hash: Option<String>,
+    pub patch_json: String,
+    pub inverse_patch_json: Option<String>,
+    pub applied_at: i64,
+    pub applies_to: String,
+    pub is_active: bool,
+    pub invalidated_by_patch_id: Option<String>,
+    pub supersedes_patch_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BranchPatchDebug {
+    pub branch_id: String,
+    pub active_turn_id: Option<String>,
+    pub rebuild_generation: i64,
+    pub applied_patches: Vec<String>,
+    pub skipped_discarded_patches: Vec<String>,
+    pub invalidated_patches: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LedgerRebuild {
+    pub soul: Soul,
+    pub session_world: SessionWorld,
+    pub debug: BranchPatchDebug,
 }
 
 pub fn connection_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -348,6 +429,63 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
         ON message_attachments(message_id);
+
+        CREATE TABLE IF NOT EXISTS session_branches (
+            branch_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            base_soul_json TEXT NOT NULL,
+            base_session_world_json TEXT NOT NULL,
+            active_turn_id TEXT,
+            rebuild_generation INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_session_branches_conversation_active
+        ON session_branches(conversation_id, is_active);
+
+        CREATE TABLE IF NOT EXISTS turn_commits (
+            turn_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            branch_id TEXT NOT NULL,
+            parent_turn_id TEXT,
+            user_message_id INTEGER,
+            assistant_message_id INTEGER,
+            state_patch_id TEXT,
+            selected_variant_id INTEGER,
+            created_at INTEGER NOT NULL,
+            active_variant INTEGER NOT NULL DEFAULT 1,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            is_discarded INTEGER NOT NULL DEFAULT 0,
+            is_regenerated_variant INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+            FOREIGN KEY (branch_id) REFERENCES session_branches(branch_id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_turn_id) REFERENCES turn_commits(turn_id) ON DELETE SET NULL,
+            FOREIGN KEY (user_message_id) REFERENCES messages(id) ON DELETE SET NULL,
+            FOREIGN KEY (assistant_message_id) REFERENCES messages(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_turn_commits_branch_active
+        ON turn_commits(branch_id, is_active, created_at);
+
+        CREATE TABLE IF NOT EXISTS state_patches (
+            patch_id TEXT PRIMARY KEY,
+            turn_id TEXT NOT NULL,
+            parent_state_hash TEXT,
+            patch_json TEXT NOT NULL,
+            inverse_patch_json TEXT,
+            applied_at INTEGER NOT NULL,
+            applies_to TEXT NOT NULL DEFAULT 'session',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            invalidated_by_patch_id TEXT,
+            supersedes_patch_id TEXT,
+            FOREIGN KEY (turn_id) REFERENCES turn_commits(turn_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_state_patches_turn_active
+        ON state_patches(turn_id, is_active);
         ",
     )?;
     add_column_if_missing(
@@ -394,6 +532,43 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     add_column_if_missing(conn, "conversations", "world_id", "TEXT")?;
     add_column_if_missing(conn, "conversations", "source_setting_id", "TEXT")?;
+    add_column_if_missing(conn, "messages", "branch_id", "TEXT")?;
+    add_column_if_missing(conn, "messages", "is_active", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "assistant_message_variants", "turn_id", "TEXT")?;
+    add_column_if_missing(conn, "assistant_message_variants", "state_patch_id", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "assistant_message_variants",
+        "is_discarded",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "llm_payload_logs", "branch_id", "TEXT")?;
+    add_column_if_missing(conn, "llm_payload_logs", "active_turn_id", "TEXT")?;
+    add_column_if_missing(conn, "llm_payload_logs", "parent_turn_id", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "llm_payload_logs",
+        "state_patch_ids_applied_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "llm_payload_logs",
+        "discarded_patch_ids_skipped_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "llm_payload_logs",
+        "state_rebuild_generation",
+        "INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "llm_payload_logs",
+        "latest_assistant_variant_id",
+        "INTEGER",
+    )?;
     if added_soul_summary_columns {
         backfill_soul_summary_columns(conn)?;
     }
@@ -478,6 +653,15 @@ fn backfill_setting_summary_columns(conn: &Connection) -> rusqlite::Result<()> {
 
 pub fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+fn ledger_id(prefix: &str) -> String {
+    format!(
+        "{}_{}_{}",
+        prefix,
+        chrono::Utc::now().timestamp_millis(),
+        LEDGER_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn normalized_soul_kind(kind: &str) -> String {
@@ -875,14 +1059,14 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             (
                 SELECT content
                 FROM messages
-                WHERE conversation_id = c.id
+                WHERE conversation_id = c.id AND is_active != 0
                 ORDER BY id DESC
                 LIMIT 1
             ) AS last_message_preview,
             (
                 SELECT COUNT(*)
                 FROM messages
-                WHERE conversation_id = c.id
+                WHERE conversation_id = c.id AND is_active != 0
             ) AS message_count
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
@@ -961,7 +1145,7 @@ fn last_message_preview(
     conn.query_row(
         "
         SELECT content FROM messages
-        WHERE conversation_id = ?1
+        WHERE conversation_id = ?1 AND is_active != 0
         ORDER BY id DESC
         LIMIT 1
         ",
@@ -974,7 +1158,7 @@ fn last_message_preview(
 
 fn count_messages(conn: &Connection, conversation_id: &str) -> rusqlite::Result<i64> {
     conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND is_active != 0",
         [conversation_id],
         |row| row.get(0),
     )
@@ -1454,8 +1638,8 @@ pub fn insert_llm_payload_log(conn: &Connection, log: &LlmPayloadLog) -> rusqlit
     conn.execute(
         "
         INSERT INTO llm_payload_logs
-            (conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            (conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
         ",
         params![
             log.conversation_id,
@@ -1473,6 +1657,13 @@ pub fn insert_llm_payload_log(conn: &Connection, log: &LlmPayloadLog) -> rusqlit
             log.estimated_total_tokens as i64,
             if log.truncated { 1 } else { 0 },
             log.created_at,
+            log.branch_id,
+            log.active_turn_id,
+            log.parent_turn_id,
+            serde_json::to_string(&log.state_patch_ids_applied).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&log.discarded_patch_ids_skipped).unwrap_or_else(|_| "[]".into()),
+            log.state_rebuild_generation,
+            log.latest_assistant_variant_id,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1490,13 +1681,46 @@ pub fn set_llm_payload_log_message_id(
     Ok(affected > 0)
 }
 
+pub fn set_llm_payload_log_ledger_metadata(
+    conn: &Connection,
+    log_id: i64,
+    debug: &BranchPatchDebug,
+    parent_turn_id: Option<&str>,
+    latest_assistant_variant_id: Option<i64>,
+) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "
+        UPDATE llm_payload_logs
+        SET branch_id = ?1,
+            active_turn_id = ?2,
+            parent_turn_id = ?3,
+            state_patch_ids_applied_json = ?4,
+            discarded_patch_ids_skipped_json = ?5,
+            state_rebuild_generation = ?6,
+            latest_assistant_variant_id = ?7
+        WHERE id = ?8
+        ",
+        params![
+            debug.branch_id,
+            debug.active_turn_id,
+            parent_turn_id,
+            serde_json::to_string(&debug.applied_patches).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&debug.skipped_discarded_patches).unwrap_or_else(|_| "[]".into()),
+            debug.rebuild_generation,
+            latest_assistant_variant_id,
+            log_id
+        ],
+    )?;
+    Ok(affected > 0)
+}
+
 pub fn list_llm_payload_logs(
     conn: &Connection,
     conversation_id: &str,
 ) -> rusqlite::Result<Vec<LlmPayloadLog>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at
+        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id
         FROM llm_payload_logs
         WHERE conversation_id = ?1
         ORDER BY id ASC
@@ -1509,7 +1733,7 @@ pub fn list_llm_payload_logs(
 pub fn get_llm_payload_log(conn: &Connection, log_id: i64) -> rusqlite::Result<LlmPayloadLog> {
     conn.query_row(
         "
-        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at
+        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id
         FROM llm_payload_logs
         WHERE id = ?1
         ",
@@ -1530,7 +1754,7 @@ pub fn list_messages_before_id(
         FROM (
             SELECT id, conversation_id, role, content, created_at
             FROM messages
-            WHERE conversation_id = ?1 AND id < ?2
+            WHERE conversation_id = ?1 AND id < ?2 AND is_active != 0
             ORDER BY id DESC
             LIMIT ?3
         )
@@ -1629,7 +1853,7 @@ pub fn list_messages(
         FROM (
             SELECT id, conversation_id, role, content, created_at
             FROM messages
-            WHERE conversation_id = ?1
+            WHERE conversation_id = ?1 AND is_active != 0
             ORDER BY id DESC
             LIMIT ?2
         )
@@ -1786,6 +2010,8 @@ fn llm_payload_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmPayl
     let estimated_user_tokens: i64 = row.get(12)?;
     let estimated_total_tokens: i64 = row.get(13)?;
     let truncated: i64 = row.get(14)?;
+    let applied_json: String = row.get(19).unwrap_or_else(|_| "[]".into());
+    let skipped_json: String = row.get(20).unwrap_or_else(|_| "[]".into());
     Ok(LlmPayloadLog {
         id: row.get(0)?,
         conversation_id: row.get(1)?,
@@ -1803,12 +2029,19 @@ fn llm_payload_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmPayl
         estimated_total_tokens: estimated_total_tokens.max(0) as usize,
         truncated: truncated != 0,
         created_at: row.get(15)?,
+        branch_id: row.get(16).ok(),
+        active_turn_id: row.get(17).ok(),
+        parent_turn_id: row.get(18).ok(),
+        state_patch_ids_applied: serde_json::from_str(&applied_json).unwrap_or_default(),
+        discarded_patch_ids_skipped: serde_json::from_str(&skipped_json).unwrap_or_default(),
+        state_rebuild_generation: row.get(21).ok(),
+        latest_assistant_variant_id: row.get(22).ok(),
     })
 }
 
 pub fn count_assistant_messages(conn: &Connection, conversation_id: &str) -> rusqlite::Result<i64> {
     conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND role = 'assistant'",
+        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND role = 'assistant' AND is_active != 0",
         [conversation_id],
         |row| row.get(0),
     )
@@ -1857,6 +2090,432 @@ pub fn get_turn_snapshot(
         },
     )
     .optional()
+}
+
+pub fn create_session_branch(
+    conn: &Connection,
+    conversation_id: &str,
+    base_soul: &Soul,
+    base_world: &SessionWorld,
+) -> rusqlite::Result<SessionBranch> {
+    let existing = get_active_session_branch(conn, conversation_id).optional()?;
+    if let Some(existing) = existing {
+        return Ok(existing);
+    }
+    let now = now_ts();
+    let branch = SessionBranch {
+        branch_id: ledger_id("branch"),
+        conversation_id: conversation_id.to_string(),
+        base_soul_json: serde_json::to_string(base_soul)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+        base_session_world_json: serde_json::to_string(base_world)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+        active_turn_id: None,
+        rebuild_generation: 0,
+        is_active: true,
+        created_at: now,
+        updated_at: now,
+    };
+    conn.execute(
+        "
+        INSERT INTO session_branches
+            (branch_id, conversation_id, base_soul_json, base_session_world_json, active_turn_id, rebuild_generation, is_active, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)
+        ",
+        params![
+            branch.branch_id,
+            branch.conversation_id,
+            branch.base_soul_json,
+            branch.base_session_world_json,
+            branch.active_turn_id,
+            branch.rebuild_generation,
+            branch.created_at,
+            branch.updated_at
+        ],
+    )?;
+    get_active_session_branch(conn, conversation_id)
+}
+
+pub fn get_active_session_branch(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<SessionBranch> {
+    conn.query_row(
+        "
+        SELECT branch_id, conversation_id, base_soul_json, base_session_world_json, active_turn_id, rebuild_generation, is_active, created_at, updated_at
+        FROM session_branches
+        WHERE conversation_id = ?1 AND is_active = 1
+        ORDER BY created_at DESC
+        LIMIT 1
+        ",
+        [conversation_id],
+        session_branch_from_row,
+    )
+}
+
+pub fn has_session_branch(conn: &Connection, conversation_id: &str) -> rusqlite::Result<bool> {
+    Ok(get_active_session_branch(conn, conversation_id)
+        .optional()?
+        .is_some())
+}
+
+pub fn get_active_turn_id(conn: &Connection, branch_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT active_turn_id FROM session_branches WHERE branch_id = ?1",
+        [branch_id],
+        |row| row.get(0),
+    )
+}
+
+pub fn get_turn_commit_by_assistant(
+    conn: &Connection,
+    conversation_id: &str,
+    assistant_message_id: i64,
+) -> rusqlite::Result<Option<TurnCommit>> {
+    conn.query_row(
+        "
+        SELECT turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant
+        FROM turn_commits
+        WHERE conversation_id = ?1 AND assistant_message_id = ?2 AND is_active = 1
+        ORDER BY created_at DESC
+        LIMIT 1
+        ",
+        params![conversation_id, assistant_message_id],
+        turn_commit_from_row,
+    )
+    .optional()
+}
+
+pub fn record_turn_commit_with_patch(
+    conn: &Connection,
+    conversation_id: &str,
+    branch_id: &str,
+    parent_turn_id: Option<&str>,
+    user_message_id: Option<i64>,
+    assistant_message_id: i64,
+    selected_variant_id: Option<i64>,
+    patch: &EnginePatch,
+    is_regenerated_variant: bool,
+) -> rusqlite::Result<(TurnCommit, StatePatchRecord)> {
+    let now = now_ts();
+    let turn_id = ledger_id("turn");
+    let patch_id = ledger_id("patch");
+    let patch_json = serde_json::to_string(patch)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    conn.execute(
+        "
+        INSERT INTO turn_commits
+            (turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, 1, 0, ?10)
+        ",
+        params![
+            turn_id,
+            conversation_id,
+            branch_id,
+            parent_turn_id,
+            user_message_id,
+            assistant_message_id,
+            patch_id,
+            selected_variant_id,
+            now,
+            if is_regenerated_variant { 1 } else { 0 }
+        ],
+    )?;
+    conn.execute(
+        "
+        INSERT INTO state_patches
+            (patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id)
+        VALUES (?1, ?2, NULL, ?3, NULL, ?4, 'session', 1, NULL, NULL)
+        ",
+        params![patch_id, turn_id, patch_json, now],
+    )?;
+    conn.execute(
+        "UPDATE session_branches SET active_turn_id = ?1, updated_at = ?2 WHERE branch_id = ?3",
+        params![turn_id, now, branch_id],
+    )?;
+    if let Some(variant_id) = selected_variant_id {
+        let _ = conn.execute(
+            "UPDATE assistant_message_variants SET turn_id = ?1, state_patch_id = ?2, is_discarded = 0 WHERE id = ?3",
+            params![turn_id, patch_id, variant_id],
+        );
+    }
+    Ok((
+        get_turn_commit(conn, &turn_id)?,
+        get_state_patch(conn, &patch_id)?,
+    ))
+}
+
+pub fn discard_active_commits_for_assistant(
+    conn: &Connection,
+    conversation_id: &str,
+    assistant_message_id: i64,
+) -> rusqlite::Result<()> {
+    let commits = list_commits_for_assistant(conn, conversation_id, assistant_message_id)?;
+    for commit in commits {
+        if let Some(patch_id) = commit.state_patch_id.as_deref() {
+            conn.execute(
+                "UPDATE state_patches SET is_active = 0 WHERE patch_id = ?1",
+                [patch_id],
+            )?;
+        }
+        conn.execute(
+            "UPDATE turn_commits SET active_variant = 0, is_active = 0, is_discarded = 1 WHERE turn_id = ?1",
+            [commit.turn_id],
+        )?;
+    }
+    conn.execute(
+        "UPDATE assistant_message_variants SET is_discarded = 1 WHERE conversation_id = ?1 AND message_id = ?2",
+        params![conversation_id, assistant_message_id],
+    )?;
+    Ok(())
+}
+
+pub fn deactivate_downstream_from_message(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE messages SET is_active = 0 WHERE conversation_id = ?1 AND id >= ?2",
+        params![conversation_id, message_id],
+    )?;
+    let commits = list_commits_at_or_after_message(conn, conversation_id, message_id)?;
+    let mut count = 0;
+    for commit in commits {
+        if let Some(patch_id) = commit.state_patch_id.as_deref() {
+            conn.execute(
+                "UPDATE state_patches SET is_active = 0 WHERE patch_id = ?1",
+                [patch_id],
+            )?;
+        }
+        conn.execute(
+            "UPDATE turn_commits SET is_active = 0, is_discarded = 1, active_variant = 0 WHERE turn_id = ?1",
+            [commit.turn_id],
+        )?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+pub fn activate_variant_commit(
+    conn: &Connection,
+    conversation_id: &str,
+    variant_id: i64,
+) -> rusqlite::Result<Option<String>> {
+    let turn_id: Option<String> = conn
+        .query_row(
+            "SELECT turn_id FROM assistant_message_variants WHERE conversation_id = ?1 AND id = ?2",
+            params![conversation_id, variant_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(turn_id) = turn_id else {
+        return Ok(None);
+    };
+    let commit = get_turn_commit(conn, &turn_id)?;
+    if let Some(assistant_id) = commit.assistant_message_id {
+        discard_active_commits_for_assistant(conn, conversation_id, assistant_id)?;
+    }
+    if let Some(patch_id) = commit.state_patch_id.as_deref() {
+        conn.execute(
+            "UPDATE state_patches SET is_active = 1 WHERE patch_id = ?1",
+            [patch_id],
+        )?;
+    }
+    conn.execute(
+        "UPDATE turn_commits SET active_variant = 1, is_active = 1, is_discarded = 0 WHERE turn_id = ?1",
+        [turn_id.as_str()],
+    )?;
+    conn.execute(
+        "UPDATE assistant_message_variants SET is_discarded = 0 WHERE id = ?1",
+        [variant_id],
+    )?;
+    conn.execute(
+        "UPDATE session_branches SET active_turn_id = ?1, updated_at = ?2 WHERE branch_id = ?3",
+        params![turn_id, now_ts(), commit.branch_id],
+    )?;
+    Ok(Some(commit.branch_id))
+}
+
+pub fn rebuild_session_state(
+    conn: &Connection,
+    conversation_id: &str,
+    branch_id: &str,
+) -> rusqlite::Result<LedgerRebuild> {
+    let active_turn_id = get_active_turn_id(conn, branch_id)?;
+    rebuild_session_state_until(conn, conversation_id, branch_id, active_turn_id.as_deref())
+}
+
+pub fn rebuild_session_state_until(
+    conn: &Connection,
+    conversation_id: &str,
+    branch_id: &str,
+    until_turn_id: Option<&str>,
+) -> rusqlite::Result<LedgerRebuild> {
+    let branch = get_active_session_branch(conn, conversation_id)?;
+    let mut soul = decode_soul(&branch.base_soul_json)?;
+    let mut session_world = decode_session_world(&branch.base_session_world_json)?;
+    let commits = active_commit_path_until(conn, branch_id, until_turn_id)?;
+    let mut debug = BranchPatchDebug {
+        branch_id: branch_id.to_string(),
+        active_turn_id: until_turn_id.map(str::to_string),
+        rebuild_generation: branch.rebuild_generation + 1,
+        ..BranchPatchDebug::default()
+    };
+    for commit in commits {
+        let Some(patch_id) = commit.state_patch_id.as_deref() else {
+            continue;
+        };
+        let patch_record = get_state_patch(conn, patch_id)?;
+        if !patch_record.is_active || commit.is_discarded || !commit.is_active {
+            debug.skipped_discarded_patches.push(patch_id.to_string());
+            continue;
+        }
+        let patch: EnginePatch = serde_json::from_str(&patch_record.patch_json)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        patch
+            .apply_to_session(&mut soul, Some(&mut session_world))
+            .map_err(|err| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("{err:?}"),
+                )))
+            })?;
+        debug.applied_patches.push(patch_id.to_string());
+    }
+    let invalidated = list_inactive_patch_ids(conn, branch_id)?;
+    debug.invalidated_patches = invalidated;
+    conn.execute(
+        "UPDATE session_branches SET rebuild_generation = rebuild_generation + 1, updated_at = ?1 WHERE branch_id = ?2",
+        params![now_ts(), branch_id],
+    )?;
+    upsert_soul(conn, &soul)?;
+    upsert_session_world(conn, &session_world)?;
+    Ok(LedgerRebuild {
+        soul,
+        session_world,
+        debug,
+    })
+}
+
+fn session_branch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionBranch> {
+    Ok(SessionBranch {
+        branch_id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        base_soul_json: row.get(2)?,
+        base_session_world_json: row.get(3)?,
+        active_turn_id: row.get(4)?,
+        rebuild_generation: row.get(5)?,
+        is_active: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn turn_commit_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnCommit> {
+    Ok(TurnCommit {
+        turn_id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        branch_id: row.get(2)?,
+        parent_turn_id: row.get(3)?,
+        user_message_id: row.get(4)?,
+        assistant_message_id: row.get(5)?,
+        state_patch_id: row.get(6)?,
+        selected_variant_id: row.get(7)?,
+        created_at: row.get(8)?,
+        active_variant: row.get::<_, i64>(9)? != 0,
+        is_active: row.get::<_, i64>(10)? != 0,
+        is_discarded: row.get::<_, i64>(11)? != 0,
+        is_regenerated_variant: row.get::<_, i64>(12)? != 0,
+    })
+}
+
+fn state_patch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StatePatchRecord> {
+    Ok(StatePatchRecord {
+        patch_id: row.get(0)?,
+        turn_id: row.get(1)?,
+        parent_state_hash: row.get(2)?,
+        patch_json: row.get(3)?,
+        inverse_patch_json: row.get(4)?,
+        applied_at: row.get(5)?,
+        applies_to: row.get(6)?,
+        is_active: row.get::<_, i64>(7)? != 0,
+        invalidated_by_patch_id: row.get(8)?,
+        supersedes_patch_id: row.get(9)?,
+    })
+}
+
+fn get_turn_commit(conn: &Connection, turn_id: &str) -> rusqlite::Result<TurnCommit> {
+    conn.query_row(
+        "SELECT turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant FROM turn_commits WHERE turn_id = ?1",
+        [turn_id],
+        turn_commit_from_row,
+    )
+}
+
+fn get_state_patch(conn: &Connection, patch_id: &str) -> rusqlite::Result<StatePatchRecord> {
+    conn.query_row(
+        "SELECT patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id FROM state_patches WHERE patch_id = ?1",
+        [patch_id],
+        state_patch_from_row,
+    )
+}
+
+fn list_commits_for_assistant(
+    conn: &Connection,
+    conversation_id: &str,
+    assistant_message_id: i64,
+) -> rusqlite::Result<Vec<TurnCommit>> {
+    let mut stmt = conn.prepare(
+        "SELECT turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant FROM turn_commits WHERE conversation_id = ?1 AND assistant_message_id = ?2 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(
+        params![conversation_id, assistant_message_id],
+        turn_commit_from_row,
+    )?;
+    rows.collect()
+}
+
+fn list_commits_at_or_after_message(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: i64,
+) -> rusqlite::Result<Vec<TurnCommit>> {
+    let mut stmt = conn.prepare(
+        "SELECT turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant FROM turn_commits WHERE conversation_id = ?1 AND is_active = 1 AND (COALESCE(user_message_id, 9223372036854775807) >= ?2 OR COALESCE(assistant_message_id, 9223372036854775807) >= ?2) ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![conversation_id, message_id], turn_commit_from_row)?;
+    rows.collect()
+}
+
+fn active_commit_path_until(
+    conn: &Connection,
+    branch_id: &str,
+    until_turn_id: Option<&str>,
+) -> rusqlite::Result<Vec<TurnCommit>> {
+    let mut stmt = conn.prepare(
+        "SELECT turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant FROM turn_commits WHERE branch_id = ?1 AND is_active = 1 AND is_discarded = 0 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([branch_id], turn_commit_from_row)?;
+    let mut commits = Vec::new();
+    for row in rows {
+        let commit = row?;
+        let reached = until_turn_id.is_some_and(|turn_id| commit.turn_id == turn_id);
+        commits.push(commit);
+        if reached {
+            break;
+        }
+    }
+    Ok(commits)
+}
+
+fn list_inactive_patch_ids(conn: &Connection, branch_id: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT sp.patch_id FROM state_patches sp JOIN turn_commits tc ON tc.turn_id = sp.turn_id WHERE tc.branch_id = ?1 AND (sp.is_active = 0 OR tc.is_discarded = 1 OR tc.is_active = 0) ORDER BY sp.applied_at ASC",
+    )?;
+    let rows = stmt.query_map([branch_id], |row| row.get(0))?;
+    rows.collect()
 }
 
 pub fn upsert_provider_profile(
@@ -1995,6 +2654,7 @@ fn summarize_setting(setting: &SettingSoul) -> SettingSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use state_engine::patch::{EnginePatch, WorldEventOperationPatch, WorldPatch};
     use state_engine::setting::new_default_setting;
     use state_engine::soul::{
         new_default_soul, session_soul_from_savepoint, soul_savepoint_from_session,
@@ -2332,6 +2992,13 @@ mod tests {
                 estimated_total_tokens: 6,
                 truncated: false,
                 created_at: now_ts(),
+                branch_id: None,
+                active_turn_id: None,
+                parent_turn_id: None,
+                state_patch_ids_applied: Vec::new(),
+                discarded_patch_ids_skipped: Vec::new(),
+                state_rebuild_generation: None,
+                latest_assistant_variant_id: None,
             },
         )
         .expect("insert log");
@@ -2344,6 +3011,177 @@ mod tests {
         let serialized = serde_json::to_string(&logs[0]).unwrap();
         assert!(!serialized.contains("secret"));
         assert!(!serialized.contains("api_key"));
+    }
+
+    #[test]
+    fn ledger_rebuild_overwrites_stale_materialized_cache() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Echo-0");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "ledger-cache", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        create_session_branch(&conn, "ledger-cache", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "ledger-cache").expect("branch");
+        let user_id =
+            insert_message_and_get_id(&conn, "ledger-cache", "user", "Move.").expect("user");
+        let assistant_id = insert_message_and_get_id(&conn, "ledger-cache", "assistant", "Moved.")
+            .expect("assistant");
+        let patch = EnginePatch {
+            world_patch: Some(WorldPatch {
+                location: Some("Ledger room".into()),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        record_turn_commit_with_patch(
+            &conn,
+            "ledger-cache",
+            &branch.branch_id,
+            None,
+            Some(user_id),
+            assistant_id,
+            None,
+            &patch,
+            false,
+        )
+        .expect("record");
+        let mut stale = soul.clone();
+        stale.world.location = "Stale cache room".into();
+        upsert_soul(&conn, &stale).expect("stale");
+
+        let rebuilt =
+            rebuild_session_state(&conn, "ledger-cache", &branch.branch_id).expect("rebuild");
+
+        assert_eq!(rebuilt.session_world.location, "Ledger room");
+        assert_eq!(
+            get_soul(&conn, &soul.character_id)
+                .expect("cache soul")
+                .world
+                .location,
+            "Unspecified starting scene."
+        );
+    }
+
+    #[test]
+    fn ledger_regenerate_discards_old_patch_state() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "ledger-regen", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        create_session_branch(&conn, "ledger-regen", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "ledger-regen").expect("branch");
+        let user_id =
+            insert_message_and_get_id(&conn, "ledger-regen", "user", "Phone?").expect("user");
+        let assistant_id = insert_message_and_get_id(&conn, "ledger-regen", "assistant", "Bad.")
+            .expect("assistant");
+        let bad = EnginePatch {
+            world_patch: Some(WorldPatch {
+                recent_event: Some("Aurora's phone buzzed.".into()),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        record_turn_commit_with_patch(
+            &conn,
+            "ledger-regen",
+            &branch.branch_id,
+            None,
+            Some(user_id),
+            assistant_id,
+            None,
+            &bad,
+            false,
+        )
+        .expect("bad");
+        discard_active_commits_for_assistant(&conn, "ledger-regen", assistant_id).expect("discard");
+        let good = EnginePatch {
+            world_patch: Some(WorldPatch {
+                recent_event: Some("Aurora keeps the silenced phone dark.".into()),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        record_turn_commit_with_patch(
+            &conn,
+            "ledger-regen",
+            &branch.branch_id,
+            None,
+            Some(user_id),
+            assistant_id,
+            None,
+            &good,
+            true,
+        )
+        .expect("good");
+
+        let rebuilt =
+            rebuild_session_state(&conn, "ledger-regen", &branch.branch_id).expect("rebuild");
+
+        assert!(!rebuilt
+            .session_world
+            .recent_events
+            .iter()
+            .any(|event| event.contains("buzzed")));
+        assert!(rebuilt
+            .session_world
+            .recent_events
+            .iter()
+            .any(|event| event.contains("silenced phone")));
+    }
+
+    #[test]
+    fn world_event_operations_invalidate_by_stable_id() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "ledger-retcon", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        create_session_branch(&conn, "ledger-retcon", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "ledger-retcon").expect("branch");
+        let assistant_id = insert_message_and_get_id(&conn, "ledger-retcon", "assistant", "Patch.")
+            .expect("assistant");
+        let patch = EnginePatch {
+            world_patch: Some(WorldPatch {
+                event_operations: vec![
+                    WorldEventOperationPatch {
+                        operation: "add_recent_event".into(),
+                        recent_event_id: Some("phone_buzz".into()),
+                        content: Some("Aurora's phone buzzed.".into()),
+                        ..WorldEventOperationPatch::default()
+                    },
+                    WorldEventOperationPatch {
+                        operation: "invalidate_recent_event".into(),
+                        target_recent_event_id: Some("phone_buzz".into()),
+                        ..WorldEventOperationPatch::default()
+                    },
+                ],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        record_turn_commit_with_patch(
+            &conn,
+            "ledger-retcon",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            None,
+            &patch,
+            false,
+        )
+        .expect("record");
+
+        let rebuilt =
+            rebuild_session_state(&conn, "ledger-retcon", &branch.branch_id).expect("rebuild");
+
+        assert!(rebuilt.session_world.recent_events.is_empty());
+        assert_eq!(
+            rebuilt.session_world.recent_event_records[0].recent_event_id,
+            "phone_buzz"
+        );
+        assert!(!rebuilt.session_world.recent_event_records[0].is_active);
     }
 
     #[test]

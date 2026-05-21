@@ -107,6 +107,10 @@ pub fn create_scored_memory(soul: &Soul, content: &str, tag: &str) -> MemoryEntr
         objective_event_id: None,
         truth_status: TruthStatus::Unknown,
         architecture_verified: false,
+        is_active: true,
+        invalidated_by_patch_id: None,
+        superseded_by_memory_id: None,
+        is_retconned: false,
     };
     let score = MemoryScorer::default().score(soul, &memory);
     let salience = (score * 100.0).round();
@@ -223,6 +227,12 @@ mod tests {
             interpretation: None,
             confidence: None,
             objective_event_id: None,
+            truth_status: TruthStatus::Unknown,
+            architecture_verified: false,
+            is_active: true,
+            invalidated_by_patch_id: None,
+            superseded_by_memory_id: None,
+            is_retconned: false,
         };
 
         let score = MemoryScorer::default().score(&soul, &memory);
@@ -251,6 +261,12 @@ mod tests {
             interpretation: None,
             confidence: None,
             objective_event_id: None,
+            truth_status: TruthStatus::Unknown,
+            architecture_verified: false,
+            is_active: true,
+            invalidated_by_patch_id: None,
+            superseded_by_memory_id: None,
+            is_retconned: false,
         });
 
         let duplicate = MemoryEntry {
@@ -272,6 +288,12 @@ mod tests {
             interpretation: None,
             confidence: None,
             objective_event_id: None,
+            truth_status: TruthStatus::Unknown,
+            architecture_verified: false,
+            is_active: true,
+            invalidated_by_patch_id: None,
+            superseded_by_memory_id: None,
+            is_retconned: false,
         };
 
         let fresh = MemoryEntry {
@@ -293,6 +315,12 @@ mod tests {
             interpretation: None,
             confidence: None,
             objective_event_id: None,
+            truth_status: TruthStatus::Unknown,
+            architecture_verified: false,
+            is_active: true,
+            invalidated_by_patch_id: None,
+            superseded_by_memory_id: None,
+            is_retconned: false,
         };
 
         let scorer = MemoryScorer::default();

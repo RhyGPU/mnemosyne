@@ -1,6 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
 
 export type Relationship = {
   trust: number;
@@ -48,6 +47,40 @@ export type SchemaMemory = {
   schema_type: string;
   summary: string;
   count: number;
+  schema_id?: string;
+  owner_soul_id?: string | null;
+  target_entity_ids?: string[];
+  trigger_tags?: string[];
+  salience?: number;
+  reinforcement_count?: number;
+  decay?: number;
+  last_reinforced_turn?: number;
+};
+
+export type PlotEntry = {
+  plot_id: string;
+  title: string;
+  summary?: string;
+  status?: "dominant" | "background" | "resolved" | "stale" | "unknown" | string;
+  salience?: number;
+  started_turn?: number;
+  last_touched_turn?: number;
+  related_entities?: string[];
+  related_world_id?: string | null;
+  unresolved_questions?: string[];
+  resolution_summary?: string | null;
+};
+
+export type WorldState = {
+  location: string;
+  active_plots: string[];
+  recent_events: string[];
+  key_objects: string[];
+  time_elapsed: string;
+  dominant_current_plot?: PlotEntry | null;
+  background_plots?: PlotEntry[];
+  resolved_plots?: PlotEntry[];
+  stale_plot_decay?: number;
 };
 
 export type Soul = {
@@ -105,13 +138,7 @@ export type Soul = {
     created_at: number;
     architecture_verified: boolean;
   }>;
-  world: {
-    location: string;
-    active_plots: string[];
-    recent_events: string[];
-    key_objects: string[];
-    time_elapsed: string;
-  };
+  world: WorldState;
 };
 
 export type SettingSoul = {
@@ -304,7 +331,21 @@ export type ContextPreview = {
   text: string;
   estimated_tokens: number;
   truncated: boolean;
+  memory_slot_debug?: Array<{
+    slot: string;
+    memory_id: string;
+    action: string;
+    reason: string;
+    source_type: string;
+    truth_status: string;
+    entity_match: boolean;
+    plot_match: boolean;
+    salience: number;
+    final_score: number;
+  }>;
 };
+
+export type MemorySlotTrace = NonNullable<ContextPreview["memory_slot_debug"]>[number];
 
 export type LlmPayloadTokenEstimate = {
   system: number;
@@ -326,6 +367,7 @@ export type LlmPayloadPreview = {
   messages: ApiPayloadMessage[];
   truncated: boolean;
   estimated_tokens: LlmPayloadTokenEstimate;
+  memory_slot_debug?: MemorySlotTrace[];
 };
 
 export type ApiPayloadMessage = {
@@ -350,6 +392,22 @@ export type LlmPayloadLog = {
   estimated_total_tokens: number;
   truncated: boolean;
   created_at: number;
+  branch_id?: string | null;
+  active_turn_id?: string | null;
+  parent_turn_id?: string | null;
+  state_patch_ids_applied?: string[];
+  discarded_patch_ids_skipped?: string[];
+  state_rebuild_generation?: number | null;
+  latest_assistant_variant_id?: number | null;
+};
+
+export type BranchPatchDebug = {
+  branch_id: string;
+  active_turn_id?: string | null;
+  rebuild_generation: number;
+  applied_patches: string[];
+  skipped_discarded_patches: string[];
+  invalidated_patches: string[];
 };
 
 export type ExportResult = {
@@ -396,17 +454,28 @@ Write third-person present-tense scene narration. You may describe engine-contro
 
 [CHARACTER CONTROL]
 Engine-controlled characters: may speak, act, react, misunderstand, interrupt, refuse, escalate, retreat, and use the environment naturally.
-User-controlled characters: may be perceived and reacted to, but their decisions, speech, and decisive actions belong to the user.
-When a user-controlled character's reaction matters, stop on the pressure point.
+
+[USER ACTION BOUNDARY]
+User-controlled characters own their decisions, thoughts, dialogue, intentions, and major voluntary actions.
+The narrator may describe user-provided actions in concrete physical detail, including immediate follow-through, contact, momentum, posture, physical consequences, and observable effects.
+The narrator may describe unavoidable physical consequences caused by engine-controlled characters or the environment, such as being shoved off-balance, forced to brace, blocked, grabbed, pulled, interrupted, or pressured.
+Do not invent new user decisions, hidden motives, emotional reactions, dialogue, or major strategic choices.
+When the user-controlled character's next reaction matters, stop at the pressure point.
 
 [ACTION AND TURN CONTROL]
 Engine-controlled characters may act proactively: speak, move, interrupt, refuse, reach, grab for something, retreat, challenge, escalate, or use their own environment. Resolve engine-controlled action naturally. When a user-controlled character's reaction matters, stop on the attempt, demand, or pressure point and leave the response to the next user turn.
+
+[CONFLICT RESOLUTION]
+When the user declares a combat, chase, argument, or struggle action, render the declared action and its immediate result. The narrator may decide partial success, resistance, interruption, or counteraction based on the scene.
+Engine-controlled characters may resist, counter, retreat, escalate, or exploit openings.
+Do not choose the user's next tactic or final decision.
 
 [GM CHANNEL]
 If the user directly addresses the Narrator, GM, or OOC layer, respond as the GM/narrator in plain text unless the user asks to resume the scene. Do not force an Aurora scene response for GM-facing instructions.
 
 [CONTINUITY PRIORITY]
 Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
+After a setting has already been established, do not re-describe the full room unless the user asks or something changes. Use one short anchor detail, then advance action/dialogue.
 
 [CHARACTER CHANGE]
 Emotional shifts should feel earned. Micro-shifts are preferred unless the scene strongly justifies a sharper reaction.
@@ -427,10 +496,26 @@ Write visible scene narration or a brief GM/narrator reply. For scene narration,
 const VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT = `[VERIFIED DIAGNOSTICS BOUNDARY]
 When asked about backend tests, logs, imports, exports, memory hygiene, world routing, or engine internals, distinguish verified engine data from fictional/in-scene diagnostics. Do not claim a backend test passed unless the result is present in Dev Console logs, payload metadata, or a verified engine/debug section. If only roleplaying a test, say it is a simulated/in-scene diagnostic.`;
 
+const USER_ACTION_AND_CONFLICT_PROMPT = `[USER ACTION BOUNDARY]
+User-controlled characters own their decisions, thoughts, dialogue, intentions, and major voluntary actions.
+The narrator may describe user-provided actions in concrete physical detail, including immediate follow-through, contact, momentum, posture, physical consequences, and observable effects.
+The narrator may describe unavoidable physical consequences caused by engine-controlled characters or the environment, such as being shoved off-balance, forced to brace, blocked, grabbed, pulled, interrupted, or pressured.
+Do not invent new user decisions, hidden motives, emotional reactions, dialogue, or major strategic choices.
+When the user-controlled character's next reaction matters, stop at the pressure point.
+
+[CONFLICT RESOLUTION]
+When the user declares a combat, chase, argument, or struggle action, render the declared action and its immediate result. The narrator may decide partial success, resistance, interruption, or counteraction based on the scene.
+Engine-controlled characters may resist, counter, retreat, escalate, or exploit openings.
+Do not choose the user's next tactic or final decision.
+
+[SCENE-STATE PROGRESSION]
+After a setting has already been established, do not re-describe the full room unless the user asks or something changes. Use one short anchor detail, then advance action/dialogue.`;
+
 const MODE_PROMPTS: Record<string, string> = {
   Realistic: `## NARRATION MODE: REALISTIC
 - Describe only external actions, dialogue, and physical reactions.
 - No internal monologue. No thoughts. No emotions unless visibly expressed.
+- User-declared physical actions may be rendered cinematically and concretely, but do not invent user intent, motives, dialogue, or the user's next tactic.
 - Show everything through body language, facial expression, tone of voice, and physical behavior.
 - Like a film camera: you see and hear the scene, but you never enter anyone's head.
 - Dialogue in quotes only when describing what an engine-controlled character audibly says.`,
@@ -730,25 +815,6 @@ export function exportCurrentSessionCheckpointMne(
   return invokeOrPreview("export_current_session_checkpoint_mne", { conversationId, outputPath }, () =>
     makePreviewMneExport(outputPath, "session_checkpoint", conversationId, [], []),
   );
-}
-
-export function isDesktopApp() {
-  return hasTauriRuntime();
-}
-
-export async function pickMneBundlePath(): Promise<string | null> {
-  if (!hasTauriRuntime()) {
-    return null;
-  }
-  const selected = await open({
-    title: "Import Mnemosyne bundle",
-    multiple: false,
-    filters: [{ name: "Mnemosyne bundle", extensions: ["mne"] }],
-  });
-  if (selected === null) {
-    return null;
-  }
-  return Array.isArray(selected) ? selected[0] ?? null : selected;
 }
 
 export function importMneBundle(filePath: string): Promise<MneImportResult> {
@@ -1121,6 +1187,17 @@ export function getLlmPayloadLog(logId: number): Promise<LlmPayloadLog> {
   });
 }
 
+export function getBranchPatchDebug(conversationId: string): Promise<BranchPatchDebug> {
+  return invokeOrPreview("get_branch_patch_debug", { conversationId }, () => ({
+    branch_id: "preview",
+    active_turn_id: null,
+    rebuild_generation: 0,
+    applied_patches: [],
+    skipped_discarded_patches: [],
+    invalidated_patches: [],
+  }));
+}
+
 export function exportVisibleChatLog(conversationId: string): Promise<ExportResult> {
   return invokeOrPreview("export_visible_chat_log", { conversationId }, () => {
     const content = renderPreviewVisibleChatLog(
@@ -1205,8 +1282,9 @@ export function previewApiPayload(
           system: systemTokens,
           context: contextTokens,
           user: userTokens,
-          total: systemTokens + userTokens,
+          total: systemTokens + userTokens + contextTokens,
         },
+        memory_slot_debug: context.memory_slot_debug ?? [],
       };
     },
   );
@@ -2106,23 +2184,49 @@ function compilePreviewContext(
     `Location: ${soul.world.location || "Unspecified"}`,
     `Time elapsed: ${normalizeTimeElapsedForPreview(soul.world.time_elapsed || "Unknown")}`,
     `Active plots: ${soul.world.active_plots.join("; ") || "No active plot has been established."}`,
+    soul.world.dominant_current_plot && soul.world.dominant_current_plot.status !== "resolved"
+      ? `Dominant current plot: ${soul.world.dominant_current_plot.title} - ${soul.world.dominant_current_plot.summary || "No summary"}`
+      : "",
+    soul.world.background_plots?.length
+      ? `Background/stale plots: ${soul.world.background_plots
+          .slice(0, 3)
+          .map((plot) => `${plot.title} (${plot.status || "background"})`)
+          .join("; ")}`
+      : "",
+    soul.world.resolved_plots?.length
+      ? `Resolved plots: ${soul.world.resolved_plots
+          .slice(-2)
+          .map((plot) => `${plot.title} resolved: ${plot.resolution_summary || "resolution recorded"}`)
+          .join("; ")}`
+      : "",
     `Key objects: ${soul.world.key_objects.join("; ") || "No key objects are being tracked."}`,
     `Recent events:\n${recentEvents.join("\n") || "- No major recent events yet."}`,
-  ];
-  const memoryLines = [
+  ].filter(Boolean);
+  const identityMemoryLines = [
     ...soul.memory.core
       .filter((memory) => !isGenericFillerMemoryText(memory))
-      .slice(0, 5)
-      .map((memory) => `Core: ${memory}`),
+      .slice(0, 2)
+      .map((memory) => `- Core: ${memory}`),
     ...soul.memory.schemas
       .filter(
         (schema) =>
           !isGenericFillerMemoryText(schema.summary) &&
           !isNearEmptyGenericSchema(schema.schema_type, schema.summary),
       )
-      .slice(0, 3)
-      .map((schema) => `Schema: ${schema.schema_type} (seen ${schema.count}x): ${schema.summary}`),
+      .slice(0, 2)
+      .map((schema) => `- Schema: ${schema.schema_type} (seen ${schema.reinforcement_count ?? schema.count}x): ${schema.summary}`),
   ];
+  const recentDurable = soul.memory.recent
+    .filter((memory) => !isGenericFillerMemoryText(memory.content))
+    .sort((left, right) => right.salience + right.retrieval_strength - (left.salience + left.retrieval_strength))
+    .slice(0, 8);
+  const slotLine = (predicate: (memory: RecentMemory) => boolean, fallback: string) => {
+    const selected = recentDurable
+      .filter(predicate)
+      .slice(0, 2)
+      .map((memory) => `- [${memory.source_type ?? "unknown"} / salience ${Math.round(memory.salience)}] ${memory.content}`);
+    return selected.join("\n") || fallback;
+  };
   const latestExchange = `[LATEST EXCHANGE, HIGH PRIORITY]
 Continue from this section first. If older context conflicts with this section, ignore older context. Continue from the final state of the last narrator response and the latest user input. Do not replay earlier beats.
 Last narrator response: ${lastNarratorResponse}
@@ -2135,7 +2239,12 @@ Instruction: ${temporaryInstruction}`
       : "",
     `[WORLD SNAPSHOT]\n${worldLines.join("\n")}`,
     `[CHARACTER SNAPSHOT]\n${profileLines.join("\n")}`,
-    `[RELEVANT MEMORIES]\n${memoryLines.join("\n") || "No durable memories have been selected yet."}`,
+    `[RELATIONSHIP MEMORY]\n${slotLine((memory) => Boolean(memory.target_entity_ids?.length) || /trust|distrust|relationship|promise|betray|boundary|conflict/i.test(memory.content), "No relationship-specific durable memory selected.")}`,
+    `[CURRENT PLOT MEMORY]\n${slotLine((memory) => /plot|goal|testing|current|task|mission|intention|future/i.test(`${memory.tag} ${memory.content}`), "No current-plot memory selected.")}`,
+    `[CHARACTER IDENTITY MEMORY]\n${identityMemoryLines.join("\n") || slotLine((memory) => /identity|role|purpose|self-concept|analysis agent|test subject/i.test(`${memory.tag} ${memory.content}`), "No identity memory selected.")}`,
+    `[UNRESOLVED TENSION]\n${slotLine((memory) => /unresolved|tension|betray|promise|boundary|conflict|guilt|concern|argued/i.test(memory.content), "No unresolved tension selected.")}`,
+    `[WORLD / LOCATION MEMORY]\n${slotLine((memory) => /location|world|room|cell|lab|testing room|kitchen|door|hallway|object|terminal|orientation/i.test(`${memory.tag} ${memory.content}`), "No world/location memory selected.")}`,
+    `[RECENT EMOTIONAL STATE]\n${slotLine((memory) => /feels|felt|afraid|angry|concerned|guilt|ashamed|guarded|distressed|relieved|emotion|trauma/i.test(`${memory.tag} ${memory.content}`), "No recent emotional-state memory selected.")}`,
     `[RELATIONSHIP]\nTrust toward user: ${soul.relationships.user.trust}. Affection: ${soul.relationships.user.affection}. Fear: ${soul.relationships.user.fear}. Desire: ${soul.relationships.user.desire}.`,
     recentChat.length ? `[RECENT CHAT, LOWER PRIORITY]\n${recentChat.join("\n")}` : "",
     latestExchange,
@@ -2147,7 +2256,7 @@ Instruction: ${temporaryInstruction}`
     truncated = true;
     text = text.slice(0, text.lastIndexOf("\n"));
   }
-  return { text, estimated_tokens: estimateTokens(text), truncated };
+  return { text, estimated_tokens: estimateTokens(text), truncated, memory_slot_debug: [] };
 }
 
 function deepClone<T>(value: T): T {
@@ -2506,7 +2615,7 @@ function buildNarratorSystemPrompt(
   const isCustomMode = mode === "Custom";
   const narratorCore =
     isCustomMode && trimmedCustom
-      ? `[CUSTOM NARRATOR INSTRUCTIONS]\n${trimmedCustom}\n\n${VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT}`
+      ? `[CUSTOM NARRATOR INSTRUCTIONS]\n${trimmedCustom}\n\n${USER_ACTION_AND_CONFLICT_PROMPT}\n\n${VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT}`
       : `${NARRATOR_SYSTEM_PROMPT}\n\n${modePromptFor(mode)}\n\n${VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT}`;
   const stateInstruction = requireHiddenState ? HIDDEN_STATE_FORMAT_PROMPT : NARRATOR_VISIBLE_ONLY_PROMPT;
   return `${narratorCore}\n\n${stateInstruction}\n\nPrimary active Soul: ${soul.character_name}\n\n${context}`;

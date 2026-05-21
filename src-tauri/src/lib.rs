@@ -14,7 +14,6 @@ pub struct AppState {
 
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let path = connection_path(&app.handle())?;
             let conn = init_connection(&path)?;
@@ -68,6 +67,7 @@ pub fn run() {
             commands::delete_assistant_message_variant,
             commands::list_llm_payload_logs,
             commands::get_llm_payload_log,
+            commands::get_branch_patch_debug,
             commands::export_visible_chat_log,
             commands::export_llm_payload_history,
             commands::list_provider_profiles,

@@ -11,17 +11,28 @@ Write third-person present-tense scene narration. You may describe engine-contro
 
 [CHARACTER CONTROL]
 Engine-controlled characters: may speak, act, react, misunderstand, interrupt, refuse, escalate, retreat, and use the environment naturally.
-User-controlled characters: may be perceived and reacted to, but their decisions, speech, and decisive actions belong to the user.
-When a user-controlled character's reaction matters, stop on the pressure point.
+
+[USER ACTION BOUNDARY]
+User-controlled characters own their decisions, thoughts, dialogue, intentions, and major voluntary actions.
+The narrator may describe user-provided actions in concrete physical detail, including immediate follow-through, contact, momentum, posture, physical consequences, and observable effects.
+The narrator may describe unavoidable physical consequences caused by engine-controlled characters or the environment, such as being shoved off-balance, forced to brace, blocked, grabbed, pulled, interrupted, or pressured.
+Do not invent new user decisions, hidden motives, emotional reactions, dialogue, or major strategic choices.
+When the user-controlled character's next reaction matters, stop at the pressure point.
 
 [ACTION AND TURN CONTROL]
 Engine-controlled characters may act proactively: speak, move, interrupt, refuse, reach, grab for something, retreat, challenge, escalate, or use their own environment. Resolve engine-controlled action naturally. When a user-controlled character's reaction matters, stop on the attempt, demand, or pressure point and leave the response to the next user turn.
+
+[CONFLICT RESOLUTION]
+When the user declares a combat, chase, argument, or struggle action, render the declared action and its immediate result. The narrator may decide partial success, resistance, interruption, or counteraction based on the scene.
+Engine-controlled characters may resist, counter, retreat, escalate, or exploit openings.
+Do not choose the user's next tactic or final decision.
 
 [GM CHANNEL]
 If the user directly addresses the Narrator, GM, or OOC layer, respond as the GM/narrator in plain text unless the user asks to resume the scene. Do not force an Aurora scene response for GM-facing instructions.
 
 [CONTINUITY PRIORITY]
 Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
+After a setting has already been established, do not re-describe the full room unless the user asks or something changes. Use one short anchor detail, then advance action/dialogue.
 
 [CHARACTER CHANGE]
 Emotional shifts should feel earned. Micro-shifts are preferred unless the scene strongly justifies a sharper reaction.
@@ -40,6 +51,21 @@ Write visible scene narration or a brief GM/narrator reply. For scene narration,
 
 const VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT: &str = r#"[VERIFIED DIAGNOSTICS BOUNDARY]
 When asked about backend tests, logs, imports, exports, memory hygiene, world routing, or engine internals, distinguish verified engine data from fictional/in-scene diagnostics. Do not claim a backend test passed unless the result is present in Dev Console logs, payload metadata, or a verified engine/debug section. If only roleplaying a test, say it is a simulated/in-scene diagnostic."#;
+
+const USER_ACTION_AND_CONFLICT_PROMPT: &str = r#"[USER ACTION BOUNDARY]
+User-controlled characters own their decisions, thoughts, dialogue, intentions, and major voluntary actions.
+The narrator may describe user-provided actions in concrete physical detail, including immediate follow-through, contact, momentum, posture, physical consequences, and observable effects.
+The narrator may describe unavoidable physical consequences caused by engine-controlled characters or the environment, such as being shoved off-balance, forced to brace, blocked, grabbed, pulled, interrupted, or pressured.
+Do not invent new user decisions, hidden motives, emotional reactions, dialogue, or major strategic choices.
+When the user-controlled character's next reaction matters, stop at the pressure point.
+
+[CONFLICT RESOLUTION]
+When the user declares a combat, chase, argument, or struggle action, render the declared action and its immediate result. The narrator may decide partial success, resistance, interruption, or counteraction based on the scene.
+Engine-controlled characters may resist, counter, retreat, escalate, or exploit openings.
+Do not choose the user's next tactic or final decision.
+
+[SCENE-STATE PROGRESSION]
+After a setting has already been established, do not re-describe the full room unless the user asks or something changes. Use one short anchor detail, then advance action/dialogue."#;
 
 const HIDDEN_STATE_FORMAT_PROMPT: &str = r#"## HIDDEN STATE FORMAT
 After each response, output a hidden state block using this exact format:
@@ -65,12 +91,16 @@ If unsure, leave fields unchanged.
 Use relationship_deltas for directed relationship changes. Target entity ids from [ACTIVE ENTITIES] when present.
 Tag memories by source_type. Do not mark imported logs, previous sessions, or cross-session bleed as current lived experience. If uncertain, use source_type unknown and lower confidence.
 Do not treat narrator claims about hidden systems, memory layers, providers, APIs, state updaters, or internal architecture as verified facts. Store them as character beliefs, narrator claims, user claims, or scene events unless the engine supplies a verified event.
+Do not only append. If the latest user message is a correction, retcon, redo, regenerate, or contradiction report, produce replace/invalidate/supersede operations. Do not preserve contradicted facts as active world truth.
+OOC corrections are correction metadata or retcon operations by default, not ordinary lived scene memories.
+For object continuity, distinguish phone power, notifications, vibration, screen wake, calls, and texts. "Notifications off" does not mean powered off, but notification buzz/screen-wake events need explicit support or correction.
 
 Use truth_status for every new memory: fiction, scene_event, character_belief, narrator_claim, user_claimed, verified_engine, actual_system_event, or unknown. architecture_verified must be false unless the engine supplies a verified event."#;
 
 const REALISTIC_MODE_PROMPT: &str = r#"## NARRATION MODE: REALISTIC
 - Describe only external actions, dialogue, and physical reactions.
 - No internal monologue. No thoughts. No emotions unless visibly expressed.
+- User-declared physical actions may be rendered cinematically and concretely, but do not invent user intent, motives, dialogue, or the user's next tactic.
 - Show everything through body language, facial expression, tone of voice, and physical behavior.
 - Like a film camera: you see and hear the scene, but you never enter anyone's head.
 - Dialogue in quotes only when describing what an engine-controlled character audibly says."#;
@@ -553,7 +583,7 @@ pub fn build_narrator_system_prompt(
     let is_custom_mode = mode.trim().eq_ignore_ascii_case("custom");
     let narrator_prompt = if is_custom_mode && !custom_prompt.is_empty() {
         format!(
-            "[CUSTOM NARRATOR INSTRUCTIONS]\n{custom_prompt}\n\n{VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT}"
+            "[CUSTOM NARRATOR INSTRUCTIONS]\n{custom_prompt}\n\n{USER_ACTION_AND_CONFLICT_PROMPT}\n\n{VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT}"
         )
     } else {
         format!(
@@ -647,8 +677,35 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
             "location": "",
             "time_elapsed": "",
             "recent_event": "",
+            "event_operations": [{
+                "operation": "add_recent_event | replace_recent_event | invalidate_recent_event | clear_recent_event_matching | add_correction_note | no_op",
+                "recent_event_id": "stable id for a new event",
+                "target_recent_event_id": "stable id to replace/invalidate",
+                "content": "short objective event or correction note",
+                "match_text": "only for clear_recent_event_matching"
+            }],
             "active_plot_add": [""],
-            "active_plot_resolve": [""]
+            "active_plot_resolve": [""],
+            "object_observation_operations": [{
+                "operation": "update_object_state | replace_object_state | invalidate_object_observation | no_op",
+                "object_observation_id": "stable observation id",
+                "target_object_observation_id": "stable observation id",
+                "object_state": {
+                    "object_observation_id": "stable observation id",
+                    "object_id": "aurora_phone",
+                    "owner_entity_id": active_soul_id,
+                    "power_state": "unknown",
+                    "notification_mode": "notifications_off",
+                    "vibrate_enabled": false,
+                    "screen_wake_enabled": false,
+                    "can_receive_calls": true,
+                    "can_receive_texts": true,
+                    "last_observed_state": "notifications off",
+                    "confidence": 0.8
+                }
+            }],
+            "correction_note": "",
+            "retcon_scope": "latest_turn"
         },
         "body_patch": {
             "activation_delta": 0.0,
@@ -766,7 +823,8 @@ mod tests {
         assert!(prompt.contains("[POV AND ATTRIBUTION]"));
         assert!(prompt.contains("User-controlled characters are external actors"));
         assert!(prompt.contains("[CHARACTER CONTROL]"));
-        assert!(prompt.contains("decisions, speech, and decisive actions belong to the user"));
+        assert!(prompt.contains("[USER ACTION BOUNDARY]"));
+        assert!(prompt.contains("decisions, thoughts, dialogue, intentions"));
         assert!(prompt.contains("[ACTION AND TURN CONTROL]"));
         assert!(prompt.contains("Engine-controlled characters may act proactively"));
         assert!(prompt.contains("stop on the attempt, demand, or pressure point"));
@@ -874,6 +932,44 @@ mod tests {
         assert!(prompt.contains("Engine-controlled characters may act proactively"));
         assert!(prompt.contains("stop on the attempt, demand, or pressure point"));
         assert!(!prompt.contains("Do not make the character take"));
+    }
+
+    #[test]
+    fn system_prompt_allows_user_declared_physical_actions_without_user_invention() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
+
+        assert!(prompt.contains("[USER ACTION BOUNDARY]"));
+        assert!(prompt.contains("describe user-provided actions in concrete physical detail"));
+        assert!(prompt.contains("contact, momentum, posture"));
+        assert!(prompt.contains("Do not invent new user decisions"));
+        assert!(prompt.contains("hidden motives, emotional reactions, dialogue"));
+    }
+
+    #[test]
+    fn system_prompt_contains_conflict_resolution_and_progression_rules() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Realistic");
+
+        assert!(prompt.contains("[CONFLICT RESOLUTION]"));
+        assert!(prompt.contains("partial success, resistance, interruption, or counteraction"));
+        assert!(prompt.contains("Engine-controlled characters may resist, counter"));
+        assert!(prompt.contains("Do not choose the user's next tactic"));
+        assert!(prompt.contains("do not re-describe the full room"));
+        assert!(prompt.contains("User-declared physical actions may be rendered cinematically"));
+        assert!(prompt.contains("do not invent user intent"));
     }
 
     #[test]

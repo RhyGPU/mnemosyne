@@ -8,7 +8,6 @@ use crate::soul::{MemoryEntry, MemorySourceType, PlotStatus, Soul, TruthStatus};
 
 const DEFAULT_TOKEN_BUDGET: usize = 2_500;
 const MIN_RECENT_MEMORY_SALIENCE: f32 = 65.0;
-const MIN_RELEVANT_MEMORY_SALIENCE: f32 = 45.0;
 const ASSISTANT_RECENT_CHAT_CHARS: usize = 350;
 const ASSISTANT_RECENT_CHAT_HEAD_CHARS: usize = 120;
 const ASSISTANT_RECENT_CHAT_TAIL_CHARS: usize = 220;
@@ -187,7 +186,14 @@ pub fn compile_context_for_separate_user_message(
     soul: &Soul,
     messages: &[ContextMessage],
 ) -> ContextPreview {
-    compile_context_with_budget_and_options(soul, None, messages, &ContextBudget::default(), true)
+    compile_context_with_budget_and_options(
+        soul,
+        None,
+        messages,
+        &ContextBudget::default(),
+        true,
+        false,
+    )
 }
 
 pub fn compile_context_for_session_separate_user_message(
@@ -201,6 +207,7 @@ pub fn compile_context_for_session_separate_user_message(
         messages,
         &ContextBudget::default(),
         true,
+        false,
     )
 }
 
@@ -218,7 +225,22 @@ pub fn compile_context_with_budget_and_world(
     messages: &[ContextMessage],
     budget: &ContextBudget,
 ) -> ContextPreview {
-    compile_context_with_budget_and_options(soul, session_world, messages, budget, false)
+    compile_context_with_budget_and_options(soul, session_world, messages, budget, false, false)
+}
+
+pub fn compile_context_for_session_with_debug_replies(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    messages: &[ContextMessage],
+) -> ContextPreview {
+    compile_context_with_budget_and_options(
+        soul,
+        session_world,
+        messages,
+        &ContextBudget::default(),
+        false,
+        true,
+    )
 }
 
 fn compile_context_with_budget_and_options(
@@ -227,17 +249,20 @@ fn compile_context_with_budget_and_options(
     messages: &[ContextMessage],
     budget: &ContextBudget,
     separate_user_message_follows: bool,
+    include_debug_replies: bool,
 ) -> ContextPreview {
     let mut truncated = false;
-    let section_builders = vec![
+    let mut section_builders = vec![
         build_world_section(soul, session_world, budget),
         build_profile_section(soul, budget),
         build_memory_section(soul, messages, budget),
-        build_verified_memory_layer_reply_section(soul, budget),
         build_relationship_section(soul, budget),
         build_recent_chat_section(messages, budget),
         build_latest_exchange_section(messages, budget, separate_user_message_follows),
     ];
+    if include_debug_replies {
+        section_builders.insert(3, build_verified_memory_layer_reply_section(soul, budget));
+    }
 
     let mut sections = Vec::new();
     let mut memory_slot_debug = Vec::new();
@@ -314,74 +339,370 @@ fn build_memory_section(
     messages: &[ContextMessage],
     budget: &ContextBudget,
 ) -> BuiltSection {
-    let mut lines = Vec::new();
-    for memory in soul
+    let query_terms = recent_chat_terms(messages);
+    let source_query_active = memory_source_query_active(messages);
+    let world_terms = world_memory_terms(soul);
+    let mut debug = Vec::new();
+    let mut section_texts = Vec::new();
+
+    let core_identity = soul
         .memory
         .core
         .iter()
         .filter_map(|memory| clean(memory))
         .filter(|memory| !is_generic_filler_text(memory))
-    {
-        lines.push(format!("Core: {memory}"));
-    }
-    for schema in &soul.memory.schemas {
-        if let Some(summary) = clean(&schema.summary) {
-            if is_generic_filler_text(summary)
-                || is_near_empty_generic_schema(&schema.schema_type, summary)
-            {
-                continue;
-            }
-            lines.push(format!(
-                "Schema: {} (seen {}x): {}",
-                fallback(&schema.schema_type, "pattern"),
-                schema.count,
-                summary
-            ));
-        }
-    }
+        .take(2)
+        .map(|memory| format!("- Core: {memory}"))
+        .collect::<Vec<_>>();
 
-    let query_terms = recent_chat_terms(messages);
-    let source_query_active = memory_source_query_active(messages);
-    let mut selected_recent = soul
+    let schema_identity = soul
+        .memory
+        .schemas
+        .iter()
+        .filter_map(|schema| {
+            clean(&schema.summary).and_then(|summary| {
+                if is_generic_filler_text(summary)
+                    || is_near_empty_generic_schema(&schema.schema_type, summary)
+                {
+                    None
+                } else {
+                    Some(format!(
+                        "- Schema: {} (seen {}x): {}",
+                        fallback(&schema.schema_type, "pattern"),
+                        schema.reinforcement_count.max(schema.count),
+                        summary
+                    ))
+                }
+            })
+        })
+        .take(2)
+        .collect::<Vec<_>>();
+
+    let all_recent = soul
         .memory
         .recent
         .iter()
+        .filter(|memory| memory.is_active && !memory.is_retconned)
         .filter(|memory| !is_generic_filler_memory(memory))
-        .map(|memory| {
-            score_recent_memory(memory, &query_terms, soul.turn_counter, source_query_active)
-        })
-        .filter(|memory| !memory.source_restricted)
-        .filter(|memory| {
-            memory.memory.salience >= MIN_RECENT_MEMORY_SALIENCE
-                || memory.score >= 80.0
-                || (!memory.repetitive && memory.memory.salience >= MIN_RELEVANT_MEMORY_SALIENCE)
-        })
         .collect::<Vec<_>>();
 
-    selected_recent.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(Ordering::Equal)
-    });
+    for slot in MemorySlot::all() {
+        let mut lines = Vec::new();
+        if slot == MemorySlot::CharacterIdentity {
+            lines.extend(core_identity.iter().cloned());
+            lines.extend(schema_identity.iter().cloned());
+        }
 
-    for scored in selected_recent {
-        lines.push(format!(
-            "Recent: [{} / salience {:.0}] {}",
-            memory_context_label(scored.memory),
-            scored.memory.salience,
-            scored.memory.content.trim()
+        let mut candidates = all_recent
+            .iter()
+            .map(|memory| {
+                score_memory_for_slot(
+                    memory,
+                    slot,
+                    &query_terms,
+                    &world_terms,
+                    soul,
+                    source_query_active,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        candidates.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+        });
+
+        let mut selected = 0;
+        for scored in candidates {
+            let reason = slot_reason(scored.memory, slot, &query_terms, &world_terms, soul);
+            let selected_for_slot = !scored.source_restricted
+                && !scored.repetitive
+                && slot_matches_memory(scored.memory, slot, &query_terms, &world_terms, soul)
+                && scored.score >= slot_min_score(slot);
+            debug.push(MemorySlotTrace {
+                slot: slot.key().into(),
+                memory_id: scored.memory.id.clone(),
+                action: if selected_for_slot && selected < slot.cap() {
+                    "selected".into()
+                } else if scored.source_restricted {
+                    "downranked_source".into()
+                } else if scored.repetitive {
+                    "rejected_low_value".into()
+                } else {
+                    "not_selected".into()
+                },
+                reason: reason.clone(),
+                source_type: scored.memory.source_type.as_label().into(),
+                truth_status: scored.memory.truth_status.as_label().into(),
+                entity_match: entity_matches_active_soul(scored.memory, soul)
+                    || target_matches_query(scored.memory, &query_terms),
+                plot_match: plot_matches_memory(scored.memory, &query_terms, &world_terms),
+                salience: scored.memory.salience,
+                final_score: scored.score,
+            });
+
+            if selected_for_slot && selected < slot.cap() {
+                lines.push(format!(
+                    "- [{} / salience {:.0}] {}",
+                    memory_context_label(scored.memory),
+                    scored.memory.salience,
+                    scored.memory.content.trim()
+                ));
+                selected += 1;
+            }
+            if selected >= slot.cap() {
+                break;
+            }
+        }
+
+        if lines.is_empty() {
+            lines.push(slot.fallback().into());
+        }
+        section_texts.push(section_from_lines(
+            slot.header(),
+            lines,
+            slot_token_cap(slot, budget).min(budget.max_tokens),
         ));
     }
 
-    if lines.is_empty() {
-        lines.push("No durable memories have been selected yet.".into());
-    }
+    let truncated = section_texts.iter().any(|section| section.truncated);
+    let text = section_texts
+        .into_iter()
+        .map(|section| section.text)
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
-    section_from_lines(
-        "[RELEVANT MEMORIES]",
-        lines,
-        budget.memory_tokens.min(budget.max_tokens),
+    BuiltSection {
+        text,
+        truncated,
+        memory_slot_debug: debug,
+    }
+}
+
+fn slot_token_cap(slot: MemorySlot, budget: &ContextBudget) -> usize {
+    match slot {
+        MemorySlot::RecentEmotionalState => 90,
+        _ => (budget.memory_tokens / 5).max(100),
+    }
+}
+
+fn slot_min_score(slot: MemorySlot) -> f32 {
+    match slot {
+        MemorySlot::RecentEmotionalState => 58.0,
+        MemorySlot::Relationship => 54.0,
+        _ => 50.0,
+    }
+}
+
+fn score_memory_for_slot<'a>(
+    memory: &'a MemoryEntry,
+    slot: MemorySlot,
+    query_terms: &HashSet<String>,
+    world_terms: &HashSet<String>,
+    soul: &Soul,
+    source_query_active: bool,
+) -> ScoredMemory<'a> {
+    let mut scored = score_recent_memory(memory, query_terms, soul.turn_counter, source_query_active);
+    if slot_matches_memory(memory, slot, query_terms, world_terms, soul) {
+        scored.score += 24.0;
+    }
+    if entity_matches_active_soul(memory, soul) {
+        scored.score += 14.0;
+    }
+    if target_matches_query(memory, query_terms) {
+        scored.score += 18.0;
+    }
+    if plot_matches_memory(memory, query_terms, world_terms) {
+        scored.score += 16.0;
+    }
+    if is_durable_memory_text(&memory.content) {
+        scored.score += 10.0;
+    }
+    if matches!(
+        memory.truth_status,
+        TruthStatus::NarratorClaim | TruthStatus::CharacterBelief | TruthStatus::UserClaimed
+    ) && is_architecture_related_memory(&memory.content)
+    {
+        scored.score -= 35.0;
+    }
+    scored
+}
+
+fn slot_matches_memory(
+    memory: &MemoryEntry,
+    slot: MemorySlot,
+    query_terms: &HashSet<String>,
+    world_terms: &HashSet<String>,
+    soul: &Soul,
+) -> bool {
+    let lower = memory.content.to_ascii_lowercase();
+    let tag = memory.tag.to_ascii_lowercase();
+    match slot {
+        MemorySlot::Relationship => {
+            let relationship_text = contains_any(
+                &lower,
+                &[
+                    "trust", "distrust", "affection", "fear of", "bond", "betray",
+                    "relationship", "promise", "boundary", "owes", "forgave", "conflict",
+                    "argued",
+                ],
+            ) || tag.contains("relationship")
+                || !memory.target_entity_ids.is_empty();
+            relationship_text
+                && (target_matches_query(memory, query_terms)
+                    || memory.target_entity_ids.iter().any(|target| {
+                        let target = display_entity_id(target);
+                        target == "default_player" || target == "user"
+                    })
+                    || memory.target_entity_ids.is_empty())
+                && entity_matches_active_soul(memory, soul)
+        }
+        MemorySlot::CurrentPlot => {
+            contains_any(
+                &lower,
+                &[
+                    "plot", "goal", "testing", "developing", "trying to", "investigate",
+                    "current", "mission", "task", "intention", "future",
+                ],
+            ) || tag.contains("plot")
+                || plot_matches_memory(memory, query_terms, world_terms)
+        }
+        MemorySlot::CharacterIdentity => {
+            contains_any(
+                &lower,
+                &[
+                    "identity", "is an", "is a", "role", "self-concept", "name",
+                    "analysis agent", "test subject", "purpose", "belongs to",
+                ],
+            ) || tag.contains("identity")
+                || tag.contains("schema")
+        }
+        MemorySlot::UnresolvedTension => {
+            contains_any(
+                &lower,
+                &[
+                    "unresolved", "tension", "betray", "promise", "commitment", "boundary",
+                    "conflict", "guilt", "concern", "afraid", "owed", "not resolved",
+                    "argued",
+                ],
+            ) || tag.contains("conflict")
+                || tag.contains("boundary")
+        }
+        MemorySlot::WorldLocation => {
+            contains_any(
+                &lower,
+                &[
+                    "location", "world", "room", "cell", "lab", "testing room", "kitchen",
+                    "door", "hallway", "object", "terminal", "white room",
+                ],
+            ) || plot_matches_memory(memory, query_terms, world_terms)
+                || tag.contains("orientation")
+        }
+        MemorySlot::RecentEmotionalState => {
+            contains_any(
+                &lower,
+                &[
+                    "feels", "felt", "afraid", "angry", "concerned", "guilt", "ashamed",
+                    "diagnostic mode", "guarded", "distressed", "relieved",
+                ],
+            ) || tag.contains("emotion")
+                || tag.contains("trauma")
+        }
+    }
+}
+
+fn slot_reason(
+    memory: &MemoryEntry,
+    slot: MemorySlot,
+    query_terms: &HashSet<String>,
+    world_terms: &HashSet<String>,
+    soul: &Soul,
+) -> String {
+    let mut reasons = Vec::new();
+    if entity_matches_active_soul(memory, soul) {
+        reasons.push("entity_match");
+    }
+    if target_matches_query(memory, query_terms) {
+        reasons.push("relationship_target_match");
+    }
+    if plot_matches_memory(memory, query_terms, world_terms) {
+        reasons.push("plot_or_world_match");
+    }
+    if is_durable_memory_text(&memory.content) {
+        reasons.push("durable_content");
+    }
+    if slot_matches_memory(memory, slot, query_terms, world_terms, soul) {
+        reasons.push("slot_keyword_match");
+    }
+    if reasons.is_empty() {
+        reasons.push("low_relevance");
+    }
+    reasons.join(" + ")
+}
+
+fn entity_matches_active_soul(memory: &MemoryEntry, soul: &Soul) -> bool {
+    let active = soul.character_id.trim();
+    let active_name = soul.character_name.trim();
+    memory
+        .perceived_by_entity_id
+        .as_deref()
+        .map(|entity| entity.eq_ignore_ascii_case(active) || entity.eq_ignore_ascii_case(active_name))
+        .unwrap_or(true)
+}
+
+fn target_matches_query(memory: &MemoryEntry, query_terms: &HashSet<String>) -> bool {
+    memory.target_entity_ids.iter().any(|target| {
+        let target = display_entity_id(target).to_ascii_lowercase();
+        query_terms.contains(&target)
+    })
+}
+
+fn plot_matches_memory(
+    memory: &MemoryEntry,
+    query_terms: &HashSet<String>,
+    world_terms: &HashSet<String>,
+) -> bool {
+    let memory_terms = token_set(&memory.content);
+    memory_terms.iter().any(|term| world_terms.contains(term) || query_terms.contains(term))
+}
+
+fn world_memory_terms(soul: &Soul) -> HashSet<String> {
+    let mut text = format!(
+        "{} {} {} {}",
+        soul.world.location,
+        soul.world.active_plots.join(" "),
+        soul.world.key_objects.join(" "),
+        soul.world
+            .dominant_current_plot
+            .as_ref()
+            .map(|plot| format!("{} {}", plot.title, plot.summary))
+            .unwrap_or_default()
+    );
+    for plot in &soul.world.background_plots {
+        if plot.status != PlotStatus::Resolved {
+            text.push(' ');
+            text.push_str(&plot.title);
+            text.push(' ');
+            text.push_str(&plot.summary);
+        }
+    }
+    token_set(&text)
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn is_durable_memory_text(text: &str) -> bool {
+    contains_any(
+        &text.to_ascii_lowercase(),
+        &[
+            "promise", "betray", "identity", "boundary", "future intention", "resolved",
+            "unresolved", "turning point", "important", "prefers", "refuses", "commitment",
+            "testing memory", "building mnemosyne",
+        ],
     )
 }
 
@@ -453,14 +774,100 @@ fn build_world_section(
         &world.active_plots,
         "No active plot has been established.",
     ));
+    if let Some(plot) = world.dominant_current_plot.as_ref().filter(|plot| {
+        matches!(plot.status, PlotStatus::Dominant | PlotStatus::Unknown)
+            && !plot.title.trim().is_empty()
+    }) {
+        lines.push(format!(
+            "Dominant current plot: {} - {}",
+            plot.title.trim(),
+            fallback(&plot.summary, "No summary")
+        ));
+    }
+    let background = world
+        .background_plots
+        .iter()
+        .filter(|plot| {
+            matches!(plot.status, PlotStatus::Background | PlotStatus::Stale | PlotStatus::Unknown)
+                && !plot.title.trim().is_empty()
+        })
+        .take(3)
+        .map(|plot| format!("{} ({})", plot.title.trim(), plot.status.as_label()))
+        .collect::<Vec<_>>();
+    if !background.is_empty() {
+        lines.push(format!("Background/stale plots: {}", background.join("; ")));
+    }
+    let resolved = world
+        .resolved_plots
+        .iter()
+        .filter(|plot| matches!(plot.status, PlotStatus::Resolved) && !plot.title.trim().is_empty())
+        .rev()
+        .take(2)
+        .map(|plot| {
+            format!(
+                "{} resolved: {}",
+                plot.title.trim(),
+                plot.resolution_summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|summary| !summary.is_empty())
+                    .unwrap_or("resolution recorded")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !resolved.is_empty() {
+        lines.push(format!("Resolved plots: {}", resolved.join("; ")));
+    }
     lines.push(format_list(
         "Key objects",
         &world.key_objects,
         "No key objects are being tracked.",
     ));
+    let object_state_lines = world
+        .object_states
+        .iter()
+        .filter(|object| !object.object_id.trim().is_empty())
+        .take(6)
+        .map(|object| {
+            let mut parts = vec![
+                format!("power {}", fallback(&object.power_state, "unknown")),
+                format!(
+                    "notifications {}",
+                    fallback(&object.notification_mode, "unknown")
+                ),
+            ];
+            if let Some(vibrate) = object.vibrate_enabled {
+                parts.push(format!("vibrate {}", bool_label(vibrate)));
+            }
+            if let Some(screen_wake) = object.screen_wake_enabled {
+                parts.push(format!("screen_wake {}", bool_label(screen_wake)));
+            }
+            if let Some(owner) = object.owner_entity_id.as_deref().and_then(clean) {
+                parts.push(format!("owner {owner}"));
+            }
+            format!("- {} ({})", object.object_id.trim(), parts.join(", "))
+        })
+        .collect::<Vec<_>>();
+    if !object_state_lines.is_empty() {
+        lines.push(format!("Object states:\n{}", object_state_lines.join("\n")));
+    }
 
-    let mut recent_events = world
-        .recent_events
+    let active_record_events = world
+        .recent_event_records
+        .iter()
+        .filter(|event| event.is_active)
+        .map(|event| event.content.as_str())
+        .collect::<Vec<_>>();
+    let recent_event_source = if active_record_events.is_empty() {
+        world
+            .recent_events
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    } else {
+        active_record_events
+    };
+    let mut recent_events = recent_event_source
         .iter()
         .rev()
         .take(8)
@@ -638,7 +1045,12 @@ fn compact_sections_to_budget(sections: &mut Vec<String>, max_tokens: usize) -> 
     let mut truncated = false;
     let trim_order = [
         "[RECENT CHAT, LOWER PRIORITY]",
-        "[RELEVANT MEMORIES]",
+        "[RECENT EMOTIONAL STATE]",
+        "[WORLD / LOCATION MEMORY]",
+        "[UNRESOLVED TENSION]",
+        "[CURRENT PLOT MEMORY]",
+        "[RELATIONSHIP MEMORY]",
+        "[CHARACTER IDENTITY MEMORY]",
         "[CHARACTER SNAPSHOT]",
         "[WORLD SNAPSHOT]",
         "[RELATIONSHIPS]",
@@ -1048,6 +1460,14 @@ fn fallback<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     clean(value).unwrap_or(fallback)
 }
 
+fn bool_label(value: bool) -> &'static str {
+    if value {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
 fn display_entity_id(entity_id: &str) -> String {
     let trimmed = entity_id.trim();
     if trimmed.eq_ignore_ascii_case("user") || trimmed.eq_ignore_ascii_case("default_player") {
@@ -1170,7 +1590,12 @@ mod tests {
 
         assert!(preview.text.contains("[WORLD SNAPSHOT]"));
         assert!(preview.text.contains("[CHARACTER SNAPSHOT]"));
-        assert!(preview.text.contains("[RELEVANT MEMORIES]"));
+        assert!(preview.text.contains("[RELATIONSHIP MEMORY]"));
+        assert!(preview.text.contains("[CURRENT PLOT MEMORY]"));
+        assert!(preview.text.contains("[CHARACTER IDENTITY MEMORY]"));
+        assert!(preview.text.contains("[UNRESOLVED TENSION]"));
+        assert!(preview.text.contains("[WORLD / LOCATION MEMORY]"));
+        assert!(preview.text.contains("[RECENT EMOTIONAL STATE]"));
         assert!(preview.text.contains("[RELATIONSHIPS]"));
         assert!(preview.text.contains("[LATEST EXCHANGE, HIGH PRIORITY]"));
     }
@@ -1598,7 +2023,7 @@ mod tests {
         ));
 
         let preview = compile_context_for_messages(&soul, &[]);
-        let memories = section_text(&preview.text, "[RELEVANT MEMORIES]");
+        let memories = section_text(&preview.text, "[WORLD / LOCATION MEMORY]");
 
         assert!(memories.contains("brass key"));
         assert!(!memories.contains("neutral exchange added texture"));
@@ -1619,9 +2044,9 @@ mod tests {
         ));
 
         let preview = compile_context_for_messages(&soul, &[]);
-        let memories = section_text(&preview.text, "[RELEVANT MEMORIES]");
+        let memories = section_text(&preview.text, "[CHARACTER IDENTITY MEMORY]");
 
-        assert!(memories.contains("Recent: [current_session / salience 72]"));
+        assert!(memories.contains("[current_session / salience 72]"));
         assert!(memories.contains("other Aurora"));
     }
 
@@ -1641,7 +2066,7 @@ mod tests {
         soul.memory.recent.push(claim);
 
         let preview = compile_context_for_messages(&soul, &[]);
-        let memories = section_text(&preview.text, "[RELEVANT MEMORIES]");
+        let memories = section_text(&preview.text, "[CHARACTER IDENTITY MEMORY]");
 
         assert!(memories.contains("[character_belief / unverified"));
         assert!(memories.contains("memory layer"));
@@ -1698,10 +2123,14 @@ mod tests {
         });
 
         let preview = compile_context_for_messages(&soul, &[]);
+        assert!(!preview.text.contains("[MEMORY LAYER REPLY - VERIFIED DEBUG]"));
 
-        assert!(preview.text.contains("[MEMORY LAYER REPLY - VERIFIED DEBUG]"));
-        assert!(preview.text.contains("nonce: nonce-123"));
-        assert!(preview
+        let debug_preview = compile_context_for_session_with_debug_replies(&soul, None, &[]);
+        assert!(debug_preview
+            .text
+            .contains("[MEMORY LAYER REPLY - VERIFIED DEBUG]"));
+        assert!(debug_preview.text.contains("nonce: nonce-123"));
+        assert!(debug_preview
             .text
             .contains("content: Debug memory-layer nonce reply received."));
     }
@@ -1737,7 +2166,7 @@ mod tests {
                 content: "We keep moving down the hallway.".into(),
             }],
         );
-        let normal_memories = section_text(&normal.text, "[RELEVANT MEMORIES]");
+        let normal_memories = section_text(&normal.text, "[WORLD / LOCATION MEMORY]");
         assert!(!normal_memories.contains("previous Aurora argued"));
         assert!(normal_memories.contains("current hallway door"));
 
@@ -1748,7 +2177,7 @@ mod tests {
                 content: "What did the imported log say about previous Aurora?".into(),
             }],
         );
-        let referenced_memories = section_text(&referenced.text, "[RELEVANT MEMORIES]");
+        let referenced_memories = section_text(&referenced.text, "[UNRESOLVED TENSION]");
         assert!(referenced_memories.contains("imported_log / not lived"));
         assert!(referenced_memories.contains("previous Aurora argued"));
     }
@@ -1758,7 +2187,7 @@ mod tests {
         let mut soul = new_default_soul("Aurora");
         let mut bleed = memory(
             "bleed",
-            "Aurora has a memory-like trace of another session's emotional alteration.",
+            "Aurora felt distressed by a memory-like trace of another session's emotional alteration.",
             "identity_continuity",
             95.0,
             95.0,
@@ -1784,7 +2213,7 @@ mod tests {
                 content: "We talk about the quiet testing room.".into(),
             }],
         );
-        assert!(!section_text(&normal.text, "[RELEVANT MEMORIES]")
+        assert!(!section_text(&normal.text, "[RECENT EMOTIONAL STATE]")
             .contains("memory-like trace"));
 
         let referenced = compile_context_for_messages(
@@ -1794,9 +2223,157 @@ mod tests {
                 content: "Do you remember the cross-session bleed from before?".into(),
             }],
         );
-        let memories = section_text(&referenced.text, "[RELEVANT MEMORIES]");
+        let memories = section_text(&referenced.text, "[RECENT EMOTIONAL STATE]");
         assert!(memories.contains("cross_session_bleed / not lived"));
         assert!(memories.contains("memory-like trace"));
+    }
+
+    #[test]
+    fn high_salience_emotional_memory_does_not_crowd_relationship_slot() {
+        let mut soul = new_default_soul("Echo-0");
+        soul.memory.recent.push(memory(
+            "emotion",
+            "Echo-0 felt distressed while staring at the debug terminal.",
+            "emotion",
+            99.0,
+            99.0,
+            1,
+        ));
+        let mut relationship = memory(
+            "relationship",
+            "Echo-0 trusts default_player as the operator building Mnemosyne memory behavior.",
+            "relationship",
+            55.0,
+            45.0,
+            2,
+        );
+        relationship.target_entity_ids = vec!["default_player".into()];
+        soul.memory.recent.push(relationship);
+
+        let preview = compile_context_for_messages(&soul, &[]);
+        let relationship_slot = section_text(&preview.text, "[RELATIONSHIP MEMORY]");
+        let emotion_slot = section_text(&preview.text, "[RECENT EMOTIONAL STATE]");
+
+        assert!(relationship_slot.contains("building Mnemosyne"));
+        assert!(!relationship_slot.contains("felt distressed"));
+        assert!(emotion_slot.contains("felt distressed"));
+    }
+
+    #[test]
+    fn relationship_slot_respects_directed_entity_pair() {
+        let mut soul = new_default_soul("Aurora");
+        let mut junhwa = memory(
+            "junhwa",
+            "Aurora distrusts Junhwa after a betrayal.",
+            "relationship",
+            98.0,
+            98.0,
+            1,
+        );
+        junhwa.target_entity_ids = vec!["junhwa".into()];
+        let mut rhy = memory(
+            "rhy",
+            "Aurora trusts Rhy with cautious collaboration.",
+            "relationship",
+            58.0,
+            50.0,
+            2,
+        );
+        rhy.target_entity_ids = vec!["rhy".into()];
+        soul.memory.recent.push(junhwa);
+        soul.memory.recent.push(rhy);
+
+        let preview = compile_context_for_messages(
+            &soul,
+            &[ContextMessage {
+                role: "user".into(),
+                content: "Talk to Rhy about collaboration.".into(),
+            }],
+        );
+        let relationship_slot = section_text(&preview.text, "[RELATIONSHIP MEMORY]");
+
+        assert!(relationship_slot.contains("trusts Rhy"));
+        assert!(!relationship_slot.contains("distrusts Junhwa"));
+    }
+
+    #[test]
+    fn identity_and_current_plot_memories_use_separate_slots() {
+        let mut soul = new_default_soul("Echo-0");
+        soul.world.active_plots = vec!["Test memory retrieval slots".into()];
+        soul.memory.recent.push(memory(
+            "identity",
+            "Echo-0 is an analysis agent for system questions.",
+            "identity",
+            62.0,
+            55.0,
+            1,
+        ));
+        soul.memory.recent.push(memory(
+            "plot",
+            "Echo-0 is testing memory retrieval, compression, and bleed control.",
+            "plot",
+            62.0,
+            55.0,
+            2,
+        ));
+
+        let preview = compile_context_for_messages(&soul, &[]);
+
+        assert!(section_text(&preview.text, "[CHARACTER IDENTITY MEMORY]")
+            .contains("analysis agent"));
+        assert!(section_text(&preview.text, "[CURRENT PLOT MEMORY]")
+            .contains("memory retrieval"));
+    }
+
+    #[test]
+    fn resolved_and_stale_plots_do_not_become_dominant() {
+        let mut soul = new_default_soul("Echo-0");
+        soul.world.dominant_current_plot = Some(crate::soul::PlotEntry {
+            plot_id: "resolved".into(),
+            title: "Old export crash".into(),
+            summary: "Already resolved.".into(),
+            status: PlotStatus::Resolved,
+            salience: 90.0,
+            started_turn: 1,
+            last_touched_turn: 2,
+            related_entities: vec!["echo_0".into()],
+            related_world_id: None,
+            unresolved_questions: Vec::new(),
+            resolution_summary: Some("Export crash was fixed.".into()),
+        });
+        soul.world.background_plots.push(crate::soul::PlotEntry {
+            plot_id: "stale".into(),
+            title: "Old hallway search".into(),
+            summary: "No longer active unless mentioned.".into(),
+            status: PlotStatus::Stale,
+            salience: 30.0,
+            started_turn: 1,
+            last_touched_turn: 1,
+            related_entities: vec!["echo_0".into()],
+            related_world_id: None,
+            unresolved_questions: Vec::new(),
+            resolution_summary: None,
+        });
+        soul.world.resolved_plots.push(crate::soul::PlotEntry {
+            plot_id: "resolved-list".into(),
+            title: "Image profile bug".into(),
+            summary: "Resolved profile-image ownership issue.".into(),
+            status: PlotStatus::Resolved,
+            salience: 60.0,
+            started_turn: 1,
+            last_touched_turn: 4,
+            related_entities: vec!["echo_0".into()],
+            related_world_id: None,
+            unresolved_questions: Vec::new(),
+            resolution_summary: Some("Avatar replacement stopped deleting old Soul images.".into()),
+        });
+
+        let preview = compile_context_for_messages(&soul, &[]);
+        let world = section_text(&preview.text, "[WORLD SNAPSHOT]");
+
+        assert!(!world.contains("Dominant current plot: Old export crash"));
+        assert!(world.contains("Old hallway search (stale)"));
+        assert!(world.contains("Image profile bug resolved"));
     }
 
     #[test]
@@ -1873,6 +2450,10 @@ mod tests {
             objective_event_id: None,
             truth_status: TruthStatus::Unknown,
             architecture_verified: false,
+            is_active: true,
+            invalidated_by_patch_id: None,
+            superseded_by_memory_id: None,
+            is_retconned: false,
         }
     }
 

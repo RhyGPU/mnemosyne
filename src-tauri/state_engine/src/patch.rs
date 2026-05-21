@@ -5,7 +5,10 @@ use crate::{
     hidden_state::HiddenState,
     memory::create_scored_memory,
     setting::SessionWorld,
-    soul::{current_timestamp, MemorySourceType, Relationship, Soul, TruthStatus},
+    soul::{
+        current_timestamp, MemorySourceType, ObjectState, Relationship, Soul, TruthStatus,
+        WorldEventRecord, WorldLog,
+    },
 };
 
 pub const PATCH_PROTOCOL_VERSION: u32 = 1;
@@ -34,11 +37,13 @@ pub struct SoulPatch {
     pub relationship_delta: Option<RelationshipDelta>,
     pub relationship_deltas: Vec<RelationshipDelta>,
     pub new_memories: Vec<MemoryPatch>,
+    pub memory_operations: Vec<MemoryPatch>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RelationshipDelta {
+    pub relationship_event_id: Option<String>,
     pub from: Option<String>,
     pub target: Option<String>,
     pub trust: Option<f32>,
@@ -59,6 +64,10 @@ pub struct RelationshipDelta {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryPatch {
+    pub operation: Option<String>,
+    pub memory_id: Option<String>,
+    pub target_memory_id: Option<String>,
+    pub supersedes_memory_id: Option<String>,
     pub content: String,
     pub tag: Option<String>,
     pub source_type: Option<MemorySourceType>,
@@ -95,6 +104,73 @@ pub struct WorldPatch {
     pub active_plot_resolve: Vec<String>,
     pub key_object_add: Vec<String>,
     pub key_object_remove: Vec<String>,
+    pub event_operations: Vec<WorldEventOperationPatch>,
+    pub object_observation_operations: Vec<ObjectObservationOperationPatch>,
+    pub corrected_object_states: Vec<ObjectState>,
+    pub invalidated_recent_event_ids: Vec<String>,
+    pub correction_note: Option<String>,
+    pub retcon_scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorldEventOperationPatch {
+    pub operation: String,
+    pub recent_event_id: Option<String>,
+    pub target_recent_event_id: Option<String>,
+    pub supersedes_recent_event_id: Option<String>,
+    pub content: Option<String>,
+    pub match_text: Option<String>,
+    pub invalidated_by_patch_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObjectObservationOperationPatch {
+    pub operation: String,
+    pub object_observation_id: Option<String>,
+    pub target_object_observation_id: Option<String>,
+    pub object_state: Option<ObjectState>,
+    pub invalidated_by_patch_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorldObjectConsistencyNotice {
+    pub event: String,
+    pub object_id: Option<String>,
+    pub reason: String,
+    pub rejected: bool,
+    pub correction: bool,
+}
+
+impl WorldEventOperationPatch {
+    fn is_empty(&self) -> bool {
+        self.operation.trim().is_empty()
+            && self.content.as_deref().map_or(true, |value| value.trim().is_empty())
+            && self
+                .recent_event_id
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self
+                .target_recent_event_id
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+    }
+}
+
+impl ObjectObservationOperationPatch {
+    fn is_empty(&self) -> bool {
+        self.operation.trim().is_empty()
+            && self.object_state.is_none()
+            && self
+                .object_observation_id
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self
+                .target_object_observation_id
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+    }
 }
 
 /// Accepted for Patch Protocol V1 compatibility; arousal bridging uses the optional scalar fields only.
@@ -311,6 +387,7 @@ impl SoulPatch {
                 .relationship_deltas
                 .iter()
                 .all(RelationshipDelta::is_empty)
+            && self.memory_operations.iter().all(MemoryPatch::is_empty)
             && self.new_memories.iter().all(MemoryPatch::is_empty)
     }
 
@@ -327,7 +404,33 @@ impl SoulPatch {
 
     fn apply_memories(&self, soul: &mut Soul) -> MemoryApplyReport {
         let mut report = MemoryApplyReport::default();
+        for operation in &self.memory_operations {
+            if apply_memory_operation(soul, operation) {
+                report.events.push(MemoryApplyEvent {
+                    action: MemoryApplyAction::Merged,
+                    source_type: operation.resolved_source_type(&operation.content),
+                    content: operation.content.clone(),
+                    reason: operation.operation.clone(),
+                });
+            }
+        }
         for memory in self.new_memories.iter().take(memory_patch_limit(&self.new_memories)) {
+            if memory.operation.as_deref().is_some_and(|op| {
+                matches!(
+                    normalized_operation(op).as_str(),
+                    "invalidate" | "replace" | "update" | "mark_retconned" | "supersede"
+                )
+            }) {
+                if apply_memory_operation(soul, memory) {
+                    report.events.push(MemoryApplyEvent {
+                        action: MemoryApplyAction::Merged,
+                        source_type: memory.resolved_source_type(&memory.content),
+                        content: memory.content.clone(),
+                        reason: memory.operation.clone(),
+                    });
+                }
+                continue;
+            }
             let Some(content) = memory.content() else {
                 continue;
             };
@@ -343,36 +446,43 @@ impl SoulPatch {
                 });
                 continue;
             }
-            if let Some(existing_index) = duplicate_memory_index(soul, content, memory.tag()) {
-                report.events.push(MemoryApplyEvent {
-                    action: MemoryApplyAction::RejectedDuplicate,
-                    source_type,
-                    content: content.to_string(),
-                    reason: Some(format!(
-                        "similar to existing memory {}",
-                        soul.memory.recent[existing_index].id
-                    )),
-                });
-                continue;
-            }
-            if let Some(existing_index) = mergeable_memory_index(soul, content, memory.tag()) {
-                let existing = &mut soul.memory.recent[existing_index];
-                existing.salience = existing.salience.max(55.0).min(100.0);
-                existing.retrieval_strength = existing.retrieval_strength.max(55.0).min(100.0);
-                if existing.confidence.is_none() {
-                    existing.confidence =
-                        memory.confidence.filter(|confidence| confidence.is_finite());
+            if source_type != MemorySourceType::ImportedLog {
+                if let Some(existing_index) = duplicate_memory_index(soul, content, memory.tag()) {
+                    report.events.push(MemoryApplyEvent {
+                        action: MemoryApplyAction::RejectedDuplicate,
+                        source_type,
+                        content: content.to_string(),
+                        reason: Some(format!(
+                            "similar to existing memory {}",
+                            soul.memory.recent[existing_index].id
+                        )),
+                    });
+                    continue;
                 }
-                report.events.push(MemoryApplyEvent {
-                    action: MemoryApplyAction::Merged,
-                    source_type,
-                    content: content.to_string(),
-                    reason: Some(format!("merged into memory {}", existing.id)),
-                });
-                continue;
+            }
+            if source_type != MemorySourceType::ImportedLog {
+                if let Some(existing_index) = mergeable_memory_index(soul, content, memory.tag()) {
+                    let existing = &mut soul.memory.recent[existing_index];
+                    existing.salience = existing.salience.max(55.0).min(100.0);
+                    existing.retrieval_strength = existing.retrieval_strength.max(55.0).min(100.0);
+                    if existing.confidence.is_none() {
+                        existing.confidence =
+                            memory.confidence.filter(|confidence| confidence.is_finite());
+                    }
+                    report.events.push(MemoryApplyEvent {
+                        action: MemoryApplyAction::Merged,
+                        source_type,
+                        content: content.to_string(),
+                        reason: Some(format!("merged into memory {}", existing.id)),
+                    });
+                    continue;
+                }
             }
             let tag = memory.tag();
             let mut recent = create_scored_memory(soul, content, tag);
+            if let Some(memory_id) = memory.cleaned_optional(&memory.memory_id) {
+                recent.id = memory_id;
+            }
             recent.source_type = source_type;
             recent.source_session_id = memory.cleaned_optional(&memory.source_session_id);
             recent.source_conversation_id = memory.cleaned_optional(&memory.source_conversation_id);
@@ -398,6 +508,7 @@ impl SoulPatch {
                 .filter(|confidence| confidence.is_finite())
                 .or_else(|| matches!(source_type, MemorySourceType::Unknown).then_some(0.45));
             recent.objective_event_id = memory.cleaned_optional(&memory.objective_event_id);
+            recent.superseded_by_memory_id = memory.cleaned_optional(&memory.supersedes_memory_id);
             recent.truth_status = memory.truth_status.unwrap_or_default();
             recent.architecture_verified =
                 memory.architecture_verified.unwrap_or(false) && recent.truth_status.is_engine_verified();
@@ -454,6 +565,51 @@ struct MemoryApplyReport {
     events: Vec<MemoryApplyEvent>,
 }
 
+fn apply_memory_operation(soul: &mut Soul, memory: &MemoryPatch) -> bool {
+    let operation = normalized_operation(memory.operation.as_deref().unwrap_or("add"));
+    let target_id = memory
+        .cleaned_optional(&memory.target_memory_id)
+        .or_else(|| memory.cleaned_optional(&memory.memory_id));
+    match operation.as_str() {
+        "invalidate" | "mark_retconned" | "revert" => {
+            let Some(target_id) = target_id else {
+                return false;
+            };
+            let mut changed = false;
+            for existing in &mut soul.memory.recent {
+                if existing.id == target_id {
+                    existing.is_active = false;
+                    existing.is_retconned = true;
+                    existing.invalidated_by_patch_id =
+                        memory.cleaned_optional(&memory.objective_event_id);
+                    changed = true;
+                }
+            }
+            changed
+        }
+        "replace" | "supersede" | "update" => {
+            let Some(target_id) = target_id else {
+                return false;
+            };
+            let mut changed = false;
+            for existing in &mut soul.memory.recent {
+                if existing.id == target_id {
+                    existing.is_active = false;
+                    existing.is_retconned = true;
+                    existing.superseded_by_memory_id =
+                        memory.cleaned_optional(&memory.memory_id);
+                    changed = true;
+                }
+            }
+            if operation == "update" {
+                return changed;
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
 impl RelationshipDelta {
     fn is_empty(&self) -> bool {
         self.trust.is_none()
@@ -484,6 +640,15 @@ impl RelationshipDelta {
 impl MemoryPatch {
     fn is_empty(&self) -> bool {
         self.content.trim().is_empty()
+            && self.operation.as_deref().map_or(true, |op| op.trim().is_empty())
+            && self
+                .memory_id
+                .as_deref()
+                .map_or(true, |id| id.trim().is_empty())
+            && self
+                .target_memory_id
+                .as_deref()
+                .map_or(true, |id| id.trim().is_empty())
     }
 
     fn content(&self) -> Option<&str> {
@@ -758,13 +923,68 @@ impl WorldPatch {
                 .key_object_remove
                 .iter()
                 .all(|object| object.trim().is_empty())
+            && self
+                .event_operations
+                .iter()
+                .all(WorldEventOperationPatch::is_empty)
+            && self
+                .object_observation_operations
+                .iter()
+                .all(ObjectObservationOperationPatch::is_empty)
+            && self
+                .corrected_object_states
+                .iter()
+                .all(|object| object.object_id.trim().is_empty())
+            && self.invalidated_recent_event_ids.is_empty()
+            && self
+                .correction_note
+                .as_deref()
+                .map_or(true, |note| note.trim().is_empty())
+            && self
+                .retcon_scope
+                .as_deref()
+                .map_or(true, |scope| scope.trim().is_empty())
     }
 
     fn apply(&self, soul: &mut Soul) -> bool {
         self.apply_to_world_log(&mut soul.world)
     }
 
-    pub fn apply_to_world_log(&self, world: &mut crate::soul::WorldLog) -> bool {
+    pub fn object_consistency_notices(
+        &self,
+        world: &crate::soul::WorldLog,
+    ) -> Vec<WorldObjectConsistencyNotice> {
+        let mut checked_world = world.clone();
+        for object_state in &self.corrected_object_states {
+            upsert_object_state(&mut checked_world, object_state);
+        }
+        let mut notices = Vec::new();
+        if let Some(note) = cleaned(&self.correction_note) {
+            if is_retcon_or_correction_text(note) {
+                notices.push(WorldObjectConsistencyNotice {
+                    event: note.to_string(),
+                    object_id: None,
+                    reason: "retcon/correction note routes through correction handling".into(),
+                    rejected: false,
+                    correction: true,
+                });
+            }
+        }
+        if let Some(event) = cleaned(&self.recent_event) {
+            if let Some(notice) = world_event_consistency_notice(&checked_world, event) {
+                notices.push(notice);
+            }
+        }
+        notices.extend(
+            self.recent_events
+                .iter()
+                .filter_map(|event| clean_str(event))
+                .filter_map(|event| world_event_consistency_notice(&checked_world, event)),
+        );
+        notices
+    }
+
+    pub fn apply_to_world_log(&self, world: &mut WorldLog) -> bool {
         let mut changed = false;
         if let Some(location) = cleaned(&self.location) {
             world.location = location.to_string();
@@ -775,17 +995,28 @@ impl WorldPatch {
             changed = true;
         }
 
+        for operation in &self.event_operations {
+            changed |= apply_world_event_operation(world, operation);
+        }
+        for operation in &self.object_observation_operations {
+            changed |= apply_object_observation_operation(world, operation);
+        }
+        for object_state in &self.corrected_object_states {
+            changed |= upsert_object_state(world, object_state);
+        }
+        if let Some(note) = cleaned(&self.correction_note) {
+            changed |= apply_retcon_correction_note(world, note);
+        }
+
         if let Some(event) = cleaned(&self.recent_event) {
-            push_recent_event_to_world(world, event);
-            changed = true;
+            changed |= apply_recent_event_with_consistency_guard(world, event);
         }
         for event in self
             .recent_events
             .iter()
             .filter_map(|event| clean_str(event))
         {
-            push_recent_event_to_world(world, event);
-            changed = true;
+            changed |= apply_recent_event_with_consistency_guard(world, event);
         }
 
         for plot in self
@@ -969,12 +1200,409 @@ fn clean_str(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
-fn push_recent_event_to_world(world: &mut crate::soul::WorldLog, event: &str) {
+fn normalized_operation(operation: &str) -> String {
+    operation
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_")
+}
+
+fn apply_recent_event_with_consistency_guard(world: &mut WorldLog, event: &str) -> bool {
+    if is_retcon_or_correction_text(event) {
+        return apply_retcon_correction_note(world, event);
+    }
+    if world_event_consistency_notice(world, event)
+        .as_ref()
+        .is_some_and(|notice| notice.rejected)
+    {
+        return false;
+    }
+    push_recent_event_to_world(world, event);
+    true
+}
+
+fn apply_world_event_operation(world: &mut WorldLog, operation: &WorldEventOperationPatch) -> bool {
+    let op = normalized_operation(&operation.operation);
+    match op.as_str() {
+        "add" | "add_recent_event" => {
+            let Some(content) = operation.content.as_deref().and_then(clean_str) else {
+                return false;
+            };
+            apply_recent_event_record_with_guard(
+                world,
+                operation
+                    .recent_event_id
+                    .as_deref()
+                    .and_then(clean_str)
+                    .map(str::to_string),
+                content,
+            )
+        }
+        "replace" | "replace_recent_event" | "supersede" => {
+            let target = operation
+                .target_recent_event_id
+                .as_deref()
+                .and_then(clean_str);
+            let mut changed = target
+                .map(|target| invalidate_recent_event(world, target, operation.invalidated_by_patch_id.as_deref()))
+                .unwrap_or(false);
+            if let Some(content) = operation.content.as_deref().and_then(clean_str) {
+                changed |= apply_recent_event_record_with_guard(
+                    world,
+                    operation
+                        .recent_event_id
+                        .as_deref()
+                        .and_then(clean_str)
+                        .map(str::to_string),
+                    content,
+                );
+            }
+            changed
+        }
+        "invalidate" | "invalidate_recent_event" | "revert" => operation
+            .target_recent_event_id
+            .as_deref()
+            .and_then(clean_str)
+            .map(|target| invalidate_recent_event(world, target, operation.invalidated_by_patch_id.as_deref()))
+            .unwrap_or(false),
+        "clear_recent_event_matching" => operation
+            .match_text
+            .as_deref()
+            .and_then(clean_str)
+            .map(|needle| clear_recent_events_matching(world, needle, operation.invalidated_by_patch_id.as_deref()))
+            .unwrap_or(false),
+        "add_correction_note" => operation
+            .content
+            .as_deref()
+            .and_then(clean_str)
+            .map(|content| apply_retcon_correction_note(world, content))
+            .unwrap_or(false),
+        "no_op" | "" => false,
+        _ => false,
+    }
+}
+
+fn apply_object_observation_operation(
+    world: &mut WorldLog,
+    operation: &ObjectObservationOperationPatch,
+) -> bool {
+    let op = normalized_operation(&operation.operation);
+    match op.as_str() {
+        "update" | "update_object_state" | "replace" | "replace_object_state" => operation
+            .object_state
+            .as_ref()
+            .map(|state| {
+                let mut state = state.clone();
+                if state.object_observation_id.is_none() {
+                    state.object_observation_id = operation
+                        .object_observation_id
+                        .as_deref()
+                        .and_then(clean_str)
+                        .map(str::to_string);
+                }
+                upsert_object_state(world, &state)
+            })
+            .unwrap_or(false),
+        "invalidate" | "invalidate_object_observation" => operation
+            .target_object_observation_id
+            .as_deref()
+            .and_then(clean_str)
+            .map(|target| {
+                let before = world.object_states.len();
+                world.object_states.retain(|state| {
+                    state.object_observation_id.as_deref() != Some(target)
+                        && state.object_id != target
+                });
+                world.object_states.len() != before
+            })
+            .unwrap_or(false),
+        "no_op" | "" => false,
+        _ => false,
+    }
+}
+
+fn apply_recent_event_record_with_guard(
+    world: &mut WorldLog,
+    recent_event_id: Option<String>,
+    event: &str,
+) -> bool {
+    if is_retcon_or_correction_text(event) {
+        return apply_retcon_correction_note(world, event);
+    }
+    if world_event_consistency_notice(world, event)
+        .as_ref()
+        .is_some_and(|notice| notice.rejected)
+    {
+        return false;
+    }
+    push_recent_event_record_to_world(world, recent_event_id, event);
+    true
+}
+
+fn apply_retcon_correction_note(world: &mut WorldLog, note: &str) -> bool {
+    let mut changed = remove_contradictory_phone_events(world);
+    let correction = if note.to_ascii_lowercase().contains("phone") {
+        "Retcon: phone did not buzz because notifications were off / no vibration / screen wake disabled."
+    } else {
+        "Retcon: previous contradictory scene event was invalidated and should not be used as objective world state."
+    };
+    if !world.recent_events.iter().any(|event| event == correction) {
+        push_recent_event_to_world(world, correction);
+        changed = true;
+    }
+    changed
+}
+
+fn remove_contradictory_phone_events(world: &mut WorldLog) -> bool {
+    let before = world.recent_events.len();
+    let snapshot = world.clone();
+    world.recent_events.retain(|event| {
+        !world_event_consistency_notice(&snapshot, event)
+            .as_ref()
+            .is_some_and(|notice| notice.rejected)
+    });
+    let event_before = world.recent_event_records.len();
+    world.recent_event_records.retain(|event| {
+        !world_event_consistency_notice(&snapshot, &event.content)
+            .as_ref()
+            .is_some_and(|notice| notice.rejected)
+    });
+    world.recent_events.len() != before || world.recent_event_records.len() != event_before
+}
+
+fn upsert_object_state(world: &mut WorldLog, object_state: &ObjectState) -> bool {
+    let object_id = object_state.object_id.trim();
+    if object_id.is_empty() {
+        return false;
+    }
+    if let Some(existing) = world
+        .object_states
+        .iter_mut()
+        .find(|existing| existing.object_id.eq_ignore_ascii_case(object_id))
+    {
+        if existing == object_state {
+            return false;
+        }
+        *existing = object_state.clone();
+        true
+    } else {
+        world.object_states.push(object_state.clone());
+        true
+    }
+}
+
+fn world_event_consistency_notice(
+    world: &WorldLog,
+    event: &str,
+) -> Option<WorldObjectConsistencyNotice> {
+    if !event_claims_phone_notification_activity(event) {
+        return None;
+    }
+    let Some((object_id, reason)) = phone_state_blocks_notification_activity(world) else {
+        return None;
+    };
+    Some(WorldObjectConsistencyNotice {
+        event: event.to_string(),
+        object_id,
+        reason,
+        rejected: true,
+        correction: false,
+    })
+}
+
+fn event_claims_phone_notification_activity(event: &str) -> bool {
+    let lower = event.to_ascii_lowercase();
+    lower.contains("phone")
+        && contains_any(
+            &lower,
+            &[
+                "buzz", "vibrat", "ping", "notification", "screen woke", "screen wake",
+                "screen lit", "lit up", "wake up",
+            ],
+        )
+}
+
+fn phone_state_blocks_notification_activity(world: &WorldLog) -> Option<(Option<String>, String)> {
+    for object_state in &world.object_states {
+        if !object_state.object_id.to_ascii_lowercase().contains("phone") {
+            continue;
+        }
+        let notification_mode = object_state.notification_mode.to_ascii_lowercase();
+        if matches!(
+            notification_mode.as_str(),
+            "notifications_off" | "notifications off" | "do_not_disturb" | "silent"
+        ) {
+            return Some((
+                Some(object_state.object_id.clone()),
+                format!(
+                    "phone notification mode is {}",
+                    object_state.notification_mode
+                ),
+            ));
+        }
+        if object_state.vibrate_enabled == Some(false) {
+            return Some((
+                Some(object_state.object_id.clone()),
+                "phone vibration is disabled".into(),
+            ));
+        }
+        if object_state.screen_wake_enabled == Some(false) {
+            return Some((
+                Some(object_state.object_id.clone()),
+                "phone screen wake is disabled".into(),
+            ));
+        }
+    }
+    for key_object in &world.key_objects {
+        let lower = key_object.to_ascii_lowercase();
+        if !lower.contains("phone") {
+            continue;
+        }
+        if lower.contains("notifications off")
+            || lower.contains("notification off")
+            || lower.contains("do not disturb")
+            || lower.contains("do_not_disturb")
+            || lower.contains("silent")
+        {
+            return Some((
+                Some(key_object.clone()),
+                "legacy key object says phone notifications are off/silent".into(),
+            ));
+        }
+        if lower.contains("vibration disabled") || lower.contains("no vibration") {
+            return Some((Some(key_object.clone()), "legacy key object says no vibration".into()));
+        }
+        if lower.contains("screen wake disabled") || lower.contains("no screen wake") {
+            return Some((
+                Some(key_object.clone()),
+                "legacy key object says screen wake is disabled".into(),
+            ));
+        }
+    }
+    None
+}
+
+pub fn is_retcon_or_correction_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "ooc: that's wrong",
+            "ooc: that is wrong",
+            "that's wrong",
+            "that is wrong",
+            "redo the scene",
+            "retcon",
+            "how does",
+            "contradicts the setting",
+            "contradict",
+        ],
+    )
+}
+
+fn invalidate_recent_event(
+    world: &mut WorldLog,
+    recent_event_id: &str,
+    invalidated_by_patch_id: Option<&str>,
+) -> bool {
+    let mut changed = false;
+    for event in &mut world.recent_event_records {
+        if event.recent_event_id == recent_event_id && event.is_active {
+            event.is_active = false;
+            event.invalidated_by_patch_id = invalidated_by_patch_id.map(str::to_string);
+            changed = true;
+        }
+    }
+    if changed {
+        sync_recent_event_strings_from_records(world);
+    }
+    changed
+}
+
+fn clear_recent_events_matching(
+    world: &mut WorldLog,
+    needle: &str,
+    invalidated_by_patch_id: Option<&str>,
+) -> bool {
+    let needle = needle.to_ascii_lowercase();
+    let mut changed = false;
+    for event in &mut world.recent_event_records {
+        if event.is_active && event.content.to_ascii_lowercase().contains(&needle) {
+            event.is_active = false;
+            event.invalidated_by_patch_id = invalidated_by_patch_id.map(str::to_string);
+            changed = true;
+        }
+    }
+    let before = world.recent_events.len();
+    world
+        .recent_events
+        .retain(|event| !event.to_ascii_lowercase().contains(&needle));
+    changed |= world.recent_events.len() != before;
+    if changed {
+        sync_recent_event_strings_from_records(world);
+    }
+    changed
+}
+
+fn push_recent_event_to_world(world: &mut WorldLog, event: &str) {
+    push_recent_event_record_to_world(world, None, event);
+}
+
+fn push_recent_event_record_to_world(
+    world: &mut WorldLog,
+    recent_event_id: Option<String>,
+    event: &str,
+) {
+    let recent_event_id = recent_event_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| stable_recent_event_id(event, world.recent_event_records.len()));
+    world.recent_event_records.push(WorldEventRecord {
+        recent_event_id,
+        content: event.to_string(),
+        is_active: true,
+        invalidated_by_patch_id: None,
+        superseded_by_event_id: None,
+        created_at: 0,
+    });
     world.recent_events.push(event.to_string());
     if world.recent_events.len() > MAX_RECENT_EVENTS {
         let remove_count = world.recent_events.len() - MAX_RECENT_EVENTS;
         world.recent_events.drain(0..remove_count);
     }
+    if world.recent_event_records.len() > MAX_RECENT_EVENTS {
+        let remove_count = world.recent_event_records.len() - MAX_RECENT_EVENTS;
+        world.recent_event_records.drain(0..remove_count);
+    }
+}
+
+fn sync_recent_event_strings_from_records(world: &mut WorldLog) {
+    if world.recent_event_records.is_empty() {
+        return;
+    }
+    world.recent_events = world
+        .recent_event_records
+        .iter()
+        .filter(|event| event.is_active)
+        .map(|event| event.content.clone())
+        .collect();
+    if world.recent_events.len() > MAX_RECENT_EVENTS {
+        let remove_count = world.recent_events.len() - MAX_RECENT_EVENTS;
+        world.recent_events.drain(0..remove_count);
+    }
+}
+
+fn stable_recent_event_id(event: &str, ordinal: usize) -> String {
+    format!("recent_event_{:016x}", stable_hash(&format!("{ordinal}:{event}")))
+}
+
+fn stable_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn push_unique(values: &mut Vec<String>, value: &str) -> bool {
@@ -1069,7 +1697,7 @@ mod tests {
         patch.apply_to_soul(&mut soul).expect("patch applies");
 
         assert_eq!(soul.relationships["user"].trust, 20.0);
-        assert_eq!(soul.relationships["user"].affection, 190.0);
+        assert_eq!(soul.relationships["user"].affection, 10.0);
         assert_eq!(soul.relationships["user"].fear, 10.0);
     }
 
@@ -1298,7 +1926,8 @@ mod tests {
                 new_memories: (0..8)
                     .map(|index| MemoryPatch {
                         content: format!(
-                            "# Mnemosyne Chat Log\n## User\nentry {index}\n## Narrator\nimported fact {index}\nCreated: {index}"
+                            "# Mnemosyne Chat Log\n## User\nentry {index}\n## Narrator\nimported durable fact {index}: {}.\nCreated: {index}",
+                            ["red key", "blue door", "silver promise", "green lab", "old map", "black terminal", "white room", "gold thread"][index]
                         ),
                         tag: Some("identity_continuity".into()),
                         ..MemoryPatch::default()
