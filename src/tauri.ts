@@ -176,6 +176,20 @@ export type ConversationSummary = {
   message_count: number;
 };
 
+export type RestoreTurnsPreview = {
+  restored_message_ids: number[];
+  skipped_duplicate_ids: number[];
+  skipped_pending_ids: number[];
+  skipped_failed_ids: number[];
+  skipped_retry_attempt_ids: number[];
+  skipped_regenerated_discarded_ids: number[];
+};
+
+export type RestoreTurnsResult = {
+  messages: ChatMessage[];
+  preview: RestoreTurnsPreview;
+};
+
 export type MneBundleManifest = {
   mne_version: number;
   bundle_id: string;
@@ -228,6 +242,8 @@ export type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   created_at: number;
+  status?: "active" | "hidden" | "pending" | "failed" | "retry_attempt" | "regenerated_discarded" | string;
+  origin?: "active" | "restored" | string;
   attachments?: MessageAttachment[];
   pending?: boolean;
 };
@@ -1122,11 +1138,21 @@ export function deleteMessage(conversationId: string, messageId: number): Promis
   });
 }
 
-export function restoreInactiveMessages(conversationId: string): Promise<ChatMessage[]> {
+export function restoreInactiveMessages(conversationId: string): Promise<RestoreTurnsResult> {
   return invokeOrPreview("restore_inactive_messages", { conversationId }, () =>
-    browserMessages
-      .filter((message) => message.conversation_id === conversationId)
-      .map(hydratePreviewMessage),
+    ({
+      messages: browserMessages
+        .filter((message) => message.conversation_id === conversationId)
+        .map(hydratePreviewMessage),
+      preview: {
+        restored_message_ids: [],
+        skipped_duplicate_ids: [],
+        skipped_pending_ids: [],
+        skipped_failed_ids: [],
+        skipped_retry_attempt_ids: [],
+        skipped_regenerated_discarded_ids: [],
+      },
+    }),
   );
 }
 

@@ -1500,13 +1500,24 @@ export function App() {
     if (busy || !currentConversationId) return;
     setBusy(true);
     try {
-      const nextMessages = await restoreInactiveMessages(currentConversationId);
+      const restore = await restoreInactiveMessages(currentConversationId);
+      const nextMessages = restore.messages;
       setMessages(nextMessages);
       setConversations(await listConversations());
       if (soul) {
         setContext(await compileContext(soul.character_id, currentConversationId));
       }
-      setStatus(nextMessages.length ? "Hidden turns restored" : "No hidden turns found");
+      const skipped =
+        restore.preview.skipped_duplicate_ids.length +
+        restore.preview.skipped_pending_ids.length +
+        restore.preview.skipped_failed_ids.length +
+        restore.preview.skipped_retry_attempt_ids.length +
+        restore.preview.skipped_regenerated_discarded_ids.length;
+      setStatus(
+        restore.preview.restored_message_ids.length
+          ? `Hidden turns restored (${restore.preview.restored_message_ids.length} restored, ${skipped} skipped)`
+          : "No hidden turns found",
+      );
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {

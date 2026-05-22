@@ -225,6 +225,14 @@ pub struct MemoryEntry {
     pub truth_status: TruthStatus,
     #[serde(default)]
     pub architecture_verified: bool,
+    #[serde(default)]
+    pub memory_slot: Option<String>,
+    #[serde(default)]
+    pub owner_soul_id: Option<String>,
+    #[serde(default)]
+    pub relevance_tags: HashMap<String, u8>,
+    #[serde(default)]
+    pub knowledge_scope: Option<String>,
     #[serde(default = "default_memory_active")]
     pub is_active: bool,
     #[serde(default)]

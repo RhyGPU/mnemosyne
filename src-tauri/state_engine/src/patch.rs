@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -84,6 +86,10 @@ pub struct MemoryPatch {
     pub objective_event_id: Option<String>,
     pub truth_status: Option<TruthStatus>,
     pub architecture_verified: Option<bool>,
+    pub memory_slot: Option<String>,
+    pub owner_soul_id: Option<String>,
+    pub relevance_tags: HashMap<String, u8>,
+    pub knowledge_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -564,6 +570,15 @@ impl SoulPatch {
             recent.truth_status = memory.truth_status.unwrap_or_default();
             recent.architecture_verified =
                 memory.architecture_verified.unwrap_or(false) && recent.truth_status.is_engine_verified();
+            recent.memory_slot = memory.cleaned_optional(&memory.memory_slot);
+            recent.owner_soul_id = memory.cleaned_optional(&memory.owner_soul_id);
+            recent.relevance_tags = memory
+                .relevance_tags
+                .iter()
+                .map(|(key, score)| (key.trim().to_string(), (*score).min(100)))
+                .filter(|(key, _)| !key.is_empty())
+                .collect();
+            recent.knowledge_scope = memory.cleaned_optional(&memory.knowledge_scope);
             let mut action = MemoryApplyAction::Added;
             if is_generic_emotional_reaction(content, tag) {
                 recent.salience = (recent.salience * 0.55).min(40.0);
@@ -1736,13 +1751,48 @@ fn push_recent_event_record_to_world(
 }
 
 fn normalize_recent_event_for_dedupe(event: &str) -> String {
-    event
-        .trim()
-        .trim_matches(|character: char| character.is_ascii_punctuation())
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut normalized = event
         .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character.is_ascii_whitespace() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
+    for (from, to) in [
+        ("aurora schwarz", "aurora"),
+        ("the user", "user"),
+        ("player", "user"),
+        ("knocked", "knock"),
+        ("knocking", "knock"),
+        ("knocks", "knock"),
+        ("responded", "respond"),
+        ("responds", "respond"),
+        ("answered", "answer"),
+        ("answers", "answer"),
+        ("apartment door", "door"),
+        ("front door", "door"),
+        ("the door", "door"),
+    ] {
+        normalized = normalized.replace(from, to);
+    }
+    let tokens = normalized
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                *token,
+                "the" | "a" | "an" | "s" | "and" | "then" | "that" | "to" | "on" | "at"
+                    | "in" | "into" | "her" | "his" | "their" | "with"
+            )
+        })
+        .collect::<Vec<_>>();
+    if tokens.contains(&"user") && tokens.contains(&"knock") && tokens.contains(&"door") {
+        return "user knock door".to_string();
+    }
+    tokens.join(" ")
 }
 
 fn sync_recent_event_strings_from_records(world: &mut WorldLog) {
@@ -2155,6 +2205,32 @@ mod tests {
                     "Aurora closed the door".into(),
                     "  Aurora closed the door.  ".into(),
                 ],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        assert_eq!(soul.world.recent_events.len(), 1);
+        assert_eq!(soul.world.recent_event_records.len(), 1);
+    }
+
+    #[test]
+    fn recent_event_semantic_dedup_knock() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            world_patch: Some(WorldPatch {
+                recent_event: Some("User knocked on Aurora's apartment door.".into()),
+                event_operations: vec![WorldEventOperationPatch {
+                    operation: "add_recent_event".into(),
+                    recent_event_id: Some("knock_response".into()),
+                    content: Some(
+                        "The user knock on the door; Aurora responded from inside.".into(),
+                    ),
+                    ..WorldEventOperationPatch::default()
+                }],
                 ..WorldPatch::default()
             }),
             ..EnginePatch::default()

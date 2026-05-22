@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use state_engine::{setting::SessionWorld, soul::Soul};
+use state_engine::{
+    evaluator::{turn_flags, EVALUATOR_SCHEMA_VERSION},
+    setting::SessionWorld,
+    soul::Soul,
+};
 use std::time::Duration;
 
 const NARRATOR_SYSTEM_PROMPT: &str = r#"# SYSTEM: Narrator AI - Mnemosyne Engine
@@ -97,6 +101,38 @@ Pure OOC/OCC/GM meta turns are not scene events. For pure meta turns, emit no wo
 For object continuity, distinguish phone power, notifications, vibration, screen wake, calls, and texts. "Notifications off" does not mean powered off, but notification buzz/screen-wake events need explicit support or correction.
 
 Use truth_status for every new memory: fiction, scene_event, character_belief, narrator_claim, user_claimed, verified_engine, actual_system_event, or unknown. architecture_verified must be false unless the engine supplies a verified event."#;
+
+pub const EVALUATOR_SYSTEM_PROMPT: &str = r#"# SYSTEM: Mnemosyne Evaluator V1
+
+You are Mnemosyne's Evaluator AI, a strict examiner. The Narrator AI is the creative writer. You are not the database clerk.
+
+Strictly based on the latest user message, latest narrator response, prior scene_state, active entities, recent chat excerpt, current world/object state, and current relationships, answer the rubric below. Do not invent facts. If evidence is absent, mark absent. Every non-no-op claim must include an evidence_quote from the latest exchange or a direct observable reference.
+
+Return valid EvaluatorOutputV1 JSON only. Do not return EnginePatch JSON. Do not write prose.
+
+[RUBRIC]
+- Is this pure OOC/GM/meta?
+- Did a scene event occur?
+- Did location/world state change?
+- Did object state change?
+- Did relationship state change?
+- Did unresolved tension appear or continue?
+- Did current plot advance?
+- Did character identity/self-concept change?
+- Did recent emotional state change?
+- Which Souls perceived the event?
+- What does each Soul know?
+- Did any Soul misunderstand the event differently from objective reality?
+- Which memory slots should receive candidates?
+
+[STRICTNESS]
+The evaluator does not decide final engine state. It only returns structured evaluation data. Engine code validates, rejects, and converts candidates.
+Use turn_flags_u64 in addition to human-readable fields.
+For every active Soul, include one per_soul_evaluations entry.
+Per-Soul memory is subjective. SessionWorld changes are objective only.
+Do not create memory candidates for generic body language such as "She looked tense", "She listened carefully", "She narrowed her eyes", or "She watched the user".
+Prefer durable memories: relationship turning points, boundary pressure, unresolved conflict, trust/fear/comfort shifts, promises, betrayals, important preferences, location-triggered emotional memories, and identity/self-concept changes.
+"#;
 
 const REALISTIC_MODE_PROMPT: &str = r#"## NARRATION MODE: REALISTIC
 - Describe only external actions, dialogue, and physical reactions.
@@ -798,6 +834,127 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
             relationship_summary.join("\n")
         },
     )
+}
+
+pub fn build_evaluator_prompt(soul: &Soul, session_world: Option<&SessionWorld>) -> String {
+    let world = session_world
+        .map(SessionWorld::world_log)
+        .unwrap_or_else(|| soul.world.clone());
+    let active_soul_id = clean_summary_value(&soul.character_id, "active_soul");
+    let active_entities = serde_json::json!([{
+        "entity_id": active_soul_id,
+        "display_name": soul.character_name,
+        "entity_type": "soul",
+        "active": true
+    }, {
+        "entity_id": "default_player",
+        "display_name": "User",
+        "entity_type": "user",
+        "active": true
+    }]);
+    let mut relationships = soul.relationships.iter().collect::<Vec<_>>();
+    relationships.sort_by(|left, right| left.0.cmp(right.0));
+    let relationships = relationships
+        .into_iter()
+        .map(|(target, relationship)| {
+            serde_json::json!({
+                "source_soul_id": active_soul_id,
+                "target_entity_id": display_relationship_target(target),
+                "trust": relationship.trust,
+                "affection": relationship.affection,
+                "intimacy": relationship.intimacy,
+                "fear": relationship.fear,
+                "desire": relationship.desire,
+                "respect": relationship.respect,
+                "conflict": relationship.conflict,
+                "curiosity": relationship.curiosity,
+                "comfort": relationship.comfort,
+                "boundary_pressure": relationship.boundary_pressure
+            })
+        })
+        .collect::<Vec<_>>();
+    let flag_reference = serde_json::json!({
+        "SCENE_TURN": turn_flags::SCENE_TURN,
+        "PURE_OOC": turn_flags::PURE_OOC,
+        "RETCON_OR_CORRECTION": turn_flags::RETCON_OR_CORRECTION,
+        "WORLD_CHANGE": turn_flags::WORLD_CHANGE,
+        "OBJECT_CHANGE": turn_flags::OBJECT_CHANGE,
+        "RELATIONSHIP_SHIFT": turn_flags::RELATIONSHIP_SHIFT,
+        "UNRESOLVED_TENSION": turn_flags::UNRESOLVED_TENSION,
+        "CURRENT_PLOT_ADVANCED": turn_flags::CURRENT_PLOT_ADVANCED,
+        "CHARACTER_IDENTITY_CHANGE": turn_flags::CHARACTER_IDENTITY_CHANGE,
+        "RECENT_EMOTIONAL_STATE": turn_flags::RECENT_EMOTIONAL_STATE,
+        "CONTRADICTION_DETECTED": turn_flags::CONTRADICTION_DETECTED,
+        "USER_ACTION_PRESENT": turn_flags::USER_ACTION_PRESENT,
+        "CHARACTER_BOUNDARY_ASSERTED": turn_flags::CHARACTER_BOUNDARY_ASSERTED,
+        "USER_BOUNDARY_PRESSURE": turn_flags::USER_BOUNDARY_PRESSURE,
+        "MULTI_SOUL_SCENE": turn_flags::MULTI_SOUL_SCENE
+    });
+    let output_schema = serde_json::json!({
+        "schema_version": EVALUATOR_SCHEMA_VERSION,
+        "turn_flags_u64": 0,
+        "turn_classification": {
+            "is_pure_ooc": false,
+            "scene_event_occurred": false,
+            "is_retcon_or_correction": false,
+            "human_summary": ""
+        },
+        "global_scene_evaluation": {
+            "scene_event_occurred": false,
+            "location_changed": false,
+            "object_state_changed": false,
+            "relationship_changed": false,
+            "unresolved_tension": false,
+            "current_plot_advanced": false,
+            "character_identity_changed": false,
+            "recent_emotional_state_changed": false,
+            "contradiction_detected": false,
+            "evidence_quote": "",
+            "summary": ""
+        },
+        "per_soul_evaluations": [{
+            "soul_id": active_soul_id,
+            "observed": false,
+            "knowledge_scope": "not_known",
+            "subjective_interpretation": "",
+            "emotional_state": "",
+            "relationship_deltas": [],
+            "memory_candidates": [],
+            "relevance_tags": empty_relevance_tags_json()
+        }],
+        "world_changes": [],
+        "object_changes": [],
+        "relationship_evaluations": [],
+        "memory_candidates": [],
+        "relevance_tags": empty_relevance_tags_json(),
+        "no_op_reason": ""
+    });
+    format!(
+        "{EVALUATOR_SYSTEM_PROMPT}\n\n[TURN FLAG VALUES]\n{}\n\n[OUTPUT SHAPE]\n{}\n\n[PRIOR SCENE_STATE]\n{}\n\n[ACTIVE ENTITIES]\n{}\n\n[CURRENT WORLD/OBJECT STATE]\nLocation: {}\nTime: {}\nActive plots: {}\nRecent events: {}\nObjects JSON: {}\n\n[CURRENT RELATIONSHIPS]\n{}",
+        serde_json::to_string_pretty(&flag_reference).unwrap_or_default(),
+        serde_json::to_string_pretty(&output_schema).unwrap_or_default(),
+        serde_json::to_string_pretty(&world.scene_state).unwrap_or_default(),
+        serde_json::to_string_pretty(&active_entities).unwrap_or_default(),
+        clean_summary_value(&world.location, "Unspecified"),
+        normalize_updater_time(&world.time_elapsed),
+        if world.active_plots.is_empty() { "None".into() } else { world.active_plots.join("; ") },
+        if world.recent_events.is_empty() { "None".into() } else { world.recent_events.join("; ") },
+        serde_json::to_string_pretty(&world.object_states).unwrap_or_default(),
+        serde_json::to_string_pretty(&relationships).unwrap_or_default(),
+    )
+}
+
+fn empty_relevance_tags_json() -> serde_json::Value {
+    serde_json::json!({
+        "setting_tags": {},
+        "location_tags": {},
+        "interacted_entities": {},
+        "event_type_tags": {},
+        "object_tags": {},
+        "emotional_tags": {},
+        "memory_slot_tags": {},
+        "per_soul_relevance": {}
+    })
 }
 
 fn display_relationship_target(target: &str) -> String {

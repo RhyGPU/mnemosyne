@@ -519,6 +519,18 @@ fn score_memory_for_slot<'a>(
     source_query_active: bool,
 ) -> ScoredMemory<'a> {
     let mut scored = score_recent_memory(memory, query_terms, soul.turn_counter, source_query_active);
+    if evaluator_slot_matches(memory, slot) {
+        scored.score += 36.0;
+    }
+    if evaluator_owner_matches(memory, soul) {
+        scored.score += 28.0;
+    }
+    if evaluator_relevance_matches(memory, query_terms, world_terms) {
+        scored.score += 22.0;
+    }
+    if matches!(memory.knowledge_scope.as_deref(), Some("not_known")) {
+        scored.score -= 80.0;
+    }
     if slot_matches_memory(memory, slot, query_terms, world_terms, soul) {
         scored.score += 24.0;
     }
@@ -551,6 +563,9 @@ fn slot_matches_memory(
     world_terms: &HashSet<String>,
     soul: &Soul,
 ) -> bool {
+    if evaluator_slot_matches(memory, slot) {
+        return evaluator_owner_matches(memory, soul);
+    }
     let lower = memory.content.to_ascii_lowercase();
     let tag = memory.tag.to_ascii_lowercase();
     match slot {
@@ -635,6 +650,15 @@ fn slot_reason(
     soul: &Soul,
 ) -> String {
     let mut reasons = Vec::new();
+    if evaluator_slot_matches(memory, slot) {
+        reasons.push("evaluator_slot_match");
+    }
+    if evaluator_owner_matches(memory, soul) {
+        reasons.push("owner_soul_match");
+    }
+    if evaluator_relevance_matches(memory, query_terms, world_terms) {
+        reasons.push("evaluator_relevance_match");
+    }
     if entity_matches_active_soul(memory, soul) {
         reasons.push("entity_match");
     }
@@ -657,6 +681,9 @@ fn slot_reason(
 }
 
 fn entity_matches_active_soul(memory: &MemoryEntry, soul: &Soul) -> bool {
+    if !evaluator_owner_matches(memory, soul) {
+        return false;
+    }
     let active = soul.character_id.trim();
     let active_name = soul.character_name.trim();
     memory
@@ -664,6 +691,55 @@ fn entity_matches_active_soul(memory: &MemoryEntry, soul: &Soul) -> bool {
         .as_deref()
         .map(|entity| entity.eq_ignore_ascii_case(active) || entity.eq_ignore_ascii_case(active_name))
         .unwrap_or(true)
+}
+
+fn evaluator_owner_matches(memory: &MemoryEntry, soul: &Soul) -> bool {
+    memory
+        .owner_soul_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+        .map(|owner| {
+            owner.eq_ignore_ascii_case(&soul.character_id)
+                || owner.eq_ignore_ascii_case(&soul.character_name)
+        })
+        .unwrap_or(true)
+}
+
+fn evaluator_slot_matches(memory: &MemoryEntry, slot: MemorySlot) -> bool {
+    let Some(memory_slot) = memory
+        .memory_slot
+        .as_deref()
+        .map(|slot| slot.trim().to_ascii_lowercase())
+        .filter(|slot| !slot.is_empty())
+    else {
+        return false;
+    };
+    memory_slot == evaluator_slot_label(slot)
+}
+
+fn evaluator_slot_label(slot: MemorySlot) -> &'static str {
+    match slot {
+        MemorySlot::Relationship => "relationship_memory",
+        MemorySlot::CurrentPlot => "current_plot_memory",
+        MemorySlot::CharacterIdentity => "character_identity_memory",
+        MemorySlot::UnresolvedTension => "unresolved_tension",
+        MemorySlot::WorldLocation => "world_location_memory",
+        MemorySlot::RecentEmotionalState => "recent_emotional_state",
+    }
+}
+
+fn evaluator_relevance_matches(
+    memory: &MemoryEntry,
+    query_terms: &HashSet<String>,
+    world_terms: &HashSet<String>,
+) -> bool {
+    memory.relevance_tags.iter().any(|(tag, score)| {
+        *score >= 50
+            && token_set(tag)
+                .iter()
+                .any(|term| query_terms.contains(term) || world_terms.contains(term))
+    })
 }
 
 fn target_matches_query(memory: &MemoryEntry, query_terms: &HashSet<String>) -> bool {
@@ -2334,6 +2410,72 @@ mod tests {
     }
 
     #[test]
+    fn bar_location_triggers_prior_aurora_memory_about_x() {
+        let mut soul = new_default_soul("Aurora");
+        let mut bar_memory = memory(
+            "bar_x",
+            "Aurora remembers that X betrayed her trust at the Blue Lantern bar.",
+            "relationship_memory",
+            70.0,
+            70.0,
+            1,
+        );
+        bar_memory.owner_soul_id = Some(soul.character_id.clone());
+        bar_memory.perceived_by_entity_id = Some(soul.character_id.clone());
+        bar_memory.memory_slot = Some("relationship_memory".into());
+        bar_memory.knowledge_scope = Some("directly_observed".into());
+        bar_memory.target_entity_ids = vec!["x".into()];
+        bar_memory.relevance_tags.insert("Blue Lantern bar".into(), 95);
+        bar_memory.relevance_tags.insert("x".into(), 90);
+        soul.memory.recent.push(bar_memory);
+        soul.world.location = "Blue Lantern bar".into();
+
+        let preview = compile_context_for_messages(
+            &soul,
+            &[ContextMessage {
+                role: "user".into(),
+                content: "We return to the Blue Lantern bar where X used to wait.".into(),
+            }],
+        );
+        let relationship_slot = section_text(&preview.text, "[RELATIONSHIP MEMORY]");
+
+        assert!(relationship_slot.contains("X betrayed her trust"));
+    }
+
+    #[test]
+    fn persona_b_does_not_know_aurora_x_bar_memory() {
+        let aurora = new_default_soul("Aurora");
+        let mut persona_b = new_default_soul("Persona B");
+        let mut bar_memory = memory(
+            "bar_x",
+            "Aurora remembers that X betrayed her trust at the Blue Lantern bar.",
+            "relationship_memory",
+            99.0,
+            99.0,
+            1,
+        );
+        bar_memory.owner_soul_id = Some(aurora.character_id.clone());
+        bar_memory.perceived_by_entity_id = Some(aurora.character_id.clone());
+        bar_memory.memory_slot = Some("relationship_memory".into());
+        bar_memory.knowledge_scope = Some("directly_observed".into());
+        bar_memory.target_entity_ids = vec!["x".into()];
+        bar_memory.relevance_tags.insert("Blue Lantern bar".into(), 95);
+        persona_b.memory.recent.push(bar_memory);
+        persona_b.world.location = "Blue Lantern bar".into();
+
+        let preview = compile_context_for_messages(
+            &persona_b,
+            &[ContextMessage {
+                role: "user".into(),
+                content: "Persona B enters the Blue Lantern bar.".into(),
+            }],
+        );
+        let relationship_slot = section_text(&preview.text, "[RELATIONSHIP MEMORY]");
+
+        assert!(!relationship_slot.contains("X betrayed her trust"));
+    }
+
+    #[test]
     fn identity_and_current_plot_memories_use_separate_slots() {
         let mut soul = new_default_soul("Echo-0");
         soul.world.active_plots = vec!["Test memory retrieval slots".into()];
@@ -2487,6 +2629,10 @@ mod tests {
             objective_event_id: None,
             truth_status: TruthStatus::Unknown,
             architecture_verified: false,
+            memory_slot: None,
+            owner_soul_id: None,
+            relevance_tags: Default::default(),
+            knowledge_scope: None,
             is_active: true,
             invalidated_by_patch_id: None,
             superseded_by_memory_id: None,

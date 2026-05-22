@@ -1,6 +1,7 @@
 pub mod arousal;
 pub mod consolidation;
 pub mod context_compiler;
+pub mod evaluator;
 pub mod hidden_state;
 pub mod memory;
 pub mod patch;

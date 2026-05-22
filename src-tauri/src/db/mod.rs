@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -45,8 +46,20 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub created_at: i64,
+    #[serde(default = "default_message_status")]
+    pub status: String,
+    #[serde(default = "default_message_origin")]
+    pub origin: String,
     #[serde(default)]
     pub attachments: Vec<MessageAttachment>,
+}
+
+fn default_message_status() -> String {
+    "active".into()
+}
+
+fn default_message_origin() -> String {
+    "active".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -608,6 +621,18 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "conversations", "source_setting_id", "TEXT")?;
     add_column_if_missing(conn, "messages", "branch_id", "TEXT")?;
     add_column_if_missing(conn, "messages", "is_active", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(
+        conn,
+        "messages",
+        "message_status",
+        "TEXT NOT NULL DEFAULT 'active'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "messages",
+        "message_origin",
+        "TEXT NOT NULL DEFAULT 'active'",
+    )?;
     add_column_if_missing(conn, "assistant_message_variants", "turn_id", "TEXT")?;
     add_column_if_missing(conn, "assistant_message_variants", "state_patch_id", "TEXT")?;
     add_column_if_missing(
@@ -1148,14 +1173,14 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             (
                 SELECT content
                 FROM messages
-                WHERE conversation_id = c.id AND is_active != 0
+                WHERE conversation_id = c.id AND is_active != 0 AND message_status = 'active'
                 ORDER BY id DESC
                 LIMIT 1
             ) AS last_message_preview,
             (
                 SELECT COUNT(*)
                 FROM messages
-                WHERE conversation_id = c.id AND is_active != 0
+                WHERE conversation_id = c.id AND is_active != 0 AND message_status = 'active'
             ) AS message_count
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
@@ -1234,7 +1259,7 @@ fn last_message_preview(
     conn.query_row(
         "
         SELECT content FROM messages
-        WHERE conversation_id = ?1 AND is_active != 0
+        WHERE conversation_id = ?1 AND is_active != 0 AND message_status = 'active'
         ORDER BY id DESC
         LIMIT 1
         ",
@@ -1247,7 +1272,7 @@ fn last_message_preview(
 
 fn count_messages(conn: &Connection, conversation_id: &str) -> rusqlite::Result<i64> {
     conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND is_active != 0",
+        "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1 AND is_active != 0 AND message_status = 'active'",
         [conversation_id],
         |row| row.get(0),
     )
@@ -1344,7 +1369,7 @@ pub fn insert_message(
 ) -> rusqlite::Result<()> {
     let now = now_ts();
     conn.execute(
-        "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO messages (conversation_id, role, content, created_at, message_status, message_origin) VALUES (?1, ?2, ?3, ?4, 'active', 'active')",
         params![conversation_id, role, content, now],
     )?;
     let _message_id = conn.last_insert_rowid();
@@ -1363,7 +1388,7 @@ pub fn insert_message_and_get_id(
 ) -> rusqlite::Result<i64> {
     let now = now_ts();
     conn.execute(
-        "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO messages (conversation_id, role, content, created_at, message_status, message_origin) VALUES (?1, ?2, ?3, ?4, 'active', 'active')",
         params![conversation_id, role, content, now],
     )?;
     let message_id = conn.last_insert_rowid();
@@ -1900,11 +1925,11 @@ pub fn list_messages_before_id(
 ) -> rusqlite::Result<Vec<ChatMessage>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, role, content, created_at
+        SELECT id, conversation_id, role, content, created_at, message_status, message_origin
         FROM (
-            SELECT id, conversation_id, role, content, created_at
+            SELECT id, conversation_id, role, content, created_at, message_status, message_origin
             FROM messages
-            WHERE conversation_id = ?1 AND id < ?2 AND is_active != 0
+            WHERE conversation_id = ?1 AND id < ?2 AND is_active != 0 AND message_status = 'active'
             ORDER BY id DESC
             LIMIT ?3
         )
@@ -1922,6 +1947,8 @@ pub fn list_messages_before_id(
                 role: row.get(2)?,
                 content: row.get(3)?,
                 created_at: row.get(4)?,
+                status: row.get(5)?,
+                origin: row.get(6)?,
                 attachments: list_message_attachments(conn, message_id)?,
             })
         },
@@ -1953,6 +1980,16 @@ pub fn delete_conversation(conn: &Connection, conversation_id: &str) -> rusqlite
     Ok(affected > 0)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RestoreInactiveMessagesResult {
+    pub restored_message_ids: Vec<i64>,
+    pub skipped_duplicate_ids: Vec<i64>,
+    pub skipped_pending_ids: Vec<i64>,
+    pub skipped_failed_ids: Vec<i64>,
+    pub skipped_retry_attempt_ids: Vec<i64>,
+    pub skipped_regenerated_discarded_ids: Vec<i64>,
+}
+
 pub fn delete_message(
     conn: &Connection,
     conversation_id: &str,
@@ -1974,7 +2011,128 @@ pub fn delete_message(
 pub fn restore_inactive_messages(
     conn: &Connection,
     conversation_id: &str,
-) -> rusqlite::Result<usize> {
+) -> rusqlite::Result<RestoreInactiveMessagesResult> {
+    let Some(branch) = get_active_session_branch(conn, conversation_id).optional()? else {
+        let mut preview = restore_preview_for_inactive_messages(conn, conversation_id, &[])?;
+        let restored = restore_inactive_messages_legacy_all(conn, conversation_id)?;
+        preview.restored_message_ids = restored;
+        return Ok(preview);
+    };
+    let canonical_commits =
+        active_commit_path_until(conn, &branch.branch_id, branch.active_turn_id.as_deref())?;
+    let canonical_message_ids = canonical_commits
+        .iter()
+        .flat_map(|commit| [commit.user_message_id, commit.assistant_message_id])
+        .flatten()
+        .collect::<HashSet<_>>();
+    let result = restore_preview_for_inactive_messages(conn, conversation_id, &canonical_commits)?;
+    if canonical_message_ids.is_empty() {
+        return Ok(result);
+    }
+    for commit in &canonical_commits {
+        conn.execute(
+            "UPDATE turn_commits SET is_active = 1, is_discarded = 0, active_variant = 1 WHERE turn_id = ?1 AND conversation_id = ?2",
+            params![commit.turn_id, conversation_id],
+        )?;
+        if let Some(patch_id) = commit.state_patch_id.as_deref() {
+            conn.execute(
+                "UPDATE state_patches SET is_active = 1 WHERE patch_id = ?1",
+                [patch_id],
+            )?;
+        }
+    }
+    for message_id in &result.restored_message_ids {
+        conn.execute(
+            "UPDATE messages SET is_active = 1, message_status = 'active', message_origin = 'restored' WHERE conversation_id = ?1 AND id = ?2",
+            params![conversation_id, message_id],
+        )?;
+    }
+    if !result.restored_message_ids.is_empty() {
+        conn.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now_ts(), conversation_id],
+        )?;
+    }
+    Ok(result)
+}
+
+fn restore_preview_for_inactive_messages(
+    conn: &Connection,
+    conversation_id: &str,
+    canonical_commits: &[TurnCommit],
+) -> rusqlite::Result<RestoreInactiveMessagesResult> {
+    let mut result = RestoreInactiveMessagesResult::default();
+    let mut canonical_by_message_id = HashSet::new();
+    let mut canonical_user_by_group = HashMap::<String, i64>::new();
+    for commit in canonical_commits {
+        if let Some(message_id) = commit.user_message_id {
+            canonical_by_message_id.insert(message_id);
+            canonical_user_by_group
+                .entry(turn_request_group_key(commit))
+                .or_insert(message_id);
+        }
+        if let Some(message_id) = commit.assistant_message_id {
+            canonical_by_message_id.insert(message_id);
+        }
+    }
+    let mut stmt = conn.prepare(
+        "
+        SELECT id, role, content, message_status
+        FROM messages
+        WHERE conversation_id = ?1 AND is_active = 0
+        ORDER BY id ASC
+        ",
+    )?;
+    let rows = stmt.query_map([conversation_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (message_id, role, _content, status) = row?;
+        match status.as_str() {
+            "pending" => result.skipped_pending_ids.push(message_id),
+            "failed" => result.skipped_failed_ids.push(message_id),
+            "retry_attempt" => result.skipped_retry_attempt_ids.push(message_id),
+            "regenerated_discarded" => result.skipped_regenerated_discarded_ids.push(message_id),
+            _ if !canonical_by_message_id.contains(&message_id) => {
+                if role == "user" {
+                    result.skipped_duplicate_ids.push(message_id);
+                }
+            }
+            _ => {
+                let is_duplicate_user = role == "user"
+                    && canonical_commits.iter().any(|commit| {
+                        commit.user_message_id == Some(message_id)
+                            && canonical_user_by_group
+                                .get(&turn_request_group_key(commit))
+                                .is_some_and(|canonical_id| *canonical_id != message_id)
+                    });
+                if is_duplicate_user {
+                    result.skipped_duplicate_ids.push(message_id);
+                } else {
+                    result.restored_message_ids.push(message_id);
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn turn_request_group_key(commit: &TurnCommit) -> String {
+    commit
+        .parent_turn_id
+        .clone()
+        .unwrap_or_else(|| "__root__".into())
+}
+
+pub fn restore_inactive_messages_legacy_all(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<i64>> {
     conn.execute(
         "
         UPDATE turn_commits
@@ -2011,17 +2169,20 @@ pub fn restore_inactive_messages(
         ",
         [conversation_id],
     )?;
-    let affected = conn.execute(
-        "UPDATE messages SET is_active = 1 WHERE conversation_id = ?1 AND is_active = 0",
-        [conversation_id],
-    )?;
-    if affected > 0 {
+    let ids = inactive_restorable_message_ids(conn, conversation_id)?;
+    for message_id in &ids {
+        conn.execute(
+            "UPDATE messages SET is_active = 1, message_status = 'active', message_origin = 'restored' WHERE conversation_id = ?1 AND id = ?2 AND message_status NOT IN ('pending', 'failed', 'retry_attempt', 'regenerated_discarded')",
+            params![conversation_id, message_id],
+        )?;
+    }
+    if !ids.is_empty() {
         conn.execute(
             "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
             params![now_ts(), conversation_id],
         )?;
     }
-    Ok(affected)
+    Ok(ids)
 }
 
 pub fn list_messages(
@@ -2031,11 +2192,11 @@ pub fn list_messages(
 ) -> rusqlite::Result<Vec<ChatMessage>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, role, content, created_at
+        SELECT id, conversation_id, role, content, created_at, message_status, message_origin
         FROM (
-            SELECT id, conversation_id, role, content, created_at
+            SELECT id, conversation_id, role, content, created_at, message_status, message_origin
             FROM messages
-            WHERE conversation_id = ?1 AND is_active != 0
+            WHERE conversation_id = ?1 AND is_active != 0 AND message_status = 'active'
             ORDER BY id DESC
             LIMIT ?2
         )
@@ -2051,6 +2212,8 @@ pub fn list_messages(
             role: row.get(2)?,
             content: row.get(3)?,
             created_at: row.get(4)?,
+            status: row.get(5)?,
+            origin: row.get(6)?,
             attachments: list_message_attachments(conn, message_id)?,
         })
     })?;
@@ -2065,7 +2228,7 @@ pub fn get_message(
 ) -> rusqlite::Result<ChatMessage> {
     conn.query_row(
         "
-        SELECT id, conversation_id, role, content, created_at
+        SELECT id, conversation_id, role, content, created_at, message_status, message_origin
         FROM messages
         WHERE conversation_id = ?1 AND id = ?2
         ",
@@ -2078,6 +2241,8 @@ pub fn get_message(
                 role: row.get(2)?,
                 content: row.get(3)?,
                 created_at: row.get(4)?,
+                status: row.get(5)?,
+                origin: row.get(6)?,
                 attachments: list_message_attachments(conn, message_id)?,
             })
         },
@@ -2468,7 +2633,7 @@ pub fn deactivate_downstream_from_message(
     message_id: i64,
 ) -> rusqlite::Result<usize> {
     conn.execute(
-        "UPDATE messages SET is_active = 0 WHERE conversation_id = ?1 AND id >= ?2",
+        "UPDATE messages SET is_active = 0, message_status = 'hidden' WHERE conversation_id = ?1 AND id >= ?2",
         params![conversation_id, message_id],
     )?;
     let commits = list_commits_at_or_after_message(conn, conversation_id, message_id)?;
@@ -2487,6 +2652,24 @@ pub fn deactivate_downstream_from_message(
         count += 1;
     }
     Ok(count)
+}
+
+fn inactive_restorable_message_ids(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT id
+        FROM messages
+        WHERE conversation_id = ?1
+          AND is_active = 0
+          AND message_status NOT IN ('pending', 'failed', 'retry_attempt', 'regenerated_discarded')
+        ORDER BY id ASC
+        ",
+    )?;
+    let rows = stmt.query_map([conversation_id], |row| row.get(0))?;
+    rows.collect()
 }
 
 pub fn activate_variant_commit(
@@ -2690,16 +2873,30 @@ fn active_commit_path_until(
         "SELECT turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant FROM turn_commits WHERE branch_id = ?1 AND is_active = 1 AND is_discarded = 0 ORDER BY created_at ASC",
     )?;
     let rows = stmt.query_map([branch_id], turn_commit_from_row)?;
-    let mut commits = Vec::new();
+    let mut commits_by_id = HashMap::new();
+    let mut latest_turn_id = None;
     for row in rows {
         let commit = row?;
-        let reached = until_turn_id.is_some_and(|turn_id| commit.turn_id == turn_id);
-        commits.push(commit);
-        if reached {
+        latest_turn_id = Some(commit.turn_id.clone());
+        commits_by_id.insert(commit.turn_id.clone(), commit);
+    }
+    let Some(mut cursor) = until_turn_id.map(str::to_string).or(latest_turn_id) else {
+        return Ok(Vec::new());
+    };
+    let mut path = Vec::new();
+    let mut seen = HashSet::new();
+    while seen.insert(cursor.clone()) {
+        let Some(commit) = commits_by_id.get(&cursor).cloned() else {
+            break;
+        };
+        cursor = commit.parent_turn_id.clone().unwrap_or_default();
+        path.push(commit);
+        if cursor.is_empty() {
             break;
         }
     }
-    Ok(commits)
+    path.reverse();
+    Ok(path)
 }
 
 fn list_inactive_patch_ids(conn: &Connection, branch_id: &str) -> rusqlite::Result<Vec<String>> {
@@ -3643,11 +3840,175 @@ mod tests {
 
         let restored =
             restore_inactive_messages(&conn, "restore-session").expect("restore inactive");
-        assert_eq!(restored, 2);
+        assert_eq!(restored.restored_message_ids.len(), 2);
         let messages = list_messages(&conn, "restore-session", 10).expect("restored messages");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "First");
         assert_eq!(messages[1].content, "Second");
+    }
+
+    #[test]
+    fn restore_turns_does_not_restore_duplicate_user_messages() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "restore-dupes", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        let branch = create_session_branch(&conn, "restore-dupes", &soul, &world).expect("branch");
+        let canonical_user =
+            insert_message_and_get_id(&conn, "restore-dupes", "user", "I knock on the door.")
+                .expect("user");
+        let duplicate_user =
+            insert_message_and_get_id(&conn, "restore-dupes", "user", "I knock on the door.")
+                .expect("dup");
+        let assistant =
+            insert_message_and_get_id(&conn, "restore-dupes", "assistant", "Aurora answers.")
+                .expect("assistant");
+        record_turn_commit_with_patch(
+            &conn,
+            "restore-dupes",
+            &branch.branch_id,
+            None,
+            Some(canonical_user),
+            assistant,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("commit");
+        conn.execute(
+            "UPDATE messages SET is_active = 0, message_status = 'hidden' WHERE id IN (?1, ?2, ?3)",
+            params![canonical_user, duplicate_user, assistant],
+        )
+        .expect("hide");
+
+        let restored = restore_inactive_messages(&conn, "restore-dupes").expect("restore");
+
+        assert_eq!(
+            restored.restored_message_ids,
+            vec![canonical_user, assistant]
+        );
+        assert_eq!(restored.skipped_duplicate_ids, vec![duplicate_user]);
+        let messages = list_messages(&conn, "restore-dupes", 10).expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn restore_turns_skips_pending_failed_retry_messages() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "restore-status", &soul.character_id).expect("conversation");
+        let pending =
+            insert_message_and_get_id(&conn, "restore-status", "user", "Pending").expect("pending");
+        let failed =
+            insert_message_and_get_id(&conn, "restore-status", "user", "Failed").expect("failed");
+        let retry =
+            insert_message_and_get_id(&conn, "restore-status", "user", "Retry").expect("retry");
+        conn.execute(
+            "
+            UPDATE messages
+            SET is_active = 0,
+                message_status = CASE id
+                    WHEN ?1 THEN 'pending'
+                    WHEN ?2 THEN 'failed'
+                    ELSE 'retry_attempt'
+                END
+            WHERE id IN (?1, ?2, ?3)
+            ",
+            params![pending, failed, retry],
+        )
+        .expect("mark statuses");
+
+        let restored = restore_inactive_messages(&conn, "restore-status").expect("restore");
+
+        assert!(restored.restored_message_ids.is_empty());
+        assert_eq!(restored.skipped_pending_ids, vec![pending]);
+        assert_eq!(restored.skipped_failed_ids, vec![failed]);
+        assert_eq!(restored.skipped_retry_attempt_ids, vec![retry]);
+        assert!(list_messages(&conn, "restore-status", 10)
+            .expect("messages")
+            .is_empty());
+    }
+
+    #[test]
+    fn restore_turns_restores_only_active_branch_path() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "restore-path", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        let branch = create_session_branch(&conn, "restore-path", &soul, &world).expect("branch");
+        let root_user =
+            insert_message_and_get_id(&conn, "restore-path", "user", "First").expect("root user");
+        let root_assistant = insert_message_and_get_id(&conn, "restore-path", "assistant", "Root")
+            .expect("root assistant");
+        let (root_commit, _) = record_turn_commit_with_patch(
+            &conn,
+            "restore-path",
+            &branch.branch_id,
+            None,
+            Some(root_user),
+            root_assistant,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("root");
+        let abandoned_user =
+            insert_message_and_get_id(&conn, "restore-path", "user", "Branch A").expect("a user");
+        let abandoned_assistant =
+            insert_message_and_get_id(&conn, "restore-path", "assistant", "Abandoned")
+                .expect("a assistant");
+        record_turn_commit_with_patch(
+            &conn,
+            "restore-path",
+            &branch.branch_id,
+            Some(&root_commit.turn_id),
+            Some(abandoned_user),
+            abandoned_assistant,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("abandoned");
+        let selected_user =
+            insert_message_and_get_id(&conn, "restore-path", "user", "Branch B").expect("b user");
+        let selected_assistant =
+            insert_message_and_get_id(&conn, "restore-path", "assistant", "Selected")
+                .expect("b assistant");
+        record_turn_commit_with_patch(
+            &conn,
+            "restore-path",
+            &branch.branch_id,
+            Some(&root_commit.turn_id),
+            Some(selected_user),
+            selected_assistant,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("selected");
+        conn.execute(
+            "UPDATE messages SET is_active = 0, message_status = 'hidden' WHERE conversation_id = ?1",
+            ["restore-path"],
+        )
+        .expect("hide all");
+
+        let restored = restore_inactive_messages(&conn, "restore-path").expect("restore");
+
+        assert_eq!(
+            restored.restored_message_ids,
+            vec![root_user, root_assistant, selected_user, selected_assistant]
+        );
+        assert!(!restored.restored_message_ids.contains(&abandoned_user));
+        assert!(!restored.restored_message_ids.contains(&abandoned_assistant));
     }
 
     #[test]

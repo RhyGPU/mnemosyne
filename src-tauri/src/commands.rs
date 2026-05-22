@@ -21,6 +21,10 @@ use state_engine::{
         compile_context_for_session, compile_context_for_session_separate_user_message,
         estimate_tokens, ContextMessage, ContextPreview, MemorySlotTrace,
     },
+    evaluator::{
+        active_souls_for_v1, evaluator_output_to_engine_patch, EvaluatorConversionContext,
+        EvaluatorOutputV1,
+    },
     hidden_state::{parse_hidden_state, HiddenState},
     patch::{
         is_premature_user_turn_event, is_retcon_or_correction_text,
@@ -36,11 +40,11 @@ use state_engine::{
 use crate::{
     db::{
         self, AssistantMessageVariant, ChatMessage, ConversationSummary, EntityRecord, ImageAsset,
-        LlmPayloadLog, ProviderProfile, SettingSummary, SoulSummary,
+        LlmPayloadLog, ProviderProfile, RestoreInactiveMessagesResult, SettingSummary, SoulSummary,
     },
     providers::{
         api::{
-            build_narrator_system_prompt, build_state_updater_prompt, ApiMessage, ApiProvider,
+            build_evaluator_prompt, build_narrator_system_prompt, ApiMessage, ApiProvider,
             ApiProviderSettings, PreparedApiPayload,
         },
         mock::MockProvider,
@@ -1215,18 +1219,32 @@ pub fn delete_message(
     Ok(true)
 }
 
+struct PhoneContradictionGuard {
+    text: String,
+    repaired: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RestoreTurnsResult {
+    pub messages: Vec<ChatMessage>,
+    pub preview: RestoreInactiveMessagesResult,
+}
+
 #[tauri::command]
 pub fn restore_inactive_messages(
     state: State<'_, AppState>,
     conversation_id: String,
-) -> Result<Vec<ChatMessage>, String> {
+) -> Result<RestoreTurnsResult, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    db::restore_inactive_messages(&conn, &conversation_id).map_err(|err| err.to_string())?;
+    let preview =
+        db::restore_inactive_messages(&conn, &conversation_id).map_err(|err| err.to_string())?;
     if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
         db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
             .map_err(|err| err.to_string())?;
     }
-    db::list_messages(&conn, &conversation_id, 500).map_err(|err| err.to_string())
+    let messages =
+        db::list_messages(&conn, &conversation_id, 500).map_err(|err| err.to_string())?;
+    Ok(RestoreTurnsResult { messages, preview })
 }
 
 #[tauri::command]
@@ -2272,6 +2290,18 @@ pub async fn send_api_turn(
     );
     let (mut visible_response, replay_guard, mut output_contract_warning) =
         guard_narrator_visible_response(&parsed.visible_text, &snapshot_user_text, &replay_sources);
+    let phone_guard = sanitize_phone_notification_contradiction(
+        &visible_response,
+        &snapshot_user_text,
+        &session_world,
+    );
+    if phone_guard.repaired {
+        visible_response = phone_guard.text;
+        output_contract_warning = append_output_warning(
+            output_contract_warning,
+            "phone notification contradiction repaired",
+        );
+    }
     let debug_replay_detected = replay_guard.replay_detected;
     let mut debug_replay_score = replay_guard.replay_score;
     let mut debug_replay_reason = replay_guard.replay_reason.clone();
@@ -2392,12 +2422,24 @@ pub async fn send_api_turn(
                 Ok(retry_parsed) => {
                     let pruned_retry_visible =
                         prune_repeated_scene_setup(&retry_parsed.visible_text, &replay_sources);
-                    let (retry_visible_response, retry_guard, retry_output_warning) =
+                    let (mut retry_visible_response, retry_guard, mut retry_output_warning) =
                         guard_narrator_visible_response(
                             &pruned_retry_visible,
                             &snapshot_user_text,
                             &replay_sources,
                         );
+                    let retry_phone_guard = sanitize_phone_notification_contradiction(
+                        &retry_visible_response,
+                        &snapshot_user_text,
+                        &session_world,
+                    );
+                    if retry_phone_guard.repaired {
+                        retry_visible_response = retry_phone_guard.text;
+                        retry_output_warning = append_output_warning(
+                            retry_output_warning,
+                            "phone notification contradiction repaired",
+                        );
+                    }
                     if retry_visible_response.trim().is_empty() {
                         emit_dev_log(
                             &window,
@@ -2782,13 +2824,98 @@ pub async fn send_api_turn(
         });
     }
 
+    if is_gm_facing_user_message(&snapshot_user_text)
+        || is_plain_gm_reply(&visible_response_for_updater)
+    {
+        let mut debug = pre_save_debug;
+        debug.assistant_message_id = Some(assistant_message_id);
+        debug.selected_variant_id = selected_variant_id;
+        debug.state_updater_status = "meta_no_op".into();
+        debug.output_contract_warning = output_contract_warning;
+        debug.request_id = Some(request_id.clone());
+        debug.turn_id = turn_trace.turn_id.clone();
+        if let Some(branch_id) = ledger_branch_id.as_deref() {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            let empty_patch = EnginePatch::default();
+            let (_commit, patch_record) = db::record_turn_commit_with_patch(
+                &conn,
+                &conversation_id,
+                branch_id,
+                ledger_parent_turn_id.as_deref(),
+                ledger_user_message_id,
+                assistant_message_id,
+                selected_variant_id,
+                &empty_patch,
+                replacement_assistant_id.is_some(),
+            )
+            .map_err(|err| err.to_string())?;
+            turn_trace.state_patch_id = Some(patch_record.patch_id.clone());
+            debug.state_patch_id = turn_trace.state_patch_id.clone();
+            let rebuilt = db::rebuild_session_state(&conn, &conversation_id, branch_id)
+                .map_err(|err| err.to_string())?;
+            soul = rebuilt.soul;
+            session_world = rebuilt.session_world;
+        }
+        if let Some(variant_id) = selected_variant_id {
+            if let Ok(debug_json) = serde_json::to_string(&debug) {
+                let _ = state
+                    .conn
+                    .lock()
+                    .map_err(|err| err.to_string())
+                    .and_then(|conn| {
+                        db::update_assistant_variant_debug_json(&conn, variant_id, &debug_json)
+                            .map_err(|err| err.to_string())
+                    });
+            }
+        }
+        let (messages, context_preview) = {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            let messages =
+                db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?;
+            let context_preview = compile_context_for_session(
+                &soul,
+                Some(&session_world),
+                &messages_to_context(messages.clone()),
+            );
+            (messages, context_preview)
+        };
+        emit_dev_log(
+            &window,
+            "info",
+            "state_updater",
+            "state_updater_bypassed_for_meta_turn",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "assistant_message_id": assistant_message_id,
+                "reason": "gm_ooc_meta_turn"
+            })),
+        );
+        emit_perf_log(
+            &window,
+            &conversation_id,
+            "total turn time",
+            turn_started.elapsed(),
+        );
+        return Ok(TurnResult {
+            conversation_id,
+            soul,
+            visible_response: visible_response_for_updater,
+            context_preview,
+            messages,
+            consolidation_ran: false,
+            debug,
+        });
+    }
+
     let updater_payload_started = Instant::now();
-    let updater_system_prompt = build_state_updater_prompt(&soul, Some(&session_world));
+    let updater_system_prompt = build_evaluator_prompt(&soul, Some(&session_world));
     let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
     let memory_debug_nonce = format!("memory-debug-{}", uuid_like_id());
-    let updater_user_message = build_state_updater_user_message(
+    let updater_user_message = build_evaluator_user_message(
         &snapshot_user_text,
         &visible_response_for_updater,
+        &context_preview.text,
+        Some(&session_world),
         Some(&entity_updater_context),
         Some(&memory_debug_nonce),
     );
@@ -2805,7 +2932,7 @@ pub async fn send_api_turn(
             &window,
             "warn",
             "performance",
-            "state updater payload exceeds budget",
+            "evaluator payload exceeds budget",
             Some(serde_json::json!({
                 "conversation_id": conversation_id.as_str(),
                 "estimated_tokens": updater_token_estimate,
@@ -2816,8 +2943,8 @@ pub async fn send_api_turn(
     emit_dev_log(
         &window,
         "info",
-        "state_updater",
-        "State updater started",
+        "evaluator",
+        "evaluator_called",
         Some(serde_json::json!({
             "conversation_id": conversation_id.as_str(),
             "assistant_message_id": assistant_message_id,
@@ -2837,8 +2964,8 @@ pub async fn send_api_turn(
                     id: 0,
                     conversation_id: conversation_id.clone(),
                     message_id: Some(assistant_message_id),
-                    provider: "state_updater".into(),
-                    mode: "state_updater".into(),
+                    provider: "evaluator_v1".into(),
+                    mode: "evaluator_v1".into(),
                     context_mode: context_mode.label().into(),
                     model: state_updater_settings.model.trim().to_string(),
                     base_url: state_updater_settings.base_url.trim().to_string(),
@@ -2867,13 +2994,13 @@ pub async fn send_api_turn(
         Ok(log_id) => Some(log_id),
         Err(err) => {
             eprintln!(
-                "State updater payload logging failed; narration saved without updater log: {err}"
+                "Evaluator payload logging failed; narration saved without evaluator log: {err}"
             );
             emit_dev_log(
                 &window,
                 "warn",
                 "db",
-                "State updater payload log failed",
+                "Evaluator payload log failed",
                 Some(serde_json::json!({
                     "conversation_id": conversation_id.as_str(),
                     "assistant_message_id": assistant_message_id,
@@ -2898,8 +3025,8 @@ pub async fn send_api_turn(
         emit_dev_log(
             &window,
             "warn",
-            "state_updater",
-            "State updater timed out; narration saved without state update",
+            "evaluator",
+            "Evaluator timed out; narration saved without state update",
             Some(serde_json::json!({
                 "conversation_id": conversation_id.as_str(),
                 "assistant_message_id": assistant_message_id,
@@ -2911,18 +3038,18 @@ pub async fn send_api_turn(
     emit_perf_log(
         &window,
         &conversation_id,
-        "state updater API call",
+        "evaluator API call",
         updater_call_elapsed,
     );
     let parse_started = Instant::now();
     let updater_result = match updater_response_result {
-        Ok(updater_response) => parse_engine_patch_json(&updater_response),
+        Ok(updater_response) => parse_evaluator_output_json(&updater_response),
         Err(err) => {
             if updater_call_elapsed >= Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS)
                 || err.to_lowercase().contains("timed out")
             {
                 Err(format!(
-                    "State updater timed out after {}s; narration saved without state update",
+                    "Evaluator timed out after {}s; narration saved without state update",
                     STATE_UPDATER_TIMEOUT_SECONDS
                 ))
             } else {
@@ -2933,14 +3060,78 @@ pub async fn send_api_turn(
     emit_perf_log(
         &window,
         &conversation_id,
-        "parse EnginePatch",
+        "parse EvaluatorOutputV1",
         parse_started.elapsed(),
     );
     let (hidden_state, engine_patch, state_updater_status, hidden_state_found) =
         match updater_result {
-            Ok(patch) => {
-                let mut engine_patch = sanitize_state_updater_patch(
-                    patch,
+            Ok(evaluator_output) => {
+                emit_dev_log(
+                    &window,
+                    "debug",
+                    "evaluator",
+                    "evaluator_output_parsed",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "turn_flags_u64": evaluator_output.turn_flags_u64,
+                        "memory_candidates": evaluator_output.memory_candidates.len(),
+                        "per_soul_evaluations": evaluator_output.per_soul_evaluations.len()
+                    })),
+                );
+                let conversion = evaluator_output_to_engine_patch(
+                    &evaluator_output,
+                    &EvaluatorConversionContext {
+                        active_soul_id: soul.character_id.as_str(),
+                        active_soul_ids: active_souls_for_v1(&soul),
+                        latest_user_message: &snapshot_user_text,
+                        latest_narrator_response: &visible_response_for_updater,
+                        session_world: Some(&session_world),
+                    },
+                );
+                for candidate_id in &conversion.accepted_candidate_ids {
+                    emit_dev_log(
+                        &window,
+                        "success",
+                        "evaluator",
+                        "evaluator_candidate_accepted",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "assistant_message_id": assistant_message_id,
+                            "candidate_id": candidate_id
+                        })),
+                    );
+                }
+                for rejection in &conversion.rejected_candidates {
+                    emit_dev_log(
+                        &window,
+                        "warn",
+                        "evaluator",
+                        "evaluator_candidate_rejected",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "assistant_message_id": assistant_message_id,
+                            "candidate_id": rejection.candidate_id,
+                            "reason": rejection.reason
+                        })),
+                    );
+                }
+                if conversion.no_op {
+                    emit_dev_log(
+                        &window,
+                        "info",
+                        "evaluator",
+                        "evaluator_no_op",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "assistant_message_id": assistant_message_id,
+                            "reason": evaluator_output.no_op_reason.as_deref()
+                        })),
+                    );
+                }
+                let mut engine_patch = conversion.patch;
+                engine_patch = sanitize_state_updater_patch(
+                    engine_patch,
                     &soul,
                     &snapshot_user_text,
                     &visible_response_for_updater,
@@ -2949,6 +3140,17 @@ pub async fn send_api_turn(
                     &mut engine_patch,
                     &snapshot_user_text,
                     &visible_response_for_updater,
+                );
+                emit_dev_log(
+                    &window,
+                    "success",
+                    "evaluator",
+                    "evaluator_to_patch_converted",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "summary": engine_patch_summary(&engine_patch)
+                    })),
                 );
                 emit_state_updater_patch_log(
                     &window,
@@ -2982,7 +3184,7 @@ pub async fn send_api_turn(
                     &window,
                     "error",
                     "state_updater",
-                    "state_updater_patch_parse_failed",
+                    "evaluator_output_parse_failed",
                     Some(serde_json::json!({
                         "conversation_id": conversation_id.as_str(),
                         "assistant_message_id": assistant_message_id,
@@ -2993,7 +3195,7 @@ pub async fn send_api_turn(
                     &window,
                     "error",
                     "state_updater",
-                    "State updater failed; narration saved without state update",
+                    "Evaluator failed; narration saved without state update",
                     Some(serde_json::json!({
                         "conversation_id": conversation_id.as_str(),
                         "assistant_message_id": assistant_message_id,
@@ -3136,6 +3338,7 @@ pub async fn send_api_turn(
                 "rebuild_generation": rebuild_debug.rebuild_generation
             })),
         );
+        emit_per_soul_memory_written_logs(&window, &conversation_id, &engine_patch);
         Some(rebuild_debug)
     } else {
         match engine_patch.apply_to_session(&mut soul, Some(&mut session_world)) {
@@ -3183,6 +3386,7 @@ pub async fn send_api_turn(
                 }
                 emit_relationship_delta_logs(&window, &conversation_id, &engine_patch);
                 emit_memory_apply_logs(&window, &conversation_id, &report.memory_events);
+                emit_per_soul_memory_written_logs(&window, &conversation_id, &engine_patch);
             }
             Err(err) => {
                 emit_perf_log(
@@ -3627,6 +3831,30 @@ fn emit_memory_apply_logs(
     }
 }
 
+fn emit_per_soul_memory_written_logs(window: &Window, conversation_id: &str, patch: &EnginePatch) {
+    let Some(soul_patch) = patch.soul_patch.as_ref() else {
+        return;
+    };
+    for memory in &soul_patch.new_memories {
+        if memory.content.trim().is_empty() {
+            continue;
+        }
+        emit_dev_log(
+            window,
+            "success",
+            "evaluator",
+            "per_soul_memory_written",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "owner_soul_id": memory.owner_soul_id.as_deref(),
+                "memory_slot": memory.memory_slot.as_deref().or(memory.tag.as_deref()),
+                "memory_id": memory.memory_id.as_deref(),
+                "target_entity_ids": memory.target_entity_ids
+            })),
+        );
+    }
+}
+
 fn excerpt_for_log(value: &str, max_chars: usize) -> String {
     let trimmed = value.trim();
     let chars = trimmed.chars().collect::<Vec<_>>();
@@ -3725,7 +3953,11 @@ fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContract
     let mut normalized = body.trim().to_string();
     let gm_reply = is_gm_facing_user_message(user_text) || is_plain_gm_reply(&normalized);
 
-    if let Some(status) = status_blocks.last() {
+    if let Some(status) = status_blocks
+        .iter()
+        .rev()
+        .find(|status| status_block_has_valid_line(status))
+    {
         let status = normalize_status_block(status);
         if !normalized.is_empty() {
             normalized.push_str("\n\n");
@@ -3742,6 +3974,12 @@ fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContract
         text: normalized.trim_end().to_string(),
         warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     }
+}
+
+fn status_block_has_valid_line(status_block: &str) -> bool {
+    status_block
+        .lines()
+        .any(|line| is_status_summary_line(line.trim()))
 }
 
 fn remove_status_blocks(content: &str) -> (String, Vec<String>, bool) {
@@ -4009,6 +4247,120 @@ fn is_plain_gm_reply(response: &str) -> bool {
         || trimmed.starts_with("narrator:")
         || trimmed.starts_with("ooc:")
         || trimmed.starts_with("[ooc]")
+}
+
+fn append_output_warning(current: Option<String>, warning: &str) -> Option<String> {
+    Some(match current {
+        Some(current) if !current.trim().is_empty() => format!("{current}; {warning}"),
+        _ => warning.to_string(),
+    })
+}
+
+fn sanitize_phone_notification_contradiction(
+    response: &str,
+    user_text: &str,
+    session_world: &SessionWorld,
+) -> PhoneContradictionGuard {
+    if !user_text_mentions_texting(user_text)
+        || !phone_state_blocks_visible_notification(session_world)
+        || !text_claims_phone_chime_or_screen_wake(response)
+    {
+        return PhoneContradictionGuard {
+            text: response.to_string(),
+            repaired: false,
+        };
+    }
+    let (body, status_blocks, _) = remove_status_blocks(response);
+    let mut repaired_sentences = Vec::new();
+    let mut replaced = false;
+    for sentence in split_visible_sentences(&body) {
+        if text_claims_phone_chime_or_screen_wake(sentence) {
+            if !replaced {
+                repaired_sentences.push("The message arrives silently, without a chime, vibration, or screen wake; it will only be visible when the phone is checked.".to_string());
+                replaced = true;
+            }
+        } else {
+            repaired_sentences.push(sentence.trim().to_string());
+        }
+    }
+    let mut text = repaired_sentences
+        .into_iter()
+        .filter(|sentence| !sentence.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(status) = status_blocks
+        .iter()
+        .rev()
+        .find(|status| status_block_has_valid_line(status))
+    {
+        if !text.trim().is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&normalize_status_block(status));
+    }
+    PhoneContradictionGuard {
+        text: text.trim_end().to_string(),
+        repaired: true,
+    }
+}
+
+fn user_text_mentions_texting(user_text: &str) -> bool {
+    let lower = user_text.to_ascii_lowercase();
+    lower.contains("text")
+        || lower.contains("message")
+        || lower.contains("dm")
+        || lower.contains("sms")
+        || lower.contains("send")
+}
+
+fn phone_state_blocks_visible_notification(session_world: &SessionWorld) -> bool {
+    let world = session_world.world_log();
+    world.object_states.iter().any(|object| {
+        object.object_id.to_ascii_lowercase().contains("phone")
+            && (matches!(
+                object.notification_mode.to_ascii_lowercase().as_str(),
+                "notifications_off" | "notifications off" | "do_not_disturb" | "silent"
+            ) || object.vibrate_enabled == Some(false)
+                || object.screen_wake_enabled == Some(false))
+    }) || world.key_objects.iter().any(|object| {
+        let lower = object.to_ascii_lowercase();
+        lower.contains("phone")
+            && (lower.contains("notifications off")
+                || lower.contains("notification off")
+                || lower.contains("do not disturb")
+                || lower.contains("do_not_disturb")
+                || lower.contains("silent")
+                || lower.contains("vibration disabled")
+                || lower.contains("no vibration")
+                || lower.contains("screen wake disabled")
+                || lower.contains("no screen wake"))
+    })
+}
+
+fn text_claims_phone_chime_or_screen_wake(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("phone")
+        && contains_any_text(
+            &lower,
+            &[
+                "chime",
+                "buzz",
+                "vibrat",
+                "ping",
+                "lights up",
+                "lit up",
+                "screen wakes",
+                "screen woke",
+                "screen wake",
+                "notification sound",
+            ],
+        )
+}
+
+fn split_visible_sentences(text: &str) -> Vec<&str> {
+    text.split_inclusive(['.', '!', '?'])
+        .flat_map(|chunk| chunk.split('\n'))
+        .collect()
 }
 
 fn detect_replay(new_response: &str, replay_sources: &[ReplaySource]) -> ReplayGuardResult {
@@ -4341,7 +4693,7 @@ fn messages_with_repair_instruction(messages: &[ApiMessage]) -> Vec<ApiMessage> 
         .find(|message| message.role == "user")
     {
         last_user.content = format!(
-            "{}\n\n[REPAIR INSTRUCTION - HIGH PRIORITY]\nThe previous draft repeated earlier narration. Do not restate the room setup, clothing, object list, door state, or previous physical arrangement unless changed. Use at most one short anchor detail, then advance the scene from the latest user input. Do not reuse previous wording, opening beats, or setup inventory.",
+            "{}\n\n[REPAIR INSTRUCTION - HIGH PRIORITY]\nThe previous draft repeated earlier narration or contradicted tracked object state. Do not restate the room setup, clothing, object list, door state, or previous physical arrangement unless changed. Use at most one short anchor detail, then advance the scene from the latest user input. Do not reuse previous wording, opening beats, or setup inventory. If an object state says phone notifications, vibration, or screen wake are disabled, do not write a chime, buzz, vibration, or screen light-up; the message can only arrive silently or be noticed when checked.",
             last_user.content.trim()
         );
     }
@@ -4862,6 +5214,7 @@ fn build_user_text_with_correction(
     }
 }
 
+#[cfg(test)]
 fn build_state_updater_user_message(
     user_text: &str,
     narrator_response: &str,
@@ -4886,6 +5239,46 @@ fn build_state_updater_user_message(
         "{}[LATEST USER MESSAGE]\n{}\n\n[NARRATOR RESPONSE]\n{}",
         entity_context, compact_user, compact_narrator
     ) + &debug_section
+}
+
+fn build_evaluator_user_message(
+    user_text: &str,
+    narrator_response: &str,
+    recent_chat_excerpt: &str,
+    session_world: Option<&SessionWorld>,
+    entity_context: Option<&str>,
+    memory_debug_nonce: Option<&str>,
+) -> String {
+    let entity_context = entity_context
+        .map(str::trim)
+        .filter(|context| !context.is_empty())
+        .map(|context| format!("{context}\n\n"))
+        .unwrap_or_default();
+    let compact_user = compact_user_message_for_updater(user_text);
+    let compact_narrator = compact_narrator_response_for_updater(narrator_response);
+    let scene_state = session_world
+        .map(|world| serde_json::to_string_pretty(&world.scene_state).unwrap_or_default())
+        .unwrap_or_else(|| "{}".into());
+    let world_objects = session_world
+        .map(|world| serde_json::to_string_pretty(&world.object_states).unwrap_or_default())
+        .unwrap_or_else(|| "[]".into());
+    let debug_section = memory_debug_nonce
+        .map(str::trim)
+        .filter(|nonce| !nonce.is_empty())
+        .map(|nonce| {
+            format!("\n\n[VERIFIED MEMORY LAYER DEBUG]\nbackend_nonce: {nonce}\nEvaluatorOutputV1 has no memory_layer_reply field; do not put this nonce in memory candidates.")
+        })
+        .unwrap_or_default();
+    format!(
+        "{}[PRIOR SCENE_STATE]\n{}\n\n[CURRENT WORLD/OBJECT STATE]\n{}\n\n[RECENT CHAT EXCERPT]\n{}\n\n[LATEST USER MESSAGE]\n{}\n\n[LATEST NARRATOR RESPONSE]\n{}{}",
+        entity_context,
+        scene_state,
+        world_objects,
+        head_tail_excerpt_chars(recent_chat_excerpt.trim(), 900, 900, 2_000),
+        compact_user,
+        compact_narrator,
+        debug_section
+    )
 }
 
 fn compact_user_message_for_updater(user_text: &str) -> String {
@@ -4935,11 +5328,12 @@ fn build_compact_updater_payload_for_test(
 ) -> String {
     format!(
         "{}\n\n{}",
-        build_state_updater_prompt(soul, None),
+        crate::providers::api::build_state_updater_prompt(soul, None),
         build_state_updater_user_message(user_text, narrator_response, None, None)
     )
 }
 
+#[cfg(test)]
 fn parse_engine_patch_json(raw: &str) -> Result<EnginePatch, String> {
     let trimmed = raw.trim();
     let json = if let Some(stripped) = trimmed.strip_prefix("```json") {
@@ -4951,6 +5345,19 @@ fn parse_engine_patch_json(raw: &str) -> Result<EnginePatch, String> {
     };
     serde_json::from_str::<EnginePatch>(json)
         .map_err(|err| format!("State updater returned invalid EnginePatch JSON: {err}"))
+}
+
+fn parse_evaluator_output_json(raw: &str) -> Result<EvaluatorOutputV1, String> {
+    let trimmed = raw.trim();
+    let json = if let Some(stripped) = trimmed.strip_prefix("```json") {
+        stripped.trim_end_matches("```").trim()
+    } else if let Some(stripped) = trimmed.strip_prefix("```") {
+        stripped.trim_end_matches("```").trim()
+    } else {
+        trimmed
+    };
+    serde_json::from_str::<EvaluatorOutputV1>(json)
+        .map_err(|err| format!("Evaluator returned invalid EvaluatorOutputV1 JSON: {err}"))
 }
 
 fn hidden_state_from_engine_patch(patch: &EnginePatch) -> HiddenState {
@@ -7931,6 +8338,8 @@ mod tests {
                 role: "user".into(),
                 content: "Hello.".into(),
                 created_at: 10,
+                status: "active".into(),
+                origin: "active".into(),
                 attachments: Vec::new(),
             },
             ChatMessage {
@@ -7941,6 +8350,8 @@ mod tests {
                     "Visible narrator text.\n[HIDDEN STATE]{\"tag\":\"observation\"}[/HIDDEN STATE]"
                         .into(),
                 created_at: 11,
+                status: "active".into(),
+                origin: "active".into(),
                 attachments: Vec::new(),
             },
         ];
@@ -8255,6 +8666,60 @@ mod tests {
 
         assert!(!result.text.contains("```status"));
         assert!(result.text.starts_with("GM:"));
+    }
+
+    #[test]
+    fn valid_status_block_prevents_unknown_fallback() {
+        let raw = "Aurora opens the door.\n\n```status\nScene | Focus: Aurora | Physical state: Still | Atmosphere: Quiet\n```\n\n```status\n```";
+
+        let result = apply_output_contract_guard(raw, "I knock on the door.");
+
+        assert_eq!(result.text.matches("```status").count(), 1);
+        assert!(result.text.contains("Focus: Aurora"));
+        assert!(!result.text.contains("Focus: Unknown"));
+    }
+
+    #[test]
+    fn pure_ooc_no_memory_debug_nonce() {
+        let result = apply_output_contract_guard(
+            "GM: I will keep that correction out of character.",
+            "OOC: please do not advance the scene.",
+        );
+
+        assert!(!result.text.contains("```status"));
+        assert!(!result.text.contains("memory-debug-"));
+        assert!(is_gm_facing_user_message(
+            "OOC: please do not advance the scene."
+        ));
+    }
+
+    #[test]
+    fn phone_notifications_off_blocks_chime_and_screen_wake() {
+        let mut soul = new_default_soul("Aurora");
+        soul.world
+            .object_states
+            .push(state_engine::soul::ObjectState {
+                object_id: "aurora_phone".into(),
+                notification_mode: "notifications_off".into(),
+                vibrate_enabled: Some(false),
+                screen_wake_enabled: Some(false),
+                ..state_engine::soul::ObjectState::default()
+            });
+        let session_world = state_engine::setting::session_world_from_legacy_world(
+            "Apartment",
+            Some("world-phone".into()),
+            &soul.world,
+        );
+        let raw = "Aurora's phone chimes and the screen lights up with the user's text.\n\n```status\nScene | Focus: Aurora | Physical state: Alert | Atmosphere: Quiet\n```";
+
+        let guarded =
+            sanitize_phone_notification_contradiction(raw, "I text Aurora.", &session_world);
+
+        assert!(guarded.repaired);
+        assert!(guarded.text.contains("arrives silently"));
+        assert!(!guarded.text.to_ascii_lowercase().contains("chimes"));
+        assert!(!guarded.text.to_ascii_lowercase().contains("lights up"));
+        assert!(guarded.text.contains("```status"));
     }
 
     #[test]
