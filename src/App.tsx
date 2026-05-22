@@ -363,6 +363,8 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [stateUpdating, setStateUpdating] = useState(false);
   const [activeEvaluatorJob, setActiveEvaluatorJob] = useState<EvaluatorJob | null>(null);
+  const [chatSettingsOpen, setChatSettingsOpen] = useState(false);
+  const [showArchivedSessions, setShowArchivedSessions] = useState(false);
   const didBootstrap = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const settingImportInputRef = useRef<HTMLInputElement>(null);
@@ -387,6 +389,8 @@ export function App() {
     () =>
       conversations.filter((conversation) => {
         if (!soul) return false;
+        const archived = conversation.title.startsWith("[Archived] ");
+        if (archived !== showArchivedSessions) return false;
         return (
           conversation.soul_id === soul.character_id ||
           conversation.source_savepoint_id === soul.character_id ||
@@ -394,7 +398,7 @@ export function App() {
             conversation.source_savepoint_id === soul.source_savepoint_id)
         );
       }),
-    [conversations, soul?.character_id, soul?.source_savepoint_id],
+    [conversations, showArchivedSessions, soul?.character_id, soul?.source_savepoint_id],
   );
 
   useEffect(() => {
@@ -2416,6 +2420,10 @@ export function App() {
           <FileDown size={14} />
           <span>Export</span>
         </button>
+        <button type="button" onClick={handleExportLlmPayloadHistory} disabled={busy || !currentConversationId}>
+          <FileDown size={14} />
+          <span>Export Payload</span>
+        </button>
         <button type="button" onClick={handleClearDevLogs} disabled={devLogs.length === 0}>
           <Trash2 size={14} />
           <span>Clear</span>
@@ -2568,6 +2576,16 @@ export function App() {
             <button
               className="ghost-action"
               type="button"
+              title="Open AI settings"
+              onClick={() => setChatSettingsOpen((open) => !open)}
+              disabled={busy}
+            >
+              <Database size={16} />
+              <span>AI Settings</span>
+            </button>
+            <button
+              className="ghost-action"
+              type="button"
               title="Restore turns hidden by delete/rewind"
               onClick={handleRestoreHiddenTurns}
               disabled={busy || !currentConversationId}
@@ -2592,6 +2610,80 @@ export function App() {
             {devConsoleToggle}
           </div>
         </header>
+
+        {chatSettingsOpen ? (
+          <section className="chat-only-controls" aria-label="Chat AI settings">
+            <label className="field">
+              <span>Provider</span>
+              <select
+                value={provider}
+                onChange={(event) => {
+                  const nextProvider = event.target.value as ProviderKind;
+                  setProvider(nextProvider);
+                  logDev("info", "app", "Provider mode changed", { provider: nextProvider });
+                }}
+                disabled={busy}
+              >
+                <option>Mock</option>
+                <option>API</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>Mode</span>
+              <select
+                value={mode}
+                onChange={(event) => setMode(event.target.value as NarrativeMode)}
+                disabled={busy}
+              >
+                <option>Realistic</option>
+                <option>Reader</option>
+                <option>God</option>
+                <option>Custom</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>Context</span>
+              <select
+                value={contextMode}
+                onChange={(event) => setContextMode(event.target.value as ContextMode)}
+                disabled={busy}
+              >
+                <option value="brief">Mnemosyne Brief</option>
+                <option value="full_chat">Full Chat</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>Narrator Preset</span>
+              <select
+                value={selectedProviderProfileId}
+                onChange={(event) => void handleSelectProviderProfile(event.target.value)}
+                disabled={busy || provider !== "API"}
+              >
+                <option value="">Manual</option>
+                {providerProfiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {profile.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>Updater Preset</span>
+              <select
+                value={selectedStateUpdaterProfileId}
+                onChange={(event) => void handleSelectStateUpdaterProfile(event.target.value)}
+                disabled={busy || provider !== "API" || useNarratorProviderForUpdater}
+              >
+                <option value="">Manual</option>
+                {providerProfiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {profile.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </section>
+        ) : null}
 
         <section className="chat-only-scroll" ref={chatOnlyBodyRef}>
           <div className="chat-only-body">
@@ -3735,11 +3827,23 @@ export function App() {
           </p>
           <section className="session-list" aria-label="Saved chats">
             <div className="session-list-heading">
-              <span className="eyebrow">Chats</span>
+              <span className="eyebrow">{showArchivedSessions ? "Archived chats" : "Active chats"}</span>
               <strong>{visibleConversations.length}</strong>
+              <label className="archive-toggle">
+                <input
+                  type="checkbox"
+                  checked={showArchivedSessions}
+                  onChange={(event) => setShowArchivedSessions(event.target.checked)}
+                />
+                <span>Show archived</span>
+              </label>
             </div>
             {visibleConversations.length === 0 ? (
-              <p className="muted">No named chats for this Soul yet.</p>
+              <p className="muted">
+                {showArchivedSessions
+                  ? "No archived chats for this Soul."
+                  : "No active named chats for this Soul yet."}
+              </p>
             ) : (
               visibleConversations.slice(0, 8).map((conversation) => (
                 <div
@@ -4262,7 +4366,7 @@ export function App() {
                   disabled={busy}
                 >
                   <FileDown size={16} />
-                  <span>Export LLM Payload History</span>
+                  <span>Export Payload History</span>
                 </button>
               </div>
             </div>

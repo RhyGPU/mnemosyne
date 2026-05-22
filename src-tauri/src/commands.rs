@@ -25,6 +25,7 @@ use state_engine::{
         active_souls_for_v1, evaluator_output_to_engine_patch, EvaluatorConversionContext,
         EvaluatorConversionReport, EvaluatorOutputV1,
     },
+    evaluator_ingest::parse_evaluator_output,
     hidden_state::{parse_hidden_state, HiddenState},
     patch::{
         is_premature_user_turn_event, is_retcon_or_correction_text,
@@ -84,14 +85,6 @@ struct NarratorTurnTrace {
     state_patch_id: Option<String>,
     provider_request_id: Option<String>,
     provider_response_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct EvaluatorParseResult {
-    output: EvaluatorOutputV1,
-    normalized_json: String,
-    normalized: bool,
-    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2781,18 +2774,14 @@ pub async fn send_api_turn(
             return Err(err.to_string());
         }
     };
-    let mut anti_replay_severity = ReplaySeverity::None;
-    let mut anti_replay_reason: Option<String> = None;
-    let mut original_response_score = 0.0f32;
     let mut retry_response_score = 0.0f32;
     let mut selected_response_source = "original".to_string();
-    let mut status_repair_action: Option<String> = None;
-    let mut pure_ooc_detected = false;
     let mut ooc_detection_reason = "scene_turn".to_string();
 
     let user_is_ooc = is_ooc_or_gm_prefix(&snapshot_user_text);
     let assistant_is_ooc = is_ooc_or_gm_prefix(&parsed.visible_text);
-    pure_ooc_detected = user_is_ooc || (snapshot_user_text.trim().is_empty() && assistant_is_ooc);
+    let pure_ooc_detected =
+        user_is_ooc || (snapshot_user_text.trim().is_empty() && assistant_is_ooc);
     if pure_ooc_detected {
         ooc_detection_reason = if user_is_ooc {
             "user_message_ooc_prefix".to_string()
@@ -2816,7 +2805,7 @@ pub async fn send_api_turn(
         })),
     );
 
-    let (mut visible_response, mut replay_guard, mut output_contract_warning, orig_status_repair) =
+    let (mut visible_response, replay_guard, mut output_contract_warning, orig_status_repair) =
         if pure_ooc_detected {
             let (v, mut rg, w, r) = guard_narrator_visible_response(
                 &parsed.visible_text,
@@ -2835,7 +2824,7 @@ pub async fn send_api_turn(
                 &replay_sources,
             )
         };
-    status_repair_action = orig_status_repair;
+    let mut status_repair_action = orig_status_repair;
 
     let phone_guard = sanitize_phone_notification_contradiction(
         &visible_response,
@@ -2850,7 +2839,7 @@ pub async fn send_api_turn(
         );
     }
 
-    original_response_score = evaluate_response_quality(
+    let original_response_score = evaluate_response_quality(
         &visible_response,
         &snapshot_user_text,
         &session_world,
@@ -2861,10 +2850,10 @@ pub async fn send_api_turn(
         },
     );
 
-    anti_replay_severity = replay_guard.severity;
-    anti_replay_reason = replay_guard.replay_reason.clone();
+    let anti_replay_severity = replay_guard.severity;
+    let anti_replay_reason = replay_guard.replay_reason.clone();
 
-    let mut debug_replay_detected = replay_guard.replay_detected;
+    let debug_replay_detected = replay_guard.replay_detected;
     let mut debug_replay_score = replay_guard.replay_score;
     let mut debug_replay_reason = replay_guard.replay_reason.clone();
     let mut debug_replay_compared_against_message_id = replay_guard.compared_against_message_id;
@@ -3841,7 +3830,7 @@ pub async fn send_api_turn(
                         .map_err(|err| err.to_string())
                     });
             }
-            parse_evaluator_output_json_with_trace(&updater_response)
+            parse_evaluator_output(&updater_response)
         }
         Err(err) => {
             if evaluator_timed_out(&err, updater_call_elapsed, &state_updater_settings) {
@@ -5043,7 +5032,7 @@ fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContract
         warnings.push("EnginePatch JSON stripped");
     }
 
-    let (mut body, mut status_blocks, mut status_recovered) =
+    let (mut body, mut status_blocks, status_recovered) =
         remove_status_blocks(&without_engine_patch);
     if status_recovered {
         warnings.push("malformed status fence recovered");
@@ -5065,7 +5054,6 @@ fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContract
             body = body_lines.join("\n");
 
             status_blocks.push(format!("```status\n{}\n```", line_content));
-            status_recovered = true;
             warnings.push("prose status extracted");
             repair_action = Some("extracted_from_prose".to_string());
         }
@@ -5500,6 +5488,7 @@ fn split_visible_sentences(text: &str) -> Vec<&str> {
         .collect()
 }
 
+#[cfg(test)]
 fn detect_replay(new_response: &str, replay_sources: &[ReplaySource]) -> ReplayGuardResult {
     let dummy_world =
         state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
@@ -5540,12 +5529,6 @@ fn detect_replay_with_context(
         }
     }
     best
-}
-
-fn compare_replay_against_source(new_response: &str, source: &ReplaySource) -> ReplayGuardResult {
-    let dummy_world =
-        state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
-    compare_replay_against_source_with_context(new_response, "", &dummy_world, source)
 }
 
 fn compare_replay_against_source_with_context(
@@ -7090,7 +7073,7 @@ async fn run_background_evaluator_job(
     }
 
     let evaluator_parse = match response_result
-        .and_then(|response| parse_evaluator_output_json_with_trace(&response))
+        .and_then(|response| parse_evaluator_output(&response))
     {
         Ok(output) => output,
         Err(err) => {
@@ -7524,145 +7507,6 @@ async fn run_background_evaluator_job(
         started,
         !engine_patch.is_empty(),
     );
-}
-
-fn parse_evaluator_output_json_with_trace(raw: &str) -> Result<EvaluatorParseResult, String> {
-    let trimmed = raw.trim();
-    let json = if let Some(stripped) = trimmed.strip_prefix("```json") {
-        stripped.trim_end_matches("```").trim()
-    } else if let Some(stripped) = trimmed.strip_prefix("```") {
-        stripped.trim_end_matches("```").trim()
-    } else {
-        trimmed
-    };
-    let mut value = serde_json::from_str::<serde_json::Value>(json)
-        .map_err(|err| format!("Evaluator returned invalid EvaluatorOutputV1 JSON: {err}"))?;
-    let mut warnings = Vec::new();
-    normalize_evaluator_output_value(&mut value, &mut warnings);
-    let normalized = !warnings.is_empty();
-    let normalized_json = serde_json::to_string(&value)
-        .map_err(|err| format!("Evaluator JSON normalize failed: {err}"))?;
-    let output = serde_json::from_value::<EvaluatorOutputV1>(value)
-        .map_err(|err| format!("Evaluator returned invalid EvaluatorOutputV1 JSON: {err}"))?;
-    Ok(EvaluatorParseResult {
-        output,
-        normalized_json,
-        normalized,
-        warnings,
-    })
-}
-
-fn normalize_evaluator_output_value(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
-    normalize_knowledge_scope_aliases(value, warnings);
-    if let Some(candidates) = value
-        .get_mut("memory_candidates")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        normalize_memory_candidate_array(candidates, warnings, "memory_candidates");
-    }
-    if let Some(per_soul) = value
-        .get_mut("per_soul_evaluations")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        for (index, soul_eval) in per_soul.iter_mut().enumerate() {
-            if let Some(candidates) = soul_eval
-                .get_mut("memory_candidates")
-                .and_then(serde_json::Value::as_array_mut)
-            {
-                normalize_memory_candidate_array(
-                    candidates,
-                    warnings,
-                    &format!("per_soul_evaluations[{index}].memory_candidates"),
-                );
-            }
-        }
-    }
-}
-
-fn normalize_memory_candidate_array(
-    candidates: &mut [serde_json::Value],
-    warnings: &mut Vec<String>,
-    path: &str,
-) {
-    for (index, candidate) in candidates.iter_mut().enumerate() {
-        normalize_memory_candidate_owner_alias(candidate, warnings, &format!("{path}[{index}]"));
-    }
-}
-
-fn normalize_memory_candidate_owner_alias(
-    candidate: &mut serde_json::Value,
-    warnings: &mut Vec<String>,
-    path: &str,
-) {
-    let Some(object) = candidate.as_object_mut() else {
-        return;
-    };
-    if object.contains_key("owner_soul_id") {
-        for alias in ["soul_id", "soul", "owner"] {
-            if object.remove(alias).is_some() {
-                warnings.push(format!(
-                    "{path}.{alias} ignored because owner_soul_id was present"
-                ));
-            }
-        }
-        return;
-    }
-    for alias in ["soul_id", "soul", "owner"] {
-        if let Some(value) = object.remove(alias) {
-            object.insert("owner_soul_id".into(), value);
-            warnings.push(format!("{path}.{alias} normalized to owner_soul_id"));
-            break;
-        }
-    }
-    for alias in ["soul_id", "soul", "owner"] {
-        if object.remove(alias).is_some() {
-            warnings.push(format!(
-                "{path}.{alias} ignored after owner_soul_id alias normalization"
-            ));
-        }
-    }
-}
-
-fn normalize_knowledge_scope_aliases(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(object) => {
-            if let Some(scope) = object.get_mut("knowledge_scope") {
-                if let Some(raw_scope) = scope.as_str().map(str::to_string) {
-                    if let Some(normalized) = normalized_knowledge_scope_alias(&raw_scope) {
-                        if normalized != raw_scope.as_str() {
-                            *scope = serde_json::Value::String(normalized.to_string());
-                            warnings.push(format!(
-                                "knowledge_scope alias {raw_scope:?} normalized to {normalized}"
-                            ));
-                        }
-                    }
-                }
-            }
-            for child in object.values_mut() {
-                normalize_knowledge_scope_aliases(child, warnings);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                normalize_knowledge_scope_aliases(item, warnings);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn normalized_knowledge_scope_alias(scope: &str) -> Option<&'static str> {
-    let normalized = scope.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "full" | "observed" | "direct" => Some("directly_observed"),
-        "hearsay" => Some("heard_about"),
-        "unknown" | "none" => Some("not_known"),
-        "directly_observed" => Some("directly_observed"),
-        "heard_about" => Some("heard_about"),
-        "inferred" => Some("inferred"),
-        "not_known" => Some("not_known"),
-        _ => None,
-    }
 }
 
 fn update_llm_payload_pipeline_trace(
@@ -9764,6 +9608,198 @@ mod tests {
     };
 
     #[test]
+    fn test_evaluator_json_normalization() {
+        let raw_json = r#"{
+            "schema_version": 1,
+            "turn_flags_u64": 16,
+            "turn_classification": {
+                "is_pure_ooc": false,
+                "scene_event_occurred": true,
+                "is_retcon_or_correction": false,
+                "human_summary": "Aurora was shocked by the knock on the door.",
+                "extra_drift_field": "harmless but unknown"
+            },
+            "global_scene_evaluation": {
+                "scene_event_occurred": true,
+                "location_changed": false,
+                "object_state_changed": true,
+                "relationship_changed": true,
+                "unresolved_tension": false,
+                "current_plot_advanced": true,
+                "character_identity_changed": false,
+                "recent_emotional_state_changed": true,
+                "contradiction_detected": false,
+                "summary": "Aurora hears a knock."
+            },
+            "memory_candidates": [
+                {
+                    "soul_id": "aurora_soul",
+                    "estimated_strength": 85.0,
+                    "proposed_memory_slot": "CurrentPlotMemory",
+                    "specifics": "Aurora hears a knock on the door.",
+                    "evidence_quote": "A sharp rap-rap-rap echoes from the front door.",
+                    "actor": "narrator",
+                    "tags": ["door", "knock"],
+                    "format": "v1",
+                    "sort": 1
+                }
+            ],
+            "per_soul_evaluations": [
+                {
+                    "primary_soul": "aurora_soul",
+                    "observed": true,
+                    "knowledge_scope": "full_observation",
+                    "subjective_interpretation": "She felt a wave of anxiety.",
+                    "emotional_state": "anxious",
+                    "memory_candidates": [
+                        {
+                            "target_souls": ["aurora_soul"],
+                            "estimated_strength": 0.95,
+                            "slots": ["RelationshipMemory"],
+                            "payload": {
+                                "action": "Rhy knocked on the door."
+                            },
+                            "evidence_quote": "It's me, Rhy.",
+                            "actor": ["rhy"],
+                            "tags": ["rhy", "visit"]
+                        }
+                    ],
+                    "relationship_deltas": [
+                        {
+                            "source": "aurora_soul",
+                            "target": "rhy",
+                            "changes": {
+                                "curiosity": 10.0,
+                                "comfort": -5.0,
+                                "fear": 5.0
+                            },
+                            "evidence_quote": "Why is he here?",
+                            "confidence": 0.8
+                        }
+                    ]
+                }
+            ],
+            "object_changes": [
+                {
+                    "object": "front_door",
+                    "change": "closed_locked",
+                    "previous_state": "closed_unlocked",
+                    "entity_id": "aurora_soul",
+                    "evidence_quote": "She bolted the lock.",
+                    "confidence": 0.9
+                }
+            ],
+            "relationship_evaluations": [
+                {
+                    "soul_id": "aurora_soul",
+                    "actor": "rhy",
+                    "changes": {
+                        "trust": -2.0,
+                        "affection": 1.0
+                    },
+                    "evidence_quote": "Why is he here?"
+                }
+            ],
+            "world_changes": [
+                {
+                    "location": "Aurora's house",
+                    "event_summary": "Rhy knocks",
+                    "evidence_quote": "rap-rap-rap",
+                    "confidence": 0.85
+                }
+            ],
+            "relevance_tags": {
+                "setting_tags": {},
+                "location_tags": {},
+                "interacted_entities": {},
+                "event_type_tags": {},
+                "object_tags": {},
+                "emotional_tags": {},
+                "memory_slot_tags": {},
+                "per_soul_relevance": {},
+                "extra_drift": 12
+            }
+        }"#;
+
+        let parse_res = parse_evaluator_output(raw_json).expect("Parse failed");
+        let parsed = parse_res.output;
+
+        println!("Warnings: {:?}", parse_res.warnings);
+
+        // 1. Verify Memory Candidate Normalization (top level)
+        assert_eq!(parsed.memory_candidates.len(), 1);
+        let mc1 = &parsed.memory_candidates[0];
+        assert_eq!(mc1.owner_soul_id, "aurora_soul");
+        assert_eq!(mc1.confidence, 0.85); // scaled from 85.0
+        assert_eq!(mc1.salience, Some(85.0));
+        assert_eq!(mc1.retrieval_strength, Some(85.0));
+        assert_eq!(
+            mc1.slot,
+            state_engine::evaluator::MemorySlot::CurrentPlotMemory
+        );
+        assert_eq!(mc1.content, "Aurora hears a knock on the door.");
+        assert_eq!(mc1.target_entity_ids, vec!["narrator".to_string()]);
+        assert_eq!(
+            mc1.relevance_tags,
+            vec!["door".to_string(), "knock".to_string()]
+        );
+
+        // 2. Verify Per-Soul Evaluation & nested candidates & nested deltas
+        assert_eq!(parsed.per_soul_evaluations.len(), 1);
+        let pse = &parsed.per_soul_evaluations[0];
+        assert_eq!(pse.soul_id, "aurora_soul");
+        assert_eq!(
+            pse.knowledge_scope,
+            state_engine::evaluator::KnowledgeScope::DirectlyObserved
+        ); // mapped from full_observation
+
+        assert_eq!(pse.memory_candidates.len(), 1);
+        let mc2 = &pse.memory_candidates[0];
+        assert_eq!(mc2.owner_soul_id, "aurora_soul");
+        assert_eq!(mc2.confidence, 0.95); // preserved (not scaled since <= 1.0)
+        assert_eq!(
+            mc2.slot,
+            state_engine::evaluator::MemorySlot::RelationshipMemory
+        );
+        assert_eq!(mc2.content, "Rhy knocked on the door.");
+        assert_eq!(mc2.target_entity_ids, vec!["rhy".to_string()]);
+
+        assert_eq!(pse.relationship_deltas.len(), 1);
+        let rd1 = &pse.relationship_deltas[0];
+        assert_eq!(rd1.source_soul_id, "aurora_soul");
+        assert_eq!(rd1.target_entity_id, "rhy");
+        assert_eq!(rd1.curiosity, Some(10.0));
+        assert_eq!(rd1.comfort, Some(-5.0));
+        assert_eq!(rd1.fear, Some(5.0));
+        assert_eq!(rd1.confidence, 0.8);
+
+        // 3. Verify Object Changes Normalization
+        assert_eq!(parsed.object_changes.len(), 1);
+        let oc1 = &parsed.object_changes[0];
+        assert_eq!(oc1.object_state.object_id, "front_door");
+        assert_eq!(oc1.object_state.last_observed_state, "closed_locked");
+        assert_eq!(
+            oc1.object_state.owner_entity_id,
+            Some("aurora_soul".to_string())
+        );
+        assert_eq!(
+            oc1.object_state
+                .properties
+                .get("previous_state")
+                .map(|s| s.as_str()),
+            Some("closed_unlocked")
+        );
+
+        // 4. Verify top-level Relationship Evaluations Normalization
+        assert_eq!(parsed.relationship_evaluations.len(), 1);
+        let re1 = &parsed.relationship_evaluations[0];
+        assert_eq!(re1.source_soul_id, "aurora_soul");
+        assert_eq!(re1.target_entity_id, "rhy");
+        assert_eq!(re1.trust, Some(-2.0));
+        assert_eq!(re1.affection, Some(1.0));
+    }
+
+    #[test]
     fn opening_narrator_message_seeds_visible_assistant_without_payload_logs() {
         let conn = db::init_memory_connection().expect("db");
         let mut soul = new_default_soul("Aurora");
@@ -11786,16 +11822,16 @@ mod tests {
         let mut candidate = valid_evaluator_candidate();
         candidate.as_object_mut().unwrap().remove("owner_soul_id");
         candidate["soul_id"] = serde_json::json!("Aurora");
-        let parsed = parse_evaluator_output_json_with_trace(&evaluator_output_json_with_candidate(
-            candidate,
-        ))
-        .expect("parse");
+        let parsed = parse_evaluator_output(&evaluator_output_json_with_candidate(candidate))
+            .expect("parse");
         let world =
             state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
         let conversion = evaluator_output_to_engine_patch(
             &parsed.output,
             &evaluator_context_for_alias_tests(&world),
         );
+
+        println!("Warnings in accepts_soul_id_alias: {:?}", parsed.warnings);
 
         assert!(parsed.normalized);
         assert!(parsed
@@ -11810,10 +11846,8 @@ mod tests {
     fn evaluator_normalizes_full_knowledge_scope() {
         let mut candidate = valid_evaluator_candidate();
         candidate["knowledge_scope"] = serde_json::json!("full");
-        let parsed = parse_evaluator_output_json_with_trace(&evaluator_output_json_with_candidate(
-            candidate,
-        ))
-        .expect("parse");
+        let parsed = parse_evaluator_output(&evaluator_output_json_with_candidate(candidate))
+            .expect("parse");
 
         assert!(parsed.normalized);
         assert_eq!(
@@ -11836,10 +11870,8 @@ mod tests {
         candidate["confidence"] = serde_json::json!(0.2);
         candidate["content"] = serde_json::json!("she listened carefully");
         candidate["knowledge_scope"] = serde_json::json!("observed");
-        let parsed = parse_evaluator_output_json_with_trace(&evaluator_output_json_with_candidate(
-            candidate,
-        ))
-        .expect("parse");
+        let parsed = parse_evaluator_output(&evaluator_output_json_with_candidate(candidate))
+            .expect("parse");
         let world =
             state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
         let conversion = evaluator_output_to_engine_patch(
@@ -11861,10 +11893,8 @@ mod tests {
         candidate.as_object_mut().unwrap().remove("owner_soul_id");
         candidate["owner"] = serde_json::json!("Aurora");
         candidate["knowledge_scope"] = serde_json::json!("hearsay");
-        let parsed = parse_evaluator_output_json_with_trace(&evaluator_output_json_with_candidate(
-            candidate,
-        ))
-        .expect("parse");
+        let parsed = parse_evaluator_output(&evaluator_output_json_with_candidate(candidate))
+            .expect("parse");
         let trace = serde_json::json!({
             "evaluator_json_normalized": parsed.normalized,
             "evaluator_normalization_warnings": parsed.warnings
