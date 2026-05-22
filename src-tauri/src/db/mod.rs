@@ -253,6 +253,31 @@ pub struct ProviderProfile {
     pub system_prompt: String,
     pub created_at: i64,
     pub updated_at: i64,
+    pub narrator_timeout_ms: Option<u64>,
+    pub evaluator_timeout_ms: Option<u64>,
+    pub evaluator_timeout_mode: Option<String>,
+    pub wait_for_evaluator_before_next_turn: Option<bool>,
+    pub allow_send_with_stale_state: Option<bool>,
+    pub evaluator_background_enabled: Option<bool>,
+    pub anti_replay_forced_retry_enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluatorJob {
+    pub evaluator_job_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub assistant_message_id: i64,
+    pub status: String, // pending, running, completed, failed, canceled, timed_out
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+    pub elapsed_ms: Option<i64>,
+    pub timeout_ms: Option<u64>,
+    pub timeout_mode: String, // finite, no_app_timeout
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub error_message: Option<String>,
+    pub patch_applied: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -688,6 +713,58 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "llm_payload_logs", "provider_request_id", "TEXT")?;
     add_column_if_missing(conn, "llm_payload_logs", "provider_response_id", "TEXT")?;
     add_column_if_missing(conn, "llm_payload_logs", "pipeline_trace_json", "TEXT")?;
+
+    // Migrate provider_profiles settings
+    add_column_if_missing(conn, "provider_profiles", "narrator_timeout_ms", "INTEGER")?;
+    add_column_if_missing(conn, "provider_profiles", "evaluator_timeout_ms", "INTEGER")?;
+    add_column_if_missing(conn, "provider_profiles", "evaluator_timeout_mode", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "wait_for_evaluator_before_next_turn",
+        "INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "allow_send_with_stale_state",
+        "INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "evaluator_background_enabled",
+        "INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "anti_replay_forced_retry_enabled",
+        "INTEGER",
+    )?;
+
+    // Create evaluator_background_jobs table
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS evaluator_background_jobs (
+            evaluator_job_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            assistant_message_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            elapsed_ms INTEGER,
+            timeout_ms INTEGER,
+            timeout_mode TEXT NOT NULL,
+            model TEXT,
+            provider TEXT,
+            error_message TEXT,
+            patch_applied INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_evaluator_background_jobs_conversation ON evaluator_background_jobs(conversation_id, status);"
+    )?;
+
     if added_soul_summary_columns {
         backfill_soul_summary_columns(conn)?;
     }
@@ -3050,15 +3127,27 @@ pub fn upsert_provider_profile(
     };
     conn.execute(
         "
-        INSERT INTO provider_profiles (id, name, base_url, api_key, model, system_prompt, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        INSERT INTO provider_profiles (
+            id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
+            narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode,
+            wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
+            anti_replay_forced_retry_enabled
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             base_url = excluded.base_url,
             api_key = excluded.api_key,
             model = excluded.model,
             system_prompt = excluded.system_prompt,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            narrator_timeout_ms = excluded.narrator_timeout_ms,
+            evaluator_timeout_ms = excluded.evaluator_timeout_ms,
+            evaluator_timeout_mode = excluded.evaluator_timeout_mode,
+            wait_for_evaluator_before_next_turn = excluded.wait_for_evaluator_before_next_turn,
+            allow_send_with_stale_state = excluded.allow_send_with_stale_state,
+            evaluator_background_enabled = excluded.evaluator_background_enabled,
+            anti_replay_forced_retry_enabled = excluded.anti_replay_forced_retry_enabled
         ",
         params![
             updated.id,
@@ -3068,7 +3157,14 @@ pub fn upsert_provider_profile(
             updated.model,
             updated.system_prompt,
             updated.created_at,
-            updated.updated_at
+            updated.updated_at,
+            updated.narrator_timeout_ms,
+            updated.evaluator_timeout_ms,
+            updated.evaluator_timeout_mode,
+            updated.wait_for_evaluator_before_next_turn,
+            updated.allow_send_with_stale_state,
+            updated.evaluator_background_enabled,
+            updated.anti_replay_forced_retry_enabled
         ],
     )?;
     Ok(updated)
@@ -3077,7 +3173,10 @@ pub fn upsert_provider_profile(
 pub fn list_provider_profiles(conn: &Connection) -> rusqlite::Result<Vec<ProviderProfile>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at
+        SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
+               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode,
+               wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
+               anti_replay_forced_retry_enabled
         FROM provider_profiles
         ORDER BY updated_at DESC, name ASC
         ",
@@ -3089,7 +3188,10 @@ pub fn list_provider_profiles(conn: &Connection) -> rusqlite::Result<Vec<Provide
 pub fn get_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<ProviderProfile> {
     conn.query_row(
         "
-        SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at
+        SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
+               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode,
+               wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
+               anti_replay_forced_retry_enabled
         FROM provider_profiles
         WHERE id = ?1
         ",
@@ -3113,6 +3215,142 @@ fn provider_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provid
         system_prompt: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
+        narrator_timeout_ms: row.get(8)?,
+        evaluator_timeout_ms: row.get(9)?,
+        evaluator_timeout_mode: row.get(10)?,
+        wait_for_evaluator_before_next_turn: row.get(11)?,
+        allow_send_with_stale_state: row.get(12)?,
+        evaluator_background_enabled: row.get(13)?,
+        anti_replay_forced_retry_enabled: row.get(14)?,
+    })
+}
+
+// Background Evaluator Jobs Database Helpers
+pub fn insert_evaluator_job(conn: &Connection, job: &EvaluatorJob) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO evaluator_background_jobs (
+            evaluator_job_id, conversation_id, turn_id, assistant_message_id, status,
+            started_at, completed_at, elapsed_ms, timeout_ms, timeout_mode,
+            model, provider, error_message, patch_applied
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            job.evaluator_job_id,
+            job.conversation_id,
+            job.turn_id,
+            job.assistant_message_id,
+            job.status,
+            job.started_at,
+            job.completed_at,
+            job.elapsed_ms,
+            job.timeout_ms.map(|v| v as i64),
+            job.timeout_mode,
+            job.model,
+            job.provider,
+            job.error_message,
+            if job.patch_applied { 1 } else { 0 }
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn update_evaluator_job_status(
+    conn: &Connection,
+    job_id: &str,
+    status: &str,
+    error_message: Option<&str>,
+    completed_at: Option<i64>,
+    elapsed_ms: Option<i64>,
+    patch_applied: bool,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE evaluator_background_jobs
+         SET status = ?1, error_message = ?2, completed_at = ?3, elapsed_ms = ?4, patch_applied = ?5
+         WHERE evaluator_job_id = ?6",
+        params![
+            status,
+            error_message,
+            completed_at,
+            elapsed_ms,
+            if patch_applied { 1 } else { 0 },
+            job_id
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_evaluator_job(
+    conn: &Connection,
+    job_id: &str,
+) -> rusqlite::Result<Option<EvaluatorJob>> {
+    let mut stmt = conn.prepare(
+        "SELECT evaluator_job_id, conversation_id, turn_id, assistant_message_id, status,
+                started_at, completed_at, elapsed_ms, timeout_ms, timeout_mode,
+                model, provider, error_message, patch_applied
+         FROM evaluator_background_jobs
+         WHERE evaluator_job_id = ?1",
+    )?;
+    let mut rows = stmt.query_map([job_id], evaluator_job_from_row)?;
+    if let Some(row) = rows.next() {
+        Ok(Some(row?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn get_latest_evaluator_job(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Option<EvaluatorJob>> {
+    let mut stmt = conn.prepare(
+        "SELECT evaluator_job_id, conversation_id, turn_id, assistant_message_id, status,
+                started_at, completed_at, elapsed_ms, timeout_ms, timeout_mode,
+                model, provider, error_message, patch_applied
+         FROM evaluator_background_jobs
+         WHERE conversation_id = ?1
+         ORDER BY started_at DESC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map([conversation_id], evaluator_job_from_row)?;
+    if let Some(row) = rows.next() {
+        Ok(Some(row?))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn get_pending_evaluator_jobs_for_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<EvaluatorJob>> {
+    let mut stmt = conn.prepare(
+        "SELECT evaluator_job_id, conversation_id, turn_id, assistant_message_id, status,
+                started_at, completed_at, elapsed_ms, timeout_ms, timeout_mode,
+                model, provider, error_message, patch_applied
+         FROM evaluator_background_jobs
+         WHERE conversation_id = ?1 AND status IN ('pending', 'running')
+         ORDER BY started_at ASC",
+    )?;
+    let rows = stmt.query_map([conversation_id], evaluator_job_from_row)?;
+    rows.collect()
+}
+
+fn evaluator_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvaluatorJob> {
+    let timeout_ms_i64: Option<i64> = row.get(8)?;
+    Ok(EvaluatorJob {
+        evaluator_job_id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        turn_id: row.get(2)?,
+        assistant_message_id: row.get(3)?,
+        status: row.get(4)?,
+        started_at: row.get(5)?,
+        completed_at: row.get(6)?,
+        elapsed_ms: row.get(7)?,
+        timeout_ms: timeout_ms_i64.map(|v| v as u64),
+        timeout_mode: row.get(9)?,
+        model: row.get(10)?,
+        provider: row.get(11)?,
+        error_message: row.get(12)?,
+        patch_applied: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -4388,6 +4626,13 @@ mod tests {
             system_prompt: String::new(),
             created_at: 0,
             updated_at: 0,
+            narrator_timeout_ms: Some(30_000),
+            evaluator_timeout_ms: Some(25_000),
+            evaluator_timeout_mode: Some("finite".into()),
+            wait_for_evaluator_before_next_turn: Some(true),
+            allow_send_with_stale_state: Some(false),
+            evaluator_background_enabled: Some(false),
+            anti_replay_forced_retry_enabled: Some(false),
         };
 
         let saved = upsert_provider_profile(&conn, &profile).expect("upsert");

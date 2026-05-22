@@ -257,6 +257,60 @@ button {
   border-radius: 999px;
 }
 
+.evaluator-job-banner {
+  position: fixed;
+  right: 18px;
+  bottom: 84px;
+  left: 18px;
+  z-index: 20;
+  display: flex;
+  max-width: 920px;
+  margin-inline: auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid #cfc6b6;
+  border-radius: 8px;
+  background: #fffdf8;
+  box-shadow: 0 10px 30px rgba(22, 32, 28, 0.12);
+  padding: 10px 12px;
+  color: #16201c;
+}
+
+.evaluator-job-banner.running,
+.evaluator-job-banner.pending {
+  border-color: #89afa6;
+}
+
+.evaluator-job-banner.failed,
+.evaluator-job-banner.timed_out {
+  border-color: #d6a49a;
+}
+
+.evaluator-job-banner > div:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.evaluator-job-banner span,
+.evaluator-job-banner small {
+  color: #6b786f;
+  font-size: 0.78rem;
+}
+
+.evaluator-job-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.evaluator-job-actions button {
+  min-height: 32px;
+  border-radius: 999px;
+  padding: 0 12px;
+}
+
 .panel-header,
 .chat-header {
   display: flex;

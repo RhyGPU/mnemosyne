@@ -57,7 +57,10 @@ const NO_LLM_PAYLOAD_LOGS_MESSAGE: &str = "No LLM payload logs found for this co
 const FULL_CHAT_TOKEN_BUDGET: usize = 6_000;
 const NARRATOR_BRIEF_TARGET_TOKENS: usize = 2_500;
 const STATE_UPDATER_TARGET_TOKENS: usize = 1_600;
-const STATE_UPDATER_TIMEOUT_SECONDS: u64 = 25;
+const DEFAULT_EVALUATOR_TIMEOUT_MS: u64 = 25_000;
+const NEXT_TURN_GATE_POLL_MS: u64 = 250;
+const NEXT_TURN_GATE_FALLBACK_MAX_MS: u64 = 120_000;
+const ANTI_REPLAY_FORCED_RETRY_ENABLED_DEFAULT: bool = false;
 const NARRATOR_PROVIDER_ERROR_VISIBLE: &str =
     "[Provider error: narrator response could not be generated.]";
 const MOCK_OBSERVATION_READER_LINE: &str =
@@ -83,6 +86,14 @@ struct NarratorTurnTrace {
     provider_response_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct EvaluatorParseResult {
+    output: EvaluatorOutputV1,
+    normalized_json: String,
+    normalized: bool,
+    warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ImageFileInfo {
     extension: &'static str,
@@ -102,7 +113,7 @@ pub struct TurnResult {
     pub debug: TurnDebug,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct TurnDebug {
     pub provider: String,
     pub hidden_state_found: bool,
@@ -253,6 +264,17 @@ enum SpeakerResolutionStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplaySeverity {
+    #[default]
+    None,
+    MildOverlap,
+    StrongReplay,
+    Contradiction,
+    ObjectStateViolation,
+}
+
 #[derive(Debug, Clone)]
 struct ReplaySource {
     message_id: i64,
@@ -265,12 +287,14 @@ struct ReplayGuardResult {
     replay_score: f32,
     replay_reason: Option<String>,
     compared_against_message_id: Option<i64>,
+    severity: ReplaySeverity,
 }
 
 #[derive(Debug, Clone)]
 struct OutputContractResult {
     text: String,
     warning: Option<String>,
+    status_repair_action: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1729,6 +1753,151 @@ pub fn delete_provider_profile(
 }
 
 #[tauri::command]
+pub fn get_latest_evaluator_job(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Option<db::EvaluatorJob>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::get_latest_evaluator_job(&conn, &conversation_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn cancel_evaluator_job(state: State<'_, AppState>, job_id: String) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let job = db::get_evaluator_job(&conn, &job_id)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "Evaluator job not found".to_string())?;
+    if matches!(
+        job.status.as_str(),
+        "completed" | "failed" | "canceled" | "timed_out"
+    ) {
+        return Ok(());
+    }
+    db::update_evaluator_job_status(
+        &conn,
+        &job_id,
+        "canceled",
+        Some("Canceled by user"),
+        Some(db::now_ts()),
+        None,
+        false,
+    )
+    .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub async fn retry_evaluator_job(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    conversation_id: String,
+    assistant_message_id: i64,
+    state_updater_settings: ApiProviderSettings,
+) -> Result<(), String> {
+    let (
+        soul,
+        session_world,
+        snapshot_user_text,
+        visible_response,
+        context_preview,
+        entity_updater_context,
+        branch_id,
+        parent_turn_id,
+        user_message_id,
+        selected_variant_id,
+    ) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let assistant_message = db::get_message(&conn, &conversation_id, assistant_message_id)
+            .map_err(|err| err.to_string())?;
+        if assistant_message.role != "assistant" {
+            return Err("Evaluator retry requires an assistant message".into());
+        }
+        let snapshot = db::get_turn_snapshot(&conn, &conversation_id, assistant_message_id)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "No turn snapshot found for evaluator retry".to_string())?;
+        let fallback_soul: Soul =
+            serde_json::from_str(&snapshot.soul_json).map_err(|err| err.to_string())?;
+        let commit =
+            db::get_turn_commit_by_assistant(&conn, &conversation_id, assistant_message_id)
+                .map_err(|err| err.to_string())?;
+        let branch = db::get_active_session_branch(&conn, &conversation_id).ok();
+        let (soul, session_world, parent_turn_id) = if let Some(branch) = branch.as_ref() {
+            let parent_turn_id = commit
+                .as_ref()
+                .and_then(|commit| commit.parent_turn_id.clone())
+                .or_else(|| branch.active_turn_id.clone());
+            let rebuilt = db::rebuild_session_state_until(
+                &conn,
+                &conversation_id,
+                &branch.branch_id,
+                parent_turn_id.as_deref(),
+            )
+            .map_err(|err| err.to_string())?;
+            (rebuilt.soul, rebuilt.session_world, parent_turn_id)
+        } else {
+            let session_world =
+                load_session_world_for_context(&window, &conn, &conversation_id, &fallback_soul)
+                    .map_err(|err| err.to_string())?;
+            (fallback_soul, session_world, None)
+        };
+        let messages =
+            db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?;
+        let context_preview = compile_context_for_session(
+            &soul,
+            Some(&session_world),
+            &messages_to_context(messages),
+        );
+        let entity_context =
+            resolve_speaker_for_turn(&conn, &conversation_id, &soul, &snapshot.user_text)
+                .map_err(|err| err.to_string())?;
+        let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
+        let branch_id = branch.map(|branch| branch.branch_id);
+        (
+            soul,
+            session_world,
+            snapshot.user_text,
+            strip_hidden_state_blocks(&assistant_message.content),
+            context_preview,
+            entity_updater_context,
+            branch_id,
+            parent_turn_id,
+            commit.as_ref().and_then(|commit| commit.user_message_id),
+            commit
+                .as_ref()
+                .and_then(|commit| commit.selected_variant_id),
+        )
+    };
+    let request_id = uuid_like_id();
+    let evaluator_request_id = format!("eval_retry_{request_id}");
+    let before_state_summary = compact_state_summary_json(&soul, &session_world);
+    start_background_evaluator_job(
+        app,
+        window,
+        conversation_id,
+        assistant_message_id,
+        selected_variant_id,
+        request_id,
+        evaluator_request_id,
+        None,
+        "brief".into(),
+        soul,
+        session_world,
+        snapshot_user_text,
+        visible_response,
+        context_preview.text,
+        state_updater_settings,
+        entity_updater_context,
+        format!("memory-debug-{}", uuid_like_id()),
+        branch_id,
+        parent_turn_id,
+        user_message_id,
+        true,
+        before_state_summary,
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn compile_context(
     window: Window,
     state: State<'_, AppState>,
@@ -2007,8 +2176,13 @@ fn send_mock_turn_with_conn(
     let provider = MockProvider::default();
     let raw_response = provider.complete(&soul, &context_preview.text, &snapshot_user_text, &mode);
     let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
-    let (visible_response, replay_guard, output_contract_warning) =
-        guard_narrator_visible_response(&parsed.visible_text, &snapshot_user_text, &[]);
+    let (visible_response, replay_guard, output_contract_warning, _) =
+        guard_narrator_visible_response(
+            &parsed.visible_text,
+            &snapshot_user_text,
+            &session_world,
+            &[],
+        );
     let mut debug = debug_from_hidden_state("Mock", &parsed.hidden_state, true, false);
     debug.simulated_response = true;
     debug.replay_detected = replay_guard.replay_detected;
@@ -2120,6 +2294,7 @@ fn reuse_or_insert_user_message(
 
 #[tauri::command]
 pub async fn send_api_turn(
+    app: AppHandle,
     window: Window,
     state: State<'_, AppState>,
     conversation_id: String,
@@ -2136,6 +2311,8 @@ pub async fn send_api_turn(
     let mut stage_started = Instant::now();
     let context_mode = ContextMode::from_label(context_mode.as_deref());
     let request_id = uuid_like_id();
+    let gate_outcome =
+        gate_pending_evaluator_jobs(&window, &state, &conversation_id, &state_updater_settings)?;
     let mut turn_trace = NarratorTurnTrace {
         request_id: request_id.clone(),
         conversation_id: conversation_id.clone(),
@@ -2158,7 +2335,10 @@ pub async fn send_api_turn(
             "context_mode": context_mode.label(),
             "mode": mode.as_str(),
             "replacement_assistant_id": replacement_assistant_id,
-            "user_message_chars": user_text.chars().count()
+            "user_message_chars": user_text.chars().count(),
+            "next_turn_wait_ms": gate_outcome.waited_ms,
+            "stale_state_send": gate_outcome.stale_state_send,
+            "compiled_with_pending_evaluator": gate_outcome.compiled_with_pending_evaluator
         })),
     );
     let (
@@ -2601,6 +2781,26 @@ pub async fn send_api_turn(
             return Err(err.to_string());
         }
     };
+    let mut anti_replay_severity = ReplaySeverity::None;
+    let mut anti_replay_reason: Option<String> = None;
+    let mut original_response_score = 0.0f32;
+    let mut retry_response_score = 0.0f32;
+    let mut selected_response_source = "original".to_string();
+    let mut status_repair_action: Option<String> = None;
+    let mut pure_ooc_detected = false;
+    let mut ooc_detection_reason = "scene_turn".to_string();
+
+    let user_is_ooc = is_ooc_or_gm_prefix(&snapshot_user_text);
+    let assistant_is_ooc = is_ooc_or_gm_prefix(&parsed.visible_text);
+    pure_ooc_detected = user_is_ooc || (snapshot_user_text.trim().is_empty() && assistant_is_ooc);
+    if pure_ooc_detected {
+        ooc_detection_reason = if user_is_ooc {
+            "user_message_ooc_prefix".to_string()
+        } else {
+            "assistant_ooc_prefix".to_string()
+        };
+    }
+
     emit_dev_log(
         &window,
         "debug",
@@ -2615,8 +2815,28 @@ pub async fn send_api_turn(
                 .collect::<Vec<_>>()
         })),
     );
-    let (mut visible_response, replay_guard, mut output_contract_warning) =
-        guard_narrator_visible_response(&parsed.visible_text, &snapshot_user_text, &replay_sources);
+
+    let (mut visible_response, mut replay_guard, mut output_contract_warning, orig_status_repair) =
+        if pure_ooc_detected {
+            let (v, mut rg, w, r) = guard_narrator_visible_response(
+                &parsed.visible_text,
+                &snapshot_user_text,
+                &session_world,
+                &[],
+            );
+            rg.replay_detected = false;
+            rg.severity = ReplaySeverity::None;
+            (v, rg, w, r)
+        } else {
+            guard_narrator_visible_response(
+                &parsed.visible_text,
+                &snapshot_user_text,
+                &session_world,
+                &replay_sources,
+            )
+        };
+    status_repair_action = orig_status_repair;
+
     let phone_guard = sanitize_phone_notification_contradiction(
         &visible_response,
         &snapshot_user_text,
@@ -2629,10 +2849,28 @@ pub async fn send_api_turn(
             "phone notification contradiction repaired",
         );
     }
-    let debug_replay_detected = replay_guard.replay_detected;
+
+    original_response_score = evaluate_response_quality(
+        &visible_response,
+        &snapshot_user_text,
+        &session_world,
+        if pure_ooc_detected {
+            &[]
+        } else {
+            &replay_sources
+        },
+    );
+
+    anti_replay_severity = replay_guard.severity;
+    anti_replay_reason = replay_guard.replay_reason.clone();
+
+    let mut debug_replay_detected = replay_guard.replay_detected;
     let mut debug_replay_score = replay_guard.replay_score;
     let mut debug_replay_reason = replay_guard.replay_reason.clone();
     let mut debug_replay_compared_against_message_id = replay_guard.compared_against_message_id;
+    let anti_replay_retry_enabled = anti_replay_forced_retry_enabled(&narrator_settings);
+    let mut anti_replay_retry_suppressed_by_default = false;
+    let mut anti_replay_retry_count = 0u8;
 
     if let Some(warning) = output_contract_warning.as_ref() {
         emit_dev_log(
@@ -2660,19 +2898,42 @@ pub async fn send_api_turn(
                 "compared_against_message_id": replay_guard.compared_against_message_id
             })),
         );
-        emit_dev_log(
-            &window,
-            "info",
-            "narrator",
-            "anti_replay_regenerate_started",
-            Some(serde_json::json!({
-                "conversation_id": conversation_id.as_str()
-            })),
-        );
+        if !anti_replay_retry_enabled {
+            anti_replay_retry_suppressed_by_default = true;
+            emit_dev_log(
+                &window,
+                "info",
+                "narrator",
+                "anti_replay_retry_suppressed_by_default",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "score": replay_guard.replay_score,
+                    "severity": match replay_guard.severity {
+                        ReplaySeverity::None => "none",
+                        ReplaySeverity::MildOverlap => "mild_overlap",
+                        ReplaySeverity::StrongReplay => "strong_replay",
+                        ReplaySeverity::Contradiction => "contradiction",
+                        ReplaySeverity::ObjectStateViolation => "object_state_violation",
+                    },
+                    "reason": replay_guard.replay_reason.as_deref(),
+                    "compared_against_message_id": replay_guard.compared_against_message_id
+                })),
+            );
+            debug_replay_reason = replay_guard.replay_reason.clone();
+        } else {
+            anti_replay_retry_count = 1;
+            emit_dev_log(
+                &window,
+                "info",
+                "narrator",
+                "anti_replay_regenerate_started",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str()
+                })),
+            );
 
-        let retry_messages = messages_with_repair_instruction(&narrator_payload.messages);
-        let retry_payload_log_id =
-            match state
+            let retry_messages = messages_with_repair_instruction(&narrator_payload.messages);
+            let retry_payload_log_id = match state
                 .conn
                 .lock()
                 .map_err(|err| err.to_string())
@@ -2741,33 +3002,166 @@ pub async fn send_api_turn(
                 }
             };
 
-        match provider
-            .complete_streaming_messages(&narrator_settings, retry_messages, |_| Ok(()))
-            .await
-        {
-            Ok(retry_completion) => match parse_hidden_state(&retry_completion.raw_text) {
-                Ok(retry_parsed) => {
-                    let pruned_retry_visible =
-                        prune_repeated_scene_setup(&retry_parsed.visible_text, &replay_sources);
-                    let (mut retry_visible_response, retry_guard, mut retry_output_warning) =
-                        guard_narrator_visible_response(
+            match provider
+                .complete_streaming_messages(&narrator_settings, retry_messages, |_| Ok(()))
+                .await
+            {
+                Ok(retry_completion) => match parse_hidden_state(&retry_completion.raw_text) {
+                    Ok(retry_parsed) => {
+                        let pruned_retry_visible =
+                            prune_repeated_scene_setup(&retry_parsed.visible_text, &replay_sources);
+                        let (
+                            mut retry_visible_response,
+                            retry_guard,
+                            mut retry_output_warning,
+                            retry_status_repair,
+                        ) = guard_narrator_visible_response(
                             &pruned_retry_visible,
                             &snapshot_user_text,
+                            &session_world,
                             &replay_sources,
                         );
-                    let retry_phone_guard = sanitize_phone_notification_contradiction(
-                        &retry_visible_response,
-                        &snapshot_user_text,
-                        &session_world,
-                    );
-                    if retry_phone_guard.repaired {
-                        retry_visible_response = retry_phone_guard.text;
-                        retry_output_warning = append_output_warning(
-                            retry_output_warning,
-                            "phone notification contradiction repaired",
+                        let retry_phone_guard = sanitize_phone_notification_contradiction(
+                            &retry_visible_response,
+                            &snapshot_user_text,
+                            &session_world,
                         );
+                        if retry_phone_guard.repaired {
+                            retry_visible_response = retry_phone_guard.text;
+                            retry_output_warning = append_output_warning(
+                                retry_output_warning,
+                                "phone notification contradiction repaired",
+                            );
+                        }
+
+                        retry_response_score = evaluate_response_quality(
+                            &retry_visible_response,
+                            &snapshot_user_text,
+                            &session_world,
+                            &replay_sources,
+                        );
+
+                        let original_has_violation = has_hard_violation(
+                            &visible_response,
+                            &snapshot_user_text,
+                            &session_world,
+                            &replay_sources,
+                        );
+                        let retry_has_violation = has_hard_violation(
+                            &retry_visible_response,
+                            &snapshot_user_text,
+                            &session_world,
+                            &replay_sources,
+                        );
+
+                        let select_retry = if original_has_violation && !retry_has_violation {
+                            true
+                        } else if !original_has_violation && retry_has_violation {
+                            false
+                        } else {
+                            retry_response_score > original_response_score
+                        };
+
+                        if select_retry {
+                            visible_response = retry_visible_response;
+                            active_provider_completion = retry_completion;
+                            if let Some(log_id) = retry_payload_log_id {
+                                payload_log_id = log_id;
+                            }
+                            if let Some(warning) = retry_output_warning.as_ref() {
+                                emit_dev_log(
+                                    &window,
+                                    "warn",
+                                    "narrator",
+                                    "Output contract guard normalized anti-replay retry",
+                                    Some(serde_json::json!({
+                                        "conversation_id": conversation_id.as_str(),
+                                        "warning": warning
+                                    })),
+                                );
+                            }
+                            output_contract_warning = retry_output_warning;
+                            status_repair_action = retry_status_repair;
+                            selected_response_source = "retry".to_string();
+
+                            if retry_guard.replay_detected {
+                                emit_dev_log(
+                                    &window,
+                                    "warn",
+                                    "narrator",
+                                    "anti_replay_regenerate_failed",
+                                    Some(serde_json::json!({
+                                        "conversation_id": conversation_id.as_str(),
+                                        "score": retry_guard.replay_score,
+                                        "reason": retry_guard.replay_reason.as_deref(),
+                                        "compared_against_message_id": retry_guard.compared_against_message_id
+                                    })),
+                                );
+                                emit_dev_log(
+                                    &window,
+                                    "warn",
+                                    "warning",
+                                    "anti_replay_final_warning",
+                                    Some(serde_json::json!({
+                                        "conversation_id": conversation_id.as_str(),
+                                        "score": retry_guard.replay_score,
+                                        "reason": retry_guard.replay_reason.as_deref()
+                                    })),
+                                );
+                                debug_replay_score = retry_guard.replay_score;
+                                debug_replay_reason = retry_guard
+                                    .replay_reason
+                                    .clone()
+                                    .map(|reason| format!("{reason}; saved after one retry"));
+                                debug_replay_compared_against_message_id =
+                                    retry_guard.compared_against_message_id;
+                            } else {
+                                emit_dev_log(
+                                    &window,
+                                    "success",
+                                    "narrator",
+                                    "anti_replay_passed",
+                                    Some(serde_json::json!({
+                                        "conversation_id": conversation_id.as_str(),
+                                        "score": retry_guard.replay_score,
+                                        "retry": true
+                                    })),
+                                );
+                                debug_replay_reason = Some(
+                                "Initial draft repeated earlier narration; regenerated before save"
+                                    .into(),
+                            );
+                            }
+                        } else {
+                            selected_response_source = "original".to_string();
+                            emit_dev_log(
+                                &window,
+                                "warn",
+                                "narrator",
+                                "anti_replay_regenerate_failed",
+                                Some(serde_json::json!({
+                                    "conversation_id": conversation_id.as_str(),
+                                    "reason": "Retry was lower quality or failed to resolve violation compared to original"
+                                })),
+                            );
+                            emit_dev_log(
+                                &window,
+                                "warn",
+                                "warning",
+                                "anti_replay_final_warning",
+                                Some(serde_json::json!({
+                                    "conversation_id": conversation_id.as_str(),
+                                    "score": replay_guard.replay_score,
+                                    "reason": "Retry was not selected (lower quality/worse violation)"
+                                })),
+                            );
+                            debug_replay_reason = Some(
+                            "Initial draft repeated earlier narration; retry was not selected because it was worse"
+                                .into(),
+                        );
+                        }
                     }
-                    if retry_visible_response.trim().is_empty() {
+                    Err(err) => {
                         emit_dev_log(
                             &window,
                             "warn",
@@ -2775,7 +3169,7 @@ pub async fn send_api_turn(
                             "anti_replay_regenerate_failed",
                             Some(serde_json::json!({
                                 "conversation_id": conversation_id.as_str(),
-                                "reason": "Retry returned empty visible response"
+                                "error": err.to_string()
                             })),
                         );
                         emit_dev_log(
@@ -2786,82 +3180,14 @@ pub async fn send_api_turn(
                             Some(serde_json::json!({
                                 "conversation_id": conversation_id.as_str(),
                                 "score": replay_guard.replay_score,
-                                "reason": "Original repeated earlier narration; retry returned empty response"
+                                "reason": "Retry parse failed; saving original guarded response"
                             })),
                         );
                         debug_replay_reason = Some(
-                            "Initial draft repeated earlier narration; retry returned empty response"
-                                .into(),
+                            "Initial draft repeated earlier narration; retry parse failed".into(),
                         );
-                    } else {
-                        visible_response = retry_visible_response;
-                        active_provider_completion = retry_completion;
-                        if let Some(log_id) = retry_payload_log_id {
-                            payload_log_id = log_id;
-                        }
-                        if let Some(warning) = retry_output_warning.as_ref() {
-                            emit_dev_log(
-                                &window,
-                                "warn",
-                                "narrator",
-                                "Output contract guard normalized anti-replay retry",
-                                Some(serde_json::json!({
-                                    "conversation_id": conversation_id.as_str(),
-                                    "warning": warning
-                                })),
-                            );
-                        }
-                        output_contract_warning = retry_output_warning;
-                        if retry_guard.replay_detected {
-                            emit_dev_log(
-                                &window,
-                                "warn",
-                                "narrator",
-                                "anti_replay_regenerate_failed",
-                                Some(serde_json::json!({
-                                    "conversation_id": conversation_id.as_str(),
-                                    "score": retry_guard.replay_score,
-                                    "reason": retry_guard.replay_reason.as_deref(),
-                                    "compared_against_message_id": retry_guard.compared_against_message_id
-                                })),
-                            );
-                            emit_dev_log(
-                                &window,
-                                "warn",
-                                "warning",
-                                "anti_replay_final_warning",
-                                Some(serde_json::json!({
-                                    "conversation_id": conversation_id.as_str(),
-                                    "score": retry_guard.replay_score,
-                                    "reason": retry_guard.replay_reason.as_deref()
-                                })),
-                            );
-                            debug_replay_score = retry_guard.replay_score;
-                            debug_replay_reason = retry_guard
-                                .replay_reason
-                                .clone()
-                                .map(|reason| format!("{reason}; saved after one retry"));
-                            debug_replay_compared_against_message_id =
-                                retry_guard.compared_against_message_id;
-                        } else {
-                            emit_dev_log(
-                                &window,
-                                "success",
-                                "narrator",
-                                "anti_replay_passed",
-                                Some(serde_json::json!({
-                                    "conversation_id": conversation_id.as_str(),
-                                    "score": retry_guard.replay_score,
-                                    "retry": true
-                                })),
-                            );
-                            debug_replay_reason = Some(
-                                "Initial draft repeated earlier narration; regenerated before save"
-                                    .into(),
-                            );
-                        }
                     }
-                }
+                },
                 Err(err) => {
                     emit_dev_log(
                         &window,
@@ -2870,7 +3196,7 @@ pub async fn send_api_turn(
                         "anti_replay_regenerate_failed",
                         Some(serde_json::json!({
                             "conversation_id": conversation_id.as_str(),
-                            "error": err.to_string()
+                            "error": err
                         })),
                     );
                     emit_dev_log(
@@ -2881,37 +3207,13 @@ pub async fn send_api_turn(
                         Some(serde_json::json!({
                             "conversation_id": conversation_id.as_str(),
                             "score": replay_guard.replay_score,
-                            "reason": "Retry parse failed; saving original guarded response"
+                            "reason": "Retry provider failed; saving original guarded response"
                         })),
                     );
-                    debug_replay_reason =
-                        Some("Initial draft repeated earlier narration; retry parse failed".into());
+                    debug_replay_reason = Some(
+                        "Initial draft repeated earlier narration; retry provider failed".into(),
+                    );
                 }
-            },
-            Err(err) => {
-                emit_dev_log(
-                    &window,
-                    "warn",
-                    "narrator",
-                    "anti_replay_regenerate_failed",
-                    Some(serde_json::json!({
-                        "conversation_id": conversation_id.as_str(),
-                        "error": err
-                    })),
-                );
-                emit_dev_log(
-                    &window,
-                    "warn",
-                    "warning",
-                    "anti_replay_final_warning",
-                    Some(serde_json::json!({
-                        "conversation_id": conversation_id.as_str(),
-                        "score": replay_guard.replay_score,
-                        "reason": "Retry provider failed; saving original guarded response"
-                    })),
-                );
-                debug_replay_reason =
-                    Some("Initial draft repeated earlier narration; retry provider failed".into());
             }
         }
     } else {
@@ -3134,10 +3436,29 @@ pub async fn send_api_turn(
             "fallback_used": false,
             "fallback_reason": serde_json::Value::Null,
             "anti_replay_triggered": debug_replay_detected,
-            "anti_replay_retry_count": if debug_replay_detected { 1 } else { 0 },
+            "anti_replay_retry_count": anti_replay_retry_count,
+            "anti_replay_retry_suppressed_by_default": anti_replay_retry_suppressed_by_default,
             "final_selected_attempt_id": selected_variant_id.or(Some(payload_log_id)),
             "provider_request_id": active_provider_completion.provider_request_id.as_deref(),
-            "provider_response_id": active_provider_completion.provider_response_id.as_deref()
+            "provider_response_id": active_provider_completion.provider_response_id.as_deref(),
+            "anti_replay_severity": match anti_replay_severity {
+                ReplaySeverity::None => "none",
+                ReplaySeverity::MildOverlap => "mild_overlap",
+                ReplaySeverity::StrongReplay => "strong_replay",
+                ReplaySeverity::Contradiction => "contradiction",
+                ReplaySeverity::ObjectStateViolation => "object_state_violation",
+            },
+            "anti_replay_reason": anti_replay_reason,
+            "original_response_score": original_response_score,
+            "retry_response_score": retry_response_score,
+            "selected_response_source": selected_response_source,
+            "status_repair_action": status_repair_action,
+            "pure_ooc_detected": pure_ooc_detected,
+            "ooc_detection_reason": ooc_detection_reason,
+            "next_turn_wait_ms": gate_outcome.waited_ms,
+            "stale_state_send": gate_outcome.stale_state_send,
+            "compiled_with_pending_evaluator": gate_outcome.compiled_with_pending_evaluator,
+            "pending_evaluator_job_ids": gate_outcome.pending_job_ids
         }
     });
     if let Ok(conn) = state.conn.lock() {
@@ -3178,9 +3499,11 @@ pub async fn send_api_turn(
         });
     }
 
-    if is_gm_facing_user_message(&snapshot_user_text)
-        || is_plain_gm_reply(&visible_response_for_updater)
-    {
+    let should_bypass_evaluator = pure_ooc_detected
+        && !user_text_has_correction_keywords(&snapshot_user_text)
+        && correction_instruction.is_none();
+
+    if should_bypass_evaluator {
         let mut debug = pre_save_debug;
         debug.assistant_message_id = Some(assistant_message_id);
         debug.selected_variant_id = selected_variant_id;
@@ -3263,6 +3586,92 @@ pub async fn send_api_turn(
 
     let before_state_summary = compact_state_summary_json(&soul, &session_world);
     let evaluator_request_id = format!("eval_{request_id}");
+    if evaluator_background_enabled(&state_updater_settings) {
+        let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
+        let memory_debug_nonce = format!("memory-debug-{}", uuid_like_id());
+        let job = start_background_evaluator_job(
+            app.clone(),
+            window.clone(),
+            conversation_id.clone(),
+            assistant_message_id,
+            selected_variant_id,
+            request_id.clone(),
+            evaluator_request_id.clone(),
+            turn_trace.turn_id.clone(),
+            context_mode.label().to_string(),
+            soul.clone(),
+            session_world.clone(),
+            snapshot_user_text.clone(),
+            visible_response_for_updater.clone(),
+            context_preview.text.clone(),
+            state_updater_settings.clone(),
+            entity_updater_context,
+            memory_debug_nonce,
+            ledger_branch_id.clone(),
+            ledger_parent_turn_id.clone(),
+            ledger_user_message_id,
+            replacement_assistant_id.is_some(),
+            before_state_summary.clone(),
+        )?;
+        let mut debug = pre_save_debug;
+        debug.assistant_message_id = Some(assistant_message_id);
+        debug.selected_variant_id = selected_variant_id;
+        debug.state_updater_status = format!("background_{}", job.status);
+        debug.output_contract_warning = output_contract_warning;
+        debug.request_id = Some(request_id.clone());
+        debug.turn_id = turn_trace.turn_id.clone();
+        if let Some(variant_id) = selected_variant_id {
+            if let Ok(debug_json) = serde_json::to_string(&debug) {
+                let _ = state
+                    .conn
+                    .lock()
+                    .map_err(|err| err.to_string())
+                    .and_then(|conn| {
+                        db::update_assistant_variant_debug_json(&conn, variant_id, &debug_json)
+                            .map_err(|err| err.to_string())
+                    });
+            }
+        }
+        let (messages, context_preview) = {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            let messages =
+                db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?;
+            let context_preview = compile_context_for_session(
+                &soul,
+                Some(&session_world),
+                &messages_to_context(messages.clone()),
+            );
+            (messages, context_preview)
+        };
+        emit_dev_log(
+            &window,
+            "info",
+            "evaluator",
+            "evaluator_background_job_spawned",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "assistant_message_id": assistant_message_id,
+                "evaluator_job_id": job.evaluator_job_id.as_str(),
+                "timeout_ms": job.timeout_ms,
+                "timeout_mode": job.timeout_mode.as_str()
+            })),
+        );
+        emit_perf_log(
+            &window,
+            &conversation_id,
+            "total turn time",
+            turn_started.elapsed(),
+        );
+        return Ok(TurnResult {
+            conversation_id,
+            soul,
+            visible_response: visible_response_for_updater,
+            context_preview,
+            messages,
+            consolidation_ran: false,
+            debug,
+        });
+    }
     let updater_payload_started = Instant::now();
     let updater_system_prompt = build_evaluator_prompt(&soul, Some(&session_world));
     let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
@@ -3367,17 +3776,18 @@ pub async fn send_api_turn(
         }
     };
     let updater_call_started = Instant::now();
-    let updater_response_result = provider
-        .complete_prompt_with_timeout(
-            &state_updater_settings,
-            &updater_system_prompt,
-            &updater_user_message,
-            0.0,
-            Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS),
-        )
-        .await;
+    let updater_response_result = complete_evaluator_with_config(
+        &provider,
+        &state_updater_settings,
+        &updater_system_prompt,
+        &updater_user_message,
+    )
+    .await;
     let updater_call_elapsed = updater_call_started.elapsed();
-    if updater_call_elapsed >= Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS) {
+    let evaluator_timeout_ms = effective_evaluator_timeout_ms(&state_updater_settings);
+    if evaluator_timeout_ms
+        .is_some_and(|timeout_ms| updater_call_elapsed >= Duration::from_millis(timeout_ms))
+    {
         emit_dev_log(
             &window,
             "warn",
@@ -3386,7 +3796,7 @@ pub async fn send_api_turn(
             Some(serde_json::json!({
                 "conversation_id": conversation_id.as_str(),
                 "assistant_message_id": assistant_message_id,
-                "timeout_seconds": STATE_UPDATER_TIMEOUT_SECONDS,
+                "timeout_ms": evaluator_timeout_ms,
                 "elapsed_ms": updater_call_elapsed.as_millis()
             })),
         );
@@ -3431,15 +3841,13 @@ pub async fn send_api_turn(
                         .map_err(|err| err.to_string())
                     });
             }
-            parse_evaluator_output_json(&updater_response)
+            parse_evaluator_output_json_with_trace(&updater_response)
         }
         Err(err) => {
-            if updater_call_elapsed >= Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS)
-                || err.to_lowercase().contains("timed out")
-            {
+            if evaluator_timed_out(&err, updater_call_elapsed, &state_updater_settings) {
                 Err(format!(
-                    "Evaluator timed out after {}s; narration saved without state update",
-                    STATE_UPDATER_TIMEOUT_SECONDS
+                    "Evaluator timed out after {}ms; narration saved without state update",
+                    evaluator_timeout_ms.unwrap_or(DEFAULT_EVALUATOR_TIMEOUT_MS)
                 ))
             } else {
                 Err(err)
@@ -3454,7 +3862,8 @@ pub async fn send_api_turn(
     );
     let (hidden_state, engine_patch, state_updater_status, hidden_state_found) =
         match updater_result {
-            Ok(evaluator_output) => {
+            Ok(evaluator_parse) => {
+                let evaluator_output = evaluator_parse.output.clone();
                 emit_dev_log(
                     &window,
                     "debug",
@@ -3555,16 +3964,20 @@ pub async fn send_api_turn(
                         "provider": "evaluator_v1",
                         "model": state_updater_settings.model.trim(),
                         "raw_evaluator_response": raw_updater_response.as_deref().unwrap_or_default(),
-                        "normalized_evaluator_response": raw_updater_response.as_deref().unwrap_or_default(),
+                        "normalized_evaluator_response": evaluator_parse.normalized_json.as_str(),
                         "parsed_evaluator_json": &evaluator_output,
                         "parse_status": "success",
                         "parse_error": serde_json::Value::Null,
+                        "evaluator_json_normalized": evaluator_parse.normalized,
+                        "evaluator_normalization_warnings": &evaluator_parse.warnings,
                         "evaluator_flags_u64": evaluator_output.turn_flags_u64,
                         "turn_classification": &evaluator_output.turn_classification,
                         "no_op_reason": evaluator_output.no_op_reason.as_deref()
                     },
                     "evaluator_raw_response": raw_updater_response.as_deref().unwrap_or_default(),
                     "evaluator_parsed_json": &evaluator_output,
+                    "evaluator_json_normalized": evaluator_parse.normalized,
+                    "evaluator_normalization_warnings": &evaluator_parse.warnings,
                     "evaluator_candidate_trace": candidate_trace,
                     "converted_engine_patch": converter_trace,
                     "before_after_state_summary": {
@@ -3722,6 +4135,8 @@ pub async fn send_api_turn(
                         "parsed_evaluator_json": serde_json::Value::Null,
                         "parse_status": "failed",
                         "parse_error": err.as_str(),
+                        "evaluator_json_normalized": false,
+                        "evaluator_normalization_warnings": [],
                         "evaluator_flags_u64": serde_json::Value::Null,
                         "turn_classification": serde_json::Value::Null,
                         "no_op_reason": serde_json::Value::Null
@@ -3729,7 +4144,9 @@ pub async fn send_api_turn(
                     "evaluator_raw_response": raw_updater_response.as_deref().unwrap_or_default(),
                     "evaluator_parsed_json": serde_json::json!({
                         "parse_status": "failed",
-                        "parse_error": err.as_str()
+                        "parse_error": err.as_str(),
+                        "evaluator_json_normalized": false,
+                        "evaluator_normalization_warnings": []
                     }),
                     "before_after_state_summary": {
                         "before": before_state_summary.clone(),
@@ -4600,15 +5017,22 @@ fn recent_assistant_replay_sources(messages: &[ChatMessage], limit: usize) -> Ve
 fn guard_narrator_visible_response(
     raw_visible_response: &str,
     user_text: &str,
+    session_world: &SessionWorld,
     replay_sources: &[ReplaySource],
-) -> (String, ReplayGuardResult, Option<String>) {
+) -> (String, ReplayGuardResult, Option<String>, Option<String>) {
     let output = apply_output_contract_guard(raw_visible_response, user_text);
-    let replay = detect_replay(&output.text, replay_sources);
-    (output.text, replay, output.warning)
+    let replay = detect_replay_with_context(&output.text, user_text, session_world, replay_sources);
+    (
+        output.text,
+        replay,
+        output.warning,
+        output.status_repair_action,
+    )
 }
 
 fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContractResult {
     let mut warnings = Vec::new();
+    let mut repair_action = None;
     let without_hidden = strip_hidden_state_blocks(content);
     if without_hidden.trim_end() != content.trim_end() {
         warnings.push("hidden state stripped");
@@ -4619,17 +5043,48 @@ fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContract
         warnings.push("EnginePatch JSON stripped");
     }
 
-    let (body, status_blocks, status_recovered) = remove_status_blocks(&without_engine_patch);
+    let (mut body, mut status_blocks, mut status_recovered) =
+        remove_status_blocks(&without_engine_patch);
     if status_recovered {
         warnings.push("malformed status fence recovered");
+        repair_action = Some("recovered_malformed_fence".to_string());
     }
+
+    // Recover unbackticked status lines from body prose:
+    if status_blocks.is_empty() {
+        let mut status_line_found: Option<String> = None;
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if is_status_summary_line(trimmed) {
+                status_line_found = Some(trimmed.to_string());
+                break;
+            }
+        }
+        if let Some(line_content) = status_line_found {
+            let body_lines: Vec<&str> = body.lines().filter(|l| l.trim() != line_content).collect();
+            body = body_lines.join("\n");
+
+            status_blocks.push(format!("```status\n{}\n```", line_content));
+            status_recovered = true;
+            warnings.push("prose status extracted");
+            repair_action = Some("extracted_from_prose".to_string());
+        }
+    }
+
     if status_blocks.len() > 1 {
         warnings.push("multiple status blocks normalized");
     }
     let mut normalized = body.trim().to_string();
-    let gm_reply = is_gm_facing_user_message(user_text) || is_plain_gm_reply(&normalized);
 
-    if let Some(status) = status_blocks
+    // Pure OOC Turn classification (priority primarily on user message)
+    let user_is_ooc = is_ooc_or_gm_prefix(user_text);
+    let assistant_is_ooc = is_ooc_or_gm_prefix(&normalized);
+    let is_pure_ooc = user_is_ooc || (user_text.trim().is_empty() && assistant_is_ooc);
+
+    if is_pure_ooc {
+        // pure OOC/GM turn: no status block at all!
+        repair_action = Some("gm_ooc_bypassed_status".to_string());
+    } else if let Some(status) = status_blocks
         .iter()
         .rev()
         .find(|status| status_block_has_valid_line(status))
@@ -4639,16 +5094,18 @@ fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContract
             normalized.push_str("\n\n");
         }
         normalized.push_str(&status);
-    } else if !gm_reply && !normalized.is_empty() {
+    } else if !normalized.is_empty() {
         normalized.push_str(
             "\n\n```status\nScene | Focus: Unknown | Physical state: Not specified | Atmosphere: Not specified\n```",
         );
         warnings.push("fallback status block appended");
+        repair_action = Some("appended_unknown_fallback".to_string());
     }
 
     OutputContractResult {
         text: normalized.trim_end().to_string(),
         warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        status_repair_action: repair_action,
     }
 }
 
@@ -4903,26 +5360,30 @@ fn looks_like_engine_patch_text(text: &str) -> bool {
             || lower.contains("\"relationship_deltas\""))
 }
 
-fn is_gm_facing_user_message(user_text: &str) -> bool {
-    let lower = user_text.to_ascii_lowercase();
-    let trimmed = lower.trim_start();
-    trimmed.starts_with("gm:")
-        || trimmed.starts_with("narrator:")
-        || trimmed.starts_with("ooc:")
+fn is_ooc_or_gm_prefix(text: &str) -> bool {
+    let trimmed = text.trim_start().to_ascii_lowercase();
+    trimmed.starts_with("ooc:")
+        || trimmed.starts_with("occ:")
+        || trimmed.starts_with("gm:")
+        || trimmed.starts_with("meta:")
+        || trimmed.starts_with("out of character:")
+        || trimmed.starts_with("out of charater:")
+        || trimmed.starts_with("out of character/rp:")
+        || trimmed.starts_with("out of charater/rp:")
         || trimmed.starts_with("[ooc]")
-        || lower.contains("talking to the narrator")
-        || lower.contains("talking to the gm")
-        || lower.contains("addressing the narrator")
-        || lower.contains("address the narrator")
+        || trimmed.starts_with("narrator:")
+        || trimmed.contains("talking to the narrator")
+        || trimmed.contains("talking to the gm")
+        || trimmed.contains("addressing the narrator")
+        || trimmed.contains("address the narrator")
+}
+
+fn is_gm_facing_user_message(user_text: &str) -> bool {
+    is_ooc_or_gm_prefix(user_text)
 }
 
 fn is_plain_gm_reply(response: &str) -> bool {
-    let lower = response.to_ascii_lowercase();
-    let trimmed = lower.trim_start();
-    trimmed.starts_with("gm:")
-        || trimmed.starts_with("narrator:")
-        || trimmed.starts_with("ooc:")
-        || trimmed.starts_with("[ooc]")
+    is_ooc_or_gm_prefix(response)
 }
 
 fn append_output_warning(current: Option<String>, warning: &str) -> Option<String> {
@@ -5040,10 +5501,41 @@ fn split_visible_sentences(text: &str) -> Vec<&str> {
 }
 
 fn detect_replay(new_response: &str, replay_sources: &[ReplaySource]) -> ReplayGuardResult {
+    let dummy_world =
+        state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+    detect_replay_with_context(new_response, "", &dummy_world, replay_sources)
+}
+
+fn detect_replay_with_context(
+    new_response: &str,
+    user_text: &str,
+    session_world: &SessionWorld,
+    replay_sources: &[ReplaySource],
+) -> ReplayGuardResult {
     let mut best = ReplayGuardResult::default();
     for source in replay_sources {
-        let candidate = compare_replay_against_source(new_response, source);
-        if candidate.replay_score > best.replay_score {
+        let candidate = compare_replay_against_source_with_context(
+            new_response,
+            user_text,
+            session_world,
+            source,
+        );
+        // Prioritize higher severity and higher scores
+        let candidate_rank = match candidate.severity {
+            ReplaySeverity::ObjectStateViolation | ReplaySeverity::Contradiction => 3,
+            ReplaySeverity::StrongReplay => 2,
+            ReplaySeverity::MildOverlap => 1,
+            ReplaySeverity::None => 0,
+        };
+        let best_rank = match best.severity {
+            ReplaySeverity::ObjectStateViolation | ReplaySeverity::Contradiction => 3,
+            ReplaySeverity::StrongReplay => 2,
+            ReplaySeverity::MildOverlap => 1,
+            ReplaySeverity::None => 0,
+        };
+        if candidate_rank > best_rank
+            || (candidate_rank == best_rank && candidate.replay_score > best.replay_score)
+        {
             best = candidate;
         }
     }
@@ -5051,11 +5543,23 @@ fn detect_replay(new_response: &str, replay_sources: &[ReplaySource]) -> ReplayG
 }
 
 fn compare_replay_against_source(new_response: &str, source: &ReplaySource) -> ReplayGuardResult {
+    let dummy_world =
+        state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+    compare_replay_against_source_with_context(new_response, "", &dummy_world, source)
+}
+
+fn compare_replay_against_source_with_context(
+    new_response: &str,
+    user_text: &str,
+    session_world: &SessionWorld,
+    source: &ReplaySource,
+) -> ReplayGuardResult {
     let new_clean = normalize_for_replay(new_response);
     let previous_clean = normalize_for_replay(&source.content);
     if new_clean.is_empty() || previous_clean.is_empty() {
         return ReplayGuardResult {
             compared_against_message_id: Some(source.message_id),
+            severity: ReplaySeverity::None,
             ..ReplayGuardResult::default()
         };
     }
@@ -5083,23 +5587,152 @@ fn compare_replay_against_source(new_response: &str, source: &ReplaySource) -> R
             .unwrap_or(std::cmp::Ordering::Equal)
     })
     .unwrap_or((0.0, "no overlap"));
-    let replay_detected = score > 0.35
+
+    let base_detected = score > 0.35
         || (paragraph_score >= 0.90
             && repeated_long_paragraph_exists(new_response, &source.content))
         || setup_score >= 0.42;
 
+    // Check for hard object state violation
+    let phone_contradiction = user_text_mentions_texting(user_text)
+        && phone_state_blocks_visible_notification(session_world)
+        && text_claims_phone_chime_or_screen_wake(new_response);
+
+    let (severity, replay_detected, final_reason) = if phone_contradiction {
+        (
+            ReplaySeverity::ObjectStateViolation,
+            true,
+            "chime/buzz when phone notifications/screen wake disabled".to_string(),
+        )
+    } else if base_detected {
+        // Evaluate if this is just mild overlap of scene anchoring markers
+        let new_setup = scene_setup_markers(new_response);
+        let previous_setup = scene_setup_markers(&source.content);
+        let overlap = new_setup.intersection(&previous_setup).count();
+        let is_mild_overlap = setup_score >= 0.42
+            && overlap < 5
+            && shingle_score < 0.25
+            && sentence_score < 0.25
+            && paragraph_score < 0.50;
+
+        if is_mild_overlap {
+            (
+                ReplaySeverity::MildOverlap,
+                false, // Mild overlap does not trigger regeneration/retry!
+                format!("mild setting overlap: stable scene anchoring ({reason})"),
+            )
+        } else {
+            (ReplaySeverity::StrongReplay, true, reason.to_string())
+        }
+    } else {
+        (ReplaySeverity::None, false, reason.to_string())
+    };
+
     ReplayGuardResult {
         replay_detected,
         replay_score: score,
-        replay_reason: replay_detected.then(|| reason.to_string()),
+        replay_reason: Some(final_reason),
         compared_against_message_id: Some(source.message_id),
+        severity,
     }
+}
+
+fn has_object_state_violation(
+    response: &str,
+    user_text: &str,
+    session_world: &SessionWorld,
+) -> bool {
+    user_text_mentions_texting(user_text)
+        && phone_state_blocks_visible_notification(session_world)
+        && text_claims_phone_chime_or_screen_wake(response)
+}
+
+fn evaluate_response_quality(
+    response: &str,
+    user_text: &str,
+    session_world: &SessionWorld,
+    replay_sources: &[ReplaySource],
+) -> f32 {
+    let mut score = 100.0f32;
+
+    // 1. Repetition penalty: detect replay
+    let replay_guard =
+        detect_replay_with_context(response, user_text, session_world, replay_sources);
+    if replay_guard.replay_detected {
+        score -= replay_guard.replay_score * 50.0;
+    } else if replay_guard.severity == ReplaySeverity::MildOverlap {
+        score -= replay_guard.replay_score * 15.0;
+    }
+
+    // 2. Missing status block or Unknown focus on normal turns
+    let is_ooc = is_gm_facing_user_message(user_text) || is_plain_gm_reply(response);
+    if !is_ooc {
+        let (_, status_blocks, _) = remove_status_blocks(response);
+        if status_blocks.is_empty() {
+            score -= 20.0;
+        } else if let Some(status) = status_blocks.first() {
+            if status.contains("Focus: Unknown") {
+                score -= 15.0;
+            }
+        }
+    }
+
+    // 3. Object state violation
+    if has_object_state_violation(response, user_text, session_world) {
+        score -= 40.0;
+    }
+
+    // 4. Emptiness check
+    if response.trim().is_empty() {
+        score = 0.0;
+    }
+
+    score.max(0.0)
+}
+
+fn has_hard_violation(
+    text: &str,
+    user_text: &str,
+    session_world: &SessionWorld,
+    replay_sources: &[ReplaySource],
+) -> bool {
+    if text.trim().is_empty() {
+        return true;
+    }
+    if has_object_state_violation(text, user_text, session_world) {
+        return true;
+    }
+    if user_text_mentions_texting(user_text)
+        && phone_state_blocks_visible_notification(session_world)
+        && text_claims_phone_chime_or_screen_wake(text)
+    {
+        return true;
+    }
+    let rg = detect_replay_with_context(text, user_text, session_world, replay_sources);
+    if rg.replay_detected && rg.severity == ReplaySeverity::StrongReplay && rg.replay_score >= 0.70
+    {
+        return true;
+    }
+    false
+}
+
+fn user_text_has_correction_keywords(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("correct")
+        || lower.contains("retcon")
+        || lower.contains("edit")
+        || lower.contains("override")
+        || lower.contains("rewrite")
+        || lower.contains("fix")
+        || lower.contains("adjust")
+        || lower.contains("update")
+        || lower.contains("change")
 }
 
 fn scene_setup_replay_score(new_response: &str, previous_response: &str) -> f32 {
     let new_setup = scene_setup_markers(new_response);
     let previous_setup = scene_setup_markers(previous_response);
-    if new_setup.len() < 3 || previous_setup.len() < 3 {
+    if new_setup.len() < 2 || previous_setup.len() < 2 {
         return 0.0;
     }
     let overlap = new_setup.intersection(&previous_setup).count();
@@ -5128,6 +5761,7 @@ const SCENE_SETUP_MARKERS: &[(&str, &[&str])] = &[
             "door state",
             "open door",
             "closed door",
+            "door",
         ],
     ),
     ("neon", &["neon"]),
@@ -6023,7 +6657,876 @@ fn parse_engine_patch_json(raw: &str) -> Result<EnginePatch, String> {
         .map_err(|err| format!("State updater returned invalid EnginePatch JSON: {err}"))
 }
 
-fn parse_evaluator_output_json(raw: &str) -> Result<EvaluatorOutputV1, String> {
+#[derive(Debug, Clone, Default)]
+struct EvaluatorGateOutcome {
+    waited_ms: u64,
+    stale_state_send: bool,
+    compiled_with_pending_evaluator: bool,
+    pending_job_ids: Vec<String>,
+}
+
+fn evaluator_timeout_mode(settings: &ApiProviderSettings) -> String {
+    match settings.evaluator_timeout_mode.as_deref() {
+        Some("no_app_timeout") => "no_app_timeout".into(),
+        _ => "finite".into(),
+    }
+}
+
+fn effective_evaluator_timeout_ms(settings: &ApiProviderSettings) -> Option<u64> {
+    if evaluator_timeout_mode(settings) == "no_app_timeout" {
+        None
+    } else {
+        Some(
+            settings
+                .evaluator_timeout_ms
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_EVALUATOR_TIMEOUT_MS),
+        )
+    }
+}
+
+fn evaluator_background_enabled(settings: &ApiProviderSettings) -> bool {
+    settings.evaluator_background_enabled.unwrap_or(false)
+}
+
+fn anti_replay_forced_retry_enabled(settings: &ApiProviderSettings) -> bool {
+    settings
+        .anti_replay_forced_retry_enabled
+        .unwrap_or(ANTI_REPLAY_FORCED_RETRY_ENABLED_DEFAULT)
+}
+
+fn wait_for_evaluator_before_next_turn(settings: &ApiProviderSettings) -> bool {
+    settings.wait_for_evaluator_before_next_turn.unwrap_or(true)
+}
+
+fn allow_send_with_stale_state(settings: &ApiProviderSettings) -> bool {
+    settings.allow_send_with_stale_state.unwrap_or(false)
+}
+
+fn evaluator_timed_out(err: &str, elapsed: Duration, settings: &ApiProviderSettings) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("timed out")
+        || lower.contains("timeout")
+        || effective_evaluator_timeout_ms(settings)
+            .is_some_and(|timeout_ms| elapsed >= Duration::from_millis(timeout_ms))
+}
+
+async fn complete_evaluator_with_config(
+    provider: &ApiProvider,
+    settings: &ApiProviderSettings,
+    system_prompt: &str,
+    user_message: &str,
+) -> Result<String, String> {
+    if let Some(timeout_ms) = effective_evaluator_timeout_ms(settings) {
+        provider
+            .complete_prompt_with_timeout(
+                settings,
+                system_prompt,
+                user_message,
+                0.0,
+                Duration::from_millis(timeout_ms),
+            )
+            .await
+    } else {
+        provider
+            .complete_prompt(settings, system_prompt, user_message, 0.0)
+            .await
+    }
+}
+
+fn gate_pending_evaluator_jobs(
+    window: &Window,
+    state: &State<'_, AppState>,
+    conversation_id: &str,
+    settings: &ApiProviderSettings,
+) -> Result<EvaluatorGateOutcome, String> {
+    let initial_pending = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::get_pending_evaluator_jobs_for_conversation(&conn, conversation_id)
+            .map_err(|err| err.to_string())?
+    };
+    if initial_pending.is_empty() {
+        return Ok(EvaluatorGateOutcome::default());
+    }
+    let pending_job_ids = initial_pending
+        .iter()
+        .map(|job| job.evaluator_job_id.clone())
+        .collect::<Vec<_>>();
+    if wait_for_evaluator_before_next_turn(settings) {
+        let started = Instant::now();
+        let max_wait_ms = effective_evaluator_timeout_ms(settings)
+            .unwrap_or(NEXT_TURN_GATE_FALLBACK_MAX_MS)
+            .max(NEXT_TURN_GATE_POLL_MS);
+        loop {
+            std::thread::sleep(Duration::from_millis(NEXT_TURN_GATE_POLL_MS));
+            let still_pending = {
+                let conn = state.conn.lock().map_err(|err| err.to_string())?;
+                db::get_pending_evaluator_jobs_for_conversation(&conn, conversation_id)
+                    .map_err(|err| err.to_string())?
+            };
+            if still_pending.is_empty() {
+                let waited_ms = started.elapsed().as_millis() as u64;
+                emit_dev_log(
+                    window,
+                    "info",
+                    "evaluator",
+                    "next_turn_waited_for_evaluator",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "next_turn_wait_ms": waited_ms,
+                        "pending_job_ids": pending_job_ids
+                    })),
+                );
+                return Ok(EvaluatorGateOutcome {
+                    waited_ms,
+                    pending_job_ids,
+                    ..EvaluatorGateOutcome::default()
+                });
+            }
+            if started.elapsed() >= Duration::from_millis(max_wait_ms) {
+                return Err(format!(
+                    "State update in progress and did not finish within {max_wait_ms}ms"
+                ));
+            }
+        }
+    }
+    if allow_send_with_stale_state(settings) {
+        emit_dev_log(
+            window,
+            "warn",
+            "evaluator",
+            "next_turn_proceeded_with_stale_state",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "pending_job_ids": pending_job_ids
+            })),
+        );
+        return Ok(EvaluatorGateOutcome {
+            waited_ms: 0,
+            stale_state_send: true,
+            compiled_with_pending_evaluator: true,
+            pending_job_ids,
+        });
+    }
+    Err("State update in progress and stale send is not allowed".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_background_evaluator_job(
+    app: AppHandle,
+    window: Window,
+    conversation_id: String,
+    assistant_message_id: i64,
+    selected_variant_id: Option<i64>,
+    parent_narrator_request_id: String,
+    evaluator_request_id: String,
+    turn_id: Option<String>,
+    context_mode_label: String,
+    soul: Soul,
+    session_world: SessionWorld,
+    snapshot_user_text: String,
+    visible_response_for_updater: String,
+    context_preview_text: String,
+    state_updater_settings: ApiProviderSettings,
+    entity_updater_context: String,
+    memory_debug_nonce: String,
+    ledger_branch_id: Option<String>,
+    ledger_parent_turn_id: Option<String>,
+    ledger_user_message_id: Option<i64>,
+    is_regenerated_variant: bool,
+    before_state_summary: serde_json::Value,
+) -> Result<db::EvaluatorJob, String> {
+    let timeout_ms = effective_evaluator_timeout_ms(&state_updater_settings);
+    let timeout_mode = evaluator_timeout_mode(&state_updater_settings);
+    let job = db::EvaluatorJob {
+        evaluator_job_id: format!("eval_job_{}", uuid_like_id()),
+        conversation_id: conversation_id.clone(),
+        turn_id: turn_id
+            .clone()
+            .unwrap_or_else(|| format!("turn_{}", parent_narrator_request_id)),
+        assistant_message_id,
+        status: "pending".into(),
+        started_at: db::now_ts(),
+        completed_at: None,
+        elapsed_ms: None,
+        timeout_ms,
+        timeout_mode,
+        model: Some(state_updater_settings.model.trim().to_string()),
+        provider: Some("evaluator_v1".into()),
+        error_message: None,
+        patch_applied: false,
+    };
+    {
+        let state = app.state::<AppState>();
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::insert_evaluator_job(&conn, &job).map_err(|err| err.to_string())?;
+    }
+    emit_evaluator_job_status(&window, &job);
+    let job_for_task = job.clone();
+    tauri::async_runtime::spawn(async move {
+        run_background_evaluator_job(
+            app,
+            window,
+            job_for_task,
+            selected_variant_id,
+            parent_narrator_request_id,
+            evaluator_request_id,
+            turn_id,
+            context_mode_label,
+            soul,
+            session_world,
+            snapshot_user_text,
+            visible_response_for_updater,
+            context_preview_text,
+            state_updater_settings,
+            entity_updater_context,
+            memory_debug_nonce,
+            ledger_branch_id,
+            ledger_parent_turn_id,
+            ledger_user_message_id,
+            is_regenerated_variant,
+            before_state_summary,
+        )
+        .await;
+    });
+    Ok(job)
+}
+
+fn emit_evaluator_job_status(window: &Window, job: &db::EvaluatorJob) {
+    let _ = window.emit("evaluator-job-status-changed", job);
+}
+
+fn update_background_job_status(
+    app: &AppHandle,
+    window: &Window,
+    job_id: &str,
+    status: &str,
+    error_message: Option<&str>,
+    started_at: Instant,
+    patch_applied: bool,
+) {
+    let state = app.state::<AppState>();
+    if let Ok(conn) = state.conn.lock() {
+        let elapsed_ms = started_at.elapsed().as_millis() as i64;
+        let _ = db::update_evaluator_job_status(
+            &conn,
+            job_id,
+            status,
+            error_message,
+            Some(db::now_ts()),
+            Some(elapsed_ms),
+            patch_applied,
+        );
+        if let Ok(Some(job)) = db::get_evaluator_job(&conn, job_id) {
+            emit_evaluator_job_status(window, &job);
+        }
+    };
+}
+
+fn evaluator_job_is_canceled(app: &AppHandle, job_id: &str) -> bool {
+    let state = app.state::<AppState>();
+    let canceled = state
+        .conn
+        .lock()
+        .ok()
+        .and_then(|conn| db::get_evaluator_job(&conn, job_id).ok().flatten())
+        .is_some_and(|job| job.status == "canceled");
+    canceled
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_background_evaluator_job(
+    app: AppHandle,
+    window: Window,
+    job: db::EvaluatorJob,
+    selected_variant_id: Option<i64>,
+    parent_narrator_request_id: String,
+    evaluator_request_id: String,
+    turn_id: Option<String>,
+    context_mode_label: String,
+    mut soul: Soul,
+    mut session_world: SessionWorld,
+    snapshot_user_text: String,
+    visible_response_for_updater: String,
+    context_preview_text: String,
+    state_updater_settings: ApiProviderSettings,
+    entity_updater_context: String,
+    memory_debug_nonce: String,
+    ledger_branch_id: Option<String>,
+    ledger_parent_turn_id: Option<String>,
+    ledger_user_message_id: Option<i64>,
+    is_regenerated_variant: bool,
+    before_state_summary: serde_json::Value,
+) {
+    let started = Instant::now();
+    {
+        let state = app.state::<AppState>();
+        if let Ok(conn) = state.conn.lock() {
+            let _ = db::update_evaluator_job_status(
+                &conn,
+                &job.evaluator_job_id,
+                "running",
+                None,
+                None,
+                None,
+                false,
+            );
+            if let Ok(Some(job)) = db::get_evaluator_job(&conn, &job.evaluator_job_id) {
+                emit_evaluator_job_status(&window, &job);
+            }
+        };
+    }
+
+    let updater_system_prompt = build_evaluator_prompt(&soul, Some(&session_world));
+    let updater_user_message = build_evaluator_user_message(
+        &snapshot_user_text,
+        &visible_response_for_updater,
+        &context_preview_text,
+        Some(&session_world),
+        Some(&entity_updater_context),
+        Some(&memory_debug_nonce),
+    );
+    let updater_token_estimate =
+        estimate_tokens(&updater_system_prompt) + estimate_tokens(&updater_user_message);
+    let updater_log_id = {
+        let state = app.state::<AppState>();
+        state.conn.lock().ok().and_then(|conn| {
+            db::insert_llm_payload_log(
+                &conn,
+                &LlmPayloadLog {
+                    id: 0,
+                    conversation_id: job.conversation_id.clone(),
+                    message_id: Some(job.assistant_message_id),
+                    provider: "evaluator_v1_background".into(),
+                    mode: "evaluator_v1".into(),
+                    context_mode: context_mode_label.clone(),
+                    model: state_updater_settings.model.trim().to_string(),
+                    base_url: state_updater_settings.base_url.trim().to_string(),
+                    system_message: updater_system_prompt.clone(),
+                    user_message: updater_user_message.clone(),
+                    context_text: updater_system_prompt.clone(),
+                    estimated_system_tokens: estimate_tokens(&updater_system_prompt),
+                    estimated_user_tokens: estimate_tokens(&updater_user_message),
+                    estimated_total_tokens: updater_token_estimate,
+                    truncated: false,
+                    created_at: db::now_ts(),
+                    branch_id: ledger_branch_id.clone(),
+                    active_turn_id: ledger_parent_turn_id.clone(),
+                    parent_turn_id: ledger_parent_turn_id.clone(),
+                    latest_assistant_variant_id: selected_variant_id,
+                    request_id: Some(evaluator_request_id.clone()),
+                    turn_id: turn_id.clone(),
+                    ..Default::default()
+                },
+            )
+            .ok()
+        })
+    };
+    emit_dev_log(
+        &window,
+        "info",
+        "evaluator",
+        "evaluator_called",
+        Some(serde_json::json!({
+            "conversation_id": job.conversation_id.as_str(),
+            "assistant_message_id": job.assistant_message_id,
+            "evaluator_job_id": job.evaluator_job_id.as_str(),
+            "model": state_updater_settings.model.trim(),
+            "background": true,
+            "timeout_ms": job.timeout_ms,
+            "timeout_mode": job.timeout_mode.as_str()
+        })),
+    );
+
+    if evaluator_job_is_canceled(&app, &job.evaluator_job_id) {
+        update_background_job_status(
+            &app,
+            &window,
+            &job.evaluator_job_id,
+            "canceled",
+            Some("Canceled before evaluator call"),
+            started,
+            false,
+        );
+        return;
+    }
+
+    let provider = ApiProvider::default();
+    let call_started = Instant::now();
+    let response_result = complete_evaluator_with_config(
+        &provider,
+        &state_updater_settings,
+        &updater_system_prompt,
+        &updater_user_message,
+    )
+    .await;
+    let call_elapsed = call_started.elapsed();
+    let raw_response = response_result.as_ref().ok().cloned();
+    if let (Some(log_id), Ok(response)) = (updater_log_id, response_result.as_ref()) {
+        let state = app.state::<AppState>();
+        if let Ok(conn) = state.conn.lock() {
+            let _ = db::update_llm_payload_log_response(
+                &conn,
+                log_id,
+                &db::LlmPayloadResponseUpdate {
+                    raw_provider_response: Some(response.clone()),
+                    normalized_response: Some(response.clone()),
+                    ..Default::default()
+                },
+            );
+        };
+    }
+    if evaluator_job_is_canceled(&app, &job.evaluator_job_id) {
+        update_background_job_status(
+            &app,
+            &window,
+            &job.evaluator_job_id,
+            "canceled",
+            Some("Canceled before patch commit"),
+            started,
+            false,
+        );
+        return;
+    }
+
+    let evaluator_parse = match response_result
+        .and_then(|response| parse_evaluator_output_json_with_trace(&response))
+    {
+        Ok(output) => output,
+        Err(err) => {
+            let status = if evaluator_timed_out(&err, call_elapsed, &state_updater_settings) {
+                "timed_out"
+            } else {
+                "failed"
+            };
+            let trace = serde_json::json!({
+                "evaluator_trace": {
+                    "evaluator_request_id": evaluator_request_id.as_str(),
+                    "parent_narrator_request_id": parent_narrator_request_id.as_str(),
+                    "turn_id": turn_id.as_deref(),
+                    "provider": "evaluator_v1_background",
+                    "model": state_updater_settings.model.trim(),
+                    "raw_evaluator_response": raw_response.as_deref().unwrap_or_default(),
+                    "normalized_evaluator_response": raw_response.as_deref().unwrap_or_default(),
+                    "parsed_evaluator_json": serde_json::Value::Null,
+                    "parse_status": "failed",
+                    "parse_error": err.as_str(),
+                    "evaluator_json_normalized": false,
+                    "evaluator_normalization_warnings": [],
+                    "elapsed_ms": call_elapsed.as_millis(),
+                    "timeout_ms": job.timeout_ms,
+                    "timeout_mode": job.timeout_mode.as_str()
+                },
+                "evaluator_raw_response": raw_response.as_deref().unwrap_or_default(),
+                "evaluator_parsed_json": {
+                    "parse_status": "failed",
+                    "parse_error": err.as_str(),
+                    "evaluator_json_normalized": false,
+                    "evaluator_normalization_warnings": []
+                },
+                "before_after_state_summary": {
+                    "before": before_state_summary,
+                    "after": serde_json::Value::Null
+                }
+            });
+            if let Some(log_id) = updater_log_id {
+                let state = app.state::<AppState>();
+                if let Ok(conn) = state.conn.lock() {
+                    let _ = update_llm_payload_pipeline_trace(&conn, log_id, &trace);
+                };
+            }
+            emit_dev_log(
+                &window,
+                "error",
+                "evaluator",
+                "evaluator_parse_failed",
+                Some(serde_json::json!({
+                    "conversation_id": job.conversation_id.as_str(),
+                    "assistant_message_id": job.assistant_message_id,
+                    "evaluator_job_id": job.evaluator_job_id.as_str(),
+                    "error": err
+                })),
+            );
+            update_background_job_status(
+                &app,
+                &window,
+                &job.evaluator_job_id,
+                status,
+                Some("Evaluator failed before producing a valid patch"),
+                started,
+                false,
+            );
+            return;
+        }
+    };
+    let evaluator_output = evaluator_parse.output.clone();
+
+    emit_dev_log(
+        &window,
+        "debug",
+        "evaluator",
+        "evaluator_json_parsed",
+        Some(serde_json::json!({
+            "conversation_id": job.conversation_id.as_str(),
+            "assistant_message_id": job.assistant_message_id,
+            "evaluator_job_id": job.evaluator_job_id.as_str(),
+            "turn_flags_u64": evaluator_output.turn_flags_u64
+        })),
+    );
+    let conversion = evaluator_output_to_engine_patch(
+        &evaluator_output,
+        &EvaluatorConversionContext {
+            active_soul_id: soul.character_id.as_str(),
+            active_soul_ids: active_souls_for_v1(&soul),
+            latest_user_message: &snapshot_user_text,
+            latest_narrator_response: &visible_response_for_updater,
+            session_world: Some(&session_world),
+        },
+    );
+    for candidate_id in &conversion.accepted_candidate_ids {
+        emit_dev_log(
+            &window,
+            "success",
+            "evaluator",
+            "evaluator_candidate_accepted",
+            Some(serde_json::json!({
+                "conversation_id": job.conversation_id.as_str(),
+                "assistant_message_id": job.assistant_message_id,
+                "evaluator_job_id": job.evaluator_job_id.as_str(),
+                "candidate_id": candidate_id
+            })),
+        );
+    }
+    for rejection in &conversion.rejected_candidates {
+        emit_dev_log(
+            &window,
+            "warn",
+            "evaluator",
+            "evaluator_candidate_rejected",
+            Some(serde_json::json!({
+                "conversation_id": job.conversation_id.as_str(),
+                "assistant_message_id": job.assistant_message_id,
+                "evaluator_job_id": job.evaluator_job_id.as_str(),
+                "candidate_id": rejection.candidate_id,
+                "reason": rejection.reason
+            })),
+        );
+    }
+
+    let candidate_trace = evaluator_candidate_trace_json(&evaluator_output, &conversion);
+    let mut engine_patch = sanitize_state_updater_patch(
+        conversion.patch.clone(),
+        &soul,
+        &snapshot_user_text,
+        &visible_response_for_updater,
+    );
+    strip_premature_world_events_from_updater_patch(
+        &mut engine_patch,
+        &snapshot_user_text,
+        &visible_response_for_updater,
+    );
+    let converter_trace = evaluator_converter_trace_json(&engine_patch, &conversion);
+    emit_dev_log(
+        &window,
+        "success",
+        "evaluator",
+        "evaluator_patch_converted",
+        Some(serde_json::json!({
+            "conversation_id": job.conversation_id.as_str(),
+            "assistant_message_id": job.assistant_message_id,
+            "evaluator_job_id": job.evaluator_job_id.as_str(),
+            "summary": engine_patch_summary(&engine_patch)
+        })),
+    );
+    if engine_patch.is_empty() {
+        emit_dev_log(
+            &window,
+            "info",
+            "evaluator",
+            "evaluator_patch_empty",
+            Some(serde_json::json!({
+                "conversation_id": job.conversation_id.as_str(),
+                "assistant_message_id": job.assistant_message_id,
+                "evaluator_job_id": job.evaluator_job_id.as_str()
+            })),
+        );
+    }
+    if evaluator_job_is_canceled(&app, &job.evaluator_job_id) {
+        update_background_job_status(
+            &app,
+            &window,
+            &job.evaluator_job_id,
+            "canceled",
+            Some("Canceled before ledger write"),
+            started,
+            false,
+        );
+        return;
+    }
+
+    let mut ledger_trace = serde_json::json!({
+        "state_patch_id": serde_json::Value::Null,
+        "turn_commit_id": serde_json::Value::Null,
+        "branch_id": ledger_branch_id.as_deref(),
+        "patch_stored": false,
+        "patch_applied": false,
+        "patch_apply_skipped_reason": serde_json::Value::Null,
+        "branch_rebuilt": false,
+        "applied_patch_count": 0,
+        "skipped_patch_count": 0,
+        "invalidated_patch_count": 0,
+        "materialized_soul_updated": false,
+        "materialized_session_world_updated": false
+    });
+    let apply_result: Result<(), String> = (|| {
+        let state = app.state::<AppState>();
+        let conn = match state.conn.lock() {
+            Ok(conn) => conn,
+            Err(err) => {
+                let message = err.to_string();
+                update_background_job_status(
+                    &app,
+                    &window,
+                    &job.evaluator_job_id,
+                    "failed",
+                    Some(&message),
+                    started,
+                    false,
+                );
+                return Err(message);
+            }
+        };
+        if let Some(branch_id) = ledger_branch_id.as_deref() {
+            let branch_ready = match db::get_active_session_branch(&conn, &job.conversation_id) {
+                Ok(branch) if branch.active_turn_id == ledger_parent_turn_id => Ok(()),
+                Ok(_) => {
+                    ledger_trace["patch_apply_skipped_reason"] =
+                        serde_json::json!("branch_advanced_before_background_evaluator_completed");
+                    Err("Branch advanced before background evaluator completed".to_string())
+                }
+                Err(err) => Err(err.to_string()),
+            };
+            if let Err(err) = branch_ready {
+                return Err(err);
+            }
+            let (commit, patch_record) = db::record_turn_commit_with_patch(
+                &conn,
+                &job.conversation_id,
+                branch_id,
+                ledger_parent_turn_id.as_deref(),
+                ledger_user_message_id,
+                job.assistant_message_id,
+                selected_variant_id,
+                &engine_patch,
+                is_regenerated_variant,
+            )
+            .map_err(|err| err.to_string())?;
+            emit_dev_log(
+                &window,
+                "success",
+                "evaluator",
+                "evaluator_patch_stored",
+                Some(serde_json::json!({
+                    "conversation_id": job.conversation_id.as_str(),
+                    "assistant_message_id": job.assistant_message_id,
+                    "evaluator_job_id": job.evaluator_job_id.as_str(),
+                    "state_patch_id": patch_record.patch_id.as_str(),
+                    "patch_empty": engine_patch.is_empty()
+                })),
+            );
+            let rebuilt = db::rebuild_session_state(&conn, &job.conversation_id, branch_id)
+                .map_err(|err| err.to_string())?;
+            soul = rebuilt.soul;
+            session_world = rebuilt.session_world;
+            db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
+            db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
+            if let Some(log_id) = updater_log_id {
+                let _ = db::set_llm_payload_log_ledger_metadata(
+                    &conn,
+                    log_id,
+                    &rebuilt.debug,
+                    ledger_parent_turn_id.as_deref(),
+                    selected_variant_id,
+                );
+            }
+            ledger_trace = serde_json::json!({
+                "state_patch_id": patch_record.patch_id,
+                "turn_commit_id": commit.turn_id,
+                "branch_id": branch_id,
+                "patch_stored": true,
+                "patch_applied": !engine_patch.is_empty(),
+                "patch_apply_skipped_reason": if engine_patch.is_empty() { Some("empty_patch_recorded_in_ledger") } else { None },
+                "branch_rebuilt": true,
+                "applied_patch_count": rebuilt.debug.applied_patches.len(),
+                "skipped_patch_count": rebuilt.debug.skipped_discarded_patches.len(),
+                "invalidated_patch_count": rebuilt.debug.invalidated_patches.len(),
+                "materialized_soul_updated": true,
+                "materialized_session_world_updated": true
+            });
+            Ok(())
+        } else {
+            let report = engine_patch
+                .apply_to_session(&mut soul, Some(&mut session_world))
+                .map_err(|err| format!("{err:?}"))?;
+            soul.turn_counter += 1;
+            soul.turns_since_consolidation += 1;
+            db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
+            db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
+            emit_relationship_delta_logs(&window, &job.conversation_id, &engine_patch);
+            emit_memory_apply_logs(&window, &job.conversation_id, &report.memory_events);
+            ledger_trace = serde_json::json!({
+                "state_patch_id": serde_json::Value::Null,
+                "turn_commit_id": serde_json::Value::Null,
+                "branch_id": serde_json::Value::Null,
+                "patch_stored": false,
+                "patch_applied": !engine_patch.is_empty(),
+                "patch_apply_skipped_reason": if engine_patch.is_empty() { Some("empty_patch") } else { None },
+                "branch_rebuilt": false,
+                "applied_patch_count": if engine_patch.is_empty() { 0 } else { 1 },
+                "skipped_patch_count": if engine_patch.is_empty() { 1 } else { 0 },
+                "invalidated_patch_count": 0,
+                "materialized_soul_updated": true,
+                "materialized_session_world_updated": true
+            });
+            Ok(())
+        }
+    })();
+
+    if let Err(err) = apply_result {
+        let trace = serde_json::json!({
+            "evaluator_trace": {
+                "evaluator_request_id": evaluator_request_id.as_str(),
+                "parent_narrator_request_id": parent_narrator_request_id.as_str(),
+                "turn_id": turn_id.as_deref(),
+                "provider": "evaluator_v1_background",
+                "model": state_updater_settings.model.trim(),
+                "raw_evaluator_response": raw_response.as_deref().unwrap_or_default(),
+                    "normalized_evaluator_response": evaluator_parse.normalized_json.as_str(),
+                    "parsed_evaluator_json": &evaluator_output,
+                    "parse_status": "success",
+                    "parse_error": serde_json::Value::Null,
+                    "evaluator_json_normalized": evaluator_parse.normalized,
+                    "evaluator_normalization_warnings": &evaluator_parse.warnings,
+                    "elapsed_ms": call_elapsed.as_millis(),
+                "timeout_ms": job.timeout_ms,
+                "timeout_mode": job.timeout_mode.as_str()
+            },
+            "evaluator_raw_response": raw_response.as_deref().unwrap_or_default(),
+            "evaluator_parsed_json": &evaluator_output,
+            "evaluator_json_normalized": evaluator_parse.normalized,
+            "evaluator_normalization_warnings": &evaluator_parse.warnings,
+            "evaluator_candidate_trace": candidate_trace,
+            "converted_engine_patch": converter_trace,
+            "ledger_apply_trace": ledger_trace,
+            "conversion_error": err.as_str(),
+            "before_after_state_summary": {
+                "before": before_state_summary,
+                "after": serde_json::Value::Null
+            }
+        });
+        if let Some(log_id) = updater_log_id {
+            let state = app.state::<AppState>();
+            if let Ok(conn) = state.conn.lock() {
+                let _ = update_llm_payload_pipeline_trace(&conn, log_id, &trace);
+            };
+        }
+        update_background_job_status(
+            &app,
+            &window,
+            &job.evaluator_job_id,
+            "failed",
+            Some(&err),
+            started,
+            false,
+        );
+        return;
+    }
+
+    emit_per_soul_memory_written_logs(&window, &job.conversation_id, &engine_patch);
+    emit_dev_log(
+        &window,
+        if engine_patch.is_empty() {
+            "info"
+        } else {
+            "success"
+        },
+        "evaluator",
+        if engine_patch.is_empty() {
+            "evaluator_patch_apply_skipped_reason"
+        } else {
+            "evaluator_patch_applied"
+        },
+        Some(serde_json::json!({
+            "conversation_id": job.conversation_id.as_str(),
+            "assistant_message_id": job.assistant_message_id,
+            "evaluator_job_id": job.evaluator_job_id.as_str(),
+            "reason": if engine_patch.is_empty() { "empty_patch" } else { "background_evaluator_applied_patch" }
+        })),
+    );
+    emit_dev_log(
+        &window,
+        "success",
+        "ledger",
+        "materialized_state_refreshed",
+        Some(serde_json::json!({
+            "conversation_id": job.conversation_id.as_str(),
+            "assistant_message_id": job.assistant_message_id,
+            "evaluator_job_id": job.evaluator_job_id.as_str(),
+            "soul_id": soul.character_id.as_str(),
+            "world_id": session_world.world_id.as_str()
+        })),
+    );
+    let final_trace = serde_json::json!({
+        "evaluator_trace": {
+            "evaluator_request_id": evaluator_request_id.as_str(),
+            "parent_narrator_request_id": parent_narrator_request_id.as_str(),
+            "turn_id": turn_id.as_deref(),
+            "provider": "evaluator_v1_background",
+            "model": state_updater_settings.model.trim(),
+            "raw_evaluator_response": raw_response.as_deref().unwrap_or_default(),
+            "normalized_evaluator_response": evaluator_parse.normalized_json.as_str(),
+            "parsed_evaluator_json": &evaluator_output,
+            "parse_status": "success",
+            "parse_error": serde_json::Value::Null,
+            "evaluator_json_normalized": evaluator_parse.normalized,
+            "evaluator_normalization_warnings": &evaluator_parse.warnings,
+            "evaluator_flags_u64": evaluator_output.turn_flags_u64,
+            "turn_classification": &evaluator_output.turn_classification,
+            "no_op_reason": evaluator_output.no_op_reason.as_deref(),
+            "elapsed_ms": call_elapsed.as_millis(),
+            "timeout_ms": job.timeout_ms,
+            "timeout_mode": job.timeout_mode.as_str()
+        },
+        "evaluator_raw_response": raw_response.as_deref().unwrap_or_default(),
+        "evaluator_parsed_json": &evaluator_output,
+        "evaluator_json_normalized": evaluator_parse.normalized,
+        "evaluator_normalization_warnings": &evaluator_parse.warnings,
+        "evaluator_candidate_trace": candidate_trace,
+        "converted_engine_patch": converter_trace,
+        "ledger_apply_trace": ledger_trace,
+        "before_after_state_summary": {
+            "before": before_state_summary,
+            "after": compact_state_summary_json(&soul, &session_world)
+        }
+    });
+    if let Some(log_id) = updater_log_id {
+        let state = app.state::<AppState>();
+        if let Ok(conn) = state.conn.lock() {
+            let _ = update_llm_payload_pipeline_trace(&conn, log_id, &final_trace);
+        };
+    }
+    update_background_job_status(
+        &app,
+        &window,
+        &job.evaluator_job_id,
+        "completed",
+        None,
+        started,
+        !engine_patch.is_empty(),
+    );
+}
+
+fn parse_evaluator_output_json_with_trace(raw: &str) -> Result<EvaluatorParseResult, String> {
     let trimmed = raw.trim();
     let json = if let Some(stripped) = trimmed.strip_prefix("```json") {
         stripped.trim_end_matches("```").trim()
@@ -6032,8 +7535,134 @@ fn parse_evaluator_output_json(raw: &str) -> Result<EvaluatorOutputV1, String> {
     } else {
         trimmed
     };
-    serde_json::from_str::<EvaluatorOutputV1>(json)
-        .map_err(|err| format!("Evaluator returned invalid EvaluatorOutputV1 JSON: {err}"))
+    let mut value = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|err| format!("Evaluator returned invalid EvaluatorOutputV1 JSON: {err}"))?;
+    let mut warnings = Vec::new();
+    normalize_evaluator_output_value(&mut value, &mut warnings);
+    let normalized = !warnings.is_empty();
+    let normalized_json = serde_json::to_string(&value)
+        .map_err(|err| format!("Evaluator JSON normalize failed: {err}"))?;
+    let output = serde_json::from_value::<EvaluatorOutputV1>(value)
+        .map_err(|err| format!("Evaluator returned invalid EvaluatorOutputV1 JSON: {err}"))?;
+    Ok(EvaluatorParseResult {
+        output,
+        normalized_json,
+        normalized,
+        warnings,
+    })
+}
+
+fn normalize_evaluator_output_value(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
+    normalize_knowledge_scope_aliases(value, warnings);
+    if let Some(candidates) = value
+        .get_mut("memory_candidates")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        normalize_memory_candidate_array(candidates, warnings, "memory_candidates");
+    }
+    if let Some(per_soul) = value
+        .get_mut("per_soul_evaluations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for (index, soul_eval) in per_soul.iter_mut().enumerate() {
+            if let Some(candidates) = soul_eval
+                .get_mut("memory_candidates")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                normalize_memory_candidate_array(
+                    candidates,
+                    warnings,
+                    &format!("per_soul_evaluations[{index}].memory_candidates"),
+                );
+            }
+        }
+    }
+}
+
+fn normalize_memory_candidate_array(
+    candidates: &mut [serde_json::Value],
+    warnings: &mut Vec<String>,
+    path: &str,
+) {
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        normalize_memory_candidate_owner_alias(candidate, warnings, &format!("{path}[{index}]"));
+    }
+}
+
+fn normalize_memory_candidate_owner_alias(
+    candidate: &mut serde_json::Value,
+    warnings: &mut Vec<String>,
+    path: &str,
+) {
+    let Some(object) = candidate.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("owner_soul_id") {
+        for alias in ["soul_id", "soul", "owner"] {
+            if object.remove(alias).is_some() {
+                warnings.push(format!(
+                    "{path}.{alias} ignored because owner_soul_id was present"
+                ));
+            }
+        }
+        return;
+    }
+    for alias in ["soul_id", "soul", "owner"] {
+        if let Some(value) = object.remove(alias) {
+            object.insert("owner_soul_id".into(), value);
+            warnings.push(format!("{path}.{alias} normalized to owner_soul_id"));
+            break;
+        }
+    }
+    for alias in ["soul_id", "soul", "owner"] {
+        if object.remove(alias).is_some() {
+            warnings.push(format!(
+                "{path}.{alias} ignored after owner_soul_id alias normalization"
+            ));
+        }
+    }
+}
+
+fn normalize_knowledge_scope_aliases(value: &mut serde_json::Value, warnings: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(scope) = object.get_mut("knowledge_scope") {
+                if let Some(raw_scope) = scope.as_str().map(str::to_string) {
+                    if let Some(normalized) = normalized_knowledge_scope_alias(&raw_scope) {
+                        if normalized != raw_scope.as_str() {
+                            *scope = serde_json::Value::String(normalized.to_string());
+                            warnings.push(format!(
+                                "knowledge_scope alias {raw_scope:?} normalized to {normalized}"
+                            ));
+                        }
+                    }
+                }
+            }
+            for child in object.values_mut() {
+                normalize_knowledge_scope_aliases(child, warnings);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                normalize_knowledge_scope_aliases(item, warnings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalized_knowledge_scope_alias(scope: &str) -> Option<&'static str> {
+    let normalized = scope.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "full" | "observed" | "direct" => Some("directly_observed"),
+        "hearsay" => Some("heard_about"),
+        "unknown" | "none" => Some("not_known"),
+        "directly_observed" => Some("directly_observed"),
+        "heard_about" => Some("heard_about"),
+        "inferred" => Some("inferred"),
+        "not_known" => Some("not_known"),
+        _ => None,
+    }
 }
 
 fn update_llm_payload_pipeline_trace(
@@ -7317,6 +8946,9 @@ fn render_llm_payload_history(logs: &[LlmPayloadLog]) -> String {
             if let Some(value) = trace.get("narrator_trace") {
                 push_payload_trace_section(&mut lines, "NARRATOR TRACE", value);
             }
+            if let Some(value) = trace.get("evaluator_trace") {
+                push_payload_trace_section(&mut lines, "EVALUATOR TRACE", value);
+            }
             if let Some(value) = trace.get("evaluator_raw_response").or_else(|| {
                 trace
                     .get("evaluator_trace")
@@ -8403,6 +10035,7 @@ mod tests {
             api_key: "secret-key-that-must-not-appear".into(),
             model: "debug-model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let messages = vec![ContextMessage {
             role: "user".into(),
@@ -8441,6 +10074,7 @@ mod tests {
             api_key: "secret".into(),
             model: "debug-model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
 
         let preview = build_llm_payload_preview(
@@ -8468,6 +10102,7 @@ mod tests {
             api_key: "secret".into(),
             model: "debug-model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let preview = build_llm_payload_preview(
             &soul,
@@ -8493,6 +10128,7 @@ mod tests {
             api_key: "secret".into(),
             model: "debug-model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let messages = vec![
             ContextMessage {
@@ -8535,6 +10171,7 @@ mod tests {
             api_key: "secret".into(),
             model: "debug-model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let huge = "old ".repeat(8_000);
         let messages = vec![
@@ -10069,6 +11706,387 @@ mod tests {
         assert!(exported.contains("Evaluator returned invalid EvaluatorOutputV1 JSON"));
     }
 
+    fn evaluator_output_json_with_candidate(candidate: serde_json::Value) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "turn_flags_u64": state_engine::evaluator::turn_flags::SCENE_TURN,
+            "turn_classification": {
+                "is_pure_ooc": false,
+                "scene_event_occurred": true,
+                "is_retcon_or_correction": false,
+                "human_summary": "Aurora hears the promise."
+            },
+            "global_scene_evaluation": {
+                "scene_event_occurred": true,
+                "location_changed": false,
+                "object_state_changed": false,
+                "relationship_changed": false,
+                "unresolved_tension": false,
+                "current_plot_advanced": false,
+                "character_identity_changed": false,
+                "recent_emotional_state_changed": false,
+                "contradiction_detected": false,
+                "evidence_quote": "I promise to keep watch.",
+                "summary": "A promise was made."
+            },
+            "per_soul_evaluations": [],
+            "world_changes": [],
+            "object_changes": [],
+            "relationship_evaluations": [],
+            "memory_candidates": [candidate],
+            "relevance_tags": {
+                "setting_tags": {},
+                "location_tags": {},
+                "interacted_entities": {},
+                "event_type_tags": {},
+                "object_tags": {},
+                "emotional_tags": {},
+                "memory_slot_tags": {},
+                "per_soul_relevance": {}
+            },
+            "no_op_reason": null
+        })
+        .to_string()
+    }
+
+    fn valid_evaluator_candidate() -> serde_json::Value {
+        serde_json::json!({
+            "candidate_id": "mem-1",
+            "owner_soul_id": "Aurora",
+            "slot": "relationship_memory",
+            "content": "Aurora heard the user promise to keep watch.",
+            "evidence_quote": "I promise to keep watch.",
+            "criterion_met": true,
+            "confidence": 0.9,
+            "salience": 0.6,
+            "retrieval_strength": 0.6,
+            "perceived_by_entity_id": "Aurora",
+            "target_entity_ids": ["user"],
+            "source_type": "current_session",
+            "truth_status": "scene_event",
+            "relevance_tags": ["promise"],
+            "knowledge_scope": "directly_observed"
+        })
+    }
+
+    fn evaluator_context_for_alias_tests<'a>(
+        world: &'a SessionWorld,
+    ) -> EvaluatorConversionContext<'a> {
+        EvaluatorConversionContext {
+            active_soul_id: "Aurora",
+            active_soul_ids: vec!["Aurora".into()],
+            latest_user_message: "I promise to keep watch.",
+            latest_narrator_response: "Aurora hears it clearly: I promise to keep watch.",
+            session_world: Some(world),
+        }
+    }
+
+    #[test]
+    fn evaluator_accepts_soul_id_alias_for_owner_soul_id() {
+        let mut candidate = valid_evaluator_candidate();
+        candidate.as_object_mut().unwrap().remove("owner_soul_id");
+        candidate["soul_id"] = serde_json::json!("Aurora");
+        let parsed = parse_evaluator_output_json_with_trace(&evaluator_output_json_with_candidate(
+            candidate,
+        ))
+        .expect("parse");
+        let world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+        let conversion = evaluator_output_to_engine_patch(
+            &parsed.output,
+            &evaluator_context_for_alias_tests(&world),
+        );
+
+        assert!(parsed.normalized);
+        assert!(parsed
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("soul_id normalized to owner_soul_id")));
+        assert_eq!(parsed.output.memory_candidates[0].owner_soul_id, "Aurora");
+        assert_eq!(conversion.accepted_candidate_ids, vec!["mem-1".to_string()]);
+    }
+
+    #[test]
+    fn evaluator_normalizes_full_knowledge_scope() {
+        let mut candidate = valid_evaluator_candidate();
+        candidate["knowledge_scope"] = serde_json::json!("full");
+        let parsed = parse_evaluator_output_json_with_trace(&evaluator_output_json_with_candidate(
+            candidate,
+        ))
+        .expect("parse");
+
+        assert!(parsed.normalized);
+        assert_eq!(
+            parsed.output.memory_candidates[0]
+                .knowledge_scope
+                .as_label(),
+            "directly_observed"
+        );
+        assert!(parsed
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("full")));
+    }
+
+    #[test]
+    fn evaluator_schema_aliases_do_not_bypass_candidate_validation() {
+        let mut candidate = valid_evaluator_candidate();
+        candidate.as_object_mut().unwrap().remove("owner_soul_id");
+        candidate["soul"] = serde_json::json!("Aurora");
+        candidate["confidence"] = serde_json::json!(0.2);
+        candidate["content"] = serde_json::json!("she listened carefully");
+        candidate["knowledge_scope"] = serde_json::json!("observed");
+        let parsed = parse_evaluator_output_json_with_trace(&evaluator_output_json_with_candidate(
+            candidate,
+        ))
+        .expect("parse");
+        let world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+        let conversion = evaluator_output_to_engine_patch(
+            &parsed.output,
+            &evaluator_context_for_alias_tests(&world),
+        );
+
+        assert!(parsed.normalized);
+        assert!(conversion.accepted_candidate_ids.is_empty());
+        assert!(conversion
+            .rejected_candidates
+            .iter()
+            .any(|rejection| rejection.reason == "confidence below threshold"));
+    }
+
+    #[test]
+    fn evaluator_normalization_warning_appears_in_payload_trace() {
+        let mut candidate = valid_evaluator_candidate();
+        candidate.as_object_mut().unwrap().remove("owner_soul_id");
+        candidate["owner"] = serde_json::json!("Aurora");
+        candidate["knowledge_scope"] = serde_json::json!("hearsay");
+        let parsed = parse_evaluator_output_json_with_trace(&evaluator_output_json_with_candidate(
+            candidate,
+        ))
+        .expect("parse");
+        let trace = serde_json::json!({
+            "evaluator_json_normalized": parsed.normalized,
+            "evaluator_normalization_warnings": parsed.warnings
+        });
+
+        assert_eq!(trace["evaluator_json_normalized"], true);
+        assert!(trace["evaluator_normalization_warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("owner")));
+    }
+
+    fn evaluator_test_settings() -> ApiProviderSettings {
+        ApiProviderSettings {
+            base_url: "https://api.example/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+            evaluator_timeout_ms: Some(25_000),
+            evaluator_timeout_mode: Some("finite".into()),
+            wait_for_evaluator_before_next_turn: Some(true),
+            allow_send_with_stale_state: Some(false),
+            evaluator_background_enabled: Some(false),
+            ..Default::default()
+        }
+    }
+
+    fn evaluator_test_job(status: &str) -> db::EvaluatorJob {
+        db::EvaluatorJob {
+            evaluator_job_id: format!("job-{status}"),
+            conversation_id: "async-evaluator".into(),
+            turn_id: "turn-1".into(),
+            assistant_message_id: 42,
+            status: status.into(),
+            started_at: db::now_ts(),
+            completed_at: None,
+            elapsed_ms: None,
+            timeout_ms: Some(25_000),
+            timeout_mode: "finite".into(),
+            model: Some("model".into()),
+            provider: Some("evaluator_v1".into()),
+            error_message: None,
+            patch_applied: false,
+        }
+    }
+
+    #[test]
+    fn evaluator_timeout_is_configurable() {
+        let mut settings = evaluator_test_settings();
+        settings.evaluator_timeout_ms = Some(4_200);
+
+        assert_eq!(effective_evaluator_timeout_ms(&settings), Some(4_200));
+    }
+
+    #[test]
+    fn evaluator_no_app_timeout_does_not_cancel_at_25s() {
+        let mut settings = evaluator_test_settings();
+        settings.evaluator_timeout_mode = Some("no_app_timeout".into());
+
+        assert_eq!(effective_evaluator_timeout_ms(&settings), None);
+        assert!(!evaluator_timed_out(
+            "still running",
+            Duration::from_millis(25_500),
+            &settings
+        ));
+    }
+
+    #[test]
+    fn narrator_returns_before_evaluator_completion() {
+        let mut settings = evaluator_test_settings();
+        settings.evaluator_background_enabled = Some(true);
+
+        assert!(evaluator_background_enabled(&settings));
+    }
+
+    #[test]
+    fn next_turn_waits_for_pending_evaluator_when_enabled() {
+        let mut settings = evaluator_test_settings();
+        settings.wait_for_evaluator_before_next_turn = Some(true);
+        settings.allow_send_with_stale_state = Some(false);
+
+        assert!(wait_for_evaluator_before_next_turn(&settings));
+        assert!(!allow_send_with_stale_state(&settings));
+    }
+
+    #[test]
+    fn next_turn_can_proceed_with_stale_state_when_allowed() {
+        let mut settings = evaluator_test_settings();
+        settings.wait_for_evaluator_before_next_turn = Some(false);
+        settings.allow_send_with_stale_state = Some(true);
+
+        assert!(!wait_for_evaluator_before_next_turn(&settings));
+        assert!(allow_send_with_stale_state(&settings));
+    }
+
+    #[test]
+    fn pending_evaluator_blocks_narrator_when_stale_not_allowed() {
+        let mut settings = evaluator_test_settings();
+        settings.wait_for_evaluator_before_next_turn = Some(false);
+        settings.allow_send_with_stale_state = Some(false);
+
+        assert!(!wait_for_evaluator_before_next_turn(&settings));
+        assert!(!allow_send_with_stale_state(&settings));
+    }
+
+    #[test]
+    fn evaluator_failure_does_not_apply_empty_success_patch() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "async-evaluator", &soul.character_id)
+            .expect("conversation");
+        db::insert_evaluator_job(&conn, &evaluator_test_job("running")).expect("insert");
+        db::update_evaluator_job_status(
+            &conn,
+            "job-running",
+            "failed",
+            Some("provider failed"),
+            Some(db::now_ts()),
+            Some(25),
+            false,
+        )
+        .expect("update");
+
+        let job = db::get_evaluator_job(&conn, "job-running")
+            .expect("query")
+            .expect("job");
+        assert_eq!(job.status, "failed");
+        assert!(!job.patch_applied);
+    }
+
+    #[test]
+    fn evaluator_cancel_marks_job_canceled() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "async-evaluator", &soul.character_id)
+            .expect("conversation");
+        db::insert_evaluator_job(&conn, &evaluator_test_job("running")).expect("insert");
+        db::update_evaluator_job_status(
+            &conn,
+            "job-running",
+            "canceled",
+            Some("Canceled by user"),
+            Some(db::now_ts()),
+            Some(10),
+            false,
+        )
+        .expect("cancel");
+
+        let job = db::get_evaluator_job(&conn, "job-running")
+            .expect("query")
+            .expect("job");
+        assert_eq!(job.status, "canceled");
+        assert!(!job.patch_applied);
+    }
+
+    #[test]
+    fn evaluator_retry_applies_patch_after_failure() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "async-evaluator", &soul.character_id)
+            .expect("conversation");
+        let mut failed = evaluator_test_job("failed");
+        failed.evaluator_job_id = "job-failed".into();
+        failed.error_message = Some("parse failed".into());
+        db::insert_evaluator_job(&conn, &failed).expect("insert failed");
+        let mut retry = evaluator_test_job("completed");
+        retry.evaluator_job_id = "job-retry".into();
+        retry.patch_applied = true;
+        retry.completed_at = Some(db::now_ts());
+        db::insert_evaluator_job(&conn, &retry).expect("insert retry");
+
+        let latest = db::get_latest_evaluator_job(&conn, "async-evaluator")
+            .expect("latest")
+            .expect("job");
+        assert_eq!(latest.status, "completed");
+        assert!(latest.patch_applied);
+    }
+
+    #[test]
+    fn payload_trace_records_evaluator_elapsed_and_wait() {
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "narrator_trace": {
+                "request_id": "req-1",
+                "next_turn_wait_ms": 250,
+                "compiled_with_pending_evaluator": false
+            },
+            "evaluator_raw_response": "{}",
+            "evaluator_parsed_json": { "schema_version": 1 },
+            "ledger_apply_trace": { "patch_applied": true },
+            "evaluator_trace": {
+                "elapsed_ms": 123,
+                "timeout_ms": 25000
+            }
+        }))]);
+
+        assert!(exported.contains("### NARRATOR TRACE"));
+        assert!(exported.contains("\"next_turn_wait_ms\": 250"));
+        assert!(exported.contains("\"elapsed_ms\": 123"));
+    }
+
+    #[test]
+    fn ui_state_types_include_pending_running_completed_failed_canceled() {
+        let statuses = [
+            "pending",
+            "running",
+            "completed",
+            "failed",
+            "canceled",
+            "timed_out",
+        ];
+
+        assert!(statuses.contains(&"pending"));
+        assert!(statuses.contains(&"running"));
+        assert!(statuses.contains(&"completed"));
+        assert!(statuses.contains(&"failed"));
+        assert!(statuses.contains(&"canceled"));
+    }
+
     #[test]
     fn output_contract_keeps_only_last_status_block() {
         let raw = "```status\nScene | Focus: Old | Physical state: Old | Atmosphere: Old\n```\n\nAurora steps back from the doorway.\n\n```status\nScene | Focus: Aurora | Physical state: Guarded | Atmosphere: Tense\n```";
@@ -10707,5 +12725,125 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("Aurora_Schwarz_Session_3.mne"));
+    }
+
+    #[test]
+    fn normal_scene_anchor_does_not_trigger_regenerate() {
+        let response = "Aurora moves across the dim room, her wine glass caught in the glow of the neon sign outside. Rain beats against the window.";
+        let source = ReplaySource {
+            message_id: 1,
+            content: "Aurora sits on the velvet couch, staring at the neon light. Rain is pouring heavily outside. She takes a sip of wine.".to_string(),
+        };
+        let dummy_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+        let rg = detect_replay_with_context(response, "I walk in", &dummy_world, &[source]);
+        assert!(!rg.replay_detected);
+        assert_eq!(rg.severity, ReplaySeverity::MildOverlap);
+    }
+
+    #[test]
+    fn repeated_room_detail_is_mild_overlap_only() {
+        let response = "The neon light casts a soft red glow across the heavy wooden door.";
+        let source = ReplaySource {
+            message_id: 2,
+            content:
+                "The room is dark save for the red neon light outlining the heavy wooden door."
+                    .to_string(),
+        };
+        let dummy_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+        let rg = detect_replay_with_context(response, "I open the door", &dummy_world, &[source]);
+        assert!(!rg.replay_detected);
+        assert_eq!(rg.severity, ReplaySeverity::MildOverlap);
+    }
+
+    #[test]
+    fn strong_replay_logs_without_retry_by_default() {
+        let response = "Aurora sits on the velvet couch, staring at the neon light. Rain is pouring heavily outside.";
+        let source = ReplaySource {
+            message_id: 3,
+            content: "Aurora sits on the velvet couch, staring at the neon light. Rain is pouring heavily outside.".to_string(),
+        };
+        let dummy_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+        let rg =
+            detect_replay_with_context(response, "I sit down next to her", &dummy_world, &[source]);
+        assert!(rg.replay_detected);
+        assert_eq!(rg.severity, ReplaySeverity::StrongReplay);
+        assert!(!anti_replay_forced_retry_enabled(
+            &ApiProviderSettings::default()
+        ));
+    }
+
+    #[test]
+    fn forced_retry_only_when_setting_enabled() {
+        let default_settings = ApiProviderSettings::default();
+        let enabled_settings = ApiProviderSettings {
+            anti_replay_forced_retry_enabled: Some(true),
+            ..Default::default()
+        };
+
+        assert!(!anti_replay_forced_retry_enabled(&default_settings));
+        assert!(anti_replay_forced_retry_enabled(&enabled_settings));
+    }
+
+    #[test]
+    fn deterministic_status_repair_still_runs_when_retry_disabled() {
+        let response = "Aurora takes her coat off.\nScene | Focus: Aurora | Physical state: Damp from the rain | Atmosphere: Intimate";
+        let out = apply_output_contract_guard(response, "I say hi");
+
+        assert!(!anti_replay_forced_retry_enabled(
+            &ApiProviderSettings::default()
+        ));
+        assert_eq!(
+            out.status_repair_action.as_deref(),
+            Some("extracted_from_prose")
+        );
+        assert!(out.text.contains("```status\nScene | Focus: Aurora"));
+    }
+
+    #[test]
+    fn malformed_status_recovers_valid_status_content() {
+        let response = "Aurora takes her coat off.\nScene | Focus: Aurora | Physical state: Damp from the rain | Atmosphere: Intimate";
+        let out = apply_output_contract_guard(response, "I say hi");
+        assert_eq!(
+            out.status_repair_action.as_deref(),
+            Some("extracted_from_prose")
+        );
+        assert!(out.text.contains("Focus: Aurora"));
+        assert!(out.text.contains("```status\nScene | Focus: Aurora | Physical state: Damp from the rain | Atmosphere: Intimate\n```"));
+        assert!(!out
+            .text
+            .starts_with("Aurora takes her coat off.\nScene | Focus: Aurora"));
+    }
+
+    #[test]
+    fn valid_focus_not_replaced_with_unknown() {
+        let response = "Aurora pours a drink.\n\n```status\nScene | Focus: Aurora | Physical state: Tired | Atmosphere: Warm\n```";
+        let out = apply_output_contract_guard(response, "I sit down");
+        assert!(out.text.contains("Focus: Aurora"));
+        assert!(!out.text.contains("Focus: Unknown"));
+    }
+
+    #[test]
+    fn pure_ooc_bypasses_status_and_scene_repair() {
+        let response = "Sure, I can help you with that retcon. Aurora was never actually there.";
+        let out = apply_output_contract_guard(response, "OOC: Let's change the setting");
+        assert_eq!(
+            out.status_repair_action.as_deref(),
+            Some("gm_ooc_bypassed_status")
+        );
+        assert!(!out.text.contains("```status"));
+    }
+
+    #[test]
+    fn retry_not_selected_if_worse_than_original() {
+        let original_response = "Aurora takes a sip of wine. Her expression is thoughtful.";
+        let retry_response = "";
+        let dummy_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+        let orig_score = evaluate_response_quality(original_response, "I wait", &dummy_world, &[]);
+        let retry_score = evaluate_response_quality(retry_response, "I wait", &dummy_world, &[]);
+        assert!(orig_score > retry_score);
     }
 }

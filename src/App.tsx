@@ -28,6 +28,7 @@ import {
   DevLogCategory,
   DevLogEntry,
   DevLogLevel,
+  EvaluatorJob,
   LlmPayloadPreview,
   ImageAsset,
   ProviderProfile,
@@ -41,6 +42,7 @@ import {
   clearSoulProfileScenario,
   clearSoulRecentEvents,
   clearSoulWorldState,
+  cancelEvaluatorJob,
   compileContext,
   createUserImageMessageFromFile,
   createDefaultSoul,
@@ -59,6 +61,7 @@ import {
   exportWorldSettingMne,
   exportVisibleChatLog,
   getBranchPatchDebug,
+  getLatestEvaluatorJob,
   getSetting,
   getImageAsset,
   getImageAssetDataUrl,
@@ -74,10 +77,12 @@ import {
   listenApiStream,
   listenChatMessageSaved,
   listenDevLog,
+  listenEvaluatorJobStatusChanged,
   previewApiPayload,
   rebuildSessionFromLedger,
   renameConversation,
   restoreInactiveMessages,
+  retryEvaluatorJob,
   runConsolidation,
   saveSessionAsNewSoul,
   saveSettingFile,
@@ -304,12 +309,26 @@ export function App() {
     api_key: "",
     model: "",
     system_prompt: loadStoredCustomNarratorPrompt(),
+    narrator_timeout_ms: null,
+    evaluator_timeout_ms: 25_000,
+    evaluator_timeout_mode: "finite",
+    wait_for_evaluator_before_next_turn: true,
+    allow_send_with_stale_state: false,
+    evaluator_background_enabled: false,
+    anti_replay_forced_retry_enabled: false,
   });
   const [stateUpdaterSettings, setStateUpdaterSettings] = useState<ApiProviderSettings>({
     base_url: "https://api.openai.com/v1",
     api_key: "",
     model: "",
     system_prompt: "",
+    narrator_timeout_ms: null,
+    evaluator_timeout_ms: 25_000,
+    evaluator_timeout_mode: "finite",
+    wait_for_evaluator_before_next_turn: true,
+    allow_send_with_stale_state: false,
+    evaluator_background_enabled: false,
+    anti_replay_forced_retry_enabled: false,
   });
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
   const [view, setView] = useState<AppView>("library");
@@ -343,6 +362,7 @@ export function App() {
   const [disclaimerRemember, setDisclaimerRemember] = useState(false);
   const [busy, setBusy] = useState(false);
   const [stateUpdating, setStateUpdating] = useState(false);
+  const [activeEvaluatorJob, setActiveEvaluatorJob] = useState<EvaluatorJob | null>(null);
   const didBootstrap = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const settingImportInputRef = useRef<HTMLInputElement>(null);
@@ -570,6 +590,43 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listenEvaluatorJobStatusChanged((job) => {
+      if (job.conversation_id !== currentConversationIdRef.current) return;
+      setActiveEvaluatorJob(job);
+      if (job.status === "running" || job.status === "pending") {
+        setStatus("Updating memory/state...");
+      } else if (job.status === "completed") {
+        setStatus(job.patch_applied ? "Memory/state update completed" : "Memory/state update completed with no patch");
+        if (soul) {
+          void refreshContext(soul.character_id, job.conversation_id);
+          void getSoul(soul.character_id).then(setSoul).catch(() => undefined);
+        }
+      } else if (job.status === "failed" || job.status === "timed_out") {
+        setStatus("State update failed");
+      } else if (job.status === "canceled") {
+        setStatus("State update canceled");
+      }
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [soul?.character_id]);
+
+  useEffect(() => {
+    if (!activeConversationId) {
+      setActiveEvaluatorJob(null);
+      return;
+    }
+    void getLatestEvaluatorJob(activeConversationId)
+      .then(setActiveEvaluatorJob)
+      .catch(() => undefined);
+  }, [activeConversationId]);
+
   function setCreatorFieldsFromSoul(nextSoul: Soul) {
     setCharacterName(nextSoul.character_name);
     setCharacterDescription(nextSoul.profile.description);
@@ -598,6 +655,13 @@ export function App() {
       api_key: profile.api_key,
       model: profile.model,
       system_prompt: profile.system_prompt,
+      narrator_timeout_ms: profile.narrator_timeout_ms ?? null,
+      evaluator_timeout_ms: profile.evaluator_timeout_ms ?? 25_000,
+      evaluator_timeout_mode: profile.evaluator_timeout_mode ?? "finite",
+      wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn ?? true,
+      allow_send_with_stale_state: profile.allow_send_with_stale_state ?? false,
+      evaluator_background_enabled: profile.evaluator_background_enabled ?? false,
+      anti_replay_forced_retry_enabled: profile.anti_replay_forced_retry_enabled ?? false,
     });
   }
 
@@ -608,6 +672,13 @@ export function App() {
       api_key: profile.api_key,
       model: profile.model,
       system_prompt: profile.system_prompt,
+      narrator_timeout_ms: profile.narrator_timeout_ms ?? null,
+      evaluator_timeout_ms: profile.evaluator_timeout_ms ?? 25_000,
+      evaluator_timeout_mode: profile.evaluator_timeout_mode ?? "finite",
+      wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn ?? true,
+      allow_send_with_stale_state: profile.allow_send_with_stale_state ?? false,
+      evaluator_background_enabled: profile.evaluator_background_enabled ?? false,
+      anti_replay_forced_retry_enabled: profile.anti_replay_forced_retry_enabled ?? false,
     });
   }
 
@@ -1076,11 +1147,13 @@ export function App() {
         : null;
       setStatus(
         replayStatus ??
-          (result.debug.state_updater_status.startsWith("failed")
-          ? "Turn saved; state updater failed"
-          : result.consolidation_ran
-            ? "Turn saved; consolidation ran"
-            : "Turn saved"),
+          (result.debug.state_updater_status.startsWith("background")
+            ? "Turn saved; memory/state updating in background"
+            : result.debug.state_updater_status.startsWith("failed")
+              ? "Turn saved; state updater failed"
+              : result.consolidation_ran
+                ? "Turn saved; consolidation ran"
+                : "Turn saved"),
       );
       logDev(
         result.debug.state_updater_status.startsWith("failed") ? "warn" : "success",
@@ -1731,6 +1804,37 @@ export function App() {
     setStatus("Generation stopped");
   }
 
+  async function handleCancelEvaluatorJob() {
+    if (!activeEvaluatorJob || !activeEvaluatorJobIsLive) return;
+    try {
+      await cancelEvaluatorJob(activeEvaluatorJob.evaluator_job_id);
+      setActiveEvaluatorJob({ ...activeEvaluatorJob, status: "canceled", error_message: "Canceled by user" });
+      setStatus("State update canceled");
+    } catch (error) {
+      reportError(error, "Cancel evaluator job failed", "state_updater");
+    }
+  }
+
+  async function handleRetryEvaluatorJob() {
+    if (!activeEvaluatorJob) return;
+    try {
+      await retryEvaluatorJob(
+        activeEvaluatorJob.conversation_id,
+        activeEvaluatorJob.assistant_message_id,
+        effectiveStateUpdaterSettings,
+      );
+      setStatus("Retrying memory/state update");
+      const latest = await getLatestEvaluatorJob(activeEvaluatorJob.conversation_id);
+      setActiveEvaluatorJob(latest);
+    } catch (error) {
+      reportError(error, "Retry evaluator job failed", "state_updater");
+    }
+  }
+
+  function handleProceedWithStaleState() {
+    setStatus("Proceeding with current visible chat; pending state may be stale");
+  }
+
   async function handleConsolidate() {
     if (!soul) return;
     setBusy(true);
@@ -1884,6 +1988,13 @@ export function App() {
       api_key: apiSettings.api_key,
       model: apiSettings.model,
       system_prompt: apiSettings.system_prompt,
+      narrator_timeout_ms: apiSettings.narrator_timeout_ms ?? null,
+      evaluator_timeout_ms: apiSettings.evaluator_timeout_ms ?? 25_000,
+      evaluator_timeout_mode: apiSettings.evaluator_timeout_mode ?? "finite",
+      wait_for_evaluator_before_next_turn: apiSettings.wait_for_evaluator_before_next_turn ?? true,
+      allow_send_with_stale_state: apiSettings.allow_send_with_stale_state ?? false,
+      evaluator_background_enabled: apiSettings.evaluator_background_enabled ?? false,
+      anti_replay_forced_retry_enabled: apiSettings.anti_replay_forced_retry_enabled ?? false,
       created_at: 0,
       updated_at: 0,
     };
@@ -1923,6 +2034,13 @@ export function App() {
       api_key: stateUpdaterSettings.api_key,
       model: stateUpdaterSettings.model,
       system_prompt: stateUpdaterSettings.system_prompt,
+      narrator_timeout_ms: stateUpdaterSettings.narrator_timeout_ms ?? null,
+      evaluator_timeout_ms: stateUpdaterSettings.evaluator_timeout_ms ?? 25_000,
+      evaluator_timeout_mode: stateUpdaterSettings.evaluator_timeout_mode ?? "finite",
+      wait_for_evaluator_before_next_turn: stateUpdaterSettings.wait_for_evaluator_before_next_turn ?? true,
+      allow_send_with_stale_state: stateUpdaterSettings.allow_send_with_stale_state ?? false,
+      evaluator_background_enabled: stateUpdaterSettings.evaluator_background_enabled ?? false,
+      anti_replay_forced_retry_enabled: stateUpdaterSettings.anti_replay_forced_retry_enabled ?? false,
       created_at: 0,
       updated_at: 0,
     };
@@ -2192,6 +2310,18 @@ export function App() {
     [activeMessages],
   );
   const turnInProgress = busy || stateUpdating;
+  const effectiveStateUpdaterSettings = useNarratorProviderForUpdater
+    ? apiSettings
+    : stateUpdaterSettings;
+  const updateEffectiveStateUpdaterSettings = (update: Partial<ApiProviderSettings>) => {
+    if (useNarratorProviderForUpdater) {
+      setApiSettings((current) => ({ ...current, ...update }));
+    } else {
+      setStateUpdaterSettings((current) => ({ ...current, ...update }));
+    }
+  };
+  const activeEvaluatorJobIsLive =
+    activeEvaluatorJob?.status === "pending" || activeEvaluatorJob?.status === "running";
   const filteredDevLogs = useMemo(
     () =>
       devLogs.filter(
@@ -2588,6 +2718,46 @@ export function App() {
           <div ref={chatBottomRef} aria-hidden="true" />
           </div>
         </section>
+
+        {activeEvaluatorJob ? (
+          <section className={`evaluator-job-banner ${activeEvaluatorJob.status}`}>
+            <div>
+              <strong>
+                {activeEvaluatorJob.status === "pending" || activeEvaluatorJob.status === "running"
+                  ? "Updating memory/state..."
+                  : activeEvaluatorJob.status === "completed"
+                    ? "Memory/state updated"
+                    : activeEvaluatorJob.status === "canceled"
+                      ? "State update canceled"
+                      : "State update failed"}
+              </strong>
+              <span>
+                {activeEvaluatorJob.model || "Evaluator"} / {activeEvaluatorJob.status}
+                {activeEvaluatorJob.elapsed_ms ? ` / ${activeEvaluatorJob.elapsed_ms}ms` : ""}
+              </span>
+              {activeEvaluatorJob.error_message ? <small>{activeEvaluatorJob.error_message}</small> : null}
+            </div>
+            <div className="evaluator-job-actions">
+              {activeEvaluatorJobIsLive ? (
+                <button type="button" onClick={handleCancelEvaluatorJob}>
+                  Cancel
+                </button>
+              ) : null}
+              {activeEvaluatorJob.status === "failed" ||
+              activeEvaluatorJob.status === "canceled" ||
+              activeEvaluatorJob.status === "timed_out" ? (
+                <button type="button" onClick={handleRetryEvaluatorJob}>
+                  Retry
+                </button>
+              ) : null}
+              {activeEvaluatorJobIsLive && effectiveStateUpdaterSettings.allow_send_with_stale_state ? (
+                <button type="button" onClick={handleProceedWithStaleState}>
+                  Proceed
+                </button>
+              ) : null}
+            </div>
+          </section>
+        ) : null}
 
         <form className="chat-only-composer" onSubmit={handleSubmit}>
           <input
@@ -3268,6 +3438,22 @@ export function App() {
                     />
                   </label>
                   <label className="field">
+                    <span>Narrator Timeout (seconds)</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={Math.round((apiSettings.narrator_timeout_ms ?? 0) / 1000)}
+                      onChange={(event) =>
+                        setApiSettings((current) => ({
+                          ...current,
+                          narrator_timeout_ms: Number(event.target.value) > 0 ? Number(event.target.value) * 1000 : null,
+                        }))
+                      }
+                      placeholder="0 = provider default"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label className="field">
                     <span>API Key</span>
                     <input
                       type="password"
@@ -3338,6 +3524,76 @@ export function App() {
                     disabled={busy}
                   />
                   <span>Use narrator provider for state updater</span>
+                </label>
+                <div className="provider-pass-grid">
+                  <label className="field">
+                    <span>State Updater Timeout (seconds)</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={Math.round((effectiveStateUpdaterSettings.evaluator_timeout_ms ?? 25_000) / 1000)}
+                      onChange={(event) =>
+                        updateEffectiveStateUpdaterSettings({
+                          evaluator_timeout_ms: Math.max(0, Number(event.target.value) || 0) * 1000,
+                        })
+                      }
+                      disabled={busy}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Timeout Mode</span>
+                    <select
+                      value={effectiveStateUpdaterSettings.evaluator_timeout_mode ?? "finite"}
+                      onChange={(event) =>
+                        updateEffectiveStateUpdaterSettings({
+                          evaluator_timeout_mode: event.target.value,
+                        })
+                      }
+                      disabled={busy}
+                    >
+                      <option value="finite">Finite app timeout</option>
+                      <option value="no_app_timeout">No app timeout</option>
+                    </select>
+                  </label>
+                </div>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={effectiveStateUpdaterSettings.evaluator_background_enabled ?? false}
+                    onChange={(event) =>
+                      updateEffectiveStateUpdaterSettings({
+                        evaluator_background_enabled: event.target.checked,
+                      })
+                    }
+                    disabled={busy}
+                  />
+                  <span>Run evaluator in background</span>
+                </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={effectiveStateUpdaterSettings.wait_for_evaluator_before_next_turn ?? true}
+                    onChange={(event) =>
+                      updateEffectiveStateUpdaterSettings({
+                        wait_for_evaluator_before_next_turn: event.target.checked,
+                      })
+                    }
+                    disabled={busy}
+                  />
+                  <span>Wait for state update before next turn</span>
+                </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={effectiveStateUpdaterSettings.allow_send_with_stale_state ?? false}
+                    onChange={(event) =>
+                      updateEffectiveStateUpdaterSettings({
+                        allow_send_with_stale_state: event.target.checked,
+                      })
+                    }
+                    disabled={busy}
+                  />
+                  <span>Allow send with stale state</span>
                 </label>
                 {useNarratorProviderForUpdater ? (
                   <p className="provider-note">

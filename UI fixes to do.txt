@@ -10,3 +10,4 @@ Main page should have import character export character and download web redirec
 Main page's main feature is selecting character so character profile pic and character description should be easily visible and easy to navigate and choose
 Main page should only have world and character choosing. settings- can only choose 1. Characters - can select multiple.
 Character and setting creation page should be separate from main page (Library)
+archive session (delete) does not remove it from the UI. At least make a toggle option to see archived and non archived chats

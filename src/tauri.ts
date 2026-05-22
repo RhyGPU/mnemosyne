@@ -464,6 +464,13 @@ export type ApiProviderSettings = {
   api_key: string;
   model: string;
   system_prompt: string;
+  narrator_timeout_ms?: number | null;
+  evaluator_timeout_ms?: number | null;
+  evaluator_timeout_mode?: "finite" | "no_app_timeout" | string | null;
+  wait_for_evaluator_before_next_turn?: boolean | null;
+  allow_send_with_stale_state?: boolean | null;
+  evaluator_background_enabled?: boolean | null;
+  anti_replay_forced_retry_enabled?: boolean | null;
 };
 
 export type ContextMode = "brief" | "full_chat";
@@ -473,6 +480,32 @@ export type ProviderProfile = ApiProviderSettings & {
   name: string;
   created_at: number;
   updated_at: number;
+};
+
+export type EvaluatorJobStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "canceled"
+  | "timed_out"
+  | string;
+
+export type EvaluatorJob = {
+  evaluator_job_id: string;
+  conversation_id: string;
+  turn_id: string;
+  assistant_message_id: number;
+  status: EvaluatorJobStatus;
+  started_at: number;
+  completed_at?: number | null;
+  elapsed_ms?: number | null;
+  timeout_ms?: number | null;
+  timeout_mode: string;
+  model?: string | null;
+  provider?: string | null;
+  error_message?: string | null;
+  patch_applied: boolean;
 };
 
 type HiddenStatePayload = {
@@ -958,6 +991,13 @@ export function listenDevLog(callback: (payload: DevLogEntry) => void): Promise<
   return listen<DevLogEntry>("dev-log", (event) => callback(event.payload));
 }
 
+export function listenEvaluatorJobStatusChanged(
+  callback: (payload: EvaluatorJob) => void,
+): Promise<() => void> {
+  if (!hasTauriRuntime()) return Promise.resolve(() => undefined);
+  return listen<EvaluatorJob>("evaluator-job-status-changed", (event) => callback(event.payload));
+}
+
 export function listProviderProfiles(): Promise<ProviderProfile[]> {
   return invokeOrPreview("list_provider_profiles", {}, () => browserProviderProfiles);
 }
@@ -990,6 +1030,26 @@ export function deleteProviderProfile(profileId: string): Promise<boolean> {
     browserProviderProfiles = browserProviderProfiles.filter((item) => item.id !== profileId);
     return browserProviderProfiles.length !== before;
   });
+}
+
+export function getLatestEvaluatorJob(conversationId: string): Promise<EvaluatorJob | null> {
+  return invokeOrPreview("get_latest_evaluator_job", { conversationId }, () => null);
+}
+
+export function cancelEvaluatorJob(jobId: string): Promise<void> {
+  return invokeOrPreview("cancel_evaluator_job", { jobId }, () => undefined);
+}
+
+export function retryEvaluatorJob(
+  conversationId: string,
+  assistantMessageId: number,
+  stateUpdaterSettings: ApiProviderSettings,
+): Promise<void> {
+  return invokeOrPreview(
+    "retry_evaluator_job",
+    { conversationId, assistantMessageId, stateUpdaterSettings },
+    () => undefined,
+  );
 }
 
 export function listConversationMessages(conversationId: string): Promise<ChatMessage[]> {

@@ -154,12 +154,19 @@ const GOD_MODE_PROMPT: &str = r#"## NARRATION MODE: GOD
 - Also include environmental details active characters would not notice, hidden information, and dramatic irony.
 - You may reveal secrets, foreshadow future events, describe off-screen action, and provide context active characters lack."#;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ApiProviderSettings {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
     pub system_prompt: String,
+    pub narrator_timeout_ms: Option<u64>,
+    pub evaluator_timeout_ms: Option<u64>,
+    pub evaluator_timeout_mode: Option<String>,
+    pub wait_for_evaluator_before_next_turn: Option<bool>,
+    pub allow_send_with_stale_state: Option<bool>,
+    pub evaluator_background_enabled: Option<bool>,
+    pub anti_replay_forced_retry_enabled: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -487,11 +494,16 @@ impl ApiProvider {
             messages,
         };
 
-        let response = self
+        let mut request_builder = self
             .client
             .post(chat_completions_url(base_url))
             .bearer_auth(api_key)
-            .json(&request)
+            .json(&request);
+        if let Some(ms) = settings.narrator_timeout_ms {
+            request_builder = request_builder.timeout(std::time::Duration::from_millis(ms));
+        }
+
+        let response = request_builder
             .send()
             .await
             .map_err(|err| format!("API request failed: {err}"))?;
@@ -1036,6 +1048,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: "ignored unless custom".into(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 
@@ -1073,6 +1086,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: "ignored unless custom".into(),
+            ..Default::default()
         };
         let prompt =
             build_narrator_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader", false);
@@ -1116,6 +1130,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 
@@ -1133,6 +1148,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 
@@ -1149,6 +1165,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 
@@ -1166,6 +1183,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 
@@ -1184,6 +1202,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Realistic");
 
@@ -1204,6 +1223,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let prompt =
             build_narrator_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader", false);
@@ -1224,6 +1244,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 
@@ -1242,6 +1263,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: "Custom narrator law.".into(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Custom");
 
@@ -1267,6 +1289,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: "   ".into(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Custom");
 
@@ -1283,6 +1306,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: "Custom narrator law.".into(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 
@@ -1299,6 +1323,7 @@ mod tests {
             api_key: "key".into(),
             model: "model".into(),
             system_prompt: String::new(),
+            ..Default::default()
         };
         let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader");
 

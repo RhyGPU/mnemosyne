@@ -35,6 +35,8 @@ pub mod turn_flags {
 #[serde(default, deny_unknown_fields)]
 pub struct EvaluatorOutputV1 {
     pub schema_version: u32,
+    #[serde(default)]
+    pub thought_process: Option<String>,
     pub turn_flags_u64: u64,
     pub turn_classification: TurnClassification,
     pub global_scene_evaluation: GlobalSceneEvaluation,
