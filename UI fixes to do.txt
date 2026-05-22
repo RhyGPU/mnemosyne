@@ -1,0 +1,12 @@
+UI fixes to do:
+
+Chat session needs the scrolling bar on the right most of screen. Currently on the left most
+Should be able to change API presets or access setting page from chat sessions too
+AI api settings should show up at first launch, and should be in a serperate settings page with AI settings like silky tavern and janitor AI
+LLM log download should be in dev console.
+Settings should have features of the app there that the user can choose but has default options if not configured.
+settings page should have categorized tabs to navigate around
+Main page should have import character export character and download web redirection and character setting selection. 
+Main page's main feature is selecting character so character profile pic and character description should be easily visible and easy to navigate and choose
+Main page should only have world and character choosing. settings- can only choose 1. Characters - can select multiple.
+Character and setting creation page should be separate from main page (Library)

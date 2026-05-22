@@ -1458,7 +1458,9 @@ button:disabled {
 }
 
 .dev-console-header button,
-.dev-console-actions button {
+.dev-console-actions button,
+.dev-command-header button,
+.dev-command-run {
   display: inline-flex;
   min-height: 32px;
   align-items: center;
@@ -1473,7 +1475,9 @@ button:disabled {
 }
 
 .dev-console-header button:disabled,
-.dev-console-actions button:disabled {
+.dev-console-actions button:disabled,
+.dev-command-header button:disabled,
+.dev-command-run:disabled {
   opacity: 0.45;
 }
 
@@ -1518,6 +1522,97 @@ button:disabled {
   gap: 8px;
   border-bottom: 1px solid #24362f;
   padding: 10px 14px;
+}
+
+.dev-command-console {
+  display: grid;
+  gap: 10px;
+  border-bottom: 1px solid #24362f;
+  background: #0f1814;
+  padding: 12px 14px;
+}
+
+.dev-command-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dev-command-header h3 {
+  margin: 2px 0 0;
+  color: #f4fff9;
+  font-size: 0.88rem;
+}
+
+.dev-command-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.dev-command-grid label {
+  display: grid;
+  gap: 4px;
+  color: #99b8ad;
+  font-size: 0.7rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.dev-command-grid select,
+.dev-command-grid textarea {
+  border: 1px solid #315247;
+  border-radius: 6px;
+  background: #111b17;
+  color: #d8f0e6;
+  padding: 8px;
+  font: 0.76rem/1.4 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  text-transform: none;
+}
+
+.dev-command-grid select {
+  min-height: 32px;
+}
+
+.dev-command-grid textarea {
+  min-height: 82px;
+  resize: vertical;
+}
+
+.dev-command-run {
+  justify-content: center;
+}
+
+.dev-command-result,
+.dev-command-error {
+  display: grid;
+  gap: 5px;
+}
+
+.dev-command-result span,
+.dev-command-error span {
+  color: #99b8ad;
+  font-size: 0.68rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.dev-command-result pre,
+.dev-command-error pre {
+  max-height: 180px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid #315247;
+  border-radius: 6px;
+  background: #0b100e;
+  color: #b9d7cd;
+  padding: 8px;
+  white-space: pre-wrap;
+}
+
+.dev-command-error pre {
+  border-color: #714040;
+  color: #ffb0b0;
 }
 
 .dev-console-body {

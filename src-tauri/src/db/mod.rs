@@ -169,6 +169,8 @@ pub struct LlmPayloadLog {
     pub provider_request_id: Option<String>,
     #[serde(default)]
     pub provider_response_id: Option<String>,
+    #[serde(default)]
+    pub pipeline_trace_json: Option<String>,
 }
 
 impl Default for LlmPayloadLog {
@@ -207,6 +209,7 @@ impl Default for LlmPayloadLog {
             fallback_reason: None,
             provider_request_id: None,
             provider_response_id: None,
+            pipeline_trace_json: None,
         }
     }
 }
@@ -223,6 +226,7 @@ pub struct LlmPayloadResponseUpdate {
     pub fallback_reason: Option<String>,
     pub provider_request_id: Option<String>,
     pub provider_response_id: Option<String>,
+    pub pipeline_trace_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -683,6 +687,7 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "llm_payload_logs", "fallback_reason", "TEXT")?;
     add_column_if_missing(conn, "llm_payload_logs", "provider_request_id", "TEXT")?;
     add_column_if_missing(conn, "llm_payload_logs", "provider_response_id", "TEXT")?;
+    add_column_if_missing(conn, "llm_payload_logs", "pipeline_trace_json", "TEXT")?;
     if added_soul_summary_columns {
         backfill_soul_summary_columns(conn)?;
     }
@@ -1399,6 +1404,120 @@ pub fn insert_message_and_get_id(
     Ok(message_id)
 }
 
+pub fn find_reusable_active_user_message(
+    conn: &Connection,
+    conversation_id: &str,
+    content: &str,
+) -> rusqlite::Result<Option<i64>> {
+    let normalized = normalize_message_content(content);
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    let latest: Option<(i64, String, String)> = conn
+        .query_row(
+            "
+            SELECT id, role, content
+            FROM messages
+            WHERE conversation_id = ?1 AND is_active != 0 AND message_status = 'active'
+            ORDER BY id DESC
+            LIMIT 1
+            ",
+            [conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((message_id, role, latest_content)) = latest else {
+        return Ok(None);
+    };
+    if role != "user" || normalize_message_content(&latest_content) != normalized {
+        return Ok(None);
+    }
+    let assistant_after: i64 = conn.query_row(
+        "
+        SELECT COUNT(*)
+        FROM messages
+        WHERE conversation_id = ?1
+          AND id > ?2
+          AND role = 'assistant'
+          AND is_active != 0
+          AND message_status = 'active'
+        ",
+        params![conversation_id, message_id],
+        |row| row.get(0),
+    )?;
+    Ok((assistant_after == 0).then_some(message_id))
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DedupeAdjacentUserMessagesResult {
+    pub canonical_user_message_ids: Vec<i64>,
+    pub hidden_duplicate_user_message_ids: Vec<i64>,
+}
+
+pub fn dedupe_active_adjacent_user_messages(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<DedupeAdjacentUserMessagesResult> {
+    let messages = list_messages(conn, conversation_id, 100_000)?;
+    let mut result = DedupeAdjacentUserMessagesResult::default();
+    let mut last_user: Option<(i64, String)> = None;
+    for message in messages {
+        if message.role == "assistant" {
+            last_user = None;
+            continue;
+        }
+        if message.role != "user" {
+            continue;
+        }
+        let normalized = normalize_message_content(&message.content);
+        if normalized.is_empty() {
+            last_user = Some((message.id, normalized));
+            continue;
+        }
+        if let Some((canonical_id, previous_normalized)) = last_user.as_ref() {
+            if *previous_normalized == normalized {
+                conn.execute(
+                    "
+                    UPDATE messages
+                    SET is_active = 0,
+                        message_status = 'duplicate_hidden',
+                        message_origin = 'duplicate_hidden'
+                    WHERE conversation_id = ?1 AND id = ?2
+                    ",
+                    params![conversation_id, message.id],
+                )?;
+                conn.execute(
+                    "
+                    UPDATE turn_commits
+                    SET user_message_id = ?1
+                    WHERE conversation_id = ?2 AND user_message_id = ?3
+                    ",
+                    params![canonical_id, conversation_id, message.id],
+                )?;
+                result.canonical_user_message_ids.push(*canonical_id);
+                result.hidden_duplicate_user_message_ids.push(message.id);
+                continue;
+            }
+        }
+        last_user = Some((message.id, normalized));
+    }
+    if !result.hidden_duplicate_user_message_ids.is_empty() {
+        conn.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now_ts(), conversation_id],
+        )?;
+    }
+    Ok(result)
+}
+
+fn normalize_message_content(content: &str) -> String {
+    content
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn update_message_content(
     conn: &Connection,
     conversation_id: &str,
@@ -1752,8 +1871,8 @@ pub fn insert_llm_payload_log(conn: &Connection, log: &LlmPayloadLog) -> rusqlit
     conn.execute(
         "
         INSERT INTO llm_payload_logs
-            (conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id, request_id, turn_id, raw_provider_response, normalized_response, finish_reason, provider_error, fallback_used, fallback_reason, provider_request_id, provider_response_id)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
+            (conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id, request_id, turn_id, raw_provider_response, normalized_response, finish_reason, provider_error, fallback_used, fallback_reason, provider_request_id, provider_response_id, pipeline_trace_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
         ",
         params![
             log.conversation_id,
@@ -1788,6 +1907,7 @@ pub fn insert_llm_payload_log(conn: &Connection, log: &LlmPayloadLog) -> rusqlit
             log.fallback_reason,
             log.provider_request_id,
             log.provider_response_id,
+            log.pipeline_trace_json,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1810,8 +1930,9 @@ pub fn update_llm_payload_log_response(
             fallback_used = COALESCE(?7, fallback_used),
             fallback_reason = COALESCE(?8, fallback_reason),
             provider_request_id = COALESCE(?9, provider_request_id),
-            provider_response_id = COALESCE(?10, provider_response_id)
-        WHERE id = ?11
+            provider_response_id = COALESCE(?10, provider_response_id),
+            pipeline_trace_json = COALESCE(?11, pipeline_trace_json)
+        WHERE id = ?12
         ",
         params![
             update.request_id,
@@ -1826,6 +1947,7 @@ pub fn update_llm_payload_log_response(
             update.fallback_reason,
             update.provider_request_id,
             update.provider_response_id,
+            update.pipeline_trace_json,
             log_id,
         ],
     )?;
@@ -1895,7 +2017,7 @@ pub fn list_llm_payload_logs(
 ) -> rusqlite::Result<Vec<LlmPayloadLog>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id, request_id, turn_id, raw_provider_response, normalized_response, finish_reason, provider_error, fallback_used, fallback_reason, provider_request_id, provider_response_id
+        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id, request_id, turn_id, raw_provider_response, normalized_response, finish_reason, provider_error, fallback_used, fallback_reason, provider_request_id, provider_response_id, pipeline_trace_json
         FROM llm_payload_logs
         WHERE conversation_id = ?1
         ORDER BY id ASC
@@ -1908,7 +2030,7 @@ pub fn list_llm_payload_logs(
 pub fn get_llm_payload_log(conn: &Connection, log_id: i64) -> rusqlite::Result<LlmPayloadLog> {
     conn.query_row(
         "
-        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id, request_id, turn_id, raw_provider_response, normalized_response, finish_reason, provider_error, fallback_used, fallback_reason, provider_request_id, provider_response_id
+        SELECT id, conversation_id, message_id, provider, mode, context_mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, truncated, created_at, branch_id, active_turn_id, parent_turn_id, state_patch_ids_applied_json, discarded_patch_ids_skipped_json, state_rebuild_generation, latest_assistant_variant_id, request_id, turn_id, raw_provider_response, normalized_response, finish_reason, provider_error, fallback_used, fallback_reason, provider_request_id, provider_response_id, pipeline_trace_json
         FROM llm_payload_logs
         WHERE id = ?1
         ",
@@ -2098,6 +2220,7 @@ fn restore_preview_for_inactive_messages(
             "failed" => result.skipped_failed_ids.push(message_id),
             "retry_attempt" => result.skipped_retry_attempt_ids.push(message_id),
             "regenerated_discarded" => result.skipped_regenerated_discarded_ids.push(message_id),
+            "duplicate_hidden" => result.skipped_duplicate_ids.push(message_id),
             _ if !canonical_by_message_id.contains(&message_id) => {
                 if role == "user" {
                     result.skipped_duplicate_ids.push(message_id);
@@ -2172,7 +2295,7 @@ pub fn restore_inactive_messages_legacy_all(
     let ids = inactive_restorable_message_ids(conn, conversation_id)?;
     for message_id in &ids {
         conn.execute(
-            "UPDATE messages SET is_active = 1, message_status = 'active', message_origin = 'restored' WHERE conversation_id = ?1 AND id = ?2 AND message_status NOT IN ('pending', 'failed', 'retry_attempt', 'regenerated_discarded')",
+            "UPDATE messages SET is_active = 1, message_status = 'active', message_origin = 'restored' WHERE conversation_id = ?1 AND id = ?2 AND message_status NOT IN ('pending', 'failed', 'retry_attempt', 'regenerated_discarded', 'duplicate_hidden')",
             params![conversation_id, message_id],
         )?;
     }
@@ -2393,6 +2516,7 @@ fn llm_payload_log_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LlmPayl
         fallback_reason: row.get(30).ok(),
         provider_request_id: row.get(31).ok(),
         provider_response_id: row.get(32).ok(),
+        pipeline_trace_json: row.get(33).ok(),
     })
 }
 
@@ -2664,7 +2788,7 @@ fn inactive_restorable_message_ids(
         FROM messages
         WHERE conversation_id = ?1
           AND is_active = 0
-          AND message_status NOT IN ('pending', 'failed', 'retry_attempt', 'regenerated_discarded')
+          AND message_status NOT IN ('pending', 'failed', 'retry_attempt', 'regenerated_discarded', 'duplicate_hidden')
         ORDER BY id ASC
         ",
     )?;
@@ -2757,6 +2881,8 @@ pub fn rebuild_session_state_until(
                     format!("{err:?}"),
                 )))
             })?;
+        soul.turn_counter = soul.turn_counter.saturating_add(1);
+        soul.turns_since_consolidation = soul.turns_since_consolidation.saturating_add(1);
         debug.applied_patches.push(patch_id.to_string());
     }
     let invalidated = list_inactive_patch_ids(conn, branch_id)?;
@@ -3043,10 +3169,13 @@ fn summarize_setting(setting: &SettingSoul) -> SettingSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use state_engine::patch::{EnginePatch, WorldEventOperationPatch, WorldPatch};
+    use state_engine::patch::{
+        EnginePatch, MemoryPatch, RelationshipDelta, SceneStatePatch, SoulPatch,
+        WorldEventOperationPatch, WorldPatch,
+    };
     use state_engine::setting::new_default_setting;
     use state_engine::soul::{
-        new_default_soul, session_soul_from_savepoint, soul_savepoint_from_session,
+        new_default_soul, session_soul_from_savepoint, soul_savepoint_from_session, ObjectState,
     };
 
     #[test]
@@ -3135,6 +3264,82 @@ mod tests {
         let messages = list_messages(&conn, "edit-user", 10).expect("messages");
         assert_eq!(messages[0].content, "Edited user text");
         assert_eq!(messages[1].content, "Assistant text");
+    }
+
+    #[test]
+    fn duplicate_active_user_message_guard_reuses_canonical() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+        ensure_conversation(&conn, "retry-guard", &soul.character_id).expect("conversation");
+        let user_id = insert_message_and_get_id(&conn, "retry-guard", "user", "Open the door.")
+            .expect("user");
+
+        let reusable =
+            find_reusable_active_user_message(&conn, "retry-guard", "  Open   the door.  ")
+                .expect("guard");
+
+        assert_eq!(reusable, Some(user_id));
+        insert_message_and_get_id(&conn, "retry-guard", "assistant", "The door opens.")
+            .expect("assistant");
+        assert_eq!(
+            find_reusable_active_user_message(&conn, "retry-guard", "Open the door.")
+                .expect("guard after assistant"),
+            None
+        );
+    }
+
+    #[test]
+    fn dedupe_active_adjacent_user_messages_hides_duplicate() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "repair-dupes", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        create_session_branch(&conn, "repair-dupes", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "repair-dupes").expect("branch");
+        let canonical =
+            insert_message_and_get_id(&conn, "repair-dupes", "user", "The same prompt.")
+                .expect("canonical");
+        let duplicate =
+            insert_message_and_get_id(&conn, "repair-dupes", "user", "  The same   prompt.  ")
+                .expect("duplicate");
+        let assistant = insert_message_and_get_id(&conn, "repair-dupes", "assistant", "Response.")
+            .expect("assistant");
+        let (commit, _) = record_turn_commit_with_patch(
+            &conn,
+            "repair-dupes",
+            &branch.branch_id,
+            None,
+            Some(duplicate),
+            assistant,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("commit");
+
+        let result = dedupe_active_adjacent_user_messages(&conn, "repair-dupes").expect("dedupe");
+
+        assert_eq!(result.canonical_user_message_ids, vec![canonical]);
+        assert_eq!(result.hidden_duplicate_user_message_ids, vec![duplicate]);
+        let visible = list_messages(&conn, "repair-dupes", 10).expect("messages");
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
+        );
+        assert_eq!(visible[0].id, canonical);
+        let duplicate_row = get_message(&conn, "repair-dupes", duplicate).expect("duplicate row");
+        assert_eq!(duplicate_row.status, "duplicate_hidden");
+        let commit_after = get_turn_commit(&conn, &commit.turn_id).expect("commit");
+        assert_eq!(commit_after.user_message_id, Some(canonical));
+        assert!(restore_inactive_messages(&conn, "repair-dupes")
+            .expect("restore")
+            .skipped_duplicate_ids
+            .contains(&duplicate));
     }
 
     #[test]
@@ -3504,6 +3709,148 @@ mod tests {
                 .location,
             "Unspecified starting scene."
         );
+    }
+
+    #[test]
+    fn evaluator_scene_turn_updates_session_world() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "eval-world", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        create_session_branch(&conn, "eval-world", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "eval-world").expect("branch");
+        let user_id = insert_message_and_get_id(&conn, "eval-world", "user", "Someone knocks.")
+            .expect("user");
+        let assistant_id = insert_message_and_get_id(
+            &conn,
+            "eval-world",
+            "assistant",
+            "Aurora hears a knock at the apartment door.",
+        )
+        .expect("assistant");
+        let patch = EnginePatch {
+            world_patch: Some(WorldPatch {
+                location: Some("Apartment entry".into()),
+                recent_event: Some("A knock sounded at Aurora's apartment door.".into()),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        record_turn_commit_with_patch(
+            &conn,
+            "eval-world",
+            &branch.branch_id,
+            None,
+            Some(user_id),
+            assistant_id,
+            None,
+            &patch,
+            false,
+        )
+        .expect("record");
+
+        let rebuilt =
+            rebuild_session_state(&conn, "eval-world", &branch.branch_id).expect("rebuild");
+
+        assert_eq!(rebuilt.session_world.location, "Apartment entry");
+        assert!(rebuilt
+            .session_world
+            .recent_events
+            .iter()
+            .any(|event| event.contains("knock sounded")));
+    }
+
+    #[test]
+    fn evaluator_scene_turn_increments_turn_counter_or_equivalent() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "eval-counter", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        create_session_branch(&conn, "eval-counter", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "eval-counter").expect("branch");
+        let assistant_id =
+            insert_message_and_get_id(&conn, "eval-counter", "assistant", "Scene advanced.")
+                .expect("assistant");
+        record_turn_commit_with_patch(
+            &conn,
+            "eval-counter",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            None,
+            &EnginePatch {
+                world_patch: Some(WorldPatch {
+                    recent_event: Some("The scene advanced.".into()),
+                    ..WorldPatch::default()
+                }),
+                ..EnginePatch::default()
+            },
+            false,
+        )
+        .expect("record");
+
+        let rebuilt =
+            rebuild_session_state(&conn, "eval-counter", &branch.branch_id).expect("rebuild");
+
+        assert_eq!(rebuilt.soul.turn_counter, 1);
+        assert_eq!(
+            get_soul(&conn, &soul.character_id)
+                .expect("soul")
+                .turn_counter,
+            1
+        );
+    }
+
+    #[test]
+    fn mne_export_uses_rebuilt_session_state() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "mne-rebuild", &soul.character_id).expect("conversation");
+        let world =
+            ensure_conversation_session_world(&conn, "mne-rebuild", &soul, None).expect("world");
+        create_session_branch(&conn, "mne-rebuild", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "mne-rebuild").expect("branch");
+        let assistant_id = insert_message_and_get_id(&conn, "mne-rebuild", "assistant", "Moved.")
+            .expect("assistant");
+        record_turn_commit_with_patch(
+            &conn,
+            "mne-rebuild",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            None,
+            &EnginePatch {
+                world_patch: Some(WorldPatch {
+                    location: Some("Exported rebuilt room".into()),
+                    recent_event: Some("Aurora crossed into the rebuilt room.".into()),
+                    ..WorldPatch::default()
+                }),
+                ..EnginePatch::default()
+            },
+            false,
+        )
+        .expect("record");
+        let mut stale_world = world.clone();
+        stale_world.location = "Stale export room".into();
+        upsert_session_world(&conn, &stale_world).expect("stale world");
+
+        let rebuilt =
+            rebuild_session_state(&conn, "mne-rebuild", &branch.branch_id).expect("rebuild");
+        let exported_world = get_conversation_session_world(&conn, "mne-rebuild")
+            .expect("query world")
+            .expect("world");
+
+        assert_eq!(rebuilt.session_world.location, "Exported rebuilt room");
+        assert_eq!(exported_world.location, "Exported rebuilt room");
+        assert!(exported_world
+            .recent_events
+            .iter()
+            .any(|event| event.contains("rebuilt room")));
     }
 
     #[test]
@@ -4052,5 +4399,294 @@ mod tests {
         );
         assert!(delete_provider_profile(&conn, "openai").expect("delete"));
         assert!(list_provider_profiles(&conn).expect("list").is_empty());
+    }
+
+    #[test]
+    fn duplicate_repaired_user_message_remains_hidden_and_not_exported_active() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "hidden-dupes", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        create_session_branch(&conn, "hidden-dupes", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "hidden-dupes").expect("branch");
+
+        let canonical =
+            insert_message_and_get_id(&conn, "hidden-dupes", "user", "Unique user message")
+                .expect("canonical");
+        let duplicate =
+            insert_message_and_get_id(&conn, "hidden-dupes", "user", "Unique user message")
+                .expect("duplicate");
+        let assistant = insert_message_and_get_id(&conn, "hidden-dupes", "assistant", "Response.")
+            .expect("assistant");
+
+        record_turn_commit_with_patch(
+            &conn,
+            "hidden-dupes",
+            &branch.branch_id,
+            None,
+            Some(duplicate),
+            assistant,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("record");
+
+        // Now dedupe to mark it duplicate_hidden
+        let result = dedupe_active_adjacent_user_messages(&conn, "hidden-dupes").expect("dedupe");
+        assert_eq!(result.hidden_duplicate_user_message_ids, vec![duplicate]);
+
+        // When listing active messages for export:
+        let active_messages = list_messages(&conn, "hidden-dupes", 100).expect("list");
+
+        // Assert that the duplicate message is not present in active messages
+        assert!(!active_messages.iter().any(|m| m.id == duplicate));
+        assert!(active_messages.iter().any(|m| m.id == canonical));
+    }
+
+    #[test]
+    fn scene_turn_export_contains_rebuilt_recent_event_or_scene_state() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "scene-turn-export", &soul.character_id).expect("conversation");
+        let world = ensure_conversation_session_world(&conn, "scene-turn-export", &soul, None)
+            .expect("world");
+        create_session_branch(&conn, "scene-turn-export", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "scene-turn-export").expect("branch");
+        let assistant_id = insert_message_and_get_id(
+            &conn,
+            "scene-turn-export",
+            "assistant",
+            "The plot thickens.",
+        )
+        .expect("assistant");
+
+        let patch = EnginePatch {
+            world_patch: Some(WorldPatch {
+                recent_events: vec!["A scene event occurred.".to_string()],
+                scene_state: Some(SceneStatePatch {
+                    current_scene: Some("Active Investigation Scene".into()),
+                    ..SceneStatePatch::default()
+                }),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        record_turn_commit_with_patch(
+            &conn,
+            "scene-turn-export",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            None,
+            &patch,
+            false,
+        )
+        .expect("record");
+
+        // Rebuild state
+        let rebuilt =
+            rebuild_session_state(&conn, "scene-turn-export", &branch.branch_id).expect("rebuild");
+
+        // Assert rebuilt state has the recent event and current scene
+        assert!(rebuilt
+            .session_world
+            .recent_events
+            .iter()
+            .any(|e| e.contains("scene event")));
+        assert_eq!(
+            rebuilt.session_world.scene_state.current_scene,
+            "Active Investigation Scene"
+        );
+    }
+
+    #[test]
+    fn horror_knock_scene_creates_world_plot_current_scene_state() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "horror-knock", &soul.character_id).expect("conversation");
+        let world =
+            ensure_conversation_session_world(&conn, "horror-knock", &soul, None).expect("world");
+        create_session_branch(&conn, "horror-knock", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "horror-knock").expect("branch");
+        let assistant_id = insert_message_and_get_id(
+            &conn,
+            "horror-knock",
+            "assistant",
+            "A loud knock at the door.",
+        )
+        .expect("assistant");
+
+        let patch = EnginePatch {
+            world_patch: Some(WorldPatch {
+                recent_events: vec!["A terrifying horror knock rattled the front door.".to_string()],
+                corrected_object_states: vec![ObjectState {
+                    object_id: "door".into(),
+                    status: "rattling".into(),
+                    ..ObjectState::default()
+                }],
+                scene_state: Some(SceneStatePatch {
+                    current_scene: Some("Horror Knock Scene".into()),
+                    resolved_active_plot: Some("Solve the Door Mystery".into()),
+                    ..SceneStatePatch::default()
+                }),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        record_turn_commit_with_patch(
+            &conn,
+            "horror-knock",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            None,
+            &patch,
+            false,
+        )
+        .expect("record");
+
+        let rebuilt =
+            rebuild_session_state(&conn, "horror-knock", &branch.branch_id).expect("rebuild");
+
+        assert!(rebuilt
+            .session_world
+            .recent_events
+            .iter()
+            .any(|e| e.contains("horror knock")));
+        assert_eq!(
+            rebuilt.session_world.scene_state.current_scene,
+            "Horror Knock Scene"
+        );
+        assert_eq!(
+            rebuilt.session_world.scene_state.resolved_active_plot,
+            "Solve the Door Mystery"
+        );
+        assert!(rebuilt
+            .session_world
+            .object_states
+            .iter()
+            .any(|obj| obj.object_id == "door" && obj.status == "rattling"));
+    }
+
+    #[test]
+    fn reset_loop_scene_creates_current_plot_or_unresolved_tension_memory_candidate() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "reset-loop", &soul.character_id).expect("conversation");
+        let world =
+            ensure_conversation_session_world(&conn, "reset-loop", &soul, None).expect("world");
+        create_session_branch(&conn, "reset-loop", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "reset-loop").expect("branch");
+        let assistant_id =
+            insert_message_and_get_id(&conn, "reset-loop", "assistant", "The loop resets again.")
+                .expect("assistant");
+
+        let patch = EnginePatch {
+            soul_patch: Some(SoulPatch {
+                new_memories: vec![
+                    MemoryPatch {
+                        content: "Stuck in a time loop.".into(),
+                        tag: Some("unresolved_tension".into()),
+                        ..MemoryPatch::default()
+                    },
+                    MemoryPatch {
+                        content: "Break the reset-loop sequence.".into(),
+                        tag: Some("current_plot".into()),
+                        ..MemoryPatch::default()
+                    },
+                ],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        record_turn_commit_with_patch(
+            &conn,
+            "reset-loop",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            None,
+            &patch,
+            false,
+        )
+        .expect("record");
+
+        let rebuilt =
+            rebuild_session_state(&conn, "reset-loop", &branch.branch_id).expect("rebuild");
+
+        let recent_memories = &rebuilt.soul.memory.recent;
+        assert!(recent_memories
+            .iter()
+            .any(|m| m.content.contains("time loop") && m.tag == "unresolved_tension"));
+        assert!(recent_memories
+            .iter()
+            .any(|m| m.content.contains("reset-loop") && m.tag == "current_plot"));
+    }
+
+    #[test]
+    fn mne_export_includes_rebuilt_evaluator_applied_state() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "mne-evaluator", &soul.character_id).expect("conversation");
+        let world =
+            ensure_conversation_session_world(&conn, "mne-evaluator", &soul, None).expect("world");
+        create_session_branch(&conn, "mne-evaluator", &soul, &world).expect("branch");
+        let branch = get_active_session_branch(&conn, "mne-evaluator").expect("branch");
+        let assistant_id = insert_message_and_get_id(
+            &conn,
+            "mne-evaluator",
+            "assistant",
+            "A shift in relationships.",
+        )
+        .expect("assistant");
+
+        let patch = EnginePatch {
+            soul_patch: Some(SoulPatch {
+                relationship_deltas: vec![RelationshipDelta {
+                    relationship_event_id: Some("rel-1".into()),
+                    from: Some("Aurora".into()),
+                    target: Some("Partner".into()),
+                    trust: Some(15.0),
+                    ..RelationshipDelta::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        record_turn_commit_with_patch(
+            &conn,
+            "mne-evaluator",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            None,
+            &patch,
+            false,
+        )
+        .expect("record");
+
+        let rebuilt =
+            rebuild_session_state(&conn, "mne-evaluator", &branch.branch_id).expect("rebuild");
+
+        let rel = rebuilt
+            .soul
+            .relationships
+            .get("Partner")
+            .expect("relationship exists");
+        assert_eq!(rel.trust, 10.0);
     }
 }

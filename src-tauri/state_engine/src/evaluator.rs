@@ -191,8 +191,8 @@ pub struct MemoryCandidate {
     pub evidence_quote: String,
     pub criterion_met: bool,
     pub confidence: f32,
-    pub salience: f32,
-    pub retrieval_strength: f32,
+    pub salience: Option<f32>,
+    pub retrieval_strength: Option<f32>,
     pub perceived_by_entity_id: Option<String>,
     pub target_entity_ids: Vec<String>,
     pub source_type: MemorySourceType,
@@ -416,6 +416,8 @@ pub fn evaluator_output_to_engine_patch(
                     interpretation: (!candidate.content.trim().is_empty())
                         .then(|| candidate.content.trim().to_string()),
                     confidence: Some(candidate.confidence.clamp(0.0, 1.0)),
+                    salience: clamp_optional_score(candidate.salience),
+                    retrieval_strength: clamp_optional_score(candidate.retrieval_strength),
                     truth_status: Some(candidate.truth_status),
                     architecture_verified: Some(false),
                     memory_slot: Some(candidate.slot.as_label().into()),
@@ -547,6 +549,10 @@ fn objective_object_change_has_structured_evidence(change: &ObjectChangeEvaluati
             || change.object_state.lock_state.is_some())
 }
 
+fn clamp_optional_score(value: Option<f32>) -> Option<f32> {
+    value.filter(|value| value.is_finite()).map(|value| value.clamp(0.0, 100.0))
+}
+
 fn clean(value: &Option<String>) -> Option<&str> {
     value.as_deref().map(str::trim).filter(|value| !value.is_empty())
 }
@@ -623,8 +629,8 @@ mod tests {
             evidence_quote: quote.into(),
             criterion_met: true,
             confidence: 0.82,
-            salience: 82.0,
-            retrieval_strength: 82.0,
+            salience: Some(82.0),
+            retrieval_strength: Some(82.0),
             perceived_by_entity_id: Some(soul_id.into()),
             target_entity_ids: vec!["default_player".into()],
             source_type: MemorySourceType::CurrentSession,
@@ -668,7 +674,7 @@ mod tests {
         output.world_changes.push(WorldChangeEvaluation {
             change_id: Some("door_knock".into()),
             event_summary: Some("Someone knocked on Aurora's door.".into()),
-            evidence_quote: Some("knocked on Aurora's door".into()),
+            evidence_quote: Some("knock lands on Aurora's door".into()),
             confidence: 0.8,
             ..WorldChangeEvaluation::default()
         });
@@ -888,6 +894,90 @@ mod tests {
 
         assert!(!report.patch.is_empty());
         assert_eq!(report.accepted_candidate_ids, vec!["promise"]);
+    }
+
+    #[test]
+    fn evaluator_candidate_salience_is_preserved() {
+        let mut soul = new_default_soul("Aurora");
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let mut output = base_output(&soul.character_id);
+        let mut candidate = memory_candidate(
+            &soul.character_id,
+            "salience",
+            "Aurora treats the user's boundary promise as highly important.",
+            "boundary promise",
+        );
+        candidate.salience = Some(97.5);
+        candidate.retrieval_strength = None;
+        output.memory_candidates.push(candidate);
+
+        let report = evaluator_output_to_engine_patch(
+            &output,
+            &context(&soul, "I make a boundary promise.", "Aurora hears the boundary promise.", &world),
+        );
+        report.patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        let memory = soul.memory.recent.iter().find(|memory| memory.id.contains("memory_")).unwrap();
+        assert_eq!(memory.salience, 97.5);
+    }
+
+    #[test]
+    fn evaluator_candidate_retrieval_strength_is_preserved() {
+        let mut soul = new_default_soul("Aurora");
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let mut output = base_output(&soul.character_id);
+        let mut candidate = memory_candidate(
+            &soul.character_id,
+            "retrieval",
+            "Aurora remembers the user's promise as easy to recall.",
+            "easy to recall",
+        );
+        candidate.salience = None;
+        candidate.retrieval_strength = Some(91.0);
+        output.memory_candidates.push(candidate);
+
+        let report = evaluator_output_to_engine_patch(
+            &output,
+            &context(&soul, "This should be easy to recall.", "Aurora marks it easy to recall.", &world),
+        );
+        report.patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        let memory = soul.memory.recent.iter().find(|memory| memory.id.contains("memory_")).unwrap();
+        assert_eq!(memory.retrieval_strength, 91.0);
+    }
+
+    #[test]
+    fn omitted_salience_uses_existing_fallback() {
+        let mut soul = new_default_soul("Aurora");
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let mut output = base_output(&soul.character_id);
+        let mut candidate = memory_candidate(
+            &soul.character_id,
+            "fallback",
+            "Aurora remembers the user's promise without evaluator-provided scoring.",
+            "without evaluator-provided scoring",
+        );
+        candidate.salience = None;
+        candidate.retrieval_strength = None;
+        output.memory_candidates.push(candidate);
+
+        let report = evaluator_output_to_engine_patch(
+            &output,
+            &context(
+                &soul,
+                "This is without evaluator-provided scoring.",
+                "Aurora stores it without evaluator-provided scoring.",
+                &world,
+            ),
+        );
+        let patch_memory = &report.patch.soul_patch.as_ref().unwrap().new_memories[0];
+        assert_eq!(patch_memory.salience, None);
+        assert_eq!(patch_memory.retrieval_strength, None);
+
+        report.patch.apply_to_soul(&mut soul).expect("patch applies");
+        let memory = soul.memory.recent.iter().find(|memory| memory.id.contains("memory_")).unwrap();
+        assert!(memory.salience > 0.0);
+        assert!(memory.retrieval_strength > 0.0);
     }
 
     #[test]

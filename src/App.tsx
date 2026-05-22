@@ -46,6 +46,7 @@ import {
   createDefaultSoul,
   createSessionSoulClone,
   createDefaultSetting,
+  dedupeActiveAdjacentUserMessages,
   deleteConversation,
   deleteMessage,
   deleteProviderProfile,
@@ -57,6 +58,7 @@ import {
   exportScenarioBundleMne,
   exportWorldSettingMne,
   exportVisibleChatLog,
+  getBranchPatchDebug,
   getSetting,
   getImageAsset,
   getImageAssetDataUrl,
@@ -73,6 +75,7 @@ import {
   listenChatMessageSaved,
   listenDevLog,
   previewApiPayload,
+  rebuildSessionFromLedger,
   renameConversation,
   restoreInactiveMessages,
   runConsolidation,
@@ -116,6 +119,47 @@ type NarrativeMode = "Realistic" | "Reader" | "God" | "Custom";
 type AppView = "library" | "chat";
 type ChatStartMode = "continue" | "fresh";
 type DisclaimerMode = "launch" | "manual" | null;
+type DevCommandName =
+  | "dedupe_active_adjacent_user_messages"
+  | "restore_inactive_messages"
+  | "get_branch_patch_debug"
+  | "rebuild_session_from_ledger"
+  | "export_visible_chat_log"
+  | "export_llm_payload_history";
+
+const DEV_COMMAND_OPTIONS: Array<{ name: DevCommandName; label: string; defaultArgs: string }> = [
+  {
+    name: "dedupe_active_adjacent_user_messages",
+    label: "Repair Duplicate Turns",
+    defaultArgs: "{}",
+  },
+  {
+    name: "restore_inactive_messages",
+    label: "Restore Hidden Turns",
+    defaultArgs: "{}",
+  },
+  {
+    name: "get_branch_patch_debug",
+    label: "Get Branch Patch Debug",
+    defaultArgs: "{}",
+  },
+  {
+    name: "rebuild_session_from_ledger",
+    label: "Rebuild Session From Ledger",
+    defaultArgs: "{}",
+  },
+  {
+    name: "export_visible_chat_log",
+    label: "Export Visible Chat",
+    defaultArgs: "{}",
+  },
+  {
+    name: "export_llm_payload_history",
+    label: "Export Payload History",
+    defaultArgs: "{}",
+  },
+];
+
 type ActiveGeneration = {
   id: number;
   conversationId: string;
@@ -285,6 +329,13 @@ export function App() {
   const [devConsolePaused, setDevConsolePaused] = useState(false);
   const [devLogLevelFilter, setDevLogLevelFilter] = useState<DevLogLevel | "all">("all");
   const [devLogCategoryFilter, setDevLogCategoryFilter] = useState<DevLogCategory | "all">("all");
+  const [devCommandName, setDevCommandName] = useState<DevCommandName>(
+    "dedupe_active_adjacent_user_messages",
+  );
+  const [devCommandArgs, setDevCommandArgs] = useState("{}");
+  const [devCommandRunning, setDevCommandRunning] = useState(false);
+  const [devCommandResult, setDevCommandResult] = useState<string | null>(null);
+  const [devCommandError, setDevCommandError] = useState<string | null>(null);
   const [disclaimerMode, setDisclaimerMode] = useState<DisclaimerMode>(() =>
     hasAcceptedDisclaimerVersion() ? null : "launch",
   );
@@ -1221,6 +1272,97 @@ export function App() {
     }
   }
 
+  async function refreshActiveSessionAfterDevCommand(conversationId: string) {
+    const nextMessages = await listConversationMessages(conversationId);
+    setMessages(nextMessages);
+    if (soul) {
+      const nextSoul = await getSoul(soul.character_id);
+      setSoul(nextSoul);
+      setCreatorFieldsFromSoul(nextSoul);
+      setContext(await compileContext(nextSoul.character_id, conversationId));
+    }
+    setSouls(await listSouls());
+    setConversations(await listConversations());
+    await refreshAssistantVariants(conversationId, nextMessages);
+  }
+
+  function parseDevCommandArgs(): Record<string, unknown> {
+    const trimmed = devCommandArgs.trim();
+    if (!trimmed) return {};
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("JSON args must be an object.");
+    }
+    return parsed as Record<string, unknown>;
+  }
+
+  async function runWhitelistedDevCommand(commandName: DevCommandName, argsOverride?: Record<string, unknown>) {
+    if (!import.meta.env.DEV) return;
+    const args = argsOverride ?? parseDevCommandArgs();
+    const conversationId =
+      typeof args.conversationId === "string" && args.conversationId.trim()
+        ? args.conversationId.trim()
+        : currentConversationId;
+    if (!conversationId) {
+      throw new Error("No active conversation_id.");
+    }
+
+    switch (commandName) {
+      case "dedupe_active_adjacent_user_messages":
+        return dedupeActiveAdjacentUserMessages(conversationId);
+      case "restore_inactive_messages":
+        return restoreInactiveMessages(conversationId);
+      case "get_branch_patch_debug":
+        return getBranchPatchDebug(conversationId);
+      case "rebuild_session_from_ledger":
+        return rebuildSessionFromLedger(conversationId);
+      case "export_visible_chat_log":
+        return exportVisibleChatLog(conversationId);
+      case "export_llm_payload_history":
+        return exportLlmPayloadHistory(conversationId);
+      default: {
+        const exhaustive: never = commandName;
+        throw new Error(`Command is not whitelisted: ${exhaustive}`);
+      }
+    }
+  }
+
+  async function handleRunDevCommand(commandName = devCommandName, argsOverride?: Record<string, unknown>) {
+    if (!import.meta.env.DEV || devCommandRunning) return;
+    const conversationId =
+      typeof argsOverride?.conversationId === "string"
+        ? argsOverride.conversationId
+        : currentConversationId;
+    setDevCommandRunning(true);
+    setDevCommandResult(null);
+    setDevCommandError(null);
+    try {
+      const result = await runWhitelistedDevCommand(commandName, argsOverride);
+      const formatted = JSON.stringify(result, null, 2);
+      setDevCommandResult(formatted);
+      setStatus(`Dev command complete: ${commandName}`);
+      logDev("success", "app", "Dev command complete", {
+        command: commandName,
+        conversation_id: conversationId,
+        result,
+      });
+      if (conversationId) {
+        await refreshActiveSessionAfterDevCommand(conversationId);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setDevCommandError(message);
+      setStatus(`Dev command failed: ${message}`);
+      logDev("error", "error", "Dev command failed", {
+        command: commandName,
+        conversation_id: conversationId,
+        error: message,
+      });
+    } finally {
+      setDevCommandRunning(false);
+    }
+  }
+
   async function handleStartChat() {
     if (!soul || busy) return;
     if (chatStartMode === "continue") {
@@ -1869,11 +2011,14 @@ export function App() {
     if (!soul) return;
     setBusy(true);
     try {
-      const result = await exportCharacterSoulMne(
-        soul.character_id,
-        `${soul.character_name.replace(/\s+/g, "_")}.mne`,
-      );
+      const result = await exportCharacterSoulMne(soul.character_id, "");
       setStatus(`Soul .mne exported: ${result.path}`);
+      logDev("success", "app", "Soul .mne exported", {
+        path: result.path,
+        bundle_id: result.manifest.bundle_id,
+        bundle_type: result.manifest.bundle_type,
+        soul_id: result.manifest.soul_id,
+      });
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1888,12 +2033,15 @@ export function App() {
       const nextSetting = applySettingFields(setting);
       await upsertSetting(nextSetting);
       setSetting(nextSetting);
-      const result = await exportWorldSettingMne(
-        nextSetting.setting_id,
-        `${nextSetting.setting_name.replace(/\s+/g, "_")}.mne`,
-      );
+      const result = await exportWorldSettingMne(nextSetting.setting_id, "");
       setSettings(await listSettings());
       setStatus(`World .mne exported: ${result.path}`);
+      logDev("success", "app", "World .mne exported", {
+        path: result.path,
+        bundle_id: result.manifest.bundle_id,
+        bundle_type: result.manifest.bundle_type,
+        world_id: result.manifest.world_id,
+      });
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1905,12 +2053,15 @@ export function App() {
     if (!soul || !setting) return;
     setBusy(true);
     try {
-      const result = await exportScenarioBundleMne(
-        soul.character_id,
-        setting.setting_id,
-        `${soul.character_name.replace(/\s+/g, "_")}_${setting.setting_name.replace(/\s+/g, "_")}.mne`,
-      );
+      const result = await exportScenarioBundleMne(soul.character_id, setting.setting_id, "");
       setStatus(`Scenario .mne exported: ${result.path}`);
+      logDev("success", "app", "Scenario .mne exported", {
+        path: result.path,
+        bundle_id: result.manifest.bundle_id,
+        bundle_type: result.manifest.bundle_type,
+        soul_id: result.manifest.soul_id,
+        world_id: result.manifest.world_id,
+      });
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1922,11 +2073,14 @@ export function App() {
     if (!currentConversationId) return;
     setBusy(true);
     try {
-      const result = await exportCurrentSessionCheckpointMne(
-        currentConversationId,
-        `${currentSessionTitle.replace(/\s+/g, "_") || "session_checkpoint"}.mne`,
-      );
+      const result = await exportCurrentSessionCheckpointMne(currentConversationId, "");
       setStatus(`Session checkpoint .mne exported: ${result.path}`);
+      logDev("success", "app", "Session checkpoint .mne exported", {
+        path: result.path,
+        bundle_id: result.manifest.bundle_id,
+        bundle_type: result.manifest.bundle_type,
+        conversation_id: result.manifest.conversation_id,
+      });
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -2137,6 +2291,79 @@ export function App() {
           <span>Clear</span>
         </button>
       </div>
+      {import.meta.env.DEV ? (
+        <section className="dev-command-console" aria-label="Dev Command Console">
+          <div className="dev-command-header">
+            <div>
+              <span className="eyebrow">Whitelisted commands</span>
+              <h3>Command Runner</h3>
+            </div>
+            <button
+              type="button"
+              onClick={() =>
+                void handleRunDevCommand("dedupe_active_adjacent_user_messages", {
+                  conversationId: currentConversationId,
+                })
+              }
+              disabled={devCommandRunning || !currentConversationId}
+            >
+              Repair Duplicate Turns
+            </button>
+          </div>
+          <div className="dev-command-grid">
+            <label>
+              <span>Command</span>
+              <select
+                value={devCommandName}
+                onChange={(event) => {
+                  const nextName = event.target.value as DevCommandName;
+                  setDevCommandName(nextName);
+                  setDevCommandArgs(
+                    DEV_COMMAND_OPTIONS.find((option) => option.name === nextName)?.defaultArgs ??
+                      "{}",
+                  );
+                }}
+              >
+                {DEV_COMMAND_OPTIONS.map((option) => (
+                  <option key={option.name} value={option.name}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>JSON Args</span>
+              <textarea
+                value={devCommandArgs}
+                onChange={(event) => setDevCommandArgs(event.target.value)}
+                spellCheck={false}
+                rows={4}
+              />
+            </label>
+          </div>
+          <button
+            className="dev-command-run"
+            type="button"
+            onClick={() => void handleRunDevCommand()}
+            disabled={devCommandRunning || !currentConversationId}
+          >
+            <Play size={14} />
+            <span>{devCommandRunning ? "Running..." : "Run"}</span>
+          </button>
+          {devCommandResult ? (
+            <div className="dev-command-result">
+              <span>Result</span>
+              <pre>{devCommandResult}</pre>
+            </div>
+          ) : null}
+          {devCommandError ? (
+            <div className="dev-command-error">
+              <span>Error</span>
+              <pre>{devCommandError}</pre>
+            </div>
+          ) : null}
+        </section>
+      ) : null}
       <div className="dev-console-body" ref={devConsoleBodyRef}>
         {filteredDevLogs.length === 0 ? (
           <p className="dev-console-empty">No logs.</p>

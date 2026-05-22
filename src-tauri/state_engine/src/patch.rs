@@ -83,6 +83,8 @@ pub struct MemoryPatch {
     pub target_entity_ids: Vec<String>,
     pub interpretation: Option<String>,
     pub confidence: Option<f32>,
+    pub salience: Option<f32>,
+    pub retrieval_strength: Option<f32>,
     pub objective_event_id: Option<String>,
     pub truth_status: Option<TruthStatus>,
     pub architecture_verified: Option<bool>,
@@ -591,6 +593,12 @@ impl SoulPatch {
                 content,
                 tag,
             );
+            if let Some(salience) = clamped_memory_score(memory.salience) {
+                recent.salience = salience;
+            }
+            if let Some(retrieval_strength) = clamped_memory_score(memory.retrieval_strength) {
+                recent.retrieval_strength = retrieval_strength;
+            }
             let event_content = recent.content.clone();
             soul.memory.recent.push(recent);
             report.added += 1;
@@ -1793,6 +1801,10 @@ fn normalize_recent_event_for_dedupe(event: &str) -> String {
         return "user knock door".to_string();
     }
     tokens.join(" ")
+}
+
+fn clamped_memory_score(value: Option<f32>) -> Option<f32> {
+    value.filter(|value| value.is_finite()).map(|value| value.clamp(0.0, 100.0))
 }
 
 fn sync_recent_event_strings_from_records(world: &mut WorldLog) {

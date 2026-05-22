@@ -190,6 +190,11 @@ export type RestoreTurnsResult = {
   preview: RestoreTurnsPreview;
 };
 
+export type DedupeAdjacentUserMessagesResult = {
+  canonical_user_message_ids: number[];
+  hidden_duplicate_user_message_ids: number[];
+};
+
 export type MneBundleManifest = {
   mne_version: number;
   bundle_id: string;
@@ -200,6 +205,11 @@ export type MneBundleManifest = {
   created_at: number;
   app: string;
   schema_version: number;
+  conversation_id?: string | null;
+  soul_id?: string | null;
+  world_id?: string | null;
+  source_savepoint_id?: string | null;
+  source_setting_id?: string | null;
   contents: {
     souls: string[];
     worlds: string[];
@@ -422,6 +432,17 @@ export type LlmPayloadLog = {
   discarded_patch_ids_skipped?: string[];
   state_rebuild_generation?: number | null;
   latest_assistant_variant_id?: number | null;
+  request_id?: string | null;
+  turn_id?: string | null;
+  raw_provider_response?: string | null;
+  normalized_response?: string | null;
+  finish_reason?: string | null;
+  provider_error?: string | null;
+  fallback_used?: boolean;
+  fallback_reason?: string | null;
+  provider_request_id?: string | null;
+  provider_response_id?: string | null;
+  pipeline_trace_json?: string | null;
 };
 
 export type BranchPatchDebug = {
@@ -1156,6 +1177,15 @@ export function restoreInactiveMessages(conversationId: string): Promise<Restore
   );
 }
 
+export function dedupeActiveAdjacentUserMessages(
+  conversationId: string,
+): Promise<DedupeAdjacentUserMessagesResult> {
+  return invokeOrPreview("dedupe_active_adjacent_user_messages", { conversationId }, () => ({
+    canonical_user_message_ids: [],
+    hidden_duplicate_user_message_ids: [],
+  }));
+}
+
 export function updateUserMessage(
   conversationId: string,
   messageId: number,
@@ -1227,6 +1257,17 @@ export function getLlmPayloadLog(logId: number): Promise<LlmPayloadLog> {
 
 export function getBranchPatchDebug(conversationId: string): Promise<BranchPatchDebug> {
   return invokeOrPreview("get_branch_patch_debug", { conversationId }, () => ({
+    branch_id: "preview",
+    active_turn_id: null,
+    rebuild_generation: 0,
+    applied_patches: [],
+    skipped_discarded_patches: [],
+    invalidated_patches: [],
+  }));
+}
+
+export function rebuildSessionFromLedger(conversationId: string): Promise<BranchPatchDebug> {
+  return invokeOrPreview("rebuild_session_from_ledger", { conversationId }, () => ({
     branch_id: "preview",
     active_turn_id: null,
     rebuild_generation: 0,
@@ -1561,8 +1602,14 @@ function makePreviewMneExport(
   souls: string[],
   worlds: string[],
 ): MneExportResult {
+  const createdAt = Math.floor(Date.now() / 1000);
+  const identity = souls[0]?.split("/").pop()?.replace(/\.json$/, "") ?? worlds[0]?.split("/").pop()?.replace(/\.json$/, "") ?? crypto.randomUUID();
+  const safeTitle = title.trim().replace(/[^\w.-]+/g, "_").replace(/^_+|_+$/g, "") || "mnemosyne";
+  const safeType = String(bundleType).replace(/[^\w.-]+/g, "_");
+  const suffix = identity.replace(/[^A-Za-z0-9]/g, "").slice(-4).toLowerCase() || "0000";
+  const exportPath = path || `${safeTitle}_${safeType}_${createdAt}_${suffix}.mne`;
   return {
-    path,
+    path: exportPath,
     manifest: {
       mne_version: 1,
       bundle_id: crypto.randomUUID(),
@@ -1570,9 +1617,11 @@ function makePreviewMneExport(
       title,
       description: "Preview Mnemosyne bundle",
       author: null,
-      created_at: Math.floor(Date.now() / 1000),
+      created_at: createdAt,
       app: "Mnemosyne",
       schema_version: 1,
+      soul_id: souls[0]?.split("/").pop()?.replace(/\.json$/, "") ?? null,
+      world_id: worlds[0]?.split("/").pop()?.replace(/\.json$/, "") ?? null,
       contents: {
         souls,
         worlds,
@@ -2020,6 +2069,11 @@ function renderPreviewPayloadHistory(logs: LlmPayloadLog[]): string {
     lines.push("");
     lines.push("### CONTEXT");
     lines.push(log.context_text);
+    if (log.pipeline_trace_json) {
+      lines.push("");
+      lines.push("### PIPELINE TRACE JSON");
+      lines.push(log.pipeline_trace_json);
+    }
   });
   lines.push("");
   return lines.join("\n");
@@ -2684,4 +2738,20 @@ function parsePreviewHiddenState(raw: string): {
   } catch {
     return { visibleText: raw.slice(0, start).trim(), hiddenState: null };
   }
+}
+
+declare global {
+  interface Window {
+    mnemosyneDebug?: {
+      dedupeActiveAdjacentUserMessages: (
+        conversationId: string,
+      ) => Promise<DedupeAdjacentUserMessagesResult>;
+    };
+  }
+}
+
+if (import.meta.env.DEV && typeof window !== "undefined") {
+  window.mnemosyneDebug = {
+    dedupeActiveAdjacentUserMessages,
+  };
 }

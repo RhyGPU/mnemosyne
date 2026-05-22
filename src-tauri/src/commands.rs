@@ -23,7 +23,7 @@ use state_engine::{
     },
     evaluator::{
         active_souls_for_v1, evaluator_output_to_engine_patch, EvaluatorConversionContext,
-        EvaluatorOutputV1,
+        EvaluatorConversionReport, EvaluatorOutputV1,
     },
     hidden_state::{parse_hidden_state, HiddenState},
     patch::{
@@ -285,6 +285,16 @@ pub struct MneBundleManifest {
     pub created_at: i64,
     pub app: String,
     pub schema_version: u32,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub soul_id: Option<String>,
+    #[serde(default)]
+    pub world_id: Option<String>,
+    #[serde(default)]
+    pub source_savepoint_id: Option<String>,
+    #[serde(default)]
+    pub source_setting_id: Option<String>,
     pub contents: MneBundleContents,
 }
 
@@ -489,6 +499,9 @@ pub fn export_character_soul_mne(
         Vec::new(),
         None,
     );
+    let mut manifest = manifest;
+    manifest.soul_id = Some(soul.character_id.clone());
+    manifest.source_savepoint_id = soul.source_savepoint_id.clone();
     let mut files = Vec::new();
     files.push(json_bundle_file("manifest.json", &manifest)?);
     files.push(json_bundle_file(&soul_path, &soul)?);
@@ -513,6 +526,8 @@ pub fn export_world_setting_mne(
         vec![world_path.clone()],
         None,
     );
+    let mut manifest = manifest;
+    manifest.world_id = Some(setting.setting_id.clone());
     let files = vec![
         json_bundle_file("manifest.json", &manifest)?,
         json_bundle_file(&world_path, &setting)?,
@@ -543,6 +558,10 @@ pub fn export_scenario_bundle_mne(
         vec![world_path.clone()],
         None,
     );
+    let mut manifest = manifest;
+    manifest.soul_id = Some(soul.character_id.clone());
+    manifest.world_id = Some(setting.setting_id.clone());
+    manifest.source_savepoint_id = soul.source_savepoint_id.clone();
     let files = vec![
         json_bundle_file("manifest.json", &manifest)?,
         json_bundle_file(&soul_path, &soul)?,
@@ -554,6 +573,7 @@ pub fn export_scenario_bundle_mne(
 #[tauri::command]
 pub fn export_current_session_checkpoint_mne(
     app: AppHandle,
+    window: Window,
     state: State<'_, AppState>,
     conversation_id: String,
     output_path: String,
@@ -561,10 +581,43 @@ pub fn export_current_session_checkpoint_mne(
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let conversation =
         db::get_conversation_summary(&conn, &conversation_id).map_err(|err| err.to_string())?;
-    let soul = db::get_soul(&conn, &conversation.soul_id).map_err(|err| err.to_string())?;
-    let session_world = db::get_conversation_session_world(&conn, &conversation_id)
-        .map_err(|err| err.to_string())?
-        .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
+    let (soul, session_world, rebuilt_state_used) =
+        if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
+            let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+                .map_err(|err| err.to_string())?;
+            emit_dev_log(
+                &window,
+                "success",
+                "ledger",
+                "mne_export_rebuilt_state_used",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "branch_id": rebuilt.debug.branch_id,
+                    "active_turn_id": rebuilt.debug.active_turn_id,
+                    "rebuild_generation": rebuilt.debug.rebuild_generation
+                })),
+            );
+            (rebuilt.soul, rebuilt.session_world, true)
+        } else {
+            let soul = db::get_soul(&conn, &conversation.soul_id).map_err(|err| err.to_string())?;
+            let session_world = db::get_conversation_session_world(&conn, &conversation_id)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
+            (soul, session_world, false)
+        };
+    if !rebuilt_state_used {
+        emit_dev_log(
+            &window,
+            "info",
+            "ledger",
+            "mne_export_rebuilt_state_used",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "rebuilt": false,
+                "reason": "no_active_session_branch"
+            })),
+        );
+    }
     let messages =
         db::list_messages(&conn, &conversation_id, 10_000).map_err(|err| err.to_string())?;
     let soul_path = format!("souls/{}.json", safe_bundle_name(&soul.character_id));
@@ -578,6 +631,12 @@ pub fn export_current_session_checkpoint_mne(
         vec![world_path.clone()],
         Some(conversation_path.clone()),
     );
+    let mut manifest = manifest;
+    manifest.conversation_id = Some(conversation.conversation_id.clone());
+    manifest.soul_id = Some(soul.character_id.clone());
+    manifest.world_id = Some(session_world.world_id.clone());
+    manifest.source_savepoint_id = soul.source_savepoint_id.clone();
+    manifest.source_setting_id = session_world.source_setting_id.clone();
     let files = vec![
         json_bundle_file("manifest.json", &manifest)?,
         json_bundle_file(&soul_path, &soul)?,
@@ -585,7 +644,45 @@ pub fn export_current_session_checkpoint_mne(
         json_bundle_file(&conversation_path, &conversation)?,
         json_bundle_file("conversation/messages.json", &messages)?,
     ];
-    write_mne_bundle(&app, &output_path, &manifest, files)
+    let result = write_mne_bundle(&app, &output_path, &manifest, files)?;
+    let export_trace = mne_export_state_trace_json(
+        &manifest,
+        &conversation_id,
+        &soul,
+        &session_world,
+        rebuilt_state_used,
+        &result.path,
+    );
+    emit_dev_log(
+        &window,
+        "success",
+        "export",
+        "mne_export_state_trace",
+        Some(export_trace.clone()),
+    );
+    let _ = db::insert_llm_payload_log(
+        &conn,
+        &LlmPayloadLog {
+            conversation_id: conversation_id.clone(),
+            provider: "mne_export_trace".into(),
+            mode: "mne_export".into(),
+            context_mode: "export".into(),
+            model: "local".into(),
+            base_url: "local".into(),
+            system_message: "MNE export state trace".into(),
+            user_message: format!("export_current_session_checkpoint_mne({conversation_id})"),
+            context_text: String::new(),
+            created_at: db::now_ts(),
+            pipeline_trace_json: Some(
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "export_trace": export_trace
+                }))
+                .unwrap_or_default(),
+            ),
+            ..Default::default()
+        },
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -644,22 +741,118 @@ fn import_mne_entries(
         result.imported_soul_ids.push(soul.character_id);
     }
 
-    for world_path in &manifest.contents.worlds {
-        validate_bundle_path(world_path)?;
-        let world_bytes = entries
-            .get(world_path)
-            .ok_or_else(|| format!("Missing World file {world_path}"))?;
-        let mut setting = setting_from_mne_world_bytes(world_bytes)?;
-        let original_id = setting.setting_id.clone();
-        if db::get_setting(&conn, &setting.setting_id).is_ok() {
-            setting.setting_id = uuid_like_id();
-            result
-                .remapped_ids
-                .insert(original_id.clone(), setting.setting_id.clone());
+    let mut imported_session_world_id: Option<String> = None;
+    if manifest.bundle_type == "session_checkpoint" {
+        for world_path in &manifest.contents.worlds {
+            validate_bundle_path(world_path)?;
+            let world_bytes = entries
+                .get(world_path)
+                .ok_or_else(|| format!("Missing World file {world_path}"))?;
+            let mut session_world: SessionWorld =
+                serde_json::from_slice(world_bytes).or_else(|_| {
+                    let setting = setting_from_mne_world_bytes(world_bytes)?;
+                    Ok::<SessionWorld, String>(state_engine::setting::session_world_from_setting(
+                        &setting,
+                    ))
+                })?;
+            let original_id = session_world.world_id.clone();
+            if db::get_session_world(&conn, &session_world.world_id).is_ok() {
+                session_world.world_id = uuid_like_id();
+                result
+                    .remapped_ids
+                    .insert(original_id.clone(), session_world.world_id.clone());
+            }
+            session_world.last_updated = db::now_ts();
+            db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
+            imported_session_world_id = Some(session_world.world_id);
         }
-        setting.last_updated = db::now_ts();
-        db::upsert_setting(&conn, &setting).map_err(|err| err.to_string())?;
-        result.imported_setting_ids.push(setting.setting_id);
+    } else {
+        for world_path in &manifest.contents.worlds {
+            validate_bundle_path(world_path)?;
+            let world_bytes = entries
+                .get(world_path)
+                .ok_or_else(|| format!("Missing World file {world_path}"))?;
+            let mut setting = setting_from_mne_world_bytes(world_bytes)?;
+            let original_id = setting.setting_id.clone();
+            if db::get_setting(&conn, &setting.setting_id).is_ok() {
+                setting.setting_id = uuid_like_id();
+                result
+                    .remapped_ids
+                    .insert(original_id.clone(), setting.setting_id.clone());
+            }
+            setting.last_updated = db::now_ts();
+            db::upsert_setting(&conn, &setting).map_err(|err| err.to_string())?;
+            result.imported_setting_ids.push(setting.setting_id);
+        }
+    }
+
+    if manifest.bundle_type == "session_checkpoint" {
+        let conversation_path = manifest
+            .contents
+            .conversation
+            .as_deref()
+            .ok_or_else(|| "Session checkpoint is missing conversation path".to_string())?;
+        validate_bundle_path(conversation_path)?;
+        let conversation_bytes = entries
+            .get(conversation_path)
+            .ok_or_else(|| format!("Missing conversation file {conversation_path}"))?;
+        let conversation: ConversationSummary = serde_json::from_slice(conversation_bytes)
+            .map_err(|err| format!("Invalid conversation JSON: {err}"))?;
+        let original_conversation_id = manifest
+            .conversation_id
+            .clone()
+            .unwrap_or_else(|| conversation.conversation_id.clone());
+        let conversation_id =
+            if db::get_conversation_summary(&conn, &original_conversation_id).is_ok() {
+                let remapped = uuid_like_id();
+                result
+                    .remapped_ids
+                    .insert(original_conversation_id.clone(), remapped.clone());
+                remapped
+            } else {
+                original_conversation_id
+            };
+        let soul_id = result
+            .imported_soul_ids
+            .first()
+            .cloned()
+            .or_else(|| manifest.soul_id.clone())
+            .ok_or_else(|| "Session checkpoint is missing Soul identity".to_string())?;
+        let title = unique_imported_session_title(&conn, &conversation.title)
+            .map_err(|err| err.to_string())?;
+        db::ensure_conversation_with_title_and_world(
+            &conn,
+            &conversation_id,
+            &soul_id,
+            imported_session_world_id.as_deref(),
+            manifest.source_setting_id.as_deref(),
+            Some(&title),
+        )
+        .map_err(|err| err.to_string())?;
+        let messages_path = "conversation/messages.json";
+        if let Some(message_bytes) = entries.get(messages_path) {
+            let messages: Vec<ChatMessage> = serde_json::from_slice(message_bytes)
+                .map_err(|err| format!("Invalid messages JSON: {err}"))?;
+            for message in messages
+                .iter()
+                .filter(|message| message.role == "user" || message.role == "assistant")
+            {
+                db::insert_message_and_get_id(
+                    &conn,
+                    &conversation_id,
+                    &message.role,
+                    &message.content,
+                )
+                .map_err(|err| err.to_string())?;
+            }
+        }
+        if let (Ok(soul), Some(world_id)) = (
+            db::get_soul(&conn, &soul_id),
+            imported_session_world_id.as_deref(),
+        ) {
+            let world = db::get_session_world(&conn, world_id).map_err(|err| err.to_string())?;
+            let _ = db::create_session_branch(&conn, &conversation_id, &soul, &world);
+        }
     }
 
     result.summary = format!(
@@ -669,6 +862,29 @@ fn import_mne_entries(
         manifest.title
     );
     Ok(result)
+}
+
+fn unique_imported_session_title(conn: &Connection, title: &str) -> rusqlite::Result<String> {
+    let base = title.trim();
+    let base = if base.is_empty() {
+        "Imported Session"
+    } else {
+        base
+    };
+    let existing = db::list_conversations(conn)?
+        .into_iter()
+        .map(|conversation| conversation.title)
+        .collect::<HashSet<_>>();
+    if !existing.contains(base) {
+        return Ok(base.to_string());
+    }
+    for index in 2..10_000 {
+        let candidate = format!("{base} ({index})");
+        if !existing.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Ok(format!("{base} ({})", db::now_ts()))
 }
 
 #[tauri::command]
@@ -1248,6 +1464,45 @@ pub fn restore_inactive_messages(
 }
 
 #[tauri::command]
+pub fn dedupe_active_adjacent_user_messages(
+    window: Window,
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<db::DedupeAdjacentUserMessagesResult, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let result = db::dedupe_active_adjacent_user_messages(&conn, &conversation_id)
+        .map_err(|err| err.to_string())?;
+    if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
+        let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+        emit_dev_log(
+            &window,
+            "success",
+            "ledger",
+            "session_world_cache_refreshed_from_ledger",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "branch_id": rebuilt.debug.branch_id,
+                "active_turn_id": rebuilt.debug.active_turn_id,
+                "reason": "dedupe_active_adjacent_user_messages"
+            })),
+        );
+    }
+    emit_dev_log(
+        &window,
+        "success",
+        "db",
+        "dedupe_active_adjacent_user_messages",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "hidden_duplicate_user_message_ids": result.hidden_duplicate_user_message_ids.as_slice(),
+            "canonical_user_message_ids": result.canonical_user_message_ids.as_slice()
+        })),
+    );
+    Ok(result)
+}
+
+#[tauri::command]
 pub fn update_user_message(
     state: State<'_, AppState>,
     conversation_id: String,
@@ -1371,6 +1626,32 @@ pub fn get_branch_patch_debug(
         db::get_active_session_branch(&conn, &conversation_id).map_err(|err| err.to_string())?;
     let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
         .map_err(|err| err.to_string())?;
+    Ok(rebuilt.debug)
+}
+
+#[tauri::command]
+pub fn rebuild_session_from_ledger(
+    window: Window,
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<db::BranchPatchDebug, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let branch =
+        db::get_active_session_branch(&conn, &conversation_id).map_err(|err| err.to_string())?;
+    let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+        .map_err(|err| err.to_string())?;
+    emit_dev_log(
+        &window,
+        "success",
+        "ledger",
+        "session_world_cache_refreshed_from_ledger",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "branch_id": rebuilt.debug.branch_id,
+            "active_turn_id": rebuilt.debug.active_turn_id,
+            "reason": "rebuild_session_from_ledger"
+        })),
+    );
     Ok(rebuilt.debug)
 }
 
@@ -1700,10 +1981,11 @@ fn send_mock_turn_with_conn(
         None
     };
     let ledger_user_message_id = if replacement_assistant_id.is_none() {
-        Some(
-            db::insert_message_and_get_id(conn, &conversation_id, "user", &user_text)
-                .map_err(|err| err.to_string())?,
-        )
+        Some(reuse_or_insert_user_message(
+            conn,
+            &conversation_id,
+            &user_text,
+        )?)
     } else {
         old_commit
             .as_ref()
@@ -1821,6 +2103,21 @@ fn send_mock_turn_with_conn(
     })
 }
 
+fn reuse_or_insert_user_message(
+    conn: &Connection,
+    conversation_id: &str,
+    user_text: &str,
+) -> Result<i64, String> {
+    if let Some(message_id) =
+        db::find_reusable_active_user_message(conn, conversation_id, user_text)
+            .map_err(|err| err.to_string())?
+    {
+        return Ok(message_id);
+    }
+    db::insert_message_and_get_id(conn, conversation_id, "user", user_text)
+        .map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 pub async fn send_api_turn(
     window: Window,
@@ -1934,8 +2231,37 @@ pub async fn send_api_turn(
             (fallback_soul, session_world, None)
         };
         let ledger_user_message_id = if replacement_assistant_id.is_none() {
-            let id = db::insert_message_and_get_id(&conn, &conversation_id, "user", &user_text)
-                .map_err(|err| err.to_string())?;
+            let existing_id =
+                db::find_reusable_active_user_message(&conn, &conversation_id, &user_text)
+                    .map_err(|err| err.to_string())?;
+            let id = if let Some(id) = existing_id {
+                emit_dev_log(
+                    &window,
+                    "info",
+                    "db",
+                    "duplicate_user_message_prevented",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "reused_canonical_user_message_id": id,
+                        "request_id": request_id.as_str()
+                    })),
+                );
+                emit_dev_log(
+                    &window,
+                    "info",
+                    "db",
+                    "reused_canonical_user_message_id",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "user_message_id": id,
+                        "request_id": request_id.as_str()
+                    })),
+                );
+                id
+            } else {
+                db::insert_message_and_get_id(&conn, &conversation_id, "user", &user_text)
+                    .map_err(|err| err.to_string())?
+            };
             emit_perf_log(
                 &window,
                 &conversation_id,
@@ -2130,6 +2456,7 @@ pub async fn send_api_turn(
                 fallback_reason: None,
                 provider_request_id: None,
                 provider_response_id: None,
+                pipeline_trace_json: None,
             },
         )
         .map_err(|err| err.to_string())?
@@ -2790,6 +3117,33 @@ pub async fn send_api_turn(
         }
     }
 
+    let narrator_pipeline_trace = serde_json::json!({
+        "narrator_trace": {
+            "request_id": request_id.as_str(),
+            "turn_id": turn_trace.turn_id.as_deref(),
+            "conversation_id": conversation_id.as_str(),
+            "user_message_id": ledger_user_message_id,
+            "assistant_message_id": assistant_message_id,
+            "assistant_variant_id": selected_variant_id,
+            "provider": format!("narrator_{}", context_mode.label()),
+            "model": narrator_settings.model.trim(),
+            "raw_provider_response": active_provider_completion.raw_text.as_str(),
+            "normalized_response": visible_response.as_str(),
+            "saved_visible_response": visible_response_for_updater.as_str(),
+            "response_integrity_ok": integrity_ok,
+            "fallback_used": false,
+            "fallback_reason": serde_json::Value::Null,
+            "anti_replay_triggered": debug_replay_detected,
+            "anti_replay_retry_count": if debug_replay_detected { 1 } else { 0 },
+            "final_selected_attempt_id": selected_variant_id.or(Some(payload_log_id)),
+            "provider_request_id": active_provider_completion.provider_request_id.as_deref(),
+            "provider_response_id": active_provider_completion.provider_response_id.as_deref()
+        }
+    });
+    if let Ok(conn) = state.conn.lock() {
+        let _ = update_llm_payload_pipeline_trace(&conn, payload_log_id, &narrator_pipeline_trace);
+    }
+
     if !integrity_ok {
         let mut failed_debug = pre_save_debug;
         failed_debug.state_updater_status = "integrity_mismatch".into();
@@ -2907,6 +3261,8 @@ pub async fn send_api_turn(
         });
     }
 
+    let before_state_summary = compact_state_summary_json(&soul, &session_world);
+    let evaluator_request_id = format!("eval_{request_id}");
     let updater_payload_started = Instant::now();
     let updater_system_prompt = build_evaluator_prompt(&soul, Some(&session_world));
     let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
@@ -2984,7 +3340,7 @@ pub async fn send_api_turn(
                     discarded_patch_ids_skipped: Vec::new(),
                     state_rebuild_generation: None,
                     latest_assistant_variant_id: selected_variant_id,
-                    request_id: Some(request_id.clone()),
+                    request_id: Some(evaluator_request_id.clone()),
                     turn_id: turn_trace.turn_id.clone(),
                     ..Default::default()
                 },
@@ -3042,8 +3398,41 @@ pub async fn send_api_turn(
         updater_call_elapsed,
     );
     let parse_started = Instant::now();
+    let raw_updater_response = updater_response_result.as_ref().ok().cloned();
+    let mut evaluator_pipeline_trace: serde_json::Value;
     let updater_result = match updater_response_result {
-        Ok(updater_response) => parse_evaluator_output_json(&updater_response),
+        Ok(updater_response) => {
+            emit_dev_log(
+                &window,
+                "info",
+                "evaluator",
+                "evaluator_response_received",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "assistant_message_id": assistant_message_id,
+                    "response_chars": updater_response.chars().count()
+                })),
+            );
+            if let Some(updater_log_id) = updater_log_id {
+                let _ = state
+                    .conn
+                    .lock()
+                    .map_err(|err| err.to_string())
+                    .and_then(|conn| {
+                        db::update_llm_payload_log_response(
+                            &conn,
+                            updater_log_id,
+                            &db::LlmPayloadResponseUpdate {
+                                raw_provider_response: Some(updater_response.clone()),
+                                normalized_response: Some(updater_response.clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .map_err(|err| err.to_string())
+                    });
+            }
+            parse_evaluator_output_json(&updater_response)
+        }
         Err(err) => {
             if updater_call_elapsed >= Duration::from_secs(STATE_UPDATER_TIMEOUT_SECONDS)
                 || err.to_lowercase().contains("timed out")
@@ -3077,6 +3466,20 @@ pub async fn send_api_turn(
                         "turn_flags_u64": evaluator_output.turn_flags_u64,
                         "memory_candidates": evaluator_output.memory_candidates.len(),
                         "per_soul_evaluations": evaluator_output.per_soul_evaluations.len()
+                    })),
+                );
+                emit_dev_log(
+                    &window,
+                    "debug",
+                    "evaluator",
+                    "evaluator_json_parsed",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "evaluator_request_id": evaluator_request_id.as_str(),
+                        "turn_flags_u64": evaluator_output.turn_flags_u64,
+                        "turn_classification": &evaluator_output.turn_classification,
+                        "no_op_reason": evaluator_output.no_op_reason.as_deref()
                     })),
                 );
                 let conversion = evaluator_output_to_engine_patch(
@@ -3129,7 +3532,9 @@ pub async fn send_api_turn(
                         })),
                     );
                 }
-                let mut engine_patch = conversion.patch;
+                let candidate_trace =
+                    evaluator_candidate_trace_json(&evaluator_output, &conversion);
+                let mut engine_patch = conversion.patch.clone();
                 engine_patch = sanitize_state_updater_patch(
                     engine_patch,
                     &soul,
@@ -3141,6 +3546,41 @@ pub async fn send_api_turn(
                     &snapshot_user_text,
                     &visible_response_for_updater,
                 );
+                let converter_trace = evaluator_converter_trace_json(&engine_patch, &conversion);
+                evaluator_pipeline_trace = serde_json::json!({
+                    "evaluator_trace": {
+                        "evaluator_request_id": evaluator_request_id.as_str(),
+                        "parent_narrator_request_id": request_id.as_str(),
+                        "turn_id": turn_trace.turn_id.as_deref(),
+                        "provider": "evaluator_v1",
+                        "model": state_updater_settings.model.trim(),
+                        "raw_evaluator_response": raw_updater_response.as_deref().unwrap_or_default(),
+                        "normalized_evaluator_response": raw_updater_response.as_deref().unwrap_or_default(),
+                        "parsed_evaluator_json": &evaluator_output,
+                        "parse_status": "success",
+                        "parse_error": serde_json::Value::Null,
+                        "evaluator_flags_u64": evaluator_output.turn_flags_u64,
+                        "turn_classification": &evaluator_output.turn_classification,
+                        "no_op_reason": evaluator_output.no_op_reason.as_deref()
+                    },
+                    "evaluator_raw_response": raw_updater_response.as_deref().unwrap_or_default(),
+                    "evaluator_parsed_json": &evaluator_output,
+                    "evaluator_candidate_trace": candidate_trace,
+                    "converted_engine_patch": converter_trace,
+                    "before_after_state_summary": {
+                        "before": before_state_summary.clone(),
+                        "after": serde_json::Value::Null
+                    }
+                });
+                if let Some(updater_log_id) = updater_log_id {
+                    if let Ok(conn) = state.conn.lock() {
+                        let _ = update_llm_payload_pipeline_trace(
+                            &conn,
+                            updater_log_id,
+                            &evaluator_pipeline_trace,
+                        );
+                    }
+                }
                 emit_dev_log(
                     &window,
                     "success",
@@ -3152,6 +3592,97 @@ pub async fn send_api_turn(
                         "summary": engine_patch_summary(&engine_patch)
                     })),
                 );
+                emit_dev_log(
+                    &window,
+                    "success",
+                    "evaluator",
+                    "evaluator_patch_converted",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "summary": engine_patch_summary(&engine_patch)
+                    })),
+                );
+                if engine_patch.is_empty() {
+                    let is_obvious_scene_turn =
+                        evaluator_output.turn_classification.scene_event_occurred
+                            || evaluator_output
+                                .global_scene_evaluation
+                                .scene_event_occurred
+                            || (evaluator_output.turn_flags_u64
+                                & state_engine::evaluator::turn_flags::SCENE_TURN)
+                                != 0;
+
+                    if is_obvious_scene_turn {
+                        let mut reasons = Vec::new();
+                        if evaluator_output.is_pure_ooc() {
+                            reasons.push(
+                                "turn is classified as pure out-of-character (OOC)".to_string(),
+                            );
+                        }
+                        if !evaluator_output.world_changes.is_empty() {
+                            reasons.push(format!("{} world changes returned by evaluator but filtered out during engine patch conversion", evaluator_output.world_changes.len()));
+                        }
+                        if !evaluator_output.object_changes.is_empty() {
+                            reasons.push(format!("{} object changes returned by evaluator but filtered out during engine patch conversion", evaluator_output.object_changes.len()));
+                        }
+                        if !conversion.rejected_candidates.is_empty() {
+                            let rejected_reasons: Vec<String> = conversion
+                                .rejected_candidates
+                                .iter()
+                                .map(|rc| format!("{}: {}", rc.candidate_id, rc.reason))
+                                .collect();
+                            reasons.push(format!(
+                                "memory candidates rejected: [{}]",
+                                rejected_reasons.join(", ")
+                            ));
+                        } else if !evaluator_output.memory_candidates.is_empty() {
+                            reasons.push(format!(
+                                "{} global memory candidates filtered out during conversion",
+                                evaluator_output.memory_candidates.len()
+                            ));
+                        }
+                        let per_soul_memories: usize = evaluator_output
+                            .per_soul_evaluations
+                            .iter()
+                            .map(|s| s.memory_candidates.len())
+                            .sum();
+                        if per_soul_memories > 0 {
+                            reasons.push(format!(
+                                "{} per-soul memory candidates filtered out during conversion",
+                                per_soul_memories
+                            ));
+                        }
+                        if reasons.is_empty() {
+                            reasons.push("evaluator returned empty lists for all world, object, and memory change fields".to_string());
+                        }
+                        let computed_reason = reasons.join("; ");
+
+                        emit_dev_log(
+                            &window,
+                            "info",
+                            "evaluator",
+                            "evaluator_patch_empty",
+                            Some(serde_json::json!({
+                                "conversation_id": conversation_id.as_str(),
+                                "assistant_message_id": assistant_message_id,
+                                "reason": computed_reason,
+                                "raw_evaluator_response": raw_updater_response
+                            })),
+                        );
+                    } else {
+                        emit_dev_log(
+                            &window,
+                            "info",
+                            "evaluator",
+                            "evaluator_patch_empty",
+                            Some(serde_json::json!({
+                                "conversation_id": conversation_id.as_str(),
+                                "assistant_message_id": assistant_message_id
+                            })),
+                        );
+                    }
+                }
                 emit_state_updater_patch_log(
                     &window,
                     &conversation_id,
@@ -3179,12 +3710,47 @@ pub async fn send_api_turn(
                 (hidden_state, engine_patch, "success".to_string(), true)
             }
             Err(err) => {
+                evaluator_pipeline_trace = serde_json::json!({
+                    "evaluator_trace": {
+                        "evaluator_request_id": evaluator_request_id.as_str(),
+                        "parent_narrator_request_id": request_id.as_str(),
+                        "turn_id": turn_trace.turn_id.as_deref(),
+                        "provider": "evaluator_v1",
+                        "model": state_updater_settings.model.trim(),
+                        "raw_evaluator_response": raw_updater_response.as_deref().unwrap_or_default(),
+                        "normalized_evaluator_response": raw_updater_response.as_deref().unwrap_or_default(),
+                        "parsed_evaluator_json": serde_json::Value::Null,
+                        "parse_status": "failed",
+                        "parse_error": err.as_str(),
+                        "evaluator_flags_u64": serde_json::Value::Null,
+                        "turn_classification": serde_json::Value::Null,
+                        "no_op_reason": serde_json::Value::Null
+                    },
+                    "evaluator_raw_response": raw_updater_response.as_deref().unwrap_or_default(),
+                    "evaluator_parsed_json": serde_json::json!({
+                        "parse_status": "failed",
+                        "parse_error": err.as_str()
+                    }),
+                    "before_after_state_summary": {
+                        "before": before_state_summary.clone(),
+                        "after": serde_json::Value::Null
+                    }
+                });
+                if let Some(updater_log_id) = updater_log_id {
+                    if let Ok(conn) = state.conn.lock() {
+                        let _ = update_llm_payload_pipeline_trace(
+                            &conn,
+                            updater_log_id,
+                            &evaluator_pipeline_trace,
+                        );
+                    }
+                }
                 eprintln!("State updater failed; narration saved without state update: {err}");
                 emit_dev_log(
                     &window,
                     "error",
-                    "state_updater",
-                    "evaluator_output_parse_failed",
+                    "evaluator",
+                    "evaluator_parse_failed",
                     Some(serde_json::json!({
                         "conversation_id": conversation_id.as_str(),
                         "assistant_message_id": assistant_message_id,
@@ -3194,7 +3760,7 @@ pub async fn send_api_turn(
                 emit_dev_log(
                     &window,
                     "error",
-                    "state_updater",
+                    "evaluator",
                     "Evaluator failed; narration saved without state update",
                     Some(serde_json::json!({
                         "conversation_id": conversation_id.as_str(),
@@ -3278,13 +3844,14 @@ pub async fn send_api_turn(
             }
         }
     }
+    let ledger_apply_trace: serde_json::Value;
     let ledger_rebuild_debug = if let Some(branch_id) = ledger_branch_id.as_deref() {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         if replacement_assistant_id.is_some() {
             db::discard_active_commits_for_assistant(&conn, &conversation_id, assistant_message_id)
                 .map_err(|err| err.to_string())?;
         }
-        let (_commit, patch_record) = db::record_turn_commit_with_patch(
+        let (commit, patch_record) = db::record_turn_commit_with_patch(
             &conn,
             &conversation_id,
             branch_id,
@@ -3310,6 +3877,19 @@ pub async fn send_api_turn(
                 "state_patch_id": turn_trace.state_patch_id.as_deref(),
                 "assistant_message_id": assistant_message_id,
                 "user_message_id": ledger_user_message_id
+            })),
+        );
+        emit_dev_log(
+            &window,
+            "success",
+            "evaluator",
+            "evaluator_patch_stored",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "assistant_message_id": assistant_message_id,
+                "turn_commit_id": commit.turn_id.as_str(),
+                "state_patch_id": patch_record.patch_id.as_str(),
+                "patch_empty": engine_patch.is_empty()
             })),
         );
         let rebuilt = db::rebuild_session_state(&conn, &conversation_id, branch_id)
@@ -3338,11 +3918,64 @@ pub async fn send_api_turn(
                 "rebuild_generation": rebuild_debug.rebuild_generation
             })),
         );
+        emit_dev_log(
+            &window,
+            "success",
+            "ledger",
+            "session_world_cache_refreshed_from_ledger",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "branch_id": rebuild_debug.branch_id,
+                "active_turn_id": rebuild_debug.active_turn_id,
+                "rebuild_generation": rebuild_debug.rebuild_generation
+            })),
+        );
+        emit_dev_log(
+            &window,
+            if engine_patch.is_empty() {
+                "info"
+            } else {
+                "success"
+            },
+            "evaluator",
+            if engine_patch.is_empty() {
+                "evaluator_patch_apply_skipped_reason"
+            } else {
+                "evaluator_patch_applied"
+            },
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "assistant_message_id": assistant_message_id,
+                "reason": if engine_patch.is_empty() { "empty_patch_recorded_in_ledger" } else { "ledger_rebuild_applied_patch" },
+                "state_patch_id": turn_trace.state_patch_id.as_deref()
+            })),
+        );
         emit_per_soul_memory_written_logs(&window, &conversation_id, &engine_patch);
+        ledger_apply_trace = serde_json::json!({
+            "state_patch_id": patch_record.patch_id,
+            "turn_commit_id": commit.turn_id,
+            "branch_id": branch_id,
+            "patch_stored": true,
+            "patch_applied": !engine_patch.is_empty(),
+            "patch_apply_skipped_reason": if engine_patch.is_empty() { Some("empty_patch_recorded_in_ledger") } else { None },
+            "branch_rebuilt": true,
+            "applied_patch_count": rebuild_debug.applied_patches.len(),
+            "skipped_patch_count": rebuild_debug.skipped_discarded_patches.len(),
+            "invalidated_patch_count": rebuild_debug.invalidated_patches.len(),
+            "materialized_soul_updated": true,
+            "materialized_session_world_updated": true
+        });
         Some(rebuild_debug)
     } else {
+        let mut patch_applied = false;
+        let mut patch_apply_skipped_reason: Option<String> = if engine_patch.is_empty() {
+            Some("empty_patch".into())
+        } else {
+            None
+        };
         match engine_patch.apply_to_session(&mut soul, Some(&mut session_world)) {
             Ok(report) => {
+                patch_applied = !engine_patch.is_empty();
                 emit_perf_log(
                     &window,
                     &conversation_id,
@@ -3358,8 +3991,8 @@ pub async fn send_api_turn(
                 emit_dev_log(
                     &window,
                     "success",
-                    "state_updater",
-                    "EnginePatch applied",
+                    "evaluator",
+                    "evaluator_patch_applied",
                     Some(serde_json::json!({
                         "conversation_id": conversation_id.as_str(),
                         "assistant_message_id": assistant_message_id,
@@ -3389,6 +4022,7 @@ pub async fn send_api_turn(
                 emit_per_soul_memory_written_logs(&window, &conversation_id, &engine_patch);
             }
             Err(err) => {
+                patch_apply_skipped_reason = Some(format!("{err:?}"));
                 emit_perf_log(
                     &window,
                     &conversation_id,
@@ -3398,8 +4032,8 @@ pub async fn send_api_turn(
                 emit_dev_log(
                     &window,
                     "error",
-                    "state_updater",
-                    "EnginePatch skipped by validation",
+                    "evaluator",
+                    "evaluator_patch_apply_skipped_reason",
                     Some(serde_json::json!({
                         "conversation_id": conversation_id.as_str(),
                         "assistant_message_id": assistant_message_id,
@@ -3410,8 +4044,33 @@ pub async fn send_api_turn(
         }
         soul.turn_counter += 1;
         soul.turns_since_consolidation += 1;
+        ledger_apply_trace = serde_json::json!({
+            "state_patch_id": serde_json::Value::Null,
+            "turn_commit_id": serde_json::Value::Null,
+            "branch_id": serde_json::Value::Null,
+            "patch_stored": false,
+            "patch_applied": patch_applied,
+            "patch_apply_skipped_reason": patch_apply_skipped_reason,
+            "branch_rebuilt": false,
+            "applied_patch_count": if patch_applied { 1 } else { 0 },
+            "skipped_patch_count": if patch_applied { 0 } else { 1 },
+            "invalidated_patch_count": 0,
+            "materialized_soul_updated": true,
+            "materialized_session_world_updated": true
+        });
         None
     };
+
+    if let serde_json::Value::Object(trace) = &mut evaluator_pipeline_trace {
+        trace.insert("ledger_apply_trace".into(), ledger_apply_trace.clone());
+        trace.insert(
+            "before_after_state_summary".into(),
+            serde_json::json!({
+                "before": before_state_summary,
+                "after": compact_state_summary_json(&soul, &session_world)
+            }),
+        );
+    }
 
     let refresh_started = Instant::now();
     let (messages, context_preview, consolidation_ran) = {
@@ -3454,6 +4113,23 @@ pub async fn send_api_turn(
 
         db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
         db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
+        emit_dev_log(
+            &window,
+            "success",
+            "ledger",
+            "materialized_state_refreshed",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "assistant_message_id": assistant_message_id,
+                "soul_id": soul.character_id.as_str(),
+                "world_id": session_world.world_id.as_str(),
+                "turn_counter": soul.turn_counter
+            })),
+        );
+        if let Some(updater_log_id) = updater_log_id {
+            let _ =
+                update_llm_payload_pipeline_trace(&conn, updater_log_id, &evaluator_pipeline_trace);
+        }
         let messages =
             db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?;
         let context_preview = compile_context_for_session(
@@ -5360,6 +6036,177 @@ fn parse_evaluator_output_json(raw: &str) -> Result<EvaluatorOutputV1, String> {
         .map_err(|err| format!("Evaluator returned invalid EvaluatorOutputV1 JSON: {err}"))
 }
 
+fn update_llm_payload_pipeline_trace(
+    conn: &Connection,
+    log_id: i64,
+    trace: &serde_json::Value,
+) -> rusqlite::Result<bool> {
+    let pipeline_trace_json =
+        serde_json::to_string_pretty(trace).unwrap_or_else(|_| trace.to_string());
+    db::update_llm_payload_log_response(
+        conn,
+        log_id,
+        &db::LlmPayloadResponseUpdate {
+            pipeline_trace_json: Some(pipeline_trace_json),
+            ..Default::default()
+        },
+    )
+}
+
+fn compact_state_summary_json(soul: &Soul, session_world: &SessionWorld) -> serde_json::Value {
+    serde_json::json!({
+        "soul.turn_counter": soul.turn_counter,
+        "session_world.scene_state": session_world.scene_state,
+        "recent_event_count": session_world.recent_events.len(),
+        "memory_recent_count": soul.memory.recent.len(),
+        "object_state_count": session_world.object_states.len(),
+        "relationship_summary": relationship_summary_json(soul),
+    })
+}
+
+fn relationship_summary_json(soul: &Soul) -> serde_json::Value {
+    let mut relationships = serde_json::Map::new();
+    let mut ids = soul.relationships.keys().cloned().collect::<Vec<_>>();
+    ids.sort();
+    for id in ids {
+        if let Some(relationship) = soul.relationships.get(&id) {
+            relationships.insert(
+                id,
+                serde_json::json!({
+                    "trust": relationship.trust,
+                    "affection": relationship.affection,
+                    "intimacy": relationship.intimacy,
+                    "fear": relationship.fear,
+                    "respect": relationship.respect,
+                    "conflict": relationship.conflict,
+                    "comfort": relationship.comfort,
+                    "boundary_pressure": relationship.boundary_pressure,
+                }),
+            );
+        }
+    }
+    serde_json::Value::Object(relationships)
+}
+
+fn evaluator_candidate_trace_json(
+    output: &EvaluatorOutputV1,
+    conversion: &EvaluatorConversionReport,
+) -> serde_json::Value {
+    let accepted = conversion
+        .accepted_candidate_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let rejected = conversion
+        .rejected_candidates
+        .iter()
+        .map(|rejection| (rejection.candidate_id.as_str(), rejection.reason.as_str()))
+        .collect::<HashMap<_, _>>();
+    let candidates = output
+        .memory_candidates
+        .iter()
+        .chain(
+            output
+                .per_soul_evaluations
+                .iter()
+                .flat_map(|soul| soul.memory_candidates.iter()),
+        )
+        .map(|candidate| {
+            let candidate_id = candidate.candidate_id.as_str();
+            serde_json::json!({
+                "candidate_id": candidate.candidate_id,
+                "owner_soul_id": candidate.owner_soul_id,
+                "slot": candidate.slot.as_label(),
+                "content": candidate.content,
+                "evidence_quote": candidate.evidence_quote,
+                "confidence": candidate.confidence,
+                "salience": candidate.salience,
+                "retrieval_strength": candidate.retrieval_strength,
+                "target_entity_ids": candidate.target_entity_ids,
+                "relevance_tags": candidate.relevance_tags,
+                "accepted": accepted.contains(candidate_id),
+                "rejection_reason": rejected.get(candidate_id).copied(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(candidates)
+}
+
+fn evaluator_converter_trace_json(
+    patch: &EnginePatch,
+    conversion: &EvaluatorConversionReport,
+) -> serde_json::Value {
+    let soul_patch = patch.soul_patch.as_ref();
+    let world_patch = patch.world_patch.as_ref();
+    let relationship_patch_count = soul_patch
+        .map(|patch| {
+            patch.relationship_deltas.len()
+                + usize::from(patch.relationship_delta.as_ref().is_some())
+        })
+        .unwrap_or(0);
+    let object_patch_count = world_patch
+        .map(|patch| {
+            patch.corrected_object_states.len() + patch.object_observation_operations.len()
+        })
+        .unwrap_or(0);
+    serde_json::json!({
+        "converted_patch_json": patch,
+        "patch_empty": patch.is_empty(),
+        "world_patch_summary": engine_patch_summary(patch).get("world_patch").cloned().unwrap_or(serde_json::Value::Null),
+        "memory_patch_count": soul_patch.map(|patch| patch.new_memories.len() + patch.memory_operations.len()).unwrap_or(0),
+        "relationship_patch_count": relationship_patch_count,
+        "object_patch_count": object_patch_count,
+        "scene_state_patch_present": world_patch.and_then(|patch| patch.scene_state.as_ref()).is_some(),
+        "conversion_warnings": conversion.rejected_candidates.iter().map(|rejection| {
+            serde_json::json!({
+                "candidate_id": rejection.candidate_id,
+                "reason": rejection.reason,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn scene_state_present(session_world: &SessionWorld) -> bool {
+    let scene = &session_world.scene_state;
+    !scene.scene_state_id.trim().is_empty()
+        || !scene.current_scene.trim().is_empty()
+        || !scene.resolved_active_plot.trim().is_empty()
+        || !scene.scene_branch.trim().is_empty()
+        || !scene.focus.trim().is_empty()
+        || !scene.participants.is_empty()
+        || !scene.last_user_action.trim().is_empty()
+        || !scene.pressure_point.trim().is_empty()
+        || !scene.continuity_note.trim().is_empty()
+}
+
+fn mne_export_state_trace_json(
+    manifest: &MneBundleManifest,
+    conversation_id: &str,
+    soul: &Soul,
+    session_world: &SessionWorld,
+    rebuilt_state_used: bool,
+    export_path: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "export_bundle_id": manifest.bundle_id,
+        "export_conversation_id": conversation_id,
+        "export_source": if rebuilt_state_used { "rebuilt_ledger_state" } else { "materialized_cache" },
+        "rebuilt_before_export": rebuilt_state_used,
+        "exported_recent_event_count": session_world.recent_events.len(),
+        "exported_memory_recent_count": soul.memory.recent.len(),
+        "exported_object_state_count": session_world.object_states.len(),
+        "exported_scene_state_present": scene_state_present(session_world),
+        "export_filename": Path::new(export_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(export_path),
+        "bundle_type": manifest.bundle_type,
+        "conversation_id": manifest.conversation_id,
+        "soul_id": manifest.soul_id,
+        "world_id": manifest.world_id,
+    })
+}
+
 fn hidden_state_from_engine_patch(patch: &EnginePatch) -> HiddenState {
     let relationship = patch.soul_patch.as_ref().and_then(|patch| {
         patch
@@ -6462,9 +7309,57 @@ fn render_llm_payload_history(logs: &[LlmPayloadLog]) -> String {
                 lines.push(normalized.to_string());
             }
         }
+        if let Some(trace) = log
+            .pipeline_trace_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        {
+            if let Some(value) = trace.get("narrator_trace") {
+                push_payload_trace_section(&mut lines, "NARRATOR TRACE", value);
+            }
+            if let Some(value) = trace.get("evaluator_raw_response").or_else(|| {
+                trace
+                    .get("evaluator_trace")
+                    .and_then(|trace| trace.get("raw_evaluator_response"))
+            }) {
+                push_payload_trace_section(&mut lines, "EVALUATOR RAW RESPONSE", value);
+            }
+            if let Some(value) = trace.get("evaluator_parsed_json").or_else(|| {
+                trace
+                    .get("evaluator_trace")
+                    .and_then(|trace| trace.get("parsed_evaluator_json"))
+            }) {
+                push_payload_trace_section(&mut lines, "EVALUATOR PARSED JSON", value);
+            }
+            if let Some(value) = trace.get("evaluator_candidate_trace") {
+                push_payload_trace_section(&mut lines, "EVALUATOR CANDIDATE TRACE", value);
+            }
+            if let Some(value) = trace.get("converted_engine_patch") {
+                push_payload_trace_section(&mut lines, "CONVERTED ENGINE PATCH", value);
+            }
+            if let Some(value) = trace.get("ledger_apply_trace") {
+                push_payload_trace_section(&mut lines, "LEDGER/APPLY TRACE", value);
+            }
+            if let Some(value) = trace.get("before_after_state_summary") {
+                push_payload_trace_section(&mut lines, "BEFORE/AFTER STATE SUMMARY", value);
+            }
+            if let Some(value) = trace.get("export_trace") {
+                push_payload_trace_section(&mut lines, "EXPORT TRACE", value);
+            }
+        }
     }
     lines.push(String::new());
     lines.join("\n")
+}
+
+fn push_payload_trace_section(lines: &mut Vec<String>, title: &str, value: &serde_json::Value) {
+    lines.push(String::new());
+    lines.push(format!("### {title}"));
+    if let Some(text) = value.as_str() {
+        lines.push(text.to_string());
+    } else {
+        lines.push(serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
+    }
 }
 
 fn write_export_file(
@@ -6620,6 +7515,98 @@ fn resolve_export_path(
     Ok(dir)
 }
 
+fn resolve_mne_export_path(
+    app: &AppHandle,
+    requested: &str,
+    manifest: &MneBundleManifest,
+) -> Result<PathBuf, String> {
+    let path = if requested.trim().is_empty() {
+        let mut dir = app
+            .path()
+            .download_dir()
+            .or_else(|_| app.path().app_data_dir())
+            .map_err(|err| err.to_string())?;
+        dir.push("mnemosyne-exports");
+        dir.push(default_mne_filename(manifest));
+        dir
+    } else {
+        resolve_export_path(app, requested, "mne")?
+    };
+    unique_export_path(path)
+}
+
+fn unique_export_path(path: PathBuf) -> Result<PathBuf, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    if !path.exists() {
+        return Ok(path);
+    }
+    let parent = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(PathBuf::new);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("mnemosyne_export");
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    for index in 2..10_000 {
+        let file_name = match extension {
+            Some(extension) if !extension.is_empty() => format!("{stem}_{index}.{extension}"),
+            _ => format!("{stem}_{index}"),
+        };
+        let candidate = parent.join(file_name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err("Could not find an available export filename".into())
+}
+
+fn default_mne_filename(manifest: &MneBundleManifest) -> String {
+    let title = safe_bundle_name(&manifest.title).replace('-', "_");
+    let title = if title.is_empty() {
+        "mnemosyne".to_string()
+    } else {
+        title
+    };
+    let identity = manifest
+        .conversation_id
+        .as_deref()
+        .or(manifest.soul_id.as_deref())
+        .or(manifest.world_id.as_deref())
+        .unwrap_or(&manifest.bundle_id);
+    format!(
+        "{}_{}_{}_{}.mne",
+        title,
+        safe_bundle_name(&manifest.bundle_type),
+        manifest.created_at,
+        short_id_suffix(identity)
+    )
+}
+
+fn short_id_suffix(value: &str) -> String {
+    let segments: Vec<&str> = value.split('-').collect();
+    for seg in &segments {
+        let cleaned: String = seg.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        if cleaned.len() == 8 && cleaned.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return cleaned.to_ascii_lowercase();
+        }
+    }
+    let cleaned: String = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if cleaned.is_empty() {
+        "0000".into()
+    } else {
+        let start = cleaned.len().saturating_sub(4);
+        cleaned[start..].to_ascii_lowercase()
+    }
+}
+
 fn mne_manifest(
     bundle_type: &str,
     title: &str,
@@ -6638,6 +7625,11 @@ fn mne_manifest(
         created_at: db::now_ts(),
         app: "Mnemosyne".into(),
         schema_version: 1,
+        conversation_id: None,
+        soul_id: None,
+        world_id: None,
+        source_savepoint_id: None,
+        source_setting_id: None,
         contents: MneBundleContents {
             souls,
             worlds,
@@ -6659,7 +7651,7 @@ fn write_mne_bundle(
     manifest: &MneBundleManifest,
     files: Vec<(String, Vec<u8>)>,
 ) -> Result<MneExportResult, String> {
-    let path = resolve_export_path(app, output_path, "mne")?;
+    let path = resolve_mne_export_path(app, output_path, manifest)?;
     write_stored_zip(&path, &files)?;
     Ok(MneExportResult {
         path: path.to_string_lossy().to_string(),
@@ -7789,6 +8781,204 @@ mod tests {
     }
 
     #[test]
+    fn exporting_two_sessions_with_same_title_produces_different_filenames() {
+        let mut first = mne_manifest(
+            "session_checkpoint",
+            "Aurora Schwarz Session",
+            "test",
+            Vec::new(),
+            Vec::new(),
+            Some("conversation/conversation.json".into()),
+        );
+        first.created_at = 1_779_425_465;
+        first.conversation_id = Some("local-mock-aurora-cc57".into());
+        let mut second = first.clone();
+        second.bundle_id = uuid_like_id();
+        second.conversation_id = Some("local-mock-aurora-dd81".into());
+
+        let first_name = default_mne_filename(&first);
+        let second_name = default_mne_filename(&second);
+
+        assert_ne!(first_name, second_name);
+        assert_eq!(
+            first_name,
+            "Aurora_Schwarz_Session_session_checkpoint_1779425465_cc57.mne"
+        );
+    }
+
+    #[test]
+    fn export_does_not_silently_overwrite_existing_mne() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = dir.path().join("Aurora_session_checkpoint_1_cc57.mne");
+        fs::write(&existing, b"existing").expect("seed");
+
+        let next = unique_export_path(existing.clone()).expect("unique path");
+
+        assert_ne!(next, existing);
+        assert_eq!(
+            next.file_name().and_then(|name| name.to_str()),
+            Some("Aurora_session_checkpoint_1_cc57_2.mne")
+        );
+    }
+
+    #[test]
+    fn session_checkpoint_manifest_includes_identity_fields() {
+        let mut manifest = mne_manifest(
+            "session_checkpoint",
+            "Aurora Schwarz Session",
+            "test",
+            vec!["souls/aurora.json".into()],
+            vec!["worlds/world.json".into()],
+            Some("conversation/conversation.json".into()),
+        );
+        manifest.conversation_id = Some("conv-1".into());
+        manifest.soul_id = Some("soul-1".into());
+        manifest.world_id = Some("world-1".into());
+        manifest.source_savepoint_id = Some("savepoint-1".into());
+        manifest.source_setting_id = Some("setting-1".into());
+
+        let value = serde_json::to_value(&manifest).expect("manifest json");
+
+        assert_eq!(value["bundle_id"], manifest.bundle_id);
+        assert_eq!(value["bundle_type"], "session_checkpoint");
+        assert_eq!(value["created_at"], manifest.created_at);
+        assert_eq!(value["conversation_id"], "conv-1");
+        assert_eq!(value["soul_id"], "soul-1");
+        assert_eq!(value["world_id"], "world-1");
+        assert_eq!(value["source_savepoint_id"], "savepoint-1");
+        assert_eq!(value["source_setting_id"], "setting-1");
+    }
+
+    fn session_checkpoint_entries(
+        conversation_id: &str,
+        title: &str,
+        soul_id: &str,
+        world_id: &str,
+    ) -> (MneBundleManifest, HashMap<String, Vec<u8>>) {
+        let mut soul = new_default_soul("Aurora Schwarz");
+        soul.character_id = soul_id.into();
+        soul.soul_kind = "session_clone".into();
+        let mut world = state_engine::setting::session_world_from_legacy_world(
+            "Aurora Session World",
+            Some("source-setting".into()),
+            &soul.world,
+        );
+        world.world_id = world_id.into();
+        let conversation = ConversationSummary {
+            conversation_id: conversation_id.into(),
+            title: title.into(),
+            soul_id: soul_id.into(),
+            source_savepoint_id: soul.source_savepoint_id.clone(),
+            world_id: Some(world_id.into()),
+            source_setting_id: world.source_setting_id.clone(),
+            created_at: 1,
+            updated_at: 1,
+            last_message_preview: None,
+            message_count: 1,
+        };
+        let messages = vec![ChatMessage {
+            id: 1,
+            conversation_id: conversation_id.into(),
+            role: "user".into(),
+            content: "I knock on the door.".into(),
+            created_at: 1,
+            status: "active".into(),
+            origin: "active".into(),
+            attachments: Vec::new(),
+        }];
+        let mut manifest = mne_manifest(
+            "session_checkpoint",
+            title,
+            "test",
+            vec![format!("souls/{soul_id}.json")],
+            vec![format!("worlds/{world_id}.json")],
+            Some("conversation/conversation.json".into()),
+        );
+        manifest.conversation_id = Some(conversation_id.into());
+        manifest.soul_id = Some(soul_id.into());
+        manifest.world_id = Some(world_id.into());
+        manifest.source_setting_id = world.source_setting_id.clone();
+        let mut entries = HashMap::new();
+        entries.insert(
+            format!("souls/{soul_id}.json"),
+            serde_json::to_vec(&soul).expect("soul"),
+        );
+        entries.insert(
+            format!("worlds/{world_id}.json"),
+            serde_json::to_vec(&world).expect("world"),
+        );
+        entries.insert(
+            "conversation/conversation.json".into(),
+            serde_json::to_vec(&conversation).expect("conversation"),
+        );
+        entries.insert(
+            "conversation/messages.json".into(),
+            serde_json::to_vec(&messages).expect("messages"),
+        );
+        (manifest, entries)
+    }
+
+    #[test]
+    fn importing_two_bundles_with_same_title_creates_two_distinct_sessions() {
+        let conn = db::init_memory_connection().expect("db");
+        let (first_manifest, first_entries) =
+            session_checkpoint_entries("conv-a", "Aurora Schwarz Session", "soul-a", "world-a");
+        let (second_manifest, second_entries) =
+            session_checkpoint_entries("conv-b", "Aurora Schwarz Session", "soul-b", "world-b");
+
+        import_mne_entries(&conn, &first_entries, &first_manifest).expect("first import");
+        import_mne_entries(&conn, &second_entries, &second_manifest).expect("second import");
+
+        let first = db::get_conversation_summary(&conn, "conv-a").expect("first conversation");
+        let second = db::get_conversation_summary(&conn, "conv-b").expect("second conversation");
+        assert_ne!(first.conversation_id, second.conversation_id);
+        assert_eq!(first.title, "Aurora Schwarz Session");
+        assert_eq!(second.title, "Aurora Schwarz Session (2)");
+        assert_eq!(
+            db::list_messages(&conn, "conv-a", 10)
+                .expect("messages")
+                .len(),
+            1
+        );
+        assert_eq!(
+            db::list_messages(&conn, "conv-b", 10)
+                .expect("messages")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn title_collision_gets_display_suffix_but_preserves_internal_ids() {
+        let conn = db::init_memory_connection().expect("db");
+        let (first_manifest, first_entries) = session_checkpoint_entries(
+            "conv-stable-a",
+            "Aurora Schwarz Session",
+            "soul-stable-a",
+            "world-stable-a",
+        );
+        let (second_manifest, second_entries) = session_checkpoint_entries(
+            "conv-stable-b",
+            "Aurora Schwarz Session",
+            "soul-stable-b",
+            "world-stable-b",
+        );
+
+        import_mne_entries(&conn, &first_entries, &first_manifest).expect("first import");
+        import_mne_entries(&conn, &second_entries, &second_manifest).expect("second import");
+
+        let first =
+            db::get_conversation_summary(&conn, "conv-stable-a").expect("first conversation");
+        let second =
+            db::get_conversation_summary(&conn, "conv-stable-b").expect("second conversation");
+        assert_eq!(first.conversation_id, "conv-stable-a");
+        assert_eq!(second.conversation_id, "conv-stable-b");
+        assert_eq!(first.soul_id, "soul-stable-a");
+        assert_eq!(second.soul_id, "soul-stable-b");
+        assert_eq!(second.title, "Aurora Schwarz Session (2)");
+    }
+
+    #[test]
     fn import_mne_character_soul_as_savepoint_and_remap_conflict() {
         let conn = db::init_memory_connection().expect("db");
         let mut soul = new_default_soul("Echo-0");
@@ -8168,6 +9358,149 @@ mod tests {
                 .position(|variant| variant.is_selected)
                 .map(|index| index + 1),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn regenerate_reuses_existing_user_message() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        let soul_id = soul.character_id.clone();
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+
+        let first = send_mock_turn_with_conn(
+            &conn,
+            "regen-existing".into(),
+            soul_id.clone(),
+            "Stay with the locked door.".into(),
+            "Reader".into(),
+            None,
+            None,
+        )
+        .expect("first turn");
+        let assistant_id = first
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("assistant")
+            .id;
+
+        let regenerated = send_mock_turn_with_conn(
+            &conn,
+            "regen-existing".into(),
+            soul_id,
+            "Stay with the locked door.".into(),
+            "Reader".into(),
+            Some(assistant_id),
+            None,
+        )
+        .expect("regenerate");
+
+        assert_eq!(
+            regenerated
+                .messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_retry_reuses_existing_user_message() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        let soul_id = soul.character_id.clone();
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "provider-retry", &soul_id).expect("conversation");
+        let existing =
+            db::insert_message_and_get_id(&conn, "provider-retry", "user", "Retry this prompt.")
+                .expect("user");
+
+        let result = send_mock_turn_with_conn(
+            &conn,
+            "provider-retry".into(),
+            soul_id,
+            "Retry this prompt.".into(),
+            "Reader".into(),
+            None,
+            None,
+        )
+        .expect("retry");
+
+        assert_eq!(
+            result
+                .messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
+        );
+        assert_eq!(result.messages[0].id, existing);
+    }
+
+    #[test]
+    fn model_switch_retry_reuses_existing_user_message() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        let soul_id = soul.character_id.clone();
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "model-retry", &soul_id).expect("conversation");
+        let existing =
+            db::insert_message_and_get_id(&conn, "model-retry", "user", "Try the new model.")
+                .expect("user");
+
+        let reused = reuse_or_insert_user_message(&conn, "model-retry", "Try the new model.")
+            .expect("reuse");
+
+        assert_eq!(reused, existing);
+        assert_eq!(
+            db::list_messages(&conn, "model-retry", 10)
+                .expect("messages")
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn anti_replay_retry_does_not_duplicate_user_message() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("upsert soul");
+        db::ensure_conversation(&conn, "anti-replay-retry", &soul.character_id)
+            .expect("conversation");
+        let existing = db::insert_message_and_get_id(
+            &conn,
+            "anti-replay-retry",
+            "user",
+            "Do not repeat the last line.",
+        )
+        .expect("user");
+
+        let first = reuse_or_insert_user_message(
+            &conn,
+            "anti-replay-retry",
+            "Do not repeat the last line.",
+        )
+        .expect("first reuse");
+        let second = reuse_or_insert_user_message(
+            &conn,
+            "anti-replay-retry",
+            "Do not repeat the last line.",
+        )
+        .expect("second reuse");
+
+        assert_eq!(first, existing);
+        assert_eq!(second, existing);
+        assert_eq!(
+            db::list_messages(&conn, "anti-replay-retry", 10)
+                .expect("messages")
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
         );
     }
 
@@ -8574,6 +9907,168 @@ mod tests {
         assert!(!exported.contains("## Payload 1"));
     }
 
+    fn payload_trace_log(trace: serde_json::Value) -> LlmPayloadLog {
+        LlmPayloadLog {
+            id: 1,
+            conversation_id: "history".into(),
+            message_id: Some(10),
+            provider: "evaluator_v1".into(),
+            mode: "evaluator_v1".into(),
+            context_mode: "brief".into(),
+            model: "model".into(),
+            base_url: "local".into(),
+            system_message: "Evaluator system".into(),
+            user_message: "Latest exchange".into(),
+            context_text: "Compiled evaluator context".into(),
+            created_at: 100,
+            pipeline_trace_json: Some(serde_json::to_string_pretty(&trace).expect("trace json")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn payload_export_includes_evaluator_raw_response() {
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "evaluator_raw_response": "{\"schema_version\":1}"
+        }))]);
+
+        assert!(exported.contains("### EVALUATOR RAW RESPONSE"));
+        assert!(exported.contains("{\"schema_version\":1}"));
+    }
+
+    #[test]
+    fn payload_export_includes_parsed_evaluator_json() {
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "evaluator_parsed_json": {
+                "schema_version": 1,
+                "turn_flags_u64": 1,
+                "turn_classification": { "scene_event_occurred": true }
+            }
+        }))]);
+
+        assert!(exported.contains("### EVALUATOR PARSED JSON"));
+        assert!(exported.contains("\"turn_flags_u64\": 1"));
+        assert!(exported.contains("\"scene_event_occurred\": true"));
+    }
+
+    #[test]
+    fn payload_export_includes_candidate_accept_reject_trace() {
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "evaluator_candidate_trace": [
+                {
+                    "candidate_id": "mem-accepted",
+                    "owner_soul_id": "Aurora",
+                    "slot": "relationship_memory",
+                    "accepted": true
+                },
+                {
+                    "candidate_id": "mem-rejected",
+                    "owner_soul_id": "Aurora",
+                    "slot": "recent_emotional_state",
+                    "accepted": false,
+                    "rejection_reason": "generic low-value memory"
+                }
+            ]
+        }))]);
+
+        assert!(exported.contains("### EVALUATOR CANDIDATE TRACE"));
+        assert!(exported.contains("mem-accepted"));
+        assert!(exported.contains("generic low-value memory"));
+    }
+
+    #[test]
+    fn payload_export_includes_converted_patch() {
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "converted_engine_patch": {
+                "converted_patch_json": {
+                    "schema_version": 1,
+                    "world_patch": { "location": "The bar" }
+                },
+                "patch_empty": false,
+                "memory_patch_count": 0
+            }
+        }))]);
+
+        assert!(exported.contains("### CONVERTED ENGINE PATCH"));
+        assert!(exported.contains("\"location\": \"The bar\""));
+        assert!(exported.contains("\"patch_empty\": false"));
+    }
+
+    #[test]
+    fn payload_export_includes_ledger_apply_trace() {
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "ledger_apply_trace": {
+                "state_patch_id": "patch_1",
+                "turn_commit_id": "turn_1",
+                "branch_id": "branch_1",
+                "patch_stored": true,
+                "patch_applied": true,
+                "branch_rebuilt": true
+            }
+        }))]);
+
+        assert!(exported.contains("### LEDGER/APPLY TRACE"));
+        assert!(exported.contains("\"state_patch_id\": \"patch_1\""));
+        assert!(exported.contains("\"branch_rebuilt\": true"));
+    }
+
+    #[test]
+    fn payload_export_includes_before_after_state_summary() {
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "before_after_state_summary": {
+                "before": {
+                    "soul.turn_counter": 0,
+                    "recent_event_count": 0,
+                    "memory_recent_count": 0
+                },
+                "after": {
+                    "soul.turn_counter": 1,
+                    "recent_event_count": 1,
+                    "memory_recent_count": 1
+                }
+            }
+        }))]);
+
+        assert!(exported.contains("### BEFORE/AFTER STATE SUMMARY"));
+        assert!(exported.contains("\"soul.turn_counter\": 1"));
+        assert!(exported.contains("\"recent_event_count\": 1"));
+    }
+
+    #[test]
+    fn mne_export_includes_export_state_trace() {
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "export_trace": {
+                "export_bundle_id": "bundle-1",
+                "export_conversation_id": "conversation-1",
+                "export_source": "rebuilt_ledger_state",
+                "rebuilt_before_export": true,
+                "exported_recent_event_count": 2,
+                "export_filename": "Aurora_session_checkpoint_1234_abcd.mne"
+            }
+        }))]);
+
+        assert!(exported.contains("### EXPORT TRACE"));
+        assert!(exported.contains("\"export_bundle_id\": \"bundle-1\""));
+        assert!(exported.contains("Aurora_session_checkpoint_1234_abcd.mne"));
+    }
+
+    #[test]
+    fn evaluator_parse_failure_is_visible_in_payload_export() {
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "evaluator_raw_response": "not json",
+            "evaluator_parsed_json": {
+                "parse_status": "failed",
+                "parse_error": "Evaluator returned invalid EvaluatorOutputV1 JSON"
+            }
+        }))]);
+
+        assert!(exported.contains("### EVALUATOR RAW RESPONSE"));
+        assert!(exported.contains("not json"));
+        assert!(exported.contains("### EVALUATOR PARSED JSON"));
+        assert!(exported.contains("\"parse_status\": \"failed\""));
+        assert!(exported.contains("Evaluator returned invalid EvaluatorOutputV1 JSON"));
+    }
+
     #[test]
     fn output_contract_keeps_only_last_status_block() {
         let raw = "```status\nScene | Focus: Old | Physical state: Old | Atmosphere: Old\n```\n\nAurora steps back from the doorway.\n\n```status\nScene | Focus: Aurora | Physical state: Guarded | Atmosphere: Tense\n```";
@@ -8670,6 +10165,17 @@ mod tests {
 
     #[test]
     fn valid_status_block_prevents_unknown_fallback() {
+        let raw = "Aurora opens the door.\n\n```status\nScene | Focus: Aurora | Physical state: Still | Atmosphere: Quiet\n```\n\n```status\n```";
+
+        let result = apply_output_contract_guard(raw, "I knock on the door.");
+
+        assert_eq!(result.text.matches("```status").count(), 1);
+        assert!(result.text.contains("Focus: Aurora"));
+        assert!(!result.text.contains("Focus: Unknown"));
+    }
+
+    #[test]
+    fn valid_status_block_prevents_unknown_fallback_regression() {
         let raw = "Aurora opens the door.\n\n```status\nScene | Focus: Aurora | Physical state: Still | Atmosphere: Quiet\n```\n\n```status\n```";
 
         let result = apply_output_contract_guard(raw, "I knock on the door.");
@@ -9121,5 +10627,85 @@ mod tests {
         let first_index = text.find(first).expect("first section");
         let second_index = text.find(second).expect("second section");
         assert!(first_index < second_index);
+    }
+
+    #[test]
+    fn exporting_two_same_title_sessions_produces_different_filenames() {
+        let manifest1 = MneBundleManifest {
+            mne_version: 1,
+            bundle_id: "1779425465811-32".into(),
+            bundle_type: "session_checkpoint".into(),
+            title: "Aurora Schwarz Session".into(),
+            description: "mne1".into(),
+            author: None,
+            created_at: 1779425465,
+            app: "Mnemosyne".into(),
+            schema_version: 1,
+            conversation_id: Some("local-mock-088e469e-7274-47bc-918d-ab29cb16cc09-2ab002c2-95e1-4287-acec-fb41f721cc57".into()),
+            soul_id: None,
+            world_id: None,
+            source_savepoint_id: None,
+            source_setting_id: None,
+            contents: MneBundleContents {
+                souls: vec![],
+                worlds: vec![],
+                images: vec![],
+                conversation: None,
+            },
+        };
+
+        let manifest2 = MneBundleManifest {
+            mne_version: 1,
+            bundle_id: "1779425482790-35".into(),
+            bundle_type: "session_checkpoint".into(),
+            title: "Aurora Schwarz Session".into(),
+            description: "mne2".into(),
+            author: None,
+            created_at: 1779425482,
+            app: "Mnemosyne".into(),
+            schema_version: 1,
+            conversation_id: Some("local-mock-e0ad2e3b-9729-44d5-a35a-0a11f77c328c-3bc244d9-863f-416a-bafe-8b964d92dda8".into()),
+            soul_id: None,
+            world_id: None,
+            source_savepoint_id: None,
+            source_setting_id: None,
+            contents: MneBundleContents {
+                souls: vec![],
+                worlds: vec![],
+                images: vec![],
+                conversation: None,
+            },
+        };
+
+        let name1 = default_mne_filename(&manifest1);
+        let name2 = default_mne_filename(&manifest2);
+
+        assert_ne!(name1, name2);
+        assert!(name1.contains("Aurora_Schwarz_Session"));
+        assert!(name1.contains("session_checkpoint"));
+        assert!(name1.contains("1779425465"));
+        assert!(name1.contains("088e469e"));
+        assert!(name2.contains("e0ad2e3b"));
+    }
+
+    #[test]
+    fn export_never_silently_overwrites() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_path = dir.path().join("Aurora_Schwarz_Session.mne");
+        fs::write(&base_path, "original content").expect("write");
+
+        let unique = unique_export_path(base_path.clone()).expect("unique");
+        assert_ne!(unique, base_path);
+        assert!(unique
+            .to_str()
+            .unwrap()
+            .contains("Aurora_Schwarz_Session_2.mne"));
+
+        fs::write(&unique, "second content").expect("write");
+        let unique_again = unique_export_path(base_path).expect("unique");
+        assert!(unique_again
+            .to_str()
+            .unwrap()
+            .contains("Aurora_Schwarz_Session_3.mne"));
     }
 }
