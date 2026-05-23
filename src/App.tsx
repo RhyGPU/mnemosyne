@@ -102,6 +102,14 @@ const NARRATOR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:narrator_provider_profi
 const UPDATER_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:state_updater_provider_profile_id";
 const USE_NARRATOR_FOR_UPDATER_STORAGE_KEY = "mnemosyne:use_narrator_provider_for_updater";
 const CUSTOM_NARRATOR_PROMPT_STORAGE_KEY = "mnemosyne:custom_narrator_prompt";
+const SETTINGS_DRAWER_OPEN_STORAGE_KEY = "mnemosyne:settings_drawer_open";
+const SETTINGS_DRAWER_TAB_STORAGE_KEY = "mnemosyne:settings_drawer_tab";
+const SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY = "mnemosyne:settings_first_launch_seen_v1";
+const CHAT_START_MODE_STORAGE_KEY = "mnemosyne:chat_start_mode";
+const SHOW_ARCHIVED_SESSIONS_STORAGE_KEY = "mnemosyne:show_archived_sessions";
+const DEV_CONSOLE_PAUSED_STORAGE_KEY = "mnemosyne:dev_console_paused";
+const DEV_LOG_LEVEL_FILTER_STORAGE_KEY = "mnemosyne:dev_log_level_filter";
+const DEV_LOG_CATEGORY_FILTER_STORAGE_KEY = "mnemosyne:dev_log_category_filter";
 const DISCLAIMER_STORAGE_KEY = "mnemosyne_disclaimer_accepted_v1";
 const DISCLAIMER_VERSION = 1;
 const DEV_LOG_LIMIT = 1000;
@@ -124,6 +132,7 @@ type NarrativeMode = "Realistic" | "Reader" | "God" | "Custom";
 type AppView = "library" | "chat";
 type ChatStartMode = "continue" | "fresh";
 type DisclaimerMode = "launch" | "manual" | null;
+type SettingsTab = "ai" | "chat" | "library" | "dev";
 type DevCommandName =
   | "dedupe_active_adjacent_user_messages"
   | "restore_inactive_messages"
@@ -332,10 +341,11 @@ export function App() {
   });
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
   const [view, setView] = useState<AppView>("library");
-  const [chatStartMode, setChatStartMode] = useState<ChatStartMode>("fresh");
+  const [chatStartMode, setChatStartMode] = useState<ChatStartMode>(loadStoredChatStartMode);
   const [sessionContinuityLabel, setSessionContinuityLabel] = useState("New Session starts from the selected Soul snapshot");
   const [currentSessionTitle, setCurrentSessionTitle] = useState("New Session");
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [selectedCharacterIds, setSelectedCharacterIds] = useState<string[]>([]);
   const [selectedAvatarAsset, setSelectedAvatarAsset] = useState<ImageAsset | null>(null);
   const [draftAvatarAsset, setDraftAvatarAsset] = useState<ImageAsset | null>(null);
   const [draftAvatarImageId, setDraftAvatarImageId] = useState<string | null>(null);
@@ -343,11 +353,21 @@ export function App() {
   const [status, setStatus] = useState("Ready");
   const [payloadCopied, setPayloadCopied] = useState(false);
   const [exportFeedback, setExportFeedback] = useState("");
+  const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(() =>
+    loadStoredBoolean(SETTINGS_DRAWER_OPEN_STORAGE_KEY, false),
+  );
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>(loadStoredSettingsTab);
   const [devConsoleOpen, setDevConsoleOpen] = useState(false);
   const [devLogs, setDevLogs] = useState<DevLogEntry[]>([]);
-  const [devConsolePaused, setDevConsolePaused] = useState(false);
-  const [devLogLevelFilter, setDevLogLevelFilter] = useState<DevLogLevel | "all">("all");
-  const [devLogCategoryFilter, setDevLogCategoryFilter] = useState<DevLogCategory | "all">("all");
+  const [devConsolePaused, setDevConsolePaused] = useState(() =>
+    loadStoredBoolean(DEV_CONSOLE_PAUSED_STORAGE_KEY, false),
+  );
+  const [devLogLevelFilter, setDevLogLevelFilter] = useState<DevLogLevel | "all">(
+    loadStoredDevLogLevelFilter,
+  );
+  const [devLogCategoryFilter, setDevLogCategoryFilter] = useState<DevLogCategory | "all">(
+    loadStoredDevLogCategoryFilter,
+  );
   const [devCommandName, setDevCommandName] = useState<DevCommandName>(
     "dedupe_active_adjacent_user_messages",
   );
@@ -363,8 +383,9 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [stateUpdating, setStateUpdating] = useState(false);
   const [activeEvaluatorJob, setActiveEvaluatorJob] = useState<EvaluatorJob | null>(null);
-  const [chatSettingsOpen, setChatSettingsOpen] = useState(false);
-  const [showArchivedSessions, setShowArchivedSessions] = useState(false);
+  const [showArchivedSessions, setShowArchivedSessions] = useState(() =>
+    loadStoredBoolean(SHOW_ARCHIVED_SESSIONS_STORAGE_KEY, false),
+  );
   const didBootstrap = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const settingImportInputRef = useRef<HTMLInputElement>(null);
@@ -400,6 +421,18 @@ export function App() {
       }),
     [conversations, showArchivedSessions, soul?.character_id, soul?.source_savepoint_id],
   );
+  const selectedCharacterCount = selectedCharacterIds.filter((id) =>
+    souls.some((item) => item.character_id === id),
+  ).length;
+  const primaryCharacterDescription =
+    soul?.profile.description.trim() ||
+    soul?.profile.scenario.trim() ||
+    soul?.profile.personality.trim() ||
+    "No description yet. Open the Character Editor to add one.";
+  const selectedWorldSummary =
+    setting?.world.location ||
+    setting?.scenario ||
+    "No world details yet. Open the World Editor to add a location and active plots.";
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId;
@@ -488,6 +521,34 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(CUSTOM_NARRATOR_PROMPT_STORAGE_KEY, apiSettings.system_prompt);
   }, [apiSettings.system_prompt]);
+
+  useEffect(() => {
+    localStorage.setItem(SETTINGS_DRAWER_OPEN_STORAGE_KEY, settingsDrawerOpen ? "true" : "false");
+  }, [settingsDrawerOpen]);
+
+  useEffect(() => {
+    localStorage.setItem(SETTINGS_DRAWER_TAB_STORAGE_KEY, settingsTab);
+  }, [settingsTab]);
+
+  useEffect(() => {
+    localStorage.setItem(CHAT_START_MODE_STORAGE_KEY, chatStartMode);
+  }, [chatStartMode]);
+
+  useEffect(() => {
+    localStorage.setItem(SHOW_ARCHIVED_SESSIONS_STORAGE_KEY, showArchivedSessions ? "true" : "false");
+  }, [showArchivedSessions]);
+
+  useEffect(() => {
+    localStorage.setItem(DEV_CONSOLE_PAUSED_STORAGE_KEY, devConsolePaused ? "true" : "false");
+  }, [devConsolePaused]);
+
+  useEffect(() => {
+    localStorage.setItem(DEV_LOG_LEVEL_FILTER_STORAGE_KEY, devLogLevelFilter);
+  }, [devLogLevelFilter]);
+
+  useEffect(() => {
+    localStorage.setItem(DEV_LOG_CATEGORY_FILTER_STORAGE_KEY, devLogCategoryFilter);
+  }, [devLogCategoryFilter]);
 
   useEffect(() => {
     if (!soul || view !== "chat") return;
@@ -823,6 +884,7 @@ export function App() {
     if (existingSouls.length > 0) {
       const firstSoul = await getSoul(existingSouls[0].character_id);
       setSoul(firstSoul);
+      setSelectedCharacterIds([firstSoul.character_id]);
       setCreatorFieldsFromSoul(firstSoul);
       setCurrentSessionTitle("New Session");
       setStatus("Loaded local Soul and Setting indexes");
@@ -832,6 +894,7 @@ export function App() {
     const nextSoul = await createDefaultSoul(characterName);
     await upsertSoul(nextSoul);
     setSoul(nextSoul);
+    setSelectedCharacterIds([nextSoul.character_id]);
     setSouls(await listSouls());
     setStatus("Created starter Soul and Setting");
   }
@@ -840,7 +903,16 @@ export function App() {
     try {
       const existingProviderProfiles = await listProviderProfiles();
       setProviderProfiles(existingProviderProfiles);
-    if (existingProviderProfiles.length > 0) {
+      if (existingProviderProfiles.length === 0) {
+        const firstLaunchSeen = localStorage.getItem(SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY) === "true";
+        if (!firstLaunchSeen) {
+          setSettingsTab("ai");
+          setSettingsDrawerOpen(true);
+          localStorage.setItem(SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY, "true");
+        }
+        return;
+      }
+
       const savedNarratorId = localStorage.getItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY) ?? "";
       const savedUpdaterId = localStorage.getItem(UPDATER_PROVIDER_PROFILE_STORAGE_KEY) ?? "";
       const narratorProfile =
@@ -853,7 +925,6 @@ export function App() {
         setSelectedStateUpdaterProfileId(updaterProfile.id);
         applyStateUpdaterProviderProfile(updaterProfile);
       }
-    }
     } catch (error) {
       logDev("warn", "app", "Provider profile load deferred failed", {
         error: error instanceof Error ? error.message : String(error),
@@ -952,6 +1023,11 @@ export function App() {
       );
       await upsertSoul(nextSoul);
       setSoul(nextSoul);
+      setSelectedCharacterIds((current) =>
+        current.includes(nextSoul.character_id)
+          ? [nextSoul.character_id, ...current.filter((id) => id !== nextSoul.character_id)]
+          : [nextSoul.character_id, ...current],
+      );
       setSelectedAvatarAsset(draftAvatarAsset);
       setActiveConversationId(null);
       setCurrentSessionTitle("New Session");
@@ -981,6 +1057,11 @@ export function App() {
       const nextSoul = await getSoul(selected.character_id);
       setStatus(`Selected ${nextSoul.character_name}`);
       setSoul(nextSoul);
+      setSelectedCharacterIds((current) =>
+        current.includes(nextSoul.character_id)
+          ? [nextSoul.character_id, ...current.filter((id) => id !== nextSoul.character_id)]
+          : [nextSoul.character_id, ...current],
+      );
       setActiveConversationId(null);
       setCurrentSessionTitle("New Session");
       setCreatorFieldsFromSoul(nextSoul);
@@ -1349,6 +1430,16 @@ export function App() {
     }
   }
 
+  function handleToggleCharacterSelection(characterId: string) {
+    setSelectedCharacterIds((current) => {
+      if (current.includes(characterId)) {
+        if (soul?.character_id === characterId) return current;
+        return current.filter((id) => id !== characterId);
+      }
+      return [...current, characterId];
+    });
+  }
+
   async function refreshActiveSessionAfterDevCommand(conversationId: string) {
     const nextMessages = await listConversationMessages(conversationId);
     setMessages(nextMessages);
@@ -1466,6 +1557,9 @@ export function App() {
       const nextConversationId = session.conversation.conversation_id;
       setActiveConversationId(nextConversationId);
       setSoul(sessionSoul);
+      setSelectedCharacterIds((current) =>
+        current.includes(sourceId) ? current : [sourceId, ...current],
+      );
       setCreatorFieldsFromSoul(sessionSoul);
       setMessages(session.messages);
       setContext(await compileContext(sessionSoul.character_id, nextConversationId));
@@ -1531,6 +1625,11 @@ export function App() {
     try {
       const conversationSoul = await getSoul(conversation.soul_id);
       setSoul(conversationSoul);
+      setSelectedCharacterIds((current) =>
+        current.includes(conversationSoul.character_id)
+          ? [conversationSoul.character_id, ...current.filter((id) => id !== conversationSoul.character_id)]
+          : [conversationSoul.character_id, ...current],
+      );
       setCreatorFieldsFromSoul(conversationSoul);
       setActiveConversationId(conversation.conversation_id);
       setCurrentSessionTitle(conversation.title);
@@ -1897,6 +1996,7 @@ export function App() {
       setSouls(remaining);
       setConversations(await listConversations());
       setActiveConversationId(null);
+      setSelectedCharacterIds((current) => current.filter((id) => id !== soul.character_id));
 
       if (remaining.length === 0) {
         setSoul(null);
@@ -1908,6 +2008,11 @@ export function App() {
 
       const nextSoul = await getSoul(remaining[0].character_id);
       setSoul(nextSoul);
+      setSelectedCharacterIds((current) =>
+        current.includes(nextSoul.character_id)
+          ? [nextSoul.character_id, ...current.filter((id) => id !== nextSoul.character_id)]
+          : [nextSoul.character_id, ...current],
+      );
       setCreatorFieldsFromSoul(nextSoul);
       setMessages([]);
       setContext(null);
@@ -2259,6 +2364,11 @@ export function App() {
       const importedSoul = await soulFromImport(raw, file.name);
       await upsertSoul(importedSoul);
       setSoul(importedSoul);
+      setSelectedCharacterIds((current) =>
+        current.includes(importedSoul.character_id)
+          ? [importedSoul.character_id, ...current.filter((id) => id !== importedSoul.character_id)]
+          : [importedSoul.character_id, ...current],
+      );
       setActiveConversationId(null);
       setCurrentSessionTitle("New Session");
       setCreatorFieldsFromSoul(importedSoul);
@@ -2346,12 +2456,626 @@ export function App() {
       onClose={handleCloseDisclaimer}
     />
   );
+  const providerModeControls = (
+    <div className="settings-grid">
+      <label className="field">
+        <span>Provider</span>
+        <select
+          value={provider}
+          onChange={(event) => {
+            const nextProvider = event.target.value as ProviderKind;
+            setProvider(nextProvider);
+            logDev("info", "app", "Provider mode changed", { provider: nextProvider });
+          }}
+          disabled={busy}
+        >
+          <option>Mock</option>
+          <option>API</option>
+        </select>
+      </label>
+      <label className="field">
+        <span>Narration Mode</span>
+        <select
+          value={mode}
+          onChange={(event) => setMode(event.target.value as NarrativeMode)}
+          disabled={busy}
+        >
+          <option>Realistic</option>
+          <option>Reader</option>
+          <option>God</option>
+          <option>Custom</option>
+        </select>
+      </label>
+      <label className="field">
+        <span>Context Mode</span>
+        <select
+          value={contextMode}
+          onChange={(event) => {
+            const nextMode = event.target.value as ContextMode;
+            setContextMode(nextMode);
+            logDev("info", "context", "Context mode changed", { context_mode: nextMode });
+          }}
+          disabled={busy || provider !== "API"}
+        >
+          <option value="brief">Mnemosyne Brief</option>
+          <option value="full_chat">Full Chat</option>
+        </select>
+      </label>
+    </div>
+  );
+  const providerSettingsPanel = (
+    <div className="settings-tab-panel">
+      <section className="settings-section">
+        <div className="settings-section-heading">
+          <div>
+            <span className="eyebrow">Provider</span>
+            <h3>AI Connection</h3>
+          </div>
+          <button type="button" className="ghost-action compact-ghost" onClick={handleViewDisclaimer}>
+            View Disclaimer
+          </button>
+        </div>
+        <p className="settings-note">Mock remains usable without configuration. API presets are saved in the existing local provider profile store.</p>
+        {providerModeControls}
+      </section>
+
+      {provider === "API" ? (
+        <>
+          <section className="settings-section provider-pass-card">
+            <div className="provider-pass-heading">
+              <div>
+                <h3>Narrator Provider</h3>
+                <p>Narrator pass: writes visible RP response.</p>
+              </div>
+              <span className="provider-status-pill">{apiSettings.model || "No model"}</span>
+            </div>
+            <div className="provider-pass-grid">
+              <label className="field">
+                <span>Narrator Provider</span>
+                <select
+                  value={selectedProviderProfileId}
+                  onChange={(event) => void handleSelectProviderProfile(event.target.value)}
+                  disabled={busy}
+                >
+                  <option value="">Unsaved narrator profile</option>
+                  {providerProfiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field">
+                <span>Profile Name</span>
+                <input
+                  value={narratorProviderProfileName}
+                  onChange={(event) => setNarratorProviderProfileName(event.target.value)}
+                  placeholder="Narrator API"
+                  disabled={busy}
+                />
+              </label>
+              <label className="field">
+                <span>Base URL</span>
+                <input
+                  value={apiSettings.base_url}
+                  onChange={(event) =>
+                    setApiSettings((current) => ({ ...current, base_url: event.target.value }))
+                  }
+                  placeholder="https://api.openai.com/v1"
+                  disabled={busy}
+                />
+              </label>
+              <label className="field">
+                <span>Model</span>
+                <input
+                  value={apiSettings.model}
+                  onChange={(event) =>
+                    setApiSettings((current) => ({ ...current, model: event.target.value }))
+                  }
+                  placeholder="Model name"
+                  disabled={busy}
+                />
+              </label>
+              <label className="field">
+                <span>Narrator Timeout (seconds)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={Math.round((apiSettings.narrator_timeout_ms ?? 0) / 1000)}
+                  onChange={(event) =>
+                    setApiSettings((current) => ({
+                      ...current,
+                      narrator_timeout_ms:
+                        Number(event.target.value) > 0 ? Number(event.target.value) * 1000 : null,
+                    }))
+                  }
+                  placeholder="0 = provider default"
+                  disabled={busy}
+                />
+              </label>
+              <label className="field">
+                <span>API Key</span>
+                <input
+                  type="password"
+                  value={apiSettings.api_key}
+                  onChange={(event) =>
+                    setApiSettings((current) => ({ ...current, api_key: event.target.value }))
+                  }
+                  placeholder="Stored locally with profile"
+                  disabled={busy}
+                />
+              </label>
+              {mode === "Custom" ? (
+                <label className="field custom-prompt-field">
+                  <span>Custom Narrator Prompt</span>
+                  <textarea
+                    value={apiSettings.system_prompt}
+                    onChange={(event) =>
+                      setApiSettings((current) => ({
+                        ...current,
+                        system_prompt: event.target.value,
+                      }))
+                    }
+                    placeholder="Replaces default narrator + mode prompts when filled. Use Custom mode. Leave empty for default Reader narration."
+                    disabled={busy}
+                  />
+                </label>
+              ) : null}
+            </div>
+            <div className="button-row">
+              <button
+                type="button"
+                className="ghost-action"
+                onClick={handleSaveNarratorProviderProfile}
+                disabled={busy}
+              >
+                <Save size={16} />
+                <span>Save Narrator Profile</span>
+              </button>
+              <button
+                type="button"
+                className="ghost-action"
+                onClick={handleDeleteNarratorProviderProfile}
+                disabled={busy || !selectedProviderProfileId}
+              >
+                <Trash2 size={16} />
+                <span>Delete</span>
+              </button>
+            </div>
+          </section>
+
+          <section className="settings-section provider-pass-card">
+            <div className="provider-pass-heading">
+              <div>
+                <h3>State Updater Provider</h3>
+                <p>State updater pass: updates Soul/World/Memory.</p>
+              </div>
+              <span className="provider-status-pill">
+                {useNarratorProviderForUpdater
+                  ? "Using narrator provider"
+                  : stateUpdaterSettings.model || "No model"}
+              </span>
+            </div>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={useNarratorProviderForUpdater}
+                onChange={(event) => setUseNarratorProviderForUpdater(event.target.checked)}
+                disabled={busy}
+              />
+              <span>Use narrator provider for state updater</span>
+            </label>
+            <div className="provider-pass-grid">
+              <label className="field">
+                <span>State Updater Timeout (seconds)</span>
+                <input
+                  type="number"
+                  min="0"
+                  value={Math.round((effectiveStateUpdaterSettings.evaluator_timeout_ms ?? 25_000) / 1000)}
+                  onChange={(event) =>
+                    updateEffectiveStateUpdaterSettings({
+                      evaluator_timeout_ms: Math.max(0, Number(event.target.value) || 0) * 1000,
+                    })
+                  }
+                  disabled={busy}
+                />
+              </label>
+              <label className="field">
+                <span>Timeout Mode</span>
+                <select
+                  value={effectiveStateUpdaterSettings.evaluator_timeout_mode ?? "finite"}
+                  onChange={(event) =>
+                    updateEffectiveStateUpdaterSettings({
+                      evaluator_timeout_mode: event.target.value,
+                    })
+                  }
+                  disabled={busy}
+                >
+                  <option value="finite">Finite app timeout</option>
+                  <option value="no_app_timeout">No app timeout</option>
+                </select>
+              </label>
+            </div>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={effectiveStateUpdaterSettings.evaluator_background_enabled ?? false}
+                onChange={(event) =>
+                  updateEffectiveStateUpdaterSettings({
+                    evaluator_background_enabled: event.target.checked,
+                  })
+                }
+                disabled={busy}
+              />
+              <span>Run evaluator in background</span>
+            </label>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={effectiveStateUpdaterSettings.wait_for_evaluator_before_next_turn ?? true}
+                onChange={(event) =>
+                  updateEffectiveStateUpdaterSettings({
+                    wait_for_evaluator_before_next_turn: event.target.checked,
+                  })
+                }
+                disabled={busy}
+              />
+              <span>Wait for state update before next turn</span>
+            </label>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={effectiveStateUpdaterSettings.allow_send_with_stale_state ?? false}
+                onChange={(event) =>
+                  updateEffectiveStateUpdaterSettings({
+                    allow_send_with_stale_state: event.target.checked,
+                  })
+                }
+                disabled={busy}
+              />
+              <span>Allow send with stale state</span>
+            </label>
+            {useNarratorProviderForUpdater ? (
+              <p className="provider-note">
+                Using narrator provider: {apiSettings.base_url || "No base URL"} / {apiSettings.model || "No model"}
+              </p>
+            ) : (
+              <>
+                <div className="provider-pass-grid">
+                  <label className="field">
+                    <span>State Updater Provider</span>
+                    <select
+                      value={selectedStateUpdaterProfileId}
+                      onChange={(event) => void handleSelectStateUpdaterProfile(event.target.value)}
+                      disabled={busy}
+                    >
+                      <option value="">Unsaved updater profile</option>
+                      {providerProfiles.map((profile) => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>Profile Name</span>
+                    <input
+                      value={updaterProviderProfileName}
+                      onChange={(event) => setUpdaterProviderProfileName(event.target.value)}
+                      placeholder="Updater API"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Base URL</span>
+                    <input
+                      value={stateUpdaterSettings.base_url}
+                      onChange={(event) =>
+                        setStateUpdaterSettings((current) => ({
+                          ...current,
+                          base_url: event.target.value,
+                        }))
+                      }
+                      placeholder="http://localhost:11434/v1"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Model</span>
+                    <input
+                      value={stateUpdaterSettings.model}
+                      onChange={(event) =>
+                        setStateUpdaterSettings((current) => ({
+                          ...current,
+                          model: event.target.value,
+                        }))
+                      }
+                      placeholder="Cheaper/local model"
+                      disabled={busy}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>API Key</span>
+                    <input
+                      type="password"
+                      value={stateUpdaterSettings.api_key}
+                      onChange={(event) =>
+                        setStateUpdaterSettings((current) => ({
+                          ...current,
+                          api_key: event.target.value,
+                        }))
+                      }
+                      placeholder="Stored locally with profile"
+                      disabled={busy}
+                    />
+                  </label>
+                </div>
+                <div className="button-row">
+                  <button
+                    type="button"
+                    className="ghost-action"
+                    onClick={handleSaveStateUpdaterProviderProfile}
+                    disabled={busy}
+                  >
+                    <Save size={16} />
+                    <span>Save Updater Profile</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost-action"
+                    onClick={handleDeleteStateUpdaterProviderProfile}
+                    disabled={busy || !selectedStateUpdaterProfileId}
+                  >
+                    <Trash2 size={16} />
+                    <span>Delete</span>
+                  </button>
+                </div>
+              </>
+            )}
+          </section>
+        </>
+      ) : null}
+    </div>
+  );
+  const settingsDrawerToggle = (
+    <button
+      type="button"
+      className={`settings-drawer-toggle ${settingsDrawerOpen ? "open" : ""}`}
+      onClick={() => {
+        setSettingsDrawerOpen((open) => !open);
+        if (!settingsDrawerOpen) setDevConsoleOpen(false);
+      }}
+    >
+      <Database size={16} />
+      <span>Settings</span>
+    </button>
+  );
+  const settingsDrawerPanel = settingsDrawerOpen ? (
+    <aside className="settings-drawer-panel" aria-label="Settings">
+      <header className="settings-drawer-header">
+        <div>
+          <span className="eyebrow">Preferences</span>
+          <h2>Settings</h2>
+        </div>
+        <button type="button" onClick={() => setSettingsDrawerOpen(false)}>
+          Close
+        </button>
+      </header>
+      <nav className="settings-drawer-tabs" aria-label="Settings categories">
+        {(["ai", "chat", "library", "dev"] as SettingsTab[]).map((tab) => (
+          <button
+            key={tab}
+            type="button"
+            className={settingsTab === tab ? "selected" : ""}
+            onClick={() => setSettingsTab(tab)}
+          >
+            {tab.toUpperCase()}
+          </button>
+        ))}
+      </nav>
+      <div className="settings-drawer-body">
+        {settingsTab === "ai" ? providerSettingsPanel : null}
+        {settingsTab === "chat" ? (
+          <div className="settings-tab-panel">
+            <section className="settings-section">
+              <div className="settings-section-heading">
+                <div>
+                  <span className="eyebrow">Sessions</span>
+                  <h3>Chat Defaults</h3>
+                </div>
+              </div>
+              <div className="chat-start-options settings-radio-group" role="radiogroup" aria-label="Default chat start mode">
+                <label>
+                  <input
+                    type="radio"
+                    name="settings-chat-start-mode"
+                    value="continue"
+                    checked={chatStartMode === "continue"}
+                    onChange={() => setChatStartMode("continue")}
+                    disabled={busy}
+                  />
+                  <span>Continue Soul continuity</span>
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name="settings-chat-start-mode"
+                    value="fresh"
+                    checked={chatStartMode === "fresh"}
+                    onChange={() => setChatStartMode("fresh")}
+                    disabled={busy}
+                  />
+                  <span>New isolated Session</span>
+                </label>
+              </div>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={showArchivedSessions}
+                  onChange={(event) => setShowArchivedSessions(event.target.checked)}
+                />
+                <span>Show archived sessions by default</span>
+              </label>
+              <p className="settings-note">Composer shortcut remains Shift+Enter to send for this pass.</p>
+            </section>
+            <section className="settings-section">
+              <div className="settings-section-heading">
+                <div>
+                  <span className="eyebrow">Current Chat</span>
+                  <h3>Quick Actions</h3>
+                </div>
+              </div>
+              <div className="settings-action-list">
+                <button type="button" className="ghost-action" onClick={handleRestoreHiddenTurns} disabled={busy || !currentConversationId}>
+                  <RefreshCcw size={16} />
+                  <span>Restore Hidden Turns</span>
+                </button>
+                <button type="button" className="ghost-action" onClick={handleExportVisibleChatLog} disabled={busy || activeMessages.length === 0}>
+                  <FileDown size={16} />
+                  <span>Export Visible Chat</span>
+                </button>
+                <button type="button" className="ghost-action" onClick={handleExportCurrentSessionMne} disabled={busy || !currentConversationId}>
+                  <FileDown size={16} />
+                  <span>Export Session .mne</span>
+                </button>
+              </div>
+            </section>
+          </div>
+        ) : null}
+        {settingsTab === "library" ? (
+          <div className="settings-tab-panel">
+            <section className="settings-section">
+              <div className="settings-section-heading">
+                <div>
+                  <span className="eyebrow">Library</span>
+                  <h3>Import And Export</h3>
+                </div>
+              </div>
+              <div className="settings-action-list">
+                <button type="button" className="ghost-action" onClick={() => settingImportInputRef.current?.click()} disabled={busy}>
+                  <FileUp size={16} />
+                  <span>Import World JSON</span>
+                </button>
+                <button type="button" className="ghost-action" onClick={() => importInputRef.current?.click()} disabled={busy}>
+                  <FileUp size={16} />
+                  <span>Import Character JSON</span>
+                </button>
+                <button type="button" className="ghost-action" onClick={handleImportMne} disabled={busy}>
+                  <FileUp size={16} />
+                  <span>Import .mne Bundle</span>
+                </button>
+                <button type="button" className="ghost-action" onClick={handleExportSettingMne} disabled={!setting || busy}>
+                  <FileDown size={16} />
+                  <span>Export World .mne</span>
+                </button>
+                <button type="button" className="ghost-action" onClick={handleExportSoulMne} disabled={!soul || busy}>
+                  <FileDown size={16} />
+                  <span>Export Character .mne</span>
+                </button>
+                <button type="button" className="ghost-action" onClick={handleExportScenarioMne} disabled={!soul || !setting || busy}>
+                  <FileDown size={16} />
+                  <span>Export Scenario .mne</span>
+                </button>
+              </div>
+            </section>
+            <section className="settings-section">
+              <div className="settings-section-heading">
+                <div>
+                  <span className="eyebrow">Editors</span>
+                  <h3>World And Character</h3>
+                </div>
+              </div>
+              <div className="settings-action-list">
+                <button type="button" className="ghost-action" onClick={() => setSettingEditorOpen(true)}>
+                  <Database size={16} />
+                  <span>Open World Editor</span>
+                </button>
+                <button type="button" className="ghost-action" onClick={() => setSoulEditorOpen(true)}>
+                  <Brain size={16} />
+                  <span>Open Character Editor</span>
+                </button>
+              </div>
+              <p className="settings-note">The launcher stays focused on choosing a world, primary character, and session; larger forms stay collapsed until opened.</p>
+            </section>
+          </div>
+        ) : null}
+        {settingsTab === "dev" ? (
+          <div className="settings-tab-panel">
+            <section className="settings-section">
+              <div className="settings-section-heading">
+                <div>
+                  <span className="eyebrow">Diagnostics</span>
+                  <h3>Dev Console Defaults</h3>
+                </div>
+              </div>
+              <div className="settings-grid">
+                <label className="field">
+                  <span>Level Filter</span>
+                  <select
+                    value={devLogLevelFilter}
+                    onChange={(event) => setDevLogLevelFilter(event.target.value as DevLogLevel | "all")}
+                  >
+                    <option value="all">All</option>
+                    {DEV_LOG_LEVELS.map((level) => (
+                      <option key={level} value={level}>
+                        {level}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>Category Filter</span>
+                  <select
+                    value={devLogCategoryFilter}
+                    onChange={(event) => setDevLogCategoryFilter(event.target.value as DevLogCategory | "all")}
+                  >
+                    <option value="all">All</option>
+                    {DEV_LOG_CATEGORIES.map((category) => (
+                      <option key={category} value={category}>
+                        {category}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={devConsolePaused}
+                  onChange={(event) => setDevConsolePaused(event.target.checked)}
+                />
+                <span>Pause Dev Console scroll by default</span>
+              </label>
+              <div className="settings-action-list">
+                <button
+                  type="button"
+                  className="ghost-action"
+                  onClick={() => {
+                    setDevConsoleOpen(true);
+                    setSettingsDrawerOpen(false);
+                  }}
+                >
+                  <Terminal size={16} />
+                  <span>Open Dev Console</span>
+                </button>
+                <button type="button" className="ghost-action" onClick={handleExportLlmPayloadHistory} disabled={busy || !currentConversationId}>
+                  <FileDown size={16} />
+                  <span>Export Payload History</span>
+                </button>
+              </div>
+            </section>
+          </div>
+        ) : null}
+      </div>
+    </aside>
+  ) : null;
   const devConsoleToggle = (
     <button
       type="button"
       className={`dev-console-toggle ${devConsoleOpen ? "open" : ""}`}
       onClick={() => {
         setDevConsoleOpen((open) => !open);
+        if (!devConsoleOpen) setSettingsDrawerOpen(false);
         logDev("info", "app", devConsoleOpen ? "Dev Console closed" : "Dev Console opened");
       }}
     >
@@ -2523,13 +3247,6 @@ export function App() {
       </div>
     </aside>
   ) : null;
-  const devConsole = (
-    <>
-      {devConsoleToggle}
-      {devConsolePanel}
-    </>
-  );
-
   if (disclaimerMode) {
     return disclaimerScreen;
   }
@@ -2576,16 +3293,6 @@ export function App() {
             <button
               className="ghost-action"
               type="button"
-              title="Open AI settings"
-              onClick={() => setChatSettingsOpen((open) => !open)}
-              disabled={busy}
-            >
-              <Database size={16} />
-              <span>AI Settings</span>
-            </button>
-            <button
-              className="ghost-action"
-              type="button"
               title="Restore turns hidden by delete/rewind"
               onClick={handleRestoreHiddenTurns}
               disabled={busy || !currentConversationId}
@@ -2607,83 +3314,10 @@ export function App() {
               {context?.estimated_tokens ?? 0}
               <span>tok</span>
             </div>
+            {settingsDrawerToggle}
             {devConsoleToggle}
           </div>
         </header>
-
-        {chatSettingsOpen ? (
-          <section className="chat-only-controls" aria-label="Chat AI settings">
-            <label className="field">
-              <span>Provider</span>
-              <select
-                value={provider}
-                onChange={(event) => {
-                  const nextProvider = event.target.value as ProviderKind;
-                  setProvider(nextProvider);
-                  logDev("info", "app", "Provider mode changed", { provider: nextProvider });
-                }}
-                disabled={busy}
-              >
-                <option>Mock</option>
-                <option>API</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>Mode</span>
-              <select
-                value={mode}
-                onChange={(event) => setMode(event.target.value as NarrativeMode)}
-                disabled={busy}
-              >
-                <option>Realistic</option>
-                <option>Reader</option>
-                <option>God</option>
-                <option>Custom</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>Context</span>
-              <select
-                value={contextMode}
-                onChange={(event) => setContextMode(event.target.value as ContextMode)}
-                disabled={busy}
-              >
-                <option value="brief">Mnemosyne Brief</option>
-                <option value="full_chat">Full Chat</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>Narrator Preset</span>
-              <select
-                value={selectedProviderProfileId}
-                onChange={(event) => void handleSelectProviderProfile(event.target.value)}
-                disabled={busy || provider !== "API"}
-              >
-                <option value="">Manual</option>
-                {providerProfiles.map((profile) => (
-                  <option key={profile.id} value={profile.id}>
-                    {profile.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="field">
-              <span>Updater Preset</span>
-              <select
-                value={selectedStateUpdaterProfileId}
-                onChange={(event) => void handleSelectStateUpdaterProfile(event.target.value)}
-                disabled={busy || provider !== "API" || useNarratorProviderForUpdater}
-              >
-                <option value="">Manual</option>
-                {providerProfiles.map((profile) => (
-                  <option key={profile.id} value={profile.id}>
-                    {profile.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </section>
-        ) : null}
 
         <section className="chat-only-scroll" ref={chatOnlyBodyRef}>
           <div className="chat-only-body">
@@ -2889,19 +3523,36 @@ export function App() {
           )}
         </form>
         <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
+        {settingsDrawerPanel}
         {devConsolePanel}
       </main>
     );
   }
 
   return (
-    <main className="app-shell">
-      <section className="library-grid">
+    <main className="app-shell launcher-shell">
+      <header className="launcher-header">
+        <div>
+          <span className="eyebrow">Launcher</span>
+          <h1>Choose World, Primary Character, Session</h1>
+          <p>
+            {setting?.setting_name ?? "No world selected"} / {soul?.character_name ?? "No primary character"} /{" "}
+            {selectedCharacterCount} selected
+          </p>
+        </div>
+        <div className="launcher-actions">
+          {settingsDrawerToggle}
+          {devConsoleToggle}
+        </div>
+      </header>
+
+      <section className="library-grid launcher-grid">
         <section className="workspace-card library-card">
           <header className="panel-header">
             <div>
-              <span className="eyebrow">Scenes</span>
-              <h2>Local Settings</h2>
+              <span className="eyebrow">World</span>
+              <h2>{setting?.setting_name ?? "Select a World"}</h2>
+              <p>{selectedWorldSummary}</p>
             </div>
             <Database aria-hidden="true" />
           </header>
@@ -2956,14 +3607,14 @@ export function App() {
             </button>
           </div>
 
-          <section className="compact-list library-list" aria-label="Saved settings">
+          <section className="compact-list library-list world-picker-list" aria-label="Saved worlds">
             {settings.length === 0 ? (
               <p className="muted">No saved Settings yet.</p>
             ) : (
               settings.map((item) => (
                 <button
                   key={item.setting_id}
-                  className={`soul-row ${setting?.setting_id === item.setting_id ? "selected" : ""}`}
+                  className={`soul-row world-row ${setting?.setting_id === item.setting_id ? "selected" : ""}`}
                   onClick={() => handleSelectSetting(item.setting_id)}
                 >
                   <span>{item.setting_name}</span>
@@ -2983,8 +3634,8 @@ export function App() {
               aria-expanded={settingEditorOpen}
             >
               <span>
-                <span className="eyebrow">World</span>
-                <strong>{setting?.setting_name ?? "Environment Creator"}</strong>
+                <span className="eyebrow">World Editor</span>
+                <strong>{setting?.setting_name ?? "Create or edit a world"}</strong>
               </span>
               <ChevronDown size={18} aria-hidden="true" />
             </button>
@@ -3058,8 +3709,9 @@ export function App() {
         <section className="workspace-card library-card">
           <header className="panel-header character-heading">
             <div>
-              <span className="eyebrow">Characters</span>
-              <h2>Local Souls</h2>
+              <span className="eyebrow">Primary Character</span>
+              <h2>{soul?.character_name ?? "Select a Character"}</h2>
+              <p>{primaryCharacterDescription}</p>
             </div>
             <SoulAvatar soulName={soul?.character_name ?? "Mnemosyne"} asset={selectedAvatarAsset} />
           </header>
@@ -3119,25 +3771,47 @@ export function App() {
             </button>
           </div>
 
-          <section className="compact-list library-list" aria-label="Saved souls">
+          <section className="character-grid" aria-label="Saved characters">
             {souls.length === 0 ? (
               <p className="muted">No saved Souls yet.</p>
             ) : (
               souls.map((item) => (
-                <button
+                <article
                   key={item.character_id}
-                  className={`soul-row ${soul?.character_id === item.character_id ? "selected" : ""}`}
-                  onClick={() => handleSelectSoul(item.character_id)}
+                  className={`character-card ${soul?.character_id === item.character_id ? "primary" : ""} ${
+                    selectedCharacterIds.includes(item.character_id) ? "selected" : ""
+                  }`}
                 >
-                  <span className="soul-row-main">
-                    <span className="soul-row-avatar">{item.avatar_image_id ? <ImageIcon size={14} /> : item.character_name.slice(0, 1)}</span>
-                    <span>{item.character_name}</span>
-                  </span>
-                  <small>
-                    {item.core_count} core / {item.recent_count} recent
-                    {item.avatar_image_id ? " / avatar image" : " / placeholder"}
-                  </small>
-                </button>
+                  <button
+                    type="button"
+                    className="character-card-main"
+                    onClick={() => handleSelectSoul(item.character_id)}
+                    disabled={busy}
+                  >
+                    <span className="soul-row-avatar">
+                      {item.avatar_image_id ? <ImageIcon size={14} /> : item.character_name.slice(0, 1)}
+                    </span>
+                    <span className="character-card-copy">
+                      <strong>{item.character_name}</strong>
+                      <small>
+                        {item.core_count} core / {item.recent_count} recent
+                        {item.avatar_image_id ? " / avatar" : " / no avatar"}
+                      </small>
+                    </span>
+                  </button>
+                  <div className="character-card-footer">
+                    <label className="mini-toggle">
+                      <input
+                        type="checkbox"
+                        checked={selectedCharacterIds.includes(item.character_id)}
+                        onChange={() => handleToggleCharacterSelection(item.character_id)}
+                        disabled={busy}
+                      />
+                      <span>Select</span>
+                    </label>
+                    {soul?.character_id === item.character_id ? <span className="primary-pill">Primary</span> : null}
+                  </div>
+                </article>
               ))
             )}
           </section>
@@ -3150,8 +3824,8 @@ export function App() {
               aria-expanded={soulEditorOpen}
             >
               <span>
-                <span className="eyebrow">Soul</span>
-                <strong>{soul?.character_name ?? "Character Creator"}</strong>
+                <span className="eyebrow">Character Editor</span>
+                <strong>{soul?.character_name ?? "Create or edit a character"}</strong>
               </span>
               <ChevronDown size={18} aria-hidden="true" />
             </button>
@@ -3796,6 +4470,9 @@ export function App() {
           <h1>
             {soul?.character_name ?? "Choose a Soul"} in {setting?.setting_name ?? "a Setting"}
           </h1>
+          <p className="launcher-primary-note">
+            Multi-select is staged for later group chat support. Start Chat uses the Primary character only.
+          </p>
           <div className="chat-start-options" role="radiogroup" aria-label="Chat start mode">
             <label>
               <input
@@ -3873,7 +4550,7 @@ export function App() {
         </div>
         <button className="start-chat-button" onClick={handleStartChat} disabled={!soul || busy}>
           <MessageSquareText size={20} />
-          <span>Start Chat</span>
+          <span>Start Chat With Primary</span>
         </button>
       </section>
 
@@ -4496,7 +5173,8 @@ export function App() {
         <footer className="status-line">{status}</footer>
       </section>
       <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
-      {devConsole}
+      {settingsDrawerPanel}
+      {devConsolePanel}
     </main>
   );
 }
@@ -4520,6 +5198,54 @@ function loadStoredCustomNarratorPrompt() {
     return localStorage.getItem(CUSTOM_NARRATOR_PROMPT_STORAGE_KEY) ?? "";
   } catch {
     return "";
+  }
+}
+
+function loadStoredBoolean(key: string, fallback: boolean) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null) return fallback;
+    return raw === "true";
+  } catch {
+    return fallback;
+  }
+}
+
+function loadStoredChatStartMode(): ChatStartMode {
+  try {
+    const raw = localStorage.getItem(CHAT_START_MODE_STORAGE_KEY);
+    return raw === "continue" || raw === "fresh" ? raw : "fresh";
+  } catch {
+    return "fresh";
+  }
+}
+
+function loadStoredSettingsTab(): SettingsTab {
+  try {
+    const raw = localStorage.getItem(SETTINGS_DRAWER_TAB_STORAGE_KEY);
+    return raw === "ai" || raw === "chat" || raw === "library" || raw === "dev" ? raw : "ai";
+  } catch {
+    return "ai";
+  }
+}
+
+function loadStoredDevLogLevelFilter(): DevLogLevel | "all" {
+  try {
+    const raw = localStorage.getItem(DEV_LOG_LEVEL_FILTER_STORAGE_KEY);
+    return raw === "all" || DEV_LOG_LEVELS.includes(raw as DevLogLevel) ? (raw as DevLogLevel | "all") : "all";
+  } catch {
+    return "all";
+  }
+}
+
+function loadStoredDevLogCategoryFilter(): DevLogCategory | "all" {
+  try {
+    const raw = localStorage.getItem(DEV_LOG_CATEGORY_FILTER_STORAGE_KEY);
+    return raw === "all" || DEV_LOG_CATEGORIES.includes(raw as DevLogCategory)
+      ? (raw as DevLogCategory | "all")
+      : "all";
+  } catch {
+    return "all";
   }
 }
 
