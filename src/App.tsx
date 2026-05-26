@@ -182,6 +182,17 @@ type ActiveGeneration = {
   replacementAssistantId?: number;
   replacementOriginalContent?: string;
 };
+
+interface MessageRenderTrace {
+  frontend_message_render_count: number;
+  duplicate_saved_suppressed: number;
+  pending_assistant_replaced_by_saved: number;
+  active_listener_count: number;
+  pending_assistant_count: number;
+  rendered_saved_message_count: number;
+  rendered_pending_message_count: number;
+  duplicate_render_suppressed_count: number;
+}
 type PsychePresetName =
   | "Stranger"
   | "Traumatized Survivor"
@@ -612,28 +623,65 @@ export function App() {
     view,
   ]);
 
+  const soulRef = useRef(soul);
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    soulRef.current = soul;
+  }, [soul]);
+
+  const listenerRegistrationRef = useRef({
+    apiStream: false,
+    chatMessageSaved: false,
+    evaluatorJobStatusChanged: false,
+  });
+
+  useEffect(() => {
+    if (listenerRegistrationRef.current.apiStream) {
+      logDev("debug", "stream", "Listener registration suppressed", { listener: "api_stream" });
+      return;
+    }
+    listenerRegistrationRef.current.apiStream = true;
+    let active = true;
+    let cleanupFn: (() => void) | undefined;
+
     void listenApiStream((payload) => {
+      if (!active) return;
       if (payload.conversation_id !== currentConversationIdRef.current) return;
       const activeGeneration = activeGenerationRef.current;
       if (!activeGeneration || activeGeneration.conversationId !== payload.conversation_id) return;
       if (activeGeneration.narratorSaved) return;
       setMessages((current) => appendStreamingChunk(current, payload.conversation_id, payload.chunk));
     }).then((cleanup) => {
-      unlisten = cleanup;
+      cleanupFn = cleanup;
+      if (!active) {
+        cleanup();
+      }
     });
 
     return () => {
-      unlisten?.();
+      active = false;
+      listenerRegistrationRef.current.apiStream = false;
+      if (cleanupFn) {
+        cleanupFn();
+      }
     };
   }, []);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    if (listenerRegistrationRef.current.chatMessageSaved) {
+      logDev("debug", "stream", "Listener registration suppressed", { listener: "chat_message_saved" });
+      return;
+    }
+    listenerRegistrationRef.current.chatMessageSaved = true;
+    let active = true;
+    let cleanupFn: (() => void) | undefined;
+
     void listenChatMessageSaved((payload) => {
+      if (!active) return;
       if (payload.conversation_id !== currentConversationIdRef.current) return;
-      setMessages((current) => upsertSavedChatMessage(current, payload.message));
+      setMessages((current) => {
+        const result = upsertSavedChatMessage(current, payload.message);
+        return result.messages;
+      });
       const activeGeneration = activeGenerationRef.current;
       if (activeGeneration?.conversationId === payload.conversation_id) {
         activeGeneration.narratorSaved = true;
@@ -647,40 +695,68 @@ export function App() {
         void reloadSavedNarratorMessages(payload.conversation_id);
       }
     }).then((cleanup) => {
-      unlisten = cleanup;
+      cleanupFn = cleanup;
+      if (!active) {
+        cleanup();
+      }
     });
 
     return () => {
-      unlisten?.();
+      active = false;
+      listenerRegistrationRef.current.chatMessageSaved = false;
+      if (cleanupFn) {
+        cleanupFn();
+      }
     };
   }, []);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    if (listenerRegistrationRef.current.evaluatorJobStatusChanged) {
+      logDev("debug", "stream", "Listener registration suppressed", { listener: "evaluator_job_status_changed" });
+      return;
+    }
+    listenerRegistrationRef.current.evaluatorJobStatusChanged = true;
+    let active = true;
+    let cleanupFn: (() => void) | undefined;
+
     void listenEvaluatorJobStatusChanged((job) => {
+      if (!active) return;
       if (job.conversation_id !== currentConversationIdRef.current) return;
       setActiveEvaluatorJob(job);
       if (job.status === "running" || job.status === "pending") {
         setStatus("Updating memory/state...");
       } else if (job.status === "completed") {
         setStatus(job.patch_applied ? "Memory/state update completed" : "Memory/state update completed with no patch");
-        if (soul) {
-          void refreshContext(soul.character_id, job.conversation_id);
-          void getSoul(soul.character_id).then(setSoul).catch(() => undefined);
+        if (soulRef.current) {
+          void refreshContext(soulRef.current.character_id, job.conversation_id);
+          void getSoul(soulRef.current.character_id).then(setSoul).catch(() => undefined);
         }
       } else if (job.status === "failed" || job.status === "timed_out") {
         setStatus("State update failed");
       } else if (job.status === "canceled") {
         setStatus("State update canceled");
+      } else if (job.status === "some_rows_rejected") {
+        setStatus("Update completed with some enrichment rows rejected");
+        if (soulRef.current) {
+          void refreshContext(soulRef.current.character_id, job.conversation_id);
+          void getSoul(soulRef.current.character_id).then(setSoul).catch(() => undefined);
+        }
       }
     }).then((cleanup) => {
-      unlisten = cleanup;
+      cleanupFn = cleanup;
+      if (!active) {
+        cleanup();
+      }
     });
 
     return () => {
-      unlisten?.();
+      active = false;
+      listenerRegistrationRef.current.evaluatorJobStatusChanged = false;
+      if (cleanupFn) {
+        cleanupFn();
+      }
     };
-  }, [soul?.character_id]);
+  }, []);
 
   useEffect(() => {
     if (!activeConversationId) {
@@ -2414,9 +2490,10 @@ export function App() {
     100,
     Math.round((turnsSinceConsolidation / CONSOLIDATION_INTERVAL_TURNS) * 100),
   );
-  const activeMessages = useMemo(
-    () => messages.filter((message) => message.role !== "system"),
-    [messages],
+  const activeListenersCount = Object.values(listenerRegistrationRef.current).filter(Boolean).length;
+  const { messages: activeMessages, trace: renderTrace } = useMemo(
+    () => prepareMessagesForRender(messages, activeListenersCount),
+    [messages, activeListenersCount],
   );
   const latestAssistantMessageId = useMemo(
     () =>
@@ -3095,6 +3172,21 @@ export function App() {
           Close
         </button>
       </header>
+      {import.meta.env.DEV && renderTrace && (
+        <div className="dev-render-trace-banner" style={{ padding: "10px 16px", backgroundColor: "#1e293b", borderBottom: "1px solid #334155", fontSize: "11px", fontFamily: "monospace", color: "#94a3b8" }}>
+          <div style={{ color: "#38bdf8", fontWeight: "bold", marginBottom: "4px" }}>
+            Render Source: prepareMessagesForRender (Deduplicated)
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "4px 12px" }}>
+            <div>Saved Count: <span style={{ color: "#f8fafc" }}>{renderTrace.saved_message_count}</span></div>
+            <div>Pending Count: <span style={{ color: "#f8fafc" }}>{renderTrace.pending_message_count}</span></div>
+            <div>Dup Saved Suppressed: <span style={{ color: "#f8fafc" }}>{renderTrace.duplicate_saved_suppressed}</span></div>
+            <div>Dup Pending Suppressed: <span style={{ color: "#f8fafc" }}>{renderTrace.duplicate_pending_suppressed}</span></div>
+            <div>Pending Replaced: <span style={{ color: "#f8fafc" }}>{renderTrace.pending_replaced_by_saved}</span></div>
+            <div>Active Listeners: <span style={{ color: "#f8fafc" }}>{renderTrace.active_listener_count}</span></div>
+          </div>
+        </div>
+      )}
       <div className="dev-console-controls">
         <label>
           <span>Level</span>
@@ -5606,10 +5698,15 @@ function upsertSavedChatMessage(messages: ChatMessage[], savedMessage: ChatMessa
     (message) =>
       message.conversation_id === savedMessage.conversation_id && message.id === savedMessage.id,
   );
+  let pendingAssistantReplacedBySaved = 0;
   if (existingIndex >= 0) {
     const next = [...messages];
     next[existingIndex] = savedMessage;
-    return removeDuplicateStreamingAssistants(next, savedMessage.conversation_id, savedMessage.id);
+    const cleaned = removeDuplicateStreamingAssistants(next, savedMessage.conversation_id, savedMessage.id);
+    return {
+      messages: cleaned,
+      trace: messageRenderTrace(cleaned, messages.length - cleaned.length, 0),
+    };
   }
 
   if (savedMessage.role === "assistant") {
@@ -5618,20 +5715,69 @@ function upsertSavedChatMessage(messages: ChatMessage[], savedMessage: ChatMessa
       if (
         message.conversation_id === savedMessage.conversation_id &&
         message.role === "assistant" &&
-        message.id < 0
+        message.pending &&
+        pendingMatchesSavedAssistant(message, savedMessage, null)
       ) {
         const next = [...messages];
         next[index] = savedMessage;
-        return removeDuplicateStreamingAssistants(next, savedMessage.conversation_id, savedMessage.id);
+        pendingAssistantReplacedBySaved = 1;
+        const cleaned = removeDuplicateStreamingAssistants(next, savedMessage.conversation_id, savedMessage.id);
+        return {
+          messages: cleaned,
+          trace: messageRenderTrace(cleaned, messages.length - cleaned.length, pendingAssistantReplacedBySaved),
+        };
       }
     }
   }
 
-  return removeDuplicateStreamingAssistants(
+  const cleaned = removeDuplicateStreamingAssistants(
     [...messages, savedMessage].sort((left, right) => left.id - right.id),
     savedMessage.conversation_id,
     savedMessage.id,
   );
+  return {
+    messages: cleaned,
+    trace: messageRenderTrace(cleaned, messages.length + 1 - cleaned.length, pendingAssistantReplacedBySaved),
+  };
+}
+
+function pendingMatchesSavedAssistant(
+  pending: ChatMessage,
+  savedMessage: ChatMessage,
+  activeGeneration?: ActiveGeneration | null,
+) {
+  if (!pending.pending && pending.id > 0) return false;
+  if (pending.assistant_message_id && pending.assistant_message_id === savedMessage.id) return true;
+  if (pending.request_id && savedMessage.request_id && pending.request_id === savedMessage.request_id) return true;
+  if (
+    activeGeneration &&
+    pending.generation_id === activeGeneration.id &&
+    activeGeneration.conversationId === savedMessage.conversation_id &&
+    !activeGeneration.knownAssistantIds.has(savedMessage.id)
+  ) {
+    return true;
+  }
+  return pending.id < 0 && savedMessage.id > 0;
+}
+
+function messageRenderTrace(
+  messages: ChatMessage[],
+  duplicateSavedSuppressed: number,
+  pendingAssistantReplacedBySaved: number,
+): MessageRenderTrace {
+  const pendingAssistantCount = messages.filter((message) => message.role === "assistant" && message.pending).length;
+  const renderedSavedMessageCount = messages.filter((message) => message.id > 0 && !message.pending).length;
+  const renderedPendingMessageCount = messages.filter((message) => message.pending || message.id < 0).length;
+  return {
+    frontend_message_render_count: messages.filter((message) => message.role !== "system").length,
+    duplicate_saved_suppressed: duplicateSavedSuppressed,
+    pending_assistant_replaced_by_saved: pendingAssistantReplacedBySaved,
+    active_listener_count: 0,
+    pending_assistant_count: pendingAssistantCount,
+    rendered_saved_message_count: renderedSavedMessageCount,
+    rendered_pending_message_count: renderedPendingMessageCount,
+    duplicate_render_suppressed_count: duplicateSavedSuppressed,
+  };
 }
 
 function removeDuplicateStreamingAssistants(
@@ -5644,10 +5790,123 @@ function removeDuplicateStreamingAssistants(
       !(
         message.conversation_id === conversationId &&
         message.role === "assistant" &&
-        message.id < 0 &&
+        message.pending &&
         savedMessageId > 0
       ),
   );
+}
+
+function prepareMessagesForRender(messages: ChatMessage[], activeListenerCount: number = 0) {
+  const active = messages.filter((message) => message.role !== "system");
+
+  // First, split active into saved and pending
+  const saved = active.filter((msg) => msg.id > 0 && !msg.pending);
+  const pending = active.filter((msg) => msg.pending || msg.id < 0);
+
+  const dedupedSaved: ChatMessage[] = [];
+  const seenSavedIds = new Set<number>();
+  const seenSavedRequestIds = new Set<string>();
+  let duplicateSavedSuppressed = 0;
+
+  for (const msg of saved) {
+    if (seenSavedIds.has(msg.id)) {
+      duplicateSavedSuppressed += 1;
+      continue;
+    }
+    seenSavedIds.add(msg.id);
+
+    if (msg.request_id) {
+      if (seenSavedRequestIds.has(msg.request_id)) {
+        duplicateSavedSuppressed += 1;
+        continue;
+      }
+      seenSavedRequestIds.add(msg.request_id);
+    }
+
+    const isCloseDuplicate = dedupedSaved.some(
+      (existing) =>
+        existing.role === msg.role &&
+        existing.content === msg.content &&
+        Math.abs(existing.created_at - msg.created_at) < 10
+    );
+    if (isCloseDuplicate) {
+      duplicateSavedSuppressed += 1;
+      continue;
+    }
+
+    dedupedSaved.push(msg);
+  }
+
+  const visiblePending: ChatMessage[] = [];
+  let duplicatePendingSuppressed = 0;
+  let pendingReplacedBySaved = 0;
+
+  for (const pendingMsg of pending) {
+    const hasMatchingSaved = dedupedSaved.some((savedMsg) => {
+      if (pendingMsg.assistant_message_id && pendingMsg.assistant_message_id === savedMsg.id) {
+        return true;
+      }
+      if (pendingMsg.request_id && savedMsg.request_id && pendingMsg.request_id === savedMsg.request_id) {
+        return true;
+      }
+      if (
+        pendingMsg.role === savedMsg.role &&
+        pendingMsg.content === savedMsg.content &&
+        Math.abs(pendingMsg.created_at - savedMsg.created_at) < 10
+      ) {
+        return true;
+      }
+      return false;
+    });
+
+    if (hasMatchingSaved) {
+      pendingReplacedBySaved += 1;
+      continue;
+    }
+
+    const isPendingDuplicate = visiblePending.some(
+      (existing) =>
+        (pendingMsg.request_id && existing.request_id && pendingMsg.request_id === existing.request_id) ||
+        (pendingMsg.role === existing.role &&
+          pendingMsg.content === existing.content &&
+          Math.abs(pendingMsg.created_at - existing.created_at) < 10)
+    );
+    if (isPendingDuplicate) {
+      duplicatePendingSuppressed += 1;
+      continue;
+    }
+
+    visiblePending.push(pendingMsg);
+  }
+
+  const rendered = [...dedupedSaved, ...visiblePending].sort((left, right) => {
+    if (left.id < 0 && right.id > 0) return 1;
+    if (left.id > 0 && right.id < 0) return -1;
+    if (left.id < 0 && right.id < 0) {
+      return left.created_at - right.created_at;
+    }
+    return left.id - right.id;
+  });
+
+  const savedMessageCount = dedupedSaved.length;
+  const pendingMessageCount = visiblePending.length;
+  const renderedMessageCount = rendered.length;
+
+  const trace = {
+    active_listener_count: activeListenerCount,
+    saved_message_count: savedMessageCount,
+    pending_message_count: pendingMessageCount,
+    rendered_message_count: renderedMessageCount,
+    duplicate_saved_suppressed: duplicateSavedSuppressed,
+    duplicate_pending_suppressed: duplicatePendingSuppressed,
+    pending_replaced_by_saved: pendingReplacedBySaved,
+    frontend_message_render_count: renderedMessageCount,
+  };
+
+  return {
+    messages: rendered,
+    trace,
+  };
 }
 
 function reconcilePersistedMessages(current: ChatMessage[], persisted: ChatMessage[]) {

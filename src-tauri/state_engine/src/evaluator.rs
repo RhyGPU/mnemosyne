@@ -237,6 +237,7 @@ pub struct EvaluatorConversionContext<'a> {
     pub latest_user_message: &'a str,
     pub latest_narrator_response: &'a str,
     pub session_world: Option<&'a SessionWorld>,
+    pub baseline_recent_event_id: Option<String>,
 }
 
 impl EvaluatorOutputV1 {
@@ -377,12 +378,24 @@ pub fn evaluator_output_to_engine_patch(
         });
     }
 
-    let mut seen_candidates = HashSet::new();
     let candidates = output
         .memory_candidates
         .iter()
-        .chain(output.per_soul_evaluations.iter().flat_map(|s| s.memory_candidates.iter()));
+        .map(|candidate| (candidate, false))
+        .chain(
+            output
+                .per_soul_evaluations
+                .iter()
+                .flat_map(|s| s.memory_candidates.iter().map(|candidate| (candidate, true))),
+        );
+    let mut candidates = candidates.collect::<Vec<_>>();
+    candidates.sort_by(|(left, left_nested), (right, right_nested)| {
+        candidate_quality_score(right, *right_nested, context, &active_souls, &evidence_text)
+            .cmp(&candidate_quality_score(left, *left_nested, context, &active_souls, &evidence_text))
+    });
+    let mut seen_candidates = HashSet::new();
     for candidate in candidates {
+        let (candidate, _nested_origin) = candidate;
         if !seen_candidates.insert(candidate.candidate_id.clone()) {
             reject(&mut report, candidate, "duplicate candidate id");
             continue;
@@ -440,6 +453,39 @@ pub fn evaluator_output_to_engine_patch(
     report.no_op = patch.is_empty();
     report.patch = patch;
     report
+}
+
+fn candidate_quality_score(
+    candidate: &MemoryCandidate,
+    nested_origin: bool,
+    context: &EvaluatorConversionContext<'_>,
+    active_souls: &HashSet<&str>,
+    evidence_text: &str,
+) -> i32 {
+    let mut score = 0;
+    if candidate.owner_soul_id == context.active_soul_id {
+        score += 100;
+    } else if active_souls.contains(candidate.owner_soul_id.as_str()) {
+        score += 50;
+    }
+    if !candidate.content.trim().is_empty() {
+        score += 40;
+    }
+    if claim_has_evidence(Some(&candidate.evidence_quote), evidence_text) {
+        score += 30;
+    }
+    if candidate.criterion_met {
+        score += 20;
+    }
+    score += (candidate.confidence.clamp(0.0, 1.0) * 10.0) as i32;
+    score += (candidate.salience.unwrap_or_default().clamp(0.0, 100.0) / 10.0) as i32;
+    if nested_origin && candidate.owner_soul_id == context.active_soul_id {
+        score += 12;
+    }
+    if !nested_origin && candidate.owner_soul_id.trim().is_empty() {
+        score += 4;
+    }
+    score
 }
 
 trait SoulPatchEvaluatorExt {
@@ -619,6 +665,7 @@ mod tests {
             latest_user_message: user,
             latest_narrator_response: narrator,
             session_world: Some(world),
+            baseline_recent_event_id: None,
         }
     }
 
@@ -1000,5 +1047,41 @@ mod tests {
         );
 
         assert_eq!(report.rejected_candidates[0].reason, "missing or invalid evidence_quote");
+    }
+
+    #[test]
+    fn duplicate_candidate_prefers_valid_nested_owner() {
+        let soul = new_default_soul("Aurora");
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let mut output = base_output(&soul.character_id);
+        output.memory_candidates.push(MemoryCandidate {
+            candidate_id: "same".into(),
+            owner_soul_id: "".into(),
+            slot: MemorySlot::RelationshipMemory,
+            content: "".into(),
+            evidence_quote: "I promise".into(),
+            criterion_met: false,
+            confidence: 0.2,
+            ..MemoryCandidate::default()
+        });
+        output.per_soul_evaluations[0]
+            .memory_candidates
+            .push(memory_candidate(
+                &soul.character_id,
+                "same",
+                "Aurora treats the user's promise as meaningful.",
+                "I promise",
+            ));
+
+        let report = evaluator_output_to_engine_patch(
+            &output,
+            &context(&soul, "I promise.", "Aurora hears: I promise.", &world),
+        );
+
+        assert_eq!(report.accepted_candidate_ids, vec!["same"]);
+        assert!(report
+            .rejected_candidates
+            .iter()
+            .any(|rejection| rejection.reason == "duplicate candidate id"));
     }
 }

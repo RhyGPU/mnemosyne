@@ -2,6 +2,7 @@ pub mod arousal;
 pub mod consolidation;
 pub mod context_compiler;
 pub mod evaluator;
+pub mod evaluator_form;
 pub mod evaluator_ingest;
 pub mod hidden_state;
 pub mod memory;

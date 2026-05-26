@@ -256,6 +256,7 @@ pub struct ProviderProfile {
     pub narrator_timeout_ms: Option<u64>,
     pub evaluator_timeout_ms: Option<u64>,
     pub evaluator_timeout_mode: Option<String>,
+    pub evaluator_mode: Option<String>,
     pub wait_for_evaluator_before_next_turn: Option<bool>,
     pub allow_send_with_stale_state: Option<bool>,
     pub evaluator_background_enabled: Option<bool>,
@@ -718,6 +719,7 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "provider_profiles", "narrator_timeout_ms", "INTEGER")?;
     add_column_if_missing(conn, "provider_profiles", "evaluator_timeout_ms", "INTEGER")?;
     add_column_if_missing(conn, "provider_profiles", "evaluator_timeout_mode", "TEXT")?;
+    add_column_if_missing(conn, "provider_profiles", "evaluator_mode", "TEXT")?;
     add_column_if_missing(
         conn,
         "provider_profiles",
@@ -2233,12 +2235,10 @@ pub fn restore_inactive_messages(
             "UPDATE turn_commits SET is_active = 1, is_discarded = 0, active_variant = 1 WHERE turn_id = ?1 AND conversation_id = ?2",
             params![commit.turn_id, conversation_id],
         )?;
-        if let Some(patch_id) = commit.state_patch_id.as_deref() {
-            conn.execute(
-                "UPDATE state_patches SET is_active = 1 WHERE patch_id = ?1",
-                [patch_id],
-            )?;
-        }
+        conn.execute(
+            "UPDATE state_patches SET is_active = 1 WHERE turn_id = ?1",
+            [&commit.turn_id],
+        )?;
     }
     for message_id in &result.restored_message_ids {
         conn.execute(
@@ -2810,12 +2810,10 @@ pub fn discard_active_commits_for_assistant(
 ) -> rusqlite::Result<()> {
     let commits = list_commits_for_assistant(conn, conversation_id, assistant_message_id)?;
     for commit in commits {
-        if let Some(patch_id) = commit.state_patch_id.as_deref() {
-            conn.execute(
-                "UPDATE state_patches SET is_active = 0 WHERE patch_id = ?1",
-                [patch_id],
-            )?;
-        }
+        conn.execute(
+            "UPDATE state_patches SET is_active = 0 WHERE turn_id = ?1",
+            [&commit.turn_id],
+        )?;
         conn.execute(
             "UPDATE turn_commits SET active_variant = 0, is_active = 0, is_discarded = 1 WHERE turn_id = ?1",
             [commit.turn_id],
@@ -2840,12 +2838,10 @@ pub fn deactivate_downstream_from_message(
     let commits = list_commits_at_or_after_message(conn, conversation_id, message_id)?;
     let mut count = 0;
     for commit in commits {
-        if let Some(patch_id) = commit.state_patch_id.as_deref() {
-            conn.execute(
-                "UPDATE state_patches SET is_active = 0 WHERE patch_id = ?1",
-                [patch_id],
-            )?;
-        }
+        conn.execute(
+            "UPDATE state_patches SET is_active = 0 WHERE turn_id = ?1",
+            [&commit.turn_id],
+        )?;
         conn.execute(
             "UPDATE turn_commits SET is_active = 0, is_discarded = 1, active_variant = 0 WHERE turn_id = ?1",
             [commit.turn_id],
@@ -2893,12 +2889,10 @@ pub fn activate_variant_commit(
     if let Some(assistant_id) = commit.assistant_message_id {
         discard_active_commits_for_assistant(conn, conversation_id, assistant_id)?;
     }
-    if let Some(patch_id) = commit.state_patch_id.as_deref() {
-        conn.execute(
-            "UPDATE state_patches SET is_active = 1 WHERE patch_id = ?1",
-            [patch_id],
-        )?;
-    }
+    conn.execute(
+        "UPDATE state_patches SET is_active = 1 WHERE turn_id = ?1",
+        [&turn_id],
+    )?;
     conn.execute(
         "UPDATE turn_commits SET active_variant = 1, is_active = 1, is_discarded = 0 WHERE turn_id = ?1",
         [turn_id.as_str()],
@@ -2940,27 +2934,28 @@ pub fn rebuild_session_state_until(
         ..BranchPatchDebug::default()
     };
     for commit in commits {
-        let Some(patch_id) = commit.state_patch_id.as_deref() else {
-            continue;
-        };
-        let patch_record = get_state_patch(conn, patch_id)?;
-        if !patch_record.is_active || commit.is_discarded || !commit.is_active {
-            debug.skipped_discarded_patches.push(patch_id.to_string());
+        let patches = list_active_patches_for_turn(conn, &commit.turn_id)?;
+        if patches.is_empty() || commit.is_discarded || !commit.is_active {
+            if let Some(ref patch_id) = commit.state_patch_id {
+                debug.skipped_discarded_patches.push(patch_id.clone());
+            }
             continue;
         }
-        let patch: EnginePatch = serde_json::from_str(&patch_record.patch_json)
-            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
-        patch
-            .apply_to_session(&mut soul, Some(&mut session_world))
-            .map_err(|err| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("{err:?}"),
-                )))
-            })?;
+        for patch_record in patches {
+            let patch: EnginePatch = serde_json::from_str(&patch_record.patch_json)
+                .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+            patch
+                .apply_to_session(&mut soul, Some(&mut session_world))
+                .map_err(|err| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{err:?}"),
+                    )))
+                })?;
+            debug.applied_patches.push(patch_record.patch_id);
+        }
         soul.turn_counter = soul.turn_counter.saturating_add(1);
         soul.turns_since_consolidation = soul.turns_since_consolidation.saturating_add(1);
-        debug.applied_patches.push(patch_id.to_string());
     }
     let invalidated = list_inactive_patch_ids(conn, branch_id)?;
     debug.invalidated_patches = invalidated;
@@ -3032,12 +3027,50 @@ fn get_turn_commit(conn: &Connection, turn_id: &str) -> rusqlite::Result<TurnCom
     )
 }
 
-fn get_state_patch(conn: &Connection, patch_id: &str) -> rusqlite::Result<StatePatchRecord> {
+pub fn get_state_patch(conn: &Connection, patch_id: &str) -> rusqlite::Result<StatePatchRecord> {
     conn.query_row(
         "SELECT patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id FROM state_patches WHERE patch_id = ?1",
         [patch_id],
         state_patch_from_row,
     )
+}
+
+pub fn list_active_patches_for_turn(
+    conn: &Connection,
+    turn_id: &str,
+) -> rusqlite::Result<Vec<StatePatchRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id 
+         FROM state_patches 
+         WHERE turn_id = ?1 AND is_active = 1
+         ORDER BY applied_at ASC, patch_id ASC",
+    )?;
+    let rows = stmt.query_map([turn_id], state_patch_from_row)?;
+    let mut patches = Vec::new();
+    for row in rows {
+        patches.push(row?);
+    }
+    Ok(patches)
+}
+
+pub fn record_enrichment_patch(
+    conn: &Connection,
+    turn_id: &str,
+    patch: &EnginePatch,
+) -> rusqlite::Result<StatePatchRecord> {
+    let now = now_ts();
+    let patch_id = ledger_id("patch");
+    let patch_json = serde_json::to_string(patch)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    conn.execute(
+        "
+        INSERT INTO state_patches
+            (patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id)
+        VALUES (?1, ?2, NULL, ?3, NULL, ?4, 'session', 1, NULL, NULL)
+        ",
+        params![patch_id, turn_id, patch_json, now],
+    )?;
+    get_state_patch(conn, &patch_id)
 }
 
 fn list_commits_for_assistant(
@@ -3129,11 +3162,11 @@ pub fn upsert_provider_profile(
         "
         INSERT INTO provider_profiles (
             id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
-            narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode,
+            narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
             wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
             anti_replay_forced_retry_enabled
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             base_url = excluded.base_url,
@@ -3144,6 +3177,7 @@ pub fn upsert_provider_profile(
             narrator_timeout_ms = excluded.narrator_timeout_ms,
             evaluator_timeout_ms = excluded.evaluator_timeout_ms,
             evaluator_timeout_mode = excluded.evaluator_timeout_mode,
+            evaluator_mode = excluded.evaluator_mode,
             wait_for_evaluator_before_next_turn = excluded.wait_for_evaluator_before_next_turn,
             allow_send_with_stale_state = excluded.allow_send_with_stale_state,
             evaluator_background_enabled = excluded.evaluator_background_enabled,
@@ -3161,6 +3195,7 @@ pub fn upsert_provider_profile(
             updated.narrator_timeout_ms,
             updated.evaluator_timeout_ms,
             updated.evaluator_timeout_mode,
+            updated.evaluator_mode,
             updated.wait_for_evaluator_before_next_turn,
             updated.allow_send_with_stale_state,
             updated.evaluator_background_enabled,
@@ -3174,7 +3209,7 @@ pub fn list_provider_profiles(conn: &Connection) -> rusqlite::Result<Vec<Provide
     let mut stmt = conn.prepare(
         "
         SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
-               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode,
+               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
                anti_replay_forced_retry_enabled
         FROM provider_profiles
@@ -3189,7 +3224,7 @@ pub fn get_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<Pro
     conn.query_row(
         "
         SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
-               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode,
+               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
                anti_replay_forced_retry_enabled
         FROM provider_profiles
@@ -3218,10 +3253,11 @@ fn provider_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provid
         narrator_timeout_ms: row.get(8)?,
         evaluator_timeout_ms: row.get(9)?,
         evaluator_timeout_mode: row.get(10)?,
-        wait_for_evaluator_before_next_turn: row.get(11)?,
-        allow_send_with_stale_state: row.get(12)?,
-        evaluator_background_enabled: row.get(13)?,
-        anti_replay_forced_retry_enabled: row.get(14)?,
+        evaluator_mode: row.get(11)?,
+        wait_for_evaluator_before_next_turn: row.get(12)?,
+        allow_send_with_stale_state: row.get(13)?,
+        evaluator_background_enabled: row.get(14)?,
+        anti_replay_forced_retry_enabled: row.get(15)?,
     })
 }
 
@@ -4629,6 +4665,7 @@ mod tests {
             narrator_timeout_ms: Some(30_000),
             evaluator_timeout_ms: Some(25_000),
             evaluator_timeout_mode: Some("finite".into()),
+            evaluator_mode: Some("evaluator_form_v1".into()),
             wait_for_evaluator_before_next_turn: Some(true),
             allow_send_with_stale_state: Some(false),
             evaluator_background_enabled: Some(false),
@@ -4641,6 +4678,13 @@ mod tests {
         assert_eq!(
             get_provider_profile(&conn, "openai").expect("get").model,
             "gpt"
+        );
+        assert_eq!(
+            get_provider_profile(&conn, "openai")
+                .expect("get")
+                .evaluator_mode
+                .as_deref(),
+            Some("evaluator_form_v1")
         );
         assert!(delete_provider_profile(&conn, "openai").expect("delete"));
         assert!(list_provider_profiles(&conn).expect("list").is_empty());

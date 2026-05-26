@@ -256,6 +256,9 @@ export type ChatMessage = {
   origin?: "active" | "restored" | string;
   attachments?: MessageAttachment[];
   pending?: boolean;
+  request_id?: string | null;
+  generation_id?: number | null;
+  assistant_message_id?: number | null;
 };
 
 export type ImageAsset = {
@@ -467,6 +470,7 @@ export type ApiProviderSettings = {
   narrator_timeout_ms?: number | null;
   evaluator_timeout_ms?: number | null;
   evaluator_timeout_mode?: "finite" | "no_app_timeout" | string | null;
+  evaluator_mode?: "evaluator_v1" | "evaluator_form_v1" | "dual_compare" | string | null;
   wait_for_evaluator_before_next_turn?: boolean | null;
   allow_send_with_stale_state?: boolean | null;
   evaluator_background_enabled?: boolean | null;
@@ -486,6 +490,7 @@ export type EvaluatorJobStatus =
   | "pending"
   | "running"
   | "completed"
+  | "partial_success"
   | "failed"
   | "canceled"
   | "timed_out"

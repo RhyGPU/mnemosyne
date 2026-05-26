@@ -12,9 +12,34 @@ use crate::soul::{MemorySourceType, TruthStatus, ObjectState};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvaluatorParseResult {
     pub output: EvaluatorOutputV1,
+    pub draft: NormalizedEvaluationDraft,
     pub normalized_json: String,
     pub normalized: bool,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvaluatorDraftContext {
+    pub active_soul_id: String,
+    pub active_soul_display_name: String,
+    pub active_soul_ids: Vec<String>,
+    pub latest_user_message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NormalizedEvaluationDraft {
+    pub scene_evaluation: GlobalSceneEvaluation,
+    pub memory_candidate_count: usize,
+    pub world_event_count: usize,
+    pub scene_state_present: bool,
+    pub relationship_delta_count: usize,
+    pub per_soul_interpretation_count: usize,
+    pub object_observation_count: usize,
+    pub warnings: Vec<String>,
+    pub candidate_quality_decisions: Vec<String>,
+    pub candidate_routing_decisions: Vec<String>,
+    pub state_effect_guarantee_applied: bool,
+    pub state_effect_guarantee_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,6 +103,9 @@ pub struct LaxWorldChangeEvaluation {
     pub change_id: Option<serde_json::Value>,
     pub location: Option<serde_json::Value>,
     pub event_summary: Option<serde_json::Value>,
+    pub change_type: Option<serde_json::Value>,
+    pub target: Option<serde_json::Value>,
+    pub new_state: Option<serde_json::Value>,
     pub scene_state: Option<serde_json::Value>,
     pub active_plot_add: Option<serde_json::Value>,
     pub active_plot_resolve: Option<serde_json::Value>,
@@ -101,7 +129,7 @@ pub struct LaxObjectChangeEvaluation {
     pub entity_id: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LaxRelationshipEvaluation {
     pub source_soul_id: Option<serde_json::Value>,
     pub target_entity_id: Option<serde_json::Value>,
@@ -139,6 +167,9 @@ pub struct LaxMemoryCandidate {
     pub owner_soul_id: Option<serde_json::Value>,
     pub slot: Option<serde_json::Value>,
     pub content: Option<serde_json::Value>,
+    pub details: Option<serde_json::Value>,
+    pub summary: Option<serde_json::Value>,
+    pub action: Option<serde_json::Value>,
     pub evidence_quote: Option<serde_json::Value>,
     pub criterion_met: Option<serde_json::Value>,
     pub confidence: Option<serde_json::Value>,
@@ -162,6 +193,10 @@ pub struct LaxMemoryCandidate {
     pub specifics: Option<serde_json::Value>,
     pub payload: Option<serde_json::Value>,
     pub actor: Option<serde_json::Value>,
+    pub target: Option<serde_json::Value>,
+    pub relationship_delta: Option<serde_json::Value>,
+    pub changes: Option<serde_json::Value>,
+    pub deltas: Option<serde_json::Value>,
     pub tags: Option<serde_json::Value>,
     pub memory_id: Option<serde_json::Value>,
     pub soul: Option<serde_json::Value>,
@@ -187,6 +222,44 @@ fn rand_str_from_evidence(s: &str) -> String {
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);
     format!("{:x}", hasher.finish())
+}
+
+fn clean_value_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|value| match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn payload_string(payload: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    payload
+        .and_then(|payload| payload.as_object())
+        .and_then(|payload| payload.get(key))
+        .and_then(|value| clean_value_string(Some(value)))
+}
+
+fn joined_action_details(action: Option<String>, details: Option<String>) -> Option<String> {
+    match (action, details) {
+        (Some(action), Some(details)) => Some(format!("{action}: {details}")),
+        (Some(action), None) => Some(action),
+        (None, Some(details)) => Some(details),
+        (None, None) => None,
+    }
+}
+
+fn stable_candidate_id(owner_or_scope: &str, slot: MemorySlot, evidence: &str, content: &str) -> String {
+    let source = format!(
+        "{}|{}|{}|{}",
+        owner_or_scope.trim(),
+        slot.as_label(),
+        evidence.trim(),
+        content.trim()
+    );
+    format!("mem_norm_{}", rand_str_from_evidence(&source))
 }
 
 fn parse_lax_float_with_warning(
@@ -601,27 +674,52 @@ fn map_memory_candidate(
         found_slot
     };
 
-    // 4. specifics / payload -> content mapping
+    // 4. semantic aliases -> content mapping
     let content = if let Some(c) = lax.content.as_ref().and_then(|v| v.as_str()) {
         c.to_string()
     } else {
         let mut found_content = None;
-        if let Some(specifics) = &lax.specifics {
-            if let Some(s) = specifics.as_str() {
-                found_content = Some(s.to_string());
-                warnings.push(format!("{path}.specifics normalized to content"));
+        if lax.action.is_some() {
+            found_content = joined_action_details(
+                clean_value_string(lax.action.as_ref()),
+                clean_value_string(lax.details.as_ref()),
+            );
+            if found_content.is_some() {
+                warnings.push(format!("{path}.action/details normalized to content"));
+            }
+        }
+        for (key, value) in [
+            ("details", &lax.details),
+            ("summary", &lax.summary),
+            ("specifics", &lax.specifics),
+        ] {
+            if found_content.is_some() {
+                break;
+            }
+            if let Some(s) = clean_value_string(value.as_ref()) {
+                found_content = Some(s);
+                warnings.push(format!("{path}.{key} normalized to content"));
+                break;
             }
         }
         if found_content.is_none() {
             if let Some(payload) = &lax.payload {
                 if let Some(payload_obj) = payload.as_object() {
-                    for key in ["action", "interpretation", "content", "specifics"] {
-                        if let Some(val) = payload_obj.get(key) {
-                            if let Some(s) = val.as_str() {
-                                found_content = Some(s.to_string());
-                                warnings.push(format!("{path}.payload.{key} normalized to content"));
-                                break;
-                            }
+                    found_content = joined_action_details(
+                        payload_string(Some(payload), "action"),
+                        payload_string(Some(payload), "details"),
+                    );
+                    if found_content.is_some() {
+                        warnings.push(format!("{path}.payload.action/details normalized to content"));
+                    }
+                    for key in ["content", "details", "summary", "specifics", "interpretation", "action"] {
+                        if found_content.is_some() {
+                            break;
+                        }
+                        if let Some(s) = payload_obj.get(key).and_then(|v| clean_value_string(Some(v))) {
+                            found_content = Some(s);
+                            warnings.push(format!("{path}.payload.{key} normalized to content"));
+                            break;
                         }
                     }
                 } else if let Some(s) = payload.as_str() {
@@ -664,16 +762,16 @@ fn map_memory_candidate(
     }
 
     // 7. memory_id / candidate_id mapping
+    let evidence_quote = lax.evidence_quote.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
     let candidate_id = if let Some(cid) = lax.candidate_id.as_ref().and_then(|v| v.as_str()) {
         cid.to_string()
     } else if let Some(mid) = lax.memory_id.as_ref().and_then(|v| v.as_str()) {
         warnings.push(format!("{path}.memory_id normalized to candidate_id"));
         mid.to_string()
     } else {
-        let evidence_str = lax.evidence_quote.as_ref().and_then(|v| v.as_str()).unwrap_or("");
-        let fb = format!("mem_norm_{}", rand_str_from_evidence(evidence_str));
-        warnings.push(format!("{path}.candidate_id generated from evidence hash: {fb}"));
-        fb
+        let candidate_id = stable_candidate_id(&owner_soul_id, slot, &evidence_quote, &content);
+        warnings.push(format!("{path}.candidate_id generated from owner/slot/evidence/content: {candidate_id}"));
+        candidate_id
     };
 
     // 8. source_type
@@ -743,7 +841,7 @@ fn map_memory_candidate(
         owner_soul_id,
         slot,
         content,
-        evidence_quote: lax.evidence_quote.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default(),
+        evidence_quote,
         criterion_met: parse_lax_bool(lax.criterion_met.as_ref(), &format!("{path}.criterion_met"), warnings),
         confidence: confidence.unwrap_or(0.7),
         salience,
@@ -1044,10 +1142,26 @@ fn map_world_change(
 
     let relevance_tags = map_relevance_tags(lax.relevance_tags.as_ref(), warnings, &format!("{path}.relevance_tags"));
 
+    let event_summary = lax.event_summary.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())).or_else(|| {
+        let parts = [
+            clean_value_string(lax.change_type.as_ref()),
+            clean_value_string(lax.target.as_ref()),
+            clean_value_string(lax.new_state.as_ref()),
+            clean_value_string(lax.evidence_quote.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        (!parts.is_empty()).then(|| {
+            warnings.push(format!("{path}.event_summary synthesized from change_type/target/new_state/evidence"));
+            parts.join(": ")
+        })
+    });
+
     WorldChangeEvaluation {
         change_id,
         location: lax.location.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())),
-        event_summary: lax.event_summary.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())),
+        event_summary,
         scene_state,
         active_plot_add,
         active_plot_resolve,
@@ -1197,7 +1311,330 @@ pub fn map_evaluator_output(
     }
 }
 
+fn is_active_soul(context: Option<&EvaluatorDraftContext>, entity_id: &str) -> bool {
+    let id = entity_id.trim();
+    !id.is_empty()
+        && context
+            .map(|context| context.active_soul_ids.iter().any(|active| active == id))
+            .unwrap_or(true)
+}
+
+fn has_world_effect(output: &EvaluatorOutputV1) -> bool {
+    output.world_changes.iter().any(|change| {
+        change.event_summary.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+            || change.scene_state.is_some()
+            || !change.active_plot_add.is_empty()
+            || !change.active_plot_resolve.is_empty()
+    })
+}
+
+fn scene_turn_detected(output: &EvaluatorOutputV1) -> bool {
+    output.turn_classification.scene_event_occurred
+        || output.global_scene_evaluation.scene_event_occurred
+        || output.global_scene_evaluation.current_plot_advanced
+        || output.turn_flags_u64 & crate::evaluator::turn_flags::SCENE_TURN != 0
+        || output.turn_flags_u64 & crate::evaluator::turn_flags::CURRENT_PLOT_ADVANCED != 0
+}
+
+fn minimal_scene_state(context: &EvaluatorDraftContext, summary: &str) -> SceneStatePatch {
+    let current_scene = if summary.trim().is_empty() {
+        format!(
+            "{} and default_player are continuing the current scene.",
+            context.active_soul_display_name
+        )
+    } else {
+        summary.trim().to_string()
+    };
+    SceneStatePatch {
+        scene_state_id: Some(stable_candidate_id(
+            "session_world",
+            MemorySlot::CurrentPlotMemory,
+            &context.latest_user_message,
+            &current_scene,
+        )),
+        current_scene: Some(current_scene),
+        focus: Some(format!("{} and default_player", context.active_soul_display_name)),
+        participants: vec![context.active_soul_id.clone(), "default_player".into()],
+        last_user_action: (!context.latest_user_message.trim().is_empty())
+            .then(|| context.latest_user_message.trim().to_string()),
+        continuity_note: Some("The scene advanced on the latest user action.".into()),
+        ..SceneStatePatch::default()
+    }
+}
+
+fn route_top_level_world_memories(
+    output: &mut EvaluatorOutputV1,
+    draft: &mut NormalizedEvaluationDraft,
+    context: Option<&EvaluatorDraftContext>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    let mut retained = Vec::new();
+    for candidate in output.memory_candidates.drain(..) {
+        let owner = candidate.owner_soul_id.trim();
+        let should_route = owner.is_empty() || owner == "default_player";
+        if should_route && !candidate.content.trim().is_empty() {
+            draft.candidate_routing_decisions.push(format!(
+                "{} routed to SessionWorld recent_event because owner was {:?}",
+                candidate.candidate_id, owner
+            ));
+            output.world_changes.push(WorldChangeEvaluation {
+                change_id: Some(stable_candidate_id(
+                    if owner.is_empty() { "session_world" } else { owner },
+                    candidate.slot,
+                    &candidate.evidence_quote,
+                    &candidate.content,
+                )),
+                event_summary: Some(candidate.content.clone()),
+                evidence_quote: (!candidate.evidence_quote.trim().is_empty())
+                    .then(|| candidate.evidence_quote.clone())
+                    .or_else(|| Some(context.latest_user_message.clone())),
+                confidence: candidate.confidence.max(0.6),
+                ..WorldChangeEvaluation::default()
+            });
+        } else {
+            if candidate.content.trim().is_empty() {
+                draft.candidate_quality_decisions.push(format!(
+                    "{} marked low quality: empty content",
+                    candidate.candidate_id
+                ));
+            }
+            retained.push(candidate);
+        }
+    }
+    output.memory_candidates = retained;
+}
+
+fn add_relationship_delta_from_memory(
+    output: &mut EvaluatorOutputV1,
+    lax: &LaxMemoryCandidate,
+    candidate: &MemoryCandidate,
+    draft: &mut NormalizedEvaluationDraft,
+    context: Option<&EvaluatorDraftContext>,
+    path: &str,
+) {
+    let relation_value = lax
+        .relationship_delta
+        .as_ref()
+        .or(lax.changes.as_ref())
+        .or(lax.deltas.as_ref());
+    let Some(relation_value) = relation_value else {
+        return;
+    };
+    if !is_active_soul(context, &candidate.owner_soul_id) {
+        draft.candidate_routing_decisions.push(format!(
+            "{} relationship_delta ignored because owner is not an active Soul",
+            candidate.candidate_id
+        ));
+        return;
+    }
+    let mut relation = serde_json::from_value::<LaxRelationshipEvaluation>(relation_value.clone())
+        .unwrap_or_else(|_| LaxRelationshipEvaluation {
+            changes: Some(relation_value.clone()),
+            ..LaxRelationshipEvaluation::default()
+        });
+    relation.source_soul_id = Some(serde_json::Value::String(candidate.owner_soul_id.clone()));
+    relation.evidence_quote = Some(serde_json::Value::String(candidate.evidence_quote.clone()));
+    if relation.target_entity_id.is_none() && relation.target.is_none() && relation.actor.is_none() {
+        relation.target_entity_id = clean_value_string(lax.target.as_ref())
+            .or_else(|| clean_value_string(lax.actor.as_ref()))
+            .or_else(|| Some("default_player".into()))
+            .map(serde_json::Value::String);
+    }
+    relation.criterion_met = Some(serde_json::Value::Bool(
+        !candidate.owner_soul_id.trim().is_empty()
+            && !candidate.evidence_quote.trim().is_empty()
+            && relation.target_entity_id.is_some(),
+    ));
+    let mut warnings = Vec::new();
+    let mapped = map_relationship_evaluation(&relation, &mut warnings, path);
+    draft.warnings.extend(warnings);
+    output.relationship_evaluations.push(mapped);
+}
+
+fn add_recent_emotional_state_candidate(
+    output: &mut EvaluatorOutputV1,
+    draft: &mut NormalizedEvaluationDraft,
+    context: Option<&EvaluatorDraftContext>,
+) {
+    if !output.global_scene_evaluation.recent_emotional_state_changed {
+        return;
+    }
+    let Some(context) = context else {
+        return;
+    };
+    for per_soul in &mut output.per_soul_evaluations {
+        if per_soul.soul_id != context.active_soul_id {
+            continue;
+        }
+        let Some(emotional_state) = per_soul.emotional_state.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(evidence) = output.global_scene_evaluation.evidence_quote.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            draft.candidate_quality_decisions.push(
+                "recent emotional state rejected: missing evidence_quote".into(),
+            );
+            continue;
+        };
+        if emotional_state.len() < 12 || emotional_state.eq_ignore_ascii_case("tense") {
+            draft.candidate_quality_decisions.push(
+                "recent emotional state rejected: generic emotional/body-language content".into(),
+            );
+            continue;
+        }
+        let content = format!(
+            "{} recent emotional state: {}",
+            context.active_soul_display_name, emotional_state
+        );
+        per_soul.memory_candidates.push(MemoryCandidate {
+            candidate_id: stable_candidate_id(
+                &context.active_soul_id,
+                MemorySlot::RecentEmotionalState,
+                evidence,
+                &content,
+            ),
+            owner_soul_id: context.active_soul_id.clone(),
+            slot: MemorySlot::RecentEmotionalState,
+            content,
+            evidence_quote: evidence.to_string(),
+            criterion_met: true,
+            confidence: 0.7,
+            salience: Some(50.0),
+            retrieval_strength: Some(45.0),
+            perceived_by_entity_id: Some(context.active_soul_id.clone()),
+            target_entity_ids: vec!["default_player".into()],
+            source_type: MemorySourceType::CurrentSession,
+            truth_status: TruthStatus::SceneEvent,
+            relevance_tags: vec!["recent_emotional_state".into()],
+            knowledge_scope: KnowledgeScope::DirectlyObserved,
+        });
+        draft.candidate_quality_decisions.push(
+            "recent emotional state candidate created with evidence".into(),
+        );
+    }
+}
+
+fn create_normalized_draft(
+    lax: &LaxEvaluatorOutput,
+    output: &mut EvaluatorOutputV1,
+    warnings: &[String],
+    context: Option<&EvaluatorDraftContext>,
+) -> NormalizedEvaluationDraft {
+    let mut draft = NormalizedEvaluationDraft {
+        scene_evaluation: output.global_scene_evaluation.clone(),
+        warnings: warnings.to_vec(),
+        ..NormalizedEvaluationDraft::default()
+    };
+
+    route_top_level_world_memories(output, &mut draft, context);
+
+    if let Some(memories) = &lax.memory_candidates {
+        for (idx, lax_candidate) in memories.iter().enumerate() {
+            if let Some(candidate) = output.memory_candidates.get(idx).cloned() {
+                add_relationship_delta_from_memory(
+                    output,
+                    lax_candidate,
+                    &candidate,
+                    &mut draft,
+                    context,
+                    &format!("memory_candidates[{idx}].relationship_delta"),
+                );
+            }
+        }
+    }
+    if let Some(per_soul_lax) = &lax.per_soul_evaluations {
+        for (soul_idx, lax_soul) in per_soul_lax.iter().enumerate() {
+            if let Some(lax_memories) = &lax_soul.memory_candidates {
+                let candidates = output
+                    .per_soul_evaluations
+                    .get(soul_idx)
+                    .map(|soul| soul.memory_candidates.clone())
+                    .unwrap_or_default();
+                for (idx, lax_candidate) in lax_memories.iter().enumerate() {
+                    if let Some(candidate) = candidates.get(idx) {
+                        add_relationship_delta_from_memory(
+                            output,
+                            lax_candidate,
+                            candidate,
+                            &mut draft,
+                            context,
+                            &format!("per_soul_evaluations[{soul_idx}].memory_candidates[{idx}].relationship_delta"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    add_recent_emotional_state_candidate(output, &mut draft, context);
+
+    if scene_turn_detected(output) && !has_world_effect(output) {
+        if let Some(context) = context {
+            let summary = output
+                .global_scene_evaluation
+                .summary
+                .trim()
+                .to_string();
+            let fallback_summary = if summary.is_empty() {
+                context.latest_user_message.clone()
+            } else {
+                summary
+            };
+            output.world_changes.push(WorldChangeEvaluation {
+                change_id: Some(stable_candidate_id(
+                    "session_world",
+                    MemorySlot::CurrentPlotMemory,
+                    output.global_scene_evaluation.evidence_quote.as_deref().unwrap_or(""),
+                    &fallback_summary,
+                )),
+                event_summary: Some(fallback_summary.clone()),
+                scene_state: Some(minimal_scene_state(context, &fallback_summary)),
+                evidence_quote: output
+                    .global_scene_evaluation
+                    .evidence_quote
+                    .clone()
+                    .or_else(|| Some(context.latest_user_message.clone())),
+                confidence: 0.7,
+                ..WorldChangeEvaluation::default()
+            });
+            draft.state_effect_guarantee_applied = true;
+            draft.state_effect_guarantee_reason =
+                Some("scene turn had no usable world effect; synthesized recent_event and scene_state".into());
+        }
+    }
+
+    draft.memory_candidate_count = output.memory_candidates.len()
+        + output
+            .per_soul_evaluations
+            .iter()
+            .map(|soul| soul.memory_candidates.len())
+            .sum::<usize>();
+    draft.world_event_count = output.world_changes.len();
+    draft.scene_state_present = output.world_changes.iter().any(|change| change.scene_state.is_some());
+    draft.relationship_delta_count = output.relationship_evaluations.len()
+        + output
+            .per_soul_evaluations
+            .iter()
+            .map(|soul| soul.relationship_deltas.len())
+            .sum::<usize>();
+    draft.per_soul_interpretation_count = output
+        .per_soul_evaluations
+        .iter()
+        .filter(|soul| !soul.subjective_interpretation.trim().is_empty())
+        .count();
+    draft.object_observation_count = output.object_changes.len();
+    draft
+}
+
 pub fn parse_evaluator_output(raw_json: &str) -> Result<EvaluatorParseResult, String> {
+    parse_evaluator_output_with_context(raw_json, None)
+}
+
+pub fn parse_evaluator_output_with_context(
+    raw_json: &str,
+    context: Option<&EvaluatorDraftContext>,
+) -> Result<EvaluatorParseResult, String> {
     let trimmed = raw_json.trim();
     let json = if let Some(stripped) = trimmed.strip_prefix("```json") {
         stripped.trim_end_matches("```").trim()
@@ -1211,16 +1648,207 @@ pub fn parse_evaluator_output(raw_json: &str) -> Result<EvaluatorParseResult, St
     let lax_output: LaxEvaluatorOutput = serde_json::from_str(json)
         .map_err(|err| format!("Evaluator returned invalid LaxEvaluatorOutput JSON: {err}"))?;
 
-    let output = map_evaluator_output(lax_output, &mut warnings);
+    let mut output = map_evaluator_output(lax_output.clone(), &mut warnings);
+    let draft = create_normalized_draft(&lax_output, &mut output, &warnings, context);
 
-    let normalized = !warnings.is_empty();
+    let normalized = !warnings.is_empty()
+        || draft.state_effect_guarantee_applied
+        || !draft.candidate_routing_decisions.is_empty()
+        || !draft.candidate_quality_decisions.is_empty();
     let normalized_json = serde_json::to_string(&output)
         .map_err(|err| format!("Evaluator output serialization failed: {err}"))?;
 
     Ok(EvaluatorParseResult {
         output,
+        draft,
         normalized_json,
         normalized,
         warnings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> EvaluatorDraftContext {
+        EvaluatorDraftContext {
+            active_soul_id: "aurora_soul".into(),
+            active_soul_display_name: "Aurora Schwarz".into(),
+            active_soul_ids: vec!["aurora_soul".into()],
+            latest_user_message: "I walk in. Long time no see, Aurora.".into(),
+        }
+    }
+
+    fn base_json(memory: serde_json::Value) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "turn_flags_u64": 1,
+            "turn_classification": {
+                "scene_event_occurred": true
+            },
+            "global_scene_evaluation": {
+                "scene_event_occurred": true,
+                "evidence_quote": "I walk in",
+                "summary": "The visitor entered Aurora's apartment."
+            },
+            "per_soul_evaluations": [],
+            "world_changes": [],
+            "object_changes": [],
+            "relationship_evaluations": [],
+            "memory_candidates": [memory],
+            "relevance_tags": {},
+            "no_op_reason": null
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn details_maps_to_memory_content() {
+        let raw = base_json(serde_json::json!({
+            "owner_soul_id": "aurora_soul",
+            "slot": "relationship_memory",
+            "details": "Aurora noticed the visitor came inside.",
+            "evidence_quote": "I walk in",
+            "criterion_met": true
+        }));
+        let parsed = parse_evaluator_output_with_context(&raw, Some(&ctx())).unwrap();
+        assert_eq!(
+            parsed.output.memory_candidates[0].content,
+            "Aurora noticed the visitor came inside."
+        );
+    }
+
+    #[test]
+    fn action_details_maps_to_memory_content() {
+        let raw = base_json(serde_json::json!({
+            "owner_soul_id": "aurora_soul",
+            "slot": "relationship_memory",
+            "action": "visitor entered",
+            "details": "Aurora let them in after the doorway greeting.",
+            "evidence_quote": "I walk in",
+            "criterion_met": true
+        }));
+        let parsed = parse_evaluator_output_with_context(&raw, Some(&ctx())).unwrap();
+        assert!(parsed.output.memory_candidates[0]
+            .content
+            .contains("visitor entered"));
+    }
+
+    #[test]
+    fn default_player_memory_routes_to_session_world_not_soul() {
+        let raw = base_json(serde_json::json!({
+            "owner_soul_id": "default_player",
+            "slot": "current_plot_memory",
+            "content": "The visitor entered Aurora's apartment.",
+            "evidence_quote": "I walk in",
+            "criterion_met": true
+        }));
+        let parsed = parse_evaluator_output_with_context(&raw, Some(&ctx())).unwrap();
+        assert!(parsed.output.memory_candidates.is_empty());
+        assert_eq!(
+            parsed.output.world_changes[0].event_summary.as_deref(),
+            Some("The visitor entered Aurora's apartment.")
+        );
+    }
+
+    #[test]
+    fn active_soul_nested_candidate_inherits_owner() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "per_soul_evaluations": [{
+                "soul_id": "aurora_soul",
+                "memory_candidates": [{
+                    "slot": "relationship_memory",
+                    "content": "Aurora recognized the visitor's return.",
+                    "evidence_quote": "Long time no see",
+                    "criterion_met": true
+                }]
+            }]
+        })
+        .to_string();
+        let parsed = parse_evaluator_output_with_context(&raw, Some(&ctx())).unwrap();
+        assert_eq!(
+            parsed.output.per_soul_evaluations[0].memory_candidates[0].owner_soul_id,
+            "aurora_soul"
+        );
+    }
+
+    #[test]
+    fn candidate_id_includes_owner_slot_evidence_content_when_generated() {
+        let first = serde_json::json!({
+            "owner_soul_id": "aurora_soul",
+            "slot": "relationship_memory",
+            "content": "Same quote, Aurora owner.",
+            "evidence_quote": "same",
+            "criterion_met": true
+        });
+        let mut second = first.clone();
+        second["owner_soul_id"] = serde_json::json!("other_soul");
+        let first = parse_evaluator_output(&base_json(first)).unwrap();
+        let second = parse_evaluator_output(&base_json(second)).unwrap();
+        assert_ne!(
+            first.output.memory_candidates[0].candidate_id,
+            second.output.memory_candidates[0].candidate_id
+        );
+    }
+
+    #[test]
+    fn relationship_delta_inherits_candidate_evidence() {
+        let raw = base_json(serde_json::json!({
+            "owner_soul_id": "aurora_soul",
+            "slot": "relationship_memory",
+            "content": "Aurora felt more comfortable with the visitor.",
+            "evidence_quote": "Long time no see",
+            "criterion_met": true,
+            "relationship_delta": {
+                "target": "default_player",
+                "changes": { "comfort": 2.0, "curiosity": 1.0 }
+            }
+        }));
+        let parsed = parse_evaluator_output_with_context(&raw, Some(&ctx())).unwrap();
+        let relation = &parsed.output.relationship_evaluations[0];
+        assert_eq!(relation.source_soul_id, "aurora_soul");
+        assert_eq!(relation.evidence_quote.as_deref(), Some("Long time no see"));
+        assert_eq!(relation.comfort, Some(2.0));
+    }
+
+    #[test]
+    fn scene_turn_synthesizes_minimal_scene_state() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "turn_classification": { "scene_event_occurred": true },
+            "global_scene_evaluation": {
+                "scene_event_occurred": true,
+                "summary": "The visitor entered Aurora's apartment.",
+                "evidence_quote": "I walk in"
+            }
+        })
+        .to_string();
+        let parsed = parse_evaluator_output_with_context(&raw, Some(&ctx())).unwrap();
+        assert!(parsed.draft.state_effect_guarantee_applied);
+        assert!(parsed.output.world_changes[0].scene_state.is_some());
+    }
+
+    #[test]
+    fn recent_emotional_state_candidate_requires_evidence() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "global_scene_evaluation": {
+                "recent_emotional_state_changed": true
+            },
+            "per_soul_evaluations": [{
+                "soul_id": "aurora_soul",
+                "emotional_state": "playfully engaged after the visitor entered"
+            }]
+        })
+        .to_string();
+        let parsed = parse_evaluator_output_with_context(&raw, Some(&ctx())).unwrap();
+        assert!(parsed.output.per_soul_evaluations[0].memory_candidates.is_empty());
+        assert!(parsed
+            .draft
+            .candidate_quality_decisions
+            .iter()
+            .any(|decision| decision.contains("missing evidence_quote")));
+    }
 }

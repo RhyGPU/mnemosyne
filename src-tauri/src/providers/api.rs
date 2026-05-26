@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use state_engine::{
     evaluator::{turn_flags, EVALUATOR_SCHEMA_VERSION},
+    evaluator_form::{build_eval_form_spec, EvalFormResponse},
     setting::SessionWorld,
     soul::Soul,
 };
@@ -163,6 +164,7 @@ pub struct ApiProviderSettings {
     pub narrator_timeout_ms: Option<u64>,
     pub evaluator_timeout_ms: Option<u64>,
     pub evaluator_timeout_mode: Option<String>,
+    pub evaluator_mode: Option<String>,
     pub wait_for_evaluator_before_next_turn: Option<bool>,
     pub allow_send_with_stale_state: Option<bool>,
     pub evaluator_background_enabled: Option<bool>,
@@ -930,19 +932,104 @@ pub fn build_evaluator_prompt(soul: &Soul, session_world: Option<&SessionWorld>)
             "knowledge_scope": "not_known",
             "subjective_interpretation": "",
             "emotional_state": "",
-            "relationship_deltas": [],
-            "memory_candidates": [],
+            "relationship_deltas": [{
+                "source_soul_id": active_soul_id,
+                "target_entity_id": "default_player",
+                "trust": 1.0,
+                "comfort": 1.0,
+                "evidence_quote": "short exact quote from latest exchange",
+                "criterion_met": true,
+                "confidence": 0.75,
+                "relevance_tags": empty_relevance_tags_json()
+            }],
+            "memory_candidates": [{
+                "candidate_id": "stable semantic id",
+                "owner_soul_id": active_soul_id,
+                "slot": "relationship_memory",
+                "content": "specific durable memory candidate",
+                "evidence_quote": "short exact quote from latest exchange",
+                "criterion_met": true,
+                "confidence": 0.75,
+                "salience": 60.0,
+                "retrieval_strength": 55.0,
+                "perceived_by_entity_id": active_soul_id,
+                "target_entity_ids": ["default_player"],
+                "source_type": "current_session",
+                "truth_status": "scene_event",
+                "relevance_tags": ["relationship"],
+                "knowledge_scope": "directly_observed"
+            }],
             "relevance_tags": empty_relevance_tags_json()
         }],
-        "world_changes": [],
-        "object_changes": [],
-        "relationship_evaluations": [],
-        "memory_candidates": [],
+        "world_changes": [{
+            "change_id": "stable scene id",
+            "location": "",
+            "event_summary": "If the scene advances but no durable memory is warranted, summarize the objective event here.",
+            "scene_state": {
+                "scene_state_id": "stable id",
+                "current_scene": "one sentence current scene",
+                "resolved_active_plot": "single branch to continue",
+                "scene_branch": "true branch/outcome",
+                "focus": "Aurora Schwarz and default_player",
+                "participants": [active_soul_id, "default_player"],
+                "last_user_action": "latest user action",
+                "pressure_point": "",
+                "continuity_note": "what changed for continuity"
+            },
+            "active_plot_add": [],
+            "active_plot_resolve": [],
+            "evidence_quote": "short exact quote from latest exchange",
+            "confidence": 0.75,
+            "relevance_tags": empty_relevance_tags_json()
+        }],
+        "object_changes": [{
+            "change_id": "stable object id",
+            "object_state": {
+                "object_id": "door",
+                "object_kind": "door",
+                "owner_entity_id": active_soul_id,
+                "location": "",
+                "status": "opened",
+                "open_state": "open",
+                "lock_state": "unknown",
+                "power_state": "unknown",
+                "notification_mode": "unknown",
+                "last_observed_state": "door opened",
+                "confidence": 0.75
+            },
+            "evidence_quote": "short exact quote from latest exchange",
+            "confidence": 0.75,
+            "relevance_tags": empty_relevance_tags_json()
+        }],
+        "relationship_evaluations": [{
+            "source_soul_id": active_soul_id,
+            "target_entity_id": "default_player",
+            "curiosity": 1.0,
+            "comfort": 1.0,
+            "evidence_quote": "short exact quote from latest exchange",
+            "criterion_met": true,
+            "confidence": 0.75,
+            "relevance_tags": empty_relevance_tags_json()
+        }],
+        "memory_candidates": [{
+            "candidate_id": "stable objective id",
+            "owner_soul_id": "",
+            "slot": "current_plot_memory",
+            "content": "objective scene event; ingestion may route this to SessionWorld instead of Soul memory",
+            "evidence_quote": "short exact quote from latest exchange",
+            "criterion_met": true,
+            "confidence": 0.7,
+            "target_entity_ids": ["default_player"],
+            "source_type": "current_session",
+            "truth_status": "scene_event",
+            "relevance_tags": ["scene_event"],
+            "knowledge_scope": "directly_observed"
+        }],
         "relevance_tags": empty_relevance_tags_json(),
         "no_op_reason": ""
     });
     format!(
-        "{EVALUATOR_SYSTEM_PROMPT}\n\n[TURN FLAG VALUES]\n{}\n\n[OUTPUT SHAPE]\n{}\n\n[PRIOR SCENE_STATE]\n{}\n\n[ACTIVE ENTITIES]\n{}\n\n[CURRENT WORLD/OBJECT STATE]\nLocation: {}\nTime: {}\nActive plots: {}\nRecent events: {}\nObjects JSON: {}\n\n[CURRENT RELATIONSHIPS]\n{}",
+        "{EVALUATOR_SYSTEM_PROMPT}\n\nIf an event advances the current scene but no durable memory is warranted, still emit a world_change with scene_state or event_summary.\n\n[TURN FLAG VALUES]\n{}\n\n[OUTPUT SHAPE]\n{}\n\n[PRIOR SCENE_STATE]\n{}\n\n[ACTIVE ENTITIES]\n{}\n\n[CURRENT WORLD/OBJECT STATE]\nLocation: {}\nTime: {}\nActive plots: {}\nRecent events: {}\nObjects JSON: {}\n\n[CURRENT RELATIONSHIPS]\n{}",
         serde_json::to_string_pretty(&flag_reference).unwrap_or_default(),
         serde_json::to_string_pretty(&output_schema).unwrap_or_default(),
         serde_json::to_string_pretty(&world.scene_state).unwrap_or_default(),
@@ -953,6 +1040,30 @@ pub fn build_evaluator_prompt(soul: &Soul, session_world: Option<&SessionWorld>)
         if world.recent_events.is_empty() { "None".into() } else { world.recent_events.join("; ") },
         serde_json::to_string_pretty(&world.object_states).unwrap_or_default(),
         serde_json::to_string_pretty(&relationships).unwrap_or_default(),
+    )
+}
+
+pub fn build_evaluator_form_prompt(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    latest_user_message: &str,
+    latest_narrator_response: &str,
+) -> String {
+    let spec = build_eval_form_spec(
+        soul,
+        session_world,
+        latest_user_message,
+        latest_narrator_response,
+        8,
+    );
+    let empty_response = EvalFormResponse::default();
+    format!(
+        "{}\n\nReturn valid evaluator_form_v1 JSON only. Fill EvalFormResponse rows using only ids and enum values from the form spec. Do not output bitmasks, decay scores, numeric salience, numeric retrieval strength, or final EnginePatch JSON. Every non-empty row requires evidence_quote. Unknown entity ids are invalid unless an object row uses new_object_label.\n\n[LATEST EXCHANGE]\nUser: {}\nNarrator: {}\n\n[FORM SPEC]\n{}\n\n[EMPTY RESPONSE SHAPE]\n{}",
+        EVALUATOR_SYSTEM_PROMPT,
+        latest_user_message,
+        latest_narrator_response,
+        serde_json::to_string_pretty(&spec).unwrap_or_default(),
+        serde_json::to_string_pretty(&empty_response).unwrap_or_default(),
     )
 }
 
@@ -1120,6 +1231,25 @@ mod tests {
         assert!(prompt.contains("\"truth_status\":\"scene_event\""));
         assert!(!prompt.contains("\"from\":\"aurora\""));
         assert!(!prompt.contains("[COMPILED CONTEXT]"));
+    }
+
+    #[test]
+    fn evaluator_form_prompt_includes_spec_and_empty_response_shape() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let prompt = build_evaluator_form_prompt(
+            &soul,
+            None,
+            "I walk in. Long time no see, Aurora.",
+            "Aurora lets the visitor into the apartment.",
+        );
+
+        assert!(prompt.contains("evaluator_form_v1"));
+        assert!(prompt.contains("[LATEST EXCHANGE]"));
+        assert!(prompt.contains("I walk in. Long time no see, Aurora."));
+        assert!(prompt.contains("[FORM SPEC]"));
+        assert!(prompt.contains("[EMPTY RESPONSE SHAPE]"));
+        assert!(prompt.contains("Do not output bitmasks"));
+        assert!(prompt.contains("review_rows"));
     }
 
     #[test]
