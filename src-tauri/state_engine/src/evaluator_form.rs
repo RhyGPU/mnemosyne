@@ -223,7 +223,11 @@ pub struct RelationshipRow {
     #[serde(alias = "change_direction")]
     pub direction: Option<RelationshipDirection>,
     pub magnitude_tier: Option<MagnitudeTier>,
+    pub importance_tier: Option<ImportanceTier>,
     pub evidence_quote: String,
+    pub summary: Option<String>,
+    #[serde(alias = "tags")]
+    pub selected_tags: Vec<String>,
     #[serde(alias = "shift")]
     pub shift: Option<String>,
     #[serde(skip_serializing)]
@@ -279,6 +283,9 @@ pub struct EvalFormTrace {
     pub json_extract_status: String,
     pub strict_parse_failed_but_salvage_attempted: bool,
     pub salvage_success: bool,
+    pub relationship_dimension_inferred_from: Vec<String>,
+    pub relationship_direction_inferred_from: Vec<String>,
+    pub relationship_rows_split_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -728,8 +735,13 @@ fn normalize_relationship_row_value(
 ) {
     move_alias(row, "event_id", "linked_event_id", trace);
     move_alias(row, "change_direction", "direction", trace);
+    move_alias(row, "tags", "selected_tags", trace);
+    infer_relationship_dimension_from_tags(row, trace);
+    infer_relationship_direction_from_summary(row, trace);
     normalize_relationship_direction_value(row, trace);
     normalize_relationship_dimension_value(row, trace);
+    normalize_relationship_magnitude_from_importance(row, trace);
+    normalize_relationship_tags_value(row, trace);
     if let Some(relationship_id) = row
         .get("relationship_id")
         .and_then(Value::as_str)
@@ -744,6 +756,135 @@ fn normalize_relationship_row_value(
             trace.raw_form_repair_warnings.push("relationship_id split into source and target".into());
             trace.raw_form_repair_applied = true;
         }
+    }
+}
+
+fn normalize_relationship_tags_value(
+    row: &mut serde_json::Map<String, Value>,
+    trace: &mut EvalFormRepairTrace,
+) {
+    let Some(value) = row.get("selected_tags").cloned() else {
+        return;
+    };
+    let mut tags = relationship_tag_values(&value)
+        .into_iter()
+        .filter_map(|tag| relationship_dimension_label(&tag).map(str::to_string))
+        .collect::<Vec<_>>();
+    tags.sort();
+    tags.dedup();
+    row.insert(
+        "selected_tags".into(),
+        Value::Array(tags.into_iter().map(Value::String).collect()),
+    );
+    trace.raw_form_repair_warnings.push("unknown relationship tags dropped".into());
+    trace.raw_form_repair_applied = true;
+}
+
+fn infer_relationship_dimension_from_tags(
+    row: &mut serde_json::Map<String, Value>,
+    trace: &mut EvalFormRepairTrace,
+) {
+    if row.get("dimension").and_then(Value::as_str).and_then(clean).is_some() {
+        return;
+    }
+    let Some(tag_value) = row.get("selected_tags").or_else(|| row.get("tags")) else {
+        return;
+    };
+    let tags = relationship_tag_values(tag_value);
+    if let Some(dimension) = tags.iter().find_map(|tag| relationship_dimension_label(tag)) {
+        row.insert("dimension".into(), Value::String(dimension.into()));
+        trace.raw_form_repair_warnings.push(format!(
+            "relationship dimension inferred from tag {dimension}"
+        ));
+        trace.raw_form_repair_applied = true;
+    }
+}
+
+fn infer_relationship_direction_from_summary(
+    row: &mut serde_json::Map<String, Value>,
+    trace: &mut EvalFormRepairTrace,
+) {
+    if row.get("direction").and_then(Value::as_str).and_then(clean).is_some() {
+        return;
+    }
+    let Some(summary) = row.get("summary").and_then(Value::as_str) else {
+        return;
+    };
+    let normalized = normalize_token(summary);
+    let direction = if normalized.contains("increase") || normalized.contains("increases") || normalized.contains("increased") {
+        Some("increase")
+    } else if normalized.contains("decrease")
+        || normalized.contains("decreases")
+        || normalized.contains("decreased")
+    {
+        Some("decrease")
+    } else {
+        None
+    };
+    if let Some(direction) = direction {
+        row.insert("direction".into(), Value::String(direction.into()));
+        trace.raw_form_repair_warnings.push(format!(
+            "relationship direction inferred from summary {direction}"
+        ));
+        trace.raw_form_repair_applied = true;
+    }
+}
+
+fn normalize_relationship_magnitude_from_importance(
+    row: &mut serde_json::Map<String, Value>,
+    trace: &mut EvalFormRepairTrace,
+) {
+    if row.get("magnitude_tier").and_then(Value::as_str).and_then(clean).is_some() {
+        return;
+    }
+    let Some(importance) = row.get("importance_tier").and_then(Value::as_str) else {
+        return;
+    };
+    let magnitude = match normalize_token(importance).as_str() {
+        "trivial" | "low" => "small",
+        "medium" => "small",
+        "high" => "medium",
+        "critical" => "large",
+        _ => "small",
+    };
+    row.insert("magnitude_tier".into(), Value::String(magnitude.into()));
+    trace.raw_form_repair_warnings.push(format!(
+        "relationship magnitude inferred from importance_tier {magnitude}"
+    ));
+    trace.raw_form_repair_applied = true;
+}
+
+fn relationship_tag_values(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items.iter().flat_map(relationship_tag_values).collect(),
+        Value::String(tag) => vec![tag.clone()],
+        Value::Object(map) => map
+            .get("value")
+            .or_else(|| map.get("tag"))
+            .or_else(|| map.get("name"))
+            .and_then(Value::as_str)
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn relationship_dimension_label(raw: &str) -> Option<&'static str> {
+    match normalize_token(raw).as_str() {
+        "trust" => Some("trust"),
+        "affection" => Some("affection"),
+        "intimacy" => Some("intimacy"),
+        "passion" => Some("passion"),
+        "commitment" => Some("commitment"),
+        "fear" => Some("fear"),
+        "desire" => Some("desire"),
+        "respect" => Some("respect"),
+        "conflict" => Some("conflict"),
+        "dependency" => Some("dependency"),
+        "curiosity" | "interest" => Some("curiosity"),
+        "comfort" => Some("comfort"),
+        "boundary_pressure" | "boundarypressure" => Some("boundary_pressure"),
+        _ => None,
     }
 }
 
@@ -1070,6 +1211,18 @@ pub fn compile_eval_form_response(
             + response.review_rows.len(),
         ..EvalFormTrace::default()
     };
+    trace.relationship_dimension_inferred_from = response
+        .relationship_rows
+        .iter()
+        .filter(|row| row.dimension.is_some() && !row.selected_tags.is_empty())
+        .map(|row| format!("tags:{}", row.selected_tags.join(",")))
+        .collect();
+    trace.relationship_direction_inferred_from = response
+        .relationship_rows
+        .iter()
+        .filter(|row| row.direction.is_some() && row.summary.as_deref().and_then(clean).is_some())
+        .map(|_| "summary".to_string())
+        .collect();
     let allowed_entities = spec
         .active_entities
         .iter()
@@ -3092,6 +3245,181 @@ mod tests {
         let mut soul = new_default_soul("Aurora Schwarz");
         soul.character_id = "e0ee4936-2e71-4ab9-8631-4c22be68ec72".into();
         soul
+    }
+
+    fn live_fixture_context<'a>(
+        soul: &'a Soul,
+        world: &'a SessionWorld,
+        user: &'a str,
+        narrator: &'a str,
+    ) -> EvaluatorConversionContext<'a> {
+        EvaluatorConversionContext {
+            active_soul_id: &soul.character_id,
+            active_soul_ids: vec![soul.character_id.clone()],
+            latest_user_message: user,
+            latest_narrator_response: narrator,
+            session_world: Some(world),
+            baseline_recent_event_id: None,
+        }
+    }
+
+    #[test]
+    fn relationship_dimension_infers_from_curiosity_tag() {
+        let parsed = parse_eval_form_response(
+            r#"{
+              "event_rows":[{"event_id":"evt","event_type":"scene_event","summary":"Aurora grows curious.","participants":["aurora_soul","default_player"],"evidence_quote":"Long time no see."}],
+              "relationship_rows":[{
+                "relationship_id":"rel:aurora_soul:default_player",
+                "summary":"Aurora's cautious curiosity towards User increases",
+                "tags":[{"vocabulary":"relationship","value":"curiosity"},{"vocabulary":"relationship","value":"unknown_tag"}],
+                "evidence_quote":"Long time no see."
+              }]
+            }"#,
+        )
+        .expect("parse");
+
+        assert_eq!(parsed.relationship_rows[0].dimension, Some(RelationshipDimension::Curiosity));
+        assert_eq!(parsed.relationship_rows[0].selected_tags, vec!["curiosity"]);
+    }
+
+    #[test]
+    fn relationship_direction_infers_from_summary_increases() {
+        let parsed = parse_eval_form_response(
+            r#"{
+              "event_rows":[{"event_id":"evt","event_type":"scene_event","summary":"Aurora grows curious.","participants":["aurora_soul","default_player"],"evidence_quote":"Long time no see."}],
+              "relationship_rows":[{
+                "relationship_id":"rel:aurora_soul:default_player",
+                "summary":"Aurora's cautious curiosity towards User increases",
+                "tags":["curiosity"],
+                "importance_tier":"high",
+                "evidence_quote":"Long time no see."
+              }]
+            }"#,
+        )
+        .expect("parse");
+
+        assert_eq!(parsed.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+        assert_eq!(parsed.relationship_rows[0].magnitude_tier, Some(MagnitudeTier::Medium));
+    }
+
+    #[test]
+    fn relationship_unknown_tag_dropped_not_fatal() {
+        let (soul, world) = soul_and_world();
+        let spec = build_eval_form_spec(&soul, Some(&world), "Long time no see.", "Aurora studies the visitor with cautious curiosity.", 8);
+        let context = live_fixture_context(&soul, &world, "Long time no see.", "Aurora studies the visitor with cautious curiosity.");
+        let response = parse_eval_form_response(
+            r#"{
+              "event_rows":[{"event_id":"evt","event_type":"scene_event","summary":"Aurora studies the visitor.","participants":["aurora_soul","default_player"],"evidence_quote":"Long time no see."}],
+              "relationship_rows":[{
+                "relationship_id":"rel:aurora_soul:default_player",
+                "summary":"Aurora's cautious curiosity towards User increases",
+                "tags":["curiosity","totally_unknown"],
+                "evidence_quote":"Aurora studies the visitor with cautious curiosity."
+              }]
+            }"#,
+        )
+        .expect("parse");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert!(result.rejected_rows.is_empty());
+        assert_eq!(result.output.relationship_evaluations[0].curiosity, Some(1.0));
+    }
+
+    #[test]
+    fn payload_fixture_applies_curiosity_delta() {
+        let soul = soul_aurora();
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let user = "I walk in. Long time no see, Aurora.";
+        let narrator = "Aurora's cautious curiosity towards User increases as she steps aside. She studies the visitor with cautious curiosity.";
+        let spec = build_eval_form_spec(&soul, Some(&world), user, narrator, 8);
+        let context = live_fixture_context(&soul, &world, user, narrator);
+        let response = parse_eval_form_response(&format!(
+            r#"{{
+              "event_rows":[{{"event_id":"evt","event_type":"scene_event","summary":"Aurora lets the visitor in.","participants":["{}","default_player"],"evidence_quote":"I walk in. Long time no see, Aurora."}}],
+              "relationship_rows":[{{
+                "relationship_id":"rel:{}:default_player",
+                "summary":"Aurora's cautious curiosity towards User increases",
+                "tags":["curiosity","fear"],
+                "importance_tier":"medium",
+                "evidence_quote":"Aurora's cautious curiosity towards User increases"
+              }}]
+            }}"#,
+            soul.character_id, soul.character_id
+        ))
+        .expect("parse");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert_eq!(result.conversion.patch.soul_patch.as_ref().unwrap().relationship_deltas[0].curiosity, Some(1.0));
+    }
+
+    #[test]
+    fn payload_fixture_writes_unresolved_tension_memory() {
+        let soul = soul_aurora();
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let user = "I walk in. Long time no see, Aurora.";
+        let narrator = "Aurora smiles, but her nerves remain visible; the reunion leaves unresolved tension in the room.";
+        let spec = build_eval_form_spec(&soul, Some(&world), user, narrator, 8);
+        let context = live_fixture_context(&soul, &world, user, narrator);
+        let response = parse_eval_form_response(&format!(
+            r#"{{
+              "event_rows":[{{"event_id":"evt","event_type":"scene_event","summary":"The visitor enters Aurora's apartment.","participants":["{}","default_player"],"evidence_quote":"I walk in. Long time no see, Aurora."}}],
+              "memory_rows":[{{
+                "owner_soul_id":"{}",
+                "slot_id":"unresolved_tension",
+                "candidate_memory":"Aurora's nerves make the reunion feel unresolved.",
+                "salience":"medium",
+                "evidence_quote":"her nerves remain visible; the reunion leaves unresolved tension in the room"
+              }}]
+            }}"#,
+            soul.character_id, soul.character_id
+        ))
+        .expect("parse");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert!(result
+            .conversion
+            .patch
+            .soul_patch
+            .as_ref()
+            .unwrap()
+            .new_memories
+            .iter()
+            .any(|memory| memory.memory_slot.as_deref() == Some("unresolved_tension")));
+    }
+
+    #[test]
+    fn payload_fixture_writes_recent_emotional_state_memory() {
+        let soul = soul_aurora();
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let user = "I walk in. Long time no see, Aurora.";
+        let narrator = "Aurora shifts from waiting alone to playful engagement after the visitor enters.";
+        let spec = build_eval_form_spec(&soul, Some(&world), user, narrator, 8);
+        let context = live_fixture_context(&soul, &world, user, narrator);
+        let response = parse_eval_form_response(&format!(
+            r#"{{
+              "event_rows":[{{"event_id":"evt","event_type":"scene_event","summary":"The visitor enters Aurora's apartment.","participants":["{}","default_player"],"evidence_quote":"I walk in. Long time no see, Aurora."}}],
+              "memory_rows":[{{
+                "owner_soul_id":"{}",
+                "slot_id":"recent_emotional_state",
+                "candidate_memory":"Aurora shifts from waiting alone to playful engagement after the visitor enters.",
+                "salience":"medium",
+                "evidence_quote":"Aurora shifts from waiting alone to playful engagement after the visitor enters."
+              }}]
+            }}"#,
+            soul.character_id, soul.character_id
+        ))
+        .expect("parse");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert!(result
+            .conversion
+            .patch
+            .soul_patch
+            .as_ref()
+            .unwrap()
+            .new_memories
+            .iter()
+            .any(|memory| memory.memory_slot.as_deref() == Some("recent_emotional_state")));
     }
 
     const PAYLOAD4_JSON: &str = r#"{

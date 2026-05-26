@@ -331,6 +331,12 @@ pub struct StatePatchRecord {
     pub is_active: bool,
     pub invalidated_by_patch_id: Option<String>,
     pub supersedes_patch_id: Option<String>,
+    pub patch_kind: String,
+    pub parent_baseline_patch_id: Option<String>,
+    pub source_turn_id: Option<String>,
+    pub source_assistant_message_id: Option<i64>,
+    pub source_assistant_variant_id: Option<i64>,
+    pub created_by_job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -604,6 +610,34 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_state_patches_turn_active
         ON state_patches(turn_id, is_active);
         ",
+    )?;
+    add_column_if_missing(
+        conn,
+        "state_patches",
+        "patch_kind",
+        "TEXT NOT NULL DEFAULT 'baseline'",
+    )?;
+    add_column_if_missing(conn, "state_patches", "parent_baseline_patch_id", "TEXT")?;
+    add_column_if_missing(conn, "state_patches", "source_turn_id", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "state_patches",
+        "source_assistant_message_id",
+        "INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "state_patches",
+        "source_assistant_variant_id",
+        "INTEGER",
+    )?;
+    add_column_if_missing(conn, "state_patches", "created_by_job_id", "TEXT")?;
+    conn.execute(
+        "
+        CREATE INDEX IF NOT EXISTS idx_state_patches_source_turn_active
+        ON state_patches(source_turn_id, is_active, patch_kind, applied_at)
+        ",
+        [],
     )?;
     add_column_if_missing(
         conn,
@@ -1763,7 +1797,7 @@ pub fn list_assistant_message_variants(
         "
         SELECT id, message_id, conversation_id, content, created_at, label, source, is_selected, soul_snapshot_json, debug_json
         FROM assistant_message_variants
-        WHERE conversation_id = ?1 AND message_id = ?2
+        WHERE conversation_id = ?1 AND message_id = ?2 AND COALESCE(is_discarded, 0) = 0
         ORDER BY id ASC
         ",
     )?;
@@ -2755,8 +2789,34 @@ pub fn record_turn_commit_with_patch(
     patch: &EnginePatch,
     is_regenerated_variant: bool,
 ) -> rusqlite::Result<(TurnCommit, StatePatchRecord)> {
+    record_turn_commit_with_patch_for_turn_id(
+        conn,
+        &ledger_id("turn"),
+        conversation_id,
+        branch_id,
+        parent_turn_id,
+        user_message_id,
+        assistant_message_id,
+        selected_variant_id,
+        patch,
+        is_regenerated_variant,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_turn_commit_with_patch_for_turn_id(
+    conn: &Connection,
+    turn_id: &str,
+    conversation_id: &str,
+    branch_id: &str,
+    parent_turn_id: Option<&str>,
+    user_message_id: Option<i64>,
+    assistant_message_id: i64,
+    selected_variant_id: Option<i64>,
+    patch: &EnginePatch,
+    is_regenerated_variant: bool,
+) -> rusqlite::Result<(TurnCommit, StatePatchRecord)> {
     let now = now_ts();
-    let turn_id = ledger_id("turn");
     let patch_id = ledger_id("patch");
     let patch_json = serde_json::to_string(patch)
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -2782,10 +2842,10 @@ pub fn record_turn_commit_with_patch(
     conn.execute(
         "
         INSERT INTO state_patches
-            (patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id)
-        VALUES (?1, ?2, NULL, ?3, NULL, ?4, 'session', 1, NULL, NULL)
+            (patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id, patch_kind, parent_baseline_patch_id, source_turn_id, source_assistant_message_id, source_assistant_variant_id, created_by_job_id)
+        VALUES (?1, ?2, NULL, ?3, NULL, ?4, 'session', 1, NULL, NULL, 'baseline', NULL, ?2, ?5, ?6, NULL)
         ",
-        params![patch_id, turn_id, patch_json, now],
+        params![patch_id, turn_id, patch_json, now, assistant_message_id, selected_variant_id],
     )?;
     conn.execute(
         "UPDATE session_branches SET active_turn_id = ?1, updated_at = ?2 WHERE branch_id = ?3",
@@ -3016,6 +3076,12 @@ fn state_patch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StatePatchR
         is_active: row.get::<_, i64>(7)? != 0,
         invalidated_by_patch_id: row.get(8)?,
         supersedes_patch_id: row.get(9)?,
+        patch_kind: row.get(10).unwrap_or_else(|_| "baseline".to_string()),
+        parent_baseline_patch_id: row.get(11).ok().flatten(),
+        source_turn_id: row.get(12).ok().flatten(),
+        source_assistant_message_id: row.get(13).ok().flatten(),
+        source_assistant_variant_id: row.get(14).ok().flatten(),
+        created_by_job_id: row.get(15).ok().flatten(),
     })
 }
 
@@ -3029,7 +3095,7 @@ fn get_turn_commit(conn: &Connection, turn_id: &str) -> rusqlite::Result<TurnCom
 
 pub fn get_state_patch(conn: &Connection, patch_id: &str) -> rusqlite::Result<StatePatchRecord> {
     conn.query_row(
-        "SELECT patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id FROM state_patches WHERE patch_id = ?1",
+        "SELECT patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id, patch_kind, parent_baseline_patch_id, source_turn_id, source_assistant_message_id, source_assistant_variant_id, created_by_job_id FROM state_patches WHERE patch_id = ?1",
         [patch_id],
         state_patch_from_row,
     )
@@ -3040,10 +3106,10 @@ pub fn list_active_patches_for_turn(
     turn_id: &str,
 ) -> rusqlite::Result<Vec<StatePatchRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id 
+        "SELECT patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id, patch_kind, parent_baseline_patch_id, source_turn_id, source_assistant_message_id, source_assistant_variant_id, created_by_job_id
          FROM state_patches 
          WHERE turn_id = ?1 AND is_active = 1
-         ORDER BY applied_at ASC, patch_id ASC",
+         ORDER BY CASE patch_kind WHEN 'baseline' THEN 0 WHEN 'enrichment' THEN 1 ELSE 2 END, applied_at ASC, patch_id ASC",
     )?;
     let rows = stmt.query_map([turn_id], state_patch_from_row)?;
     let mut patches = Vec::new();
@@ -3058,6 +3124,18 @@ pub fn record_enrichment_patch(
     turn_id: &str,
     patch: &EnginePatch,
 ) -> rusqlite::Result<StatePatchRecord> {
+    record_enrichment_patch_with_metadata(conn, turn_id, patch, None, None, None, None)
+}
+
+pub fn record_enrichment_patch_with_metadata(
+    conn: &Connection,
+    turn_id: &str,
+    patch: &EnginePatch,
+    parent_baseline_patch_id: Option<&str>,
+    source_assistant_message_id: Option<i64>,
+    source_assistant_variant_id: Option<i64>,
+    created_by_job_id: Option<&str>,
+) -> rusqlite::Result<StatePatchRecord> {
     let now = now_ts();
     let patch_id = ledger_id("patch");
     let patch_json = serde_json::to_string(patch)
@@ -3065,10 +3143,19 @@ pub fn record_enrichment_patch(
     conn.execute(
         "
         INSERT INTO state_patches
-            (patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id)
-        VALUES (?1, ?2, NULL, ?3, NULL, ?4, 'session', 1, NULL, NULL)
+            (patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id, patch_kind, parent_baseline_patch_id, source_turn_id, source_assistant_message_id, source_assistant_variant_id, created_by_job_id)
+        VALUES (?1, ?2, NULL, ?3, NULL, ?4, 'session', 1, NULL, NULL, 'enrichment', ?5, ?2, ?6, ?7, ?8)
         ",
-        params![patch_id, turn_id, patch_json, now],
+        params![
+            patch_id,
+            turn_id,
+            patch_json,
+            now,
+            parent_baseline_patch_id,
+            source_assistant_message_id,
+            source_assistant_variant_id,
+            created_by_job_id
+        ],
     )?;
     get_state_patch(conn, &patch_id)
 }
@@ -3133,6 +3220,20 @@ fn active_commit_path_until(
     }
     path.reverse();
     Ok(path)
+}
+
+pub fn active_branch_contains_turn(
+    conn: &Connection,
+    conversation_id: &str,
+    branch_id: &str,
+    source_turn_id: &str,
+) -> rusqlite::Result<bool> {
+    let branch = get_active_session_branch(conn, conversation_id)?;
+    if branch.branch_id != branch_id {
+        return Ok(false);
+    }
+    let path = active_commit_path_until(conn, branch_id, branch.active_turn_id.as_deref())?;
+    Ok(path.iter().any(|commit| commit.turn_id == source_turn_id))
 }
 
 fn list_inactive_patch_ids(conn: &Connection, branch_id: &str) -> rusqlite::Result<Vec<String>> {
@@ -3934,6 +4035,210 @@ mod tests {
             Some("raw narrator body")
         );
         assert_eq!(log.provider_response_id.as_deref(), Some("resp-retry"));
+    }
+
+    fn test_world_event_patch(event: &str) -> EnginePatch {
+        EnginePatch {
+            world_patch: Some(WorldPatch {
+                recent_event: Some(event.into()),
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        }
+    }
+
+    #[test]
+    fn background_enrichment_applies_to_prior_active_turn_after_branch_advances() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "enrich-prior", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        let branch = create_session_branch(&conn, "enrich-prior", &soul, &world).expect("branch");
+        let first_assistant =
+            insert_message_and_get_id(&conn, "enrich-prior", "assistant", "First").expect("a1");
+        let (first_commit, first_patch) = record_turn_commit_with_patch(
+            &conn,
+            "enrich-prior",
+            &branch.branch_id,
+            None,
+            None,
+            first_assistant,
+            None,
+            &test_world_event_patch("baseline first turn"),
+            false,
+        )
+        .expect("first");
+        let second_assistant =
+            insert_message_and_get_id(&conn, "enrich-prior", "assistant", "Second").expect("a2");
+        let (_second_commit, second_patch) = record_turn_commit_with_patch(
+            &conn,
+            "enrich-prior",
+            &branch.branch_id,
+            Some(&first_commit.turn_id),
+            None,
+            second_assistant,
+            None,
+            &test_world_event_patch("second turn after branch advanced"),
+            false,
+        )
+        .expect("second");
+
+        assert!(active_branch_contains_turn(
+            &conn,
+            "enrich-prior",
+            &branch.branch_id,
+            &first_commit.turn_id
+        )
+        .expect("ancestry"));
+        let enrichment = record_enrichment_patch_with_metadata(
+            &conn,
+            &first_commit.turn_id,
+            &test_world_event_patch("enrichment for first turn"),
+            Some(&first_patch.patch_id),
+            Some(first_assistant),
+            None,
+            Some("job-prior"),
+        )
+        .expect("enrichment");
+        let rebuilt =
+            rebuild_session_state(&conn, "enrich-prior", &branch.branch_id).expect("rebuild");
+
+        assert_eq!(
+            rebuilt.debug.applied_patches,
+            vec![
+                first_patch.patch_id.clone(),
+                enrichment.patch_id.clone(),
+                second_patch.patch_id.clone()
+            ]
+        );
+        assert!(rebuilt
+            .session_world
+            .recent_events
+            .iter()
+            .any(|event| event.contains("enrichment for first turn")));
+        assert_eq!(enrichment.patch_kind, "enrichment");
+        assert_eq!(
+            enrichment.parent_baseline_patch_id.as_deref(),
+            Some(first_patch.patch_id.as_str())
+        );
+        assert_eq!(
+            enrichment.source_turn_id.as_deref(),
+            Some(first_commit.turn_id.as_str())
+        );
+        assert_eq!(enrichment.created_by_job_id.as_deref(), Some("job-prior"));
+    }
+
+    #[test]
+    fn background_enrichment_skips_only_if_source_turn_not_on_active_branch() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "enrich-stale", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        let branch = create_session_branch(&conn, "enrich-stale", &soul, &world).expect("branch");
+        let root_assistant =
+            insert_message_and_get_id(&conn, "enrich-stale", "assistant", "Root").expect("root");
+        let (root_commit, _) = record_turn_commit_with_patch(
+            &conn,
+            "enrich-stale",
+            &branch.branch_id,
+            None,
+            None,
+            root_assistant,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("root commit");
+        let abandoned_assistant =
+            insert_message_and_get_id(&conn, "enrich-stale", "assistant", "Old path").expect("old");
+        let (abandoned_commit, _) = record_turn_commit_with_patch(
+            &conn,
+            "enrich-stale",
+            &branch.branch_id,
+            Some(&root_commit.turn_id),
+            None,
+            abandoned_assistant,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("abandoned");
+        let selected_assistant =
+            insert_message_and_get_id(&conn, "enrich-stale", "assistant", "New path").expect("new");
+        record_turn_commit_with_patch(
+            &conn,
+            "enrich-stale",
+            &branch.branch_id,
+            Some(&root_commit.turn_id),
+            None,
+            selected_assistant,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("selected");
+
+        assert!(active_branch_contains_turn(
+            &conn,
+            "enrich-stale",
+            &branch.branch_id,
+            &root_commit.turn_id
+        )
+        .expect("root active"));
+        assert!(!active_branch_contains_turn(
+            &conn,
+            "enrich-stale",
+            &branch.branch_id,
+            &abandoned_commit.turn_id
+        )
+        .expect("abandoned inactive"));
+    }
+
+    #[test]
+    fn rebuild_applies_baseline_then_enrichment_for_same_turn() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "enrich-order", &soul.character_id).expect("conversation");
+        let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        let branch = create_session_branch(&conn, "enrich-order", &soul, &world).expect("branch");
+        let assistant =
+            insert_message_and_get_id(&conn, "enrich-order", "assistant", "Turn").expect("a");
+        let (commit, baseline) = record_turn_commit_with_patch(
+            &conn,
+            "enrich-order",
+            &branch.branch_id,
+            None,
+            None,
+            assistant,
+            None,
+            &test_world_event_patch("baseline event"),
+            false,
+        )
+        .expect("baseline");
+        let enrichment = record_enrichment_patch_with_metadata(
+            &conn,
+            &commit.turn_id,
+            &test_world_event_patch("enrichment event"),
+            Some(&baseline.patch_id),
+            Some(assistant),
+            None,
+            Some("job-order"),
+        )
+        .expect("enrichment");
+
+        let patches = list_active_patches_for_turn(&conn, &commit.turn_id).expect("patches");
+        assert_eq!(patches[0].patch_id, baseline.patch_id);
+        assert_eq!(patches[1].patch_id, enrichment.patch_id);
+
+        let rebuilt =
+            rebuild_session_state(&conn, "enrich-order", &branch.branch_id).expect("rebuild");
+        assert_eq!(
+            rebuilt.debug.applied_patches,
+            vec![baseline.patch_id, enrichment.patch_id]
+        );
     }
 
     #[test]

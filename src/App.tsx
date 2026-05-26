@@ -66,6 +66,7 @@ import {
   getImageAsset,
   getImageAssetDataUrl,
   getSoul,
+  inspectTurnBranchIntegrity,
   importImageAssetFromFile,
   importMneBundle,
   listConversations,
@@ -80,6 +81,7 @@ import {
   listenEvaluatorJobStatusChanged,
   previewApiPayload,
   rebuildSessionFromLedger,
+  repairAccidentalNormalSendVariants,
   renameConversation,
   restoreInactiveMessages,
   retryEvaluatorJob,
@@ -138,6 +140,8 @@ type DevCommandName =
   | "restore_inactive_messages"
   | "get_branch_patch_debug"
   | "rebuild_session_from_ledger"
+  | "inspect_turn_branch_integrity"
+  | "repair_accidental_normal_send_variants"
   | "export_visible_chat_log"
   | "export_llm_payload_history";
 
@@ -163,6 +167,16 @@ const DEV_COMMAND_OPTIONS: Array<{ name: DevCommandName; label: string; defaultA
     defaultArgs: "{}",
   },
   {
+    name: "inspect_turn_branch_integrity",
+    label: "Inspect Branch Integrity",
+    defaultArgs: "{}",
+  },
+  {
+    name: "repair_accidental_normal_send_variants",
+    label: "Repair Accidental Variants",
+    defaultArgs: "{}",
+  },
+  {
     name: "export_visible_chat_log",
     label: "Export Visible Chat",
     defaultArgs: "{}",
@@ -185,13 +199,82 @@ type ActiveGeneration = {
 
 interface MessageRenderTrace {
   frontend_message_render_count: number;
+  saved_message_count: number;
+  pending_message_count: number;
+  rendered_message_count: number;
   duplicate_saved_suppressed: number;
+  duplicate_pending_suppressed: number;
+  pending_replaced_by_saved: number;
   pending_assistant_replaced_by_saved: number;
   active_listener_count: number;
   pending_assistant_count: number;
   rendered_saved_message_count: number;
   rendered_pending_message_count: number;
   duplicate_render_suppressed_count: number;
+  duplicate_visual_pair: boolean;
+  duplicate_saved_db_assistant_detected: boolean;
+  visible_bubble_trace: VisibleBubbleTraceRow[];
+}
+
+type VisibleBubbleRenderSource =
+  | "saved_db"
+  | "pending_overlay"
+  | "streaming_overlay"
+  | "local_optimistic"
+  | "unknown";
+
+interface VisibleBubbleTraceRow {
+  render_index: number;
+  role: ChatMessage["role"];
+  render_source: VisibleBubbleRenderSource;
+  message_id: number;
+  request_id?: string;
+  assistant_message_id?: number;
+  turn_id?: string;
+  content_hash: string;
+  created_at: number;
+  status?: string;
+  origin?: string;
+  duplicate_visual_pair?: boolean;
+  duplicate_render_sources?: VisibleBubbleRenderSource[];
+}
+
+function evaluatorJobStatusText(job: EvaluatorJob) {
+  if (job.status === "pending" || job.status === "running") return "Updating memory/state...";
+  if (job.status === "completed") {
+    return job.patch_applied ? "Memory/state update completed" : "Memory/state update completed with no patch";
+  }
+  if (job.status === "partial_success") {
+    if (job.error_message?.includes("some enrichment rows rejected")) {
+      return "State updated; some enrichment rows rejected";
+    }
+    if (job.error_message?.includes("branch_advanced_before_background_evaluator_completed")) {
+      return "State updated; enrichment finished after branch advanced";
+    }
+    return "State updated partially";
+  }
+  if (job.status === "some_rows_rejected") return "State updated; some enrichment rows rejected";
+  if (job.status === "stale_skipped") return "State updated; enrichment skipped";
+  if (job.status === "canceled") return "State update canceled";
+  if (job.status === "timed_out") return "State update timed out";
+  if (job.status === "failed") return "State update failed";
+  return job.status;
+}
+
+function evaluatorJobBannerTitle(job: EvaluatorJob) {
+  if (job.status === "pending" || job.status === "running") return "Updating memory/state...";
+  if (job.status === "completed") return "Memory/state updated";
+  if (job.status === "partial_success") return evaluatorJobStatusText(job);
+  if (job.status === "some_rows_rejected") return "State updated; some enrichment rows rejected";
+  if (job.status === "stale_skipped") return "State updated; enrichment skipped";
+  if (job.status === "canceled") return "State update canceled";
+  if (job.status === "timed_out") return "State update timed out";
+  if (job.status === "failed") return "State update failed";
+  return job.status;
+}
+
+function evaluatorJobRefreshesState(job: EvaluatorJob) {
+  return ["completed", "partial_success", "some_rows_rejected", "stale_skipped"].includes(job.status);
 }
 type PsychePresetName =
   | "Stranger"
@@ -725,22 +808,16 @@ export function App() {
       setActiveEvaluatorJob(job);
       if (job.status === "running" || job.status === "pending") {
         setStatus("Updating memory/state...");
-      } else if (job.status === "completed") {
-        setStatus(job.patch_applied ? "Memory/state update completed" : "Memory/state update completed with no patch");
-        if (soulRef.current) {
+      } else if (evaluatorJobRefreshesState(job)) {
+        setStatus(evaluatorJobStatusText(job));
+        if (job.status !== "stale_skipped" && soulRef.current) {
           void refreshContext(soulRef.current.character_id, job.conversation_id);
           void getSoul(soulRef.current.character_id).then(setSoul).catch(() => undefined);
         }
       } else if (job.status === "failed" || job.status === "timed_out") {
-        setStatus("State update failed");
+        setStatus(evaluatorJobStatusText(job));
       } else if (job.status === "canceled") {
         setStatus("State update canceled");
-      } else if (job.status === "some_rows_rejected") {
-        setStatus("Update completed with some enrichment rows rejected");
-        if (soulRef.current) {
-          void refreshContext(soulRef.current.character_id, job.conversation_id);
-          void getSoul(soulRef.current.character_id).then(setSoul).catch(() => undefined);
-        }
       }
     }).then((cleanup) => {
       cleanupFn = cleanup;
@@ -1560,6 +1637,10 @@ export function App() {
         return getBranchPatchDebug(conversationId);
       case "rebuild_session_from_ledger":
         return rebuildSessionFromLedger(conversationId);
+      case "inspect_turn_branch_integrity":
+        return inspectTurnBranchIntegrity(conversationId);
+      case "repair_accidental_normal_send_variants":
+        return repairAccidentalNormalSendVariants(conversationId);
       case "export_visible_chat_log":
         return exportVisibleChatLog(conversationId);
       case "export_llm_payload_history":
@@ -2495,6 +2576,22 @@ export function App() {
     () => prepareMessagesForRender(messages, activeListenersCount),
     [messages, activeListenersCount],
   );
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    logDev(
+      renderTrace.duplicate_saved_db_assistant_detected ? "error" : "debug",
+      "stream",
+      renderTrace.duplicate_saved_db_assistant_detected
+        ? "duplicate_saved_db_assistant_detected"
+        : "visible_bubble_trace",
+      {
+        visible_bubble_trace: renderTrace.visible_bubble_trace,
+        duplicate_visual_pair: renderTrace.duplicate_visual_pair,
+        duplicate_render_suppressed_count: renderTrace.duplicate_render_suppressed_count,
+        active_listener_count: renderTrace.active_listener_count,
+      },
+    );
+  }, [renderTrace]);
   const latestAssistantMessageId = useMemo(
     () =>
       [...activeMessages].reverse().find((message) => message.role === "assistant")?.id ?? null,
@@ -3184,6 +3281,16 @@ export function App() {
             <div>Dup Pending Suppressed: <span style={{ color: "#f8fafc" }}>{renderTrace.duplicate_pending_suppressed}</span></div>
             <div>Pending Replaced: <span style={{ color: "#f8fafc" }}>{renderTrace.pending_replaced_by_saved}</span></div>
             <div>Active Listeners: <span style={{ color: "#f8fafc" }}>{renderTrace.active_listener_count}</span></div>
+            <div>Visual Pair: <span style={{ color: "#f8fafc" }}>{renderTrace.duplicate_visual_pair ? "yes" : "no"}</span></div>
+            <div>Saved DB Dup: <span style={{ color: "#f8fafc" }}>{renderTrace.duplicate_saved_db_assistant_detected ? "yes" : "no"}</span></div>
+          </div>
+          <div style={{ marginTop: "6px", maxHeight: "96px", overflow: "auto" }}>
+            {renderTrace.visible_bubble_trace.map((row) => (
+              <div key={`${row.render_index}-${row.message_id}-${row.render_source}`}>
+                #{row.render_index} {row.role} {row.render_source} id={row.message_id} req={row.request_id || "-"} hash={row.content_hash}
+                {row.duplicate_visual_pair ? ` duplicate=${row.duplicate_render_sources?.join("+")}` : ""}
+              </div>
+            ))}
           </div>
         </div>
       )}
@@ -3540,15 +3647,7 @@ export function App() {
         {activeEvaluatorJob ? (
           <section className={`evaluator-job-banner ${activeEvaluatorJob.status}`}>
             <div>
-              <strong>
-                {activeEvaluatorJob.status === "pending" || activeEvaluatorJob.status === "running"
-                  ? "Updating memory/state..."
-                  : activeEvaluatorJob.status === "completed"
-                    ? "Memory/state updated"
-                    : activeEvaluatorJob.status === "canceled"
-                      ? "State update canceled"
-                      : "State update failed"}
-              </strong>
+              <strong>{evaluatorJobBannerTitle(activeEvaluatorJob)}</strong>
               <span>
                 {activeEvaluatorJob.model || "Evaluator"} / {activeEvaluatorJob.status}
                 {activeEvaluatorJob.elapsed_ms ? ` / ${activeEvaluatorJob.elapsed_ms}ms` : ""}
@@ -5765,19 +5864,12 @@ function messageRenderTrace(
   duplicateSavedSuppressed: number,
   pendingAssistantReplacedBySaved: number,
 ): MessageRenderTrace {
-  const pendingAssistantCount = messages.filter((message) => message.role === "assistant" && message.pending).length;
-  const renderedSavedMessageCount = messages.filter((message) => message.id > 0 && !message.pending).length;
-  const renderedPendingMessageCount = messages.filter((message) => message.pending || message.id < 0).length;
-  return {
-    frontend_message_render_count: messages.filter((message) => message.role !== "system").length,
-    duplicate_saved_suppressed: duplicateSavedSuppressed,
-    pending_assistant_replaced_by_saved: pendingAssistantReplacedBySaved,
-    active_listener_count: 0,
-    pending_assistant_count: pendingAssistantCount,
-    rendered_saved_message_count: renderedSavedMessageCount,
-    rendered_pending_message_count: renderedPendingMessageCount,
-    duplicate_render_suppressed_count: duplicateSavedSuppressed,
-  };
+  return buildMessageRenderTrace(messages, {
+    activeListenerCount: 0,
+    duplicateSavedSuppressed,
+    duplicatePendingSuppressed: 0,
+    pendingReplacedBySaved: pendingAssistantReplacedBySaved,
+  });
 }
 
 function removeDuplicateStreamingAssistants(
@@ -5807,6 +5899,7 @@ function prepareMessagesForRender(messages: ChatMessage[], activeListenerCount: 
   const seenSavedIds = new Set<number>();
   const seenSavedRequestIds = new Set<string>();
   let duplicateSavedSuppressed = 0;
+  let duplicateSavedDbAssistantDetected = false;
 
   for (const msg of saved) {
     if (seenSavedIds.has(msg.id)) {
@@ -5817,8 +5910,12 @@ function prepareMessagesForRender(messages: ChatMessage[], activeListenerCount: 
 
     if (msg.request_id) {
       if (seenSavedRequestIds.has(msg.request_id)) {
-        duplicateSavedSuppressed += 1;
-        continue;
+        if (msg.role === "assistant") {
+          duplicateSavedDbAssistantDetected = true;
+        } else {
+          duplicateSavedSuppressed += 1;
+          continue;
+        }
       }
       seenSavedRequestIds.add(msg.request_id);
     }
@@ -5830,8 +5927,12 @@ function prepareMessagesForRender(messages: ChatMessage[], activeListenerCount: 
         Math.abs(existing.created_at - msg.created_at) < 10
     );
     if (isCloseDuplicate) {
-      duplicateSavedSuppressed += 1;
-      continue;
+      if (msg.role === "assistant" && msg.id !== dedupedSaved.find((existing) => existing.content === msg.content)?.id) {
+        duplicateSavedDbAssistantDetected = true;
+      } else {
+        duplicateSavedSuppressed += 1;
+        continue;
+      }
     }
 
     dedupedSaved.push(msg);
@@ -5851,8 +5952,8 @@ function prepareMessagesForRender(messages: ChatMessage[], activeListenerCount: 
       }
       if (
         pendingMsg.role === savedMsg.role &&
-        pendingMsg.content === savedMsg.content &&
-        Math.abs(pendingMsg.created_at - savedMsg.created_at) < 10
+        pendingMsg.content.trim() &&
+        contentHash(pendingMsg.content) === contentHash(savedMsg.content)
       ) {
         return true;
       }
@@ -5866,6 +5967,9 @@ function prepareMessagesForRender(messages: ChatMessage[], activeListenerCount: 
 
     const isPendingDuplicate = visiblePending.some(
       (existing) =>
+        (pendingMsg.assistant_message_id &&
+          existing.assistant_message_id &&
+          pendingMsg.assistant_message_id === existing.assistant_message_id) ||
         (pendingMsg.request_id && existing.request_id && pendingMsg.request_id === existing.request_id) ||
         (pendingMsg.role === existing.role &&
           pendingMsg.content === existing.content &&
@@ -5891,21 +5995,115 @@ function prepareMessagesForRender(messages: ChatMessage[], activeListenerCount: 
   const savedMessageCount = dedupedSaved.length;
   const pendingMessageCount = visiblePending.length;
   const renderedMessageCount = rendered.length;
-
-  const trace = {
-    active_listener_count: activeListenerCount,
-    saved_message_count: savedMessageCount,
-    pending_message_count: pendingMessageCount,
-    rendered_message_count: renderedMessageCount,
-    duplicate_saved_suppressed: duplicateSavedSuppressed,
-    duplicate_pending_suppressed: duplicatePendingSuppressed,
-    pending_replaced_by_saved: pendingReplacedBySaved,
-    frontend_message_render_count: renderedMessageCount,
-  };
+  const trace = buildMessageRenderTrace(rendered, {
+    activeListenerCount,
+    duplicateSavedSuppressed,
+    duplicatePendingSuppressed,
+    pendingReplacedBySaved,
+    savedMessageCount,
+    pendingMessageCount,
+    renderedMessageCount,
+    duplicateSavedDbAssistantDetected,
+  });
 
   return {
     messages: rendered,
     trace,
+  };
+}
+
+function contentHash(content: string) {
+  let hash = 5381;
+  const normalized = content.trim().replace(/\s+/g, " ");
+  for (let index = 0; index < normalized.length; index += 1) {
+    hash = (hash * 33) ^ normalized.charCodeAt(index);
+  }
+  return `h${(hash >>> 0).toString(16)}`;
+}
+
+function renderSourceForMessage(message: ChatMessage): VisibleBubbleRenderSource {
+  if (message.id > 0 && !message.pending) return "saved_db";
+  if (message.role === "assistant" && message.pending && message.content.trim()) return "streaming_overlay";
+  if (message.role === "assistant" && message.pending) return "pending_overlay";
+  if (message.id < 0) return "local_optimistic";
+  return "unknown";
+}
+
+function buildVisibleBubbleTrace(messages: ChatMessage[]) {
+  const trace: VisibleBubbleTraceRow[] = messages.map((message, index) => ({
+    render_index: index,
+    role: message.role,
+    render_source: renderSourceForMessage(message),
+    message_id: message.id,
+    request_id: message.request_id ?? undefined,
+    assistant_message_id: message.assistant_message_id ?? (message.role === "assistant" && message.id > 0 ? message.id : undefined),
+    turn_id: message.turn_id ?? undefined,
+    content_hash: contentHash(message.content),
+    created_at: message.created_at,
+    status: message.status,
+    origin: message.origin,
+  }));
+
+  const assistantGroups = new Map<string, VisibleBubbleTraceRow[]>();
+  for (const row of trace) {
+    if (row.role !== "assistant") continue;
+    const keys = [
+      row.assistant_message_id ? `assistant:${row.assistant_message_id}` : "",
+      row.content_hash ? `hash:${row.content_hash}` : "",
+    ].filter(Boolean);
+    for (const key of keys) {
+      const group = assistantGroups.get(key) ?? [];
+      group.push(row);
+      assistantGroups.set(key, group);
+    }
+  }
+  for (const group of assistantGroups.values()) {
+    if (group.length < 2) continue;
+    const sources = [...new Set(group.map((row) => row.render_source))];
+    for (const row of group) {
+      row.duplicate_visual_pair = true;
+      row.duplicate_render_sources = sources;
+    }
+  }
+  return trace;
+}
+
+function buildMessageRenderTrace(
+  messages: ChatMessage[],
+  options: {
+    activeListenerCount: number;
+    duplicateSavedSuppressed: number;
+    duplicatePendingSuppressed: number;
+    pendingReplacedBySaved: number;
+    savedMessageCount?: number;
+    pendingMessageCount?: number;
+    renderedMessageCount?: number;
+    duplicateSavedDbAssistantDetected?: boolean;
+  },
+): MessageRenderTrace {
+  const rendered = messages.filter((message) => message.role !== "system");
+  const pendingAssistantCount = rendered.filter((message) => message.role === "assistant" && message.pending).length;
+  const renderedSavedMessageCount = rendered.filter((message) => message.id > 0 && !message.pending).length;
+  const renderedPendingMessageCount = rendered.filter((message) => message.pending || message.id < 0).length;
+  const visibleBubbleTrace = buildVisibleBubbleTrace(rendered);
+  return {
+    frontend_message_render_count: options.renderedMessageCount ?? rendered.length,
+    saved_message_count: options.savedMessageCount ?? renderedSavedMessageCount,
+    pending_message_count: options.pendingMessageCount ?? renderedPendingMessageCount,
+    rendered_message_count: options.renderedMessageCount ?? rendered.length,
+    duplicate_saved_suppressed: options.duplicateSavedSuppressed,
+    duplicate_pending_suppressed: options.duplicatePendingSuppressed,
+    pending_replaced_by_saved: options.pendingReplacedBySaved,
+    pending_assistant_replaced_by_saved: options.pendingReplacedBySaved,
+    active_listener_count: options.activeListenerCount,
+    pending_assistant_count: pendingAssistantCount,
+    rendered_saved_message_count: renderedSavedMessageCount,
+    rendered_pending_message_count: renderedPendingMessageCount,
+    duplicate_render_suppressed_count:
+      options.duplicateSavedSuppressed + options.duplicatePendingSuppressed + options.pendingReplacedBySaved,
+    duplicate_visual_pair: visibleBubbleTrace.some((row) => row.duplicate_visual_pair),
+    duplicate_saved_db_assistant_detected: options.duplicateSavedDbAssistantDetected ?? false,
+    visible_bubble_trace: visibleBubbleTrace,
   };
 }
 

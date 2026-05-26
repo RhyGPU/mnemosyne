@@ -221,6 +221,7 @@ pub struct EvaluatorConversionReport {
     pub patch: EnginePatch,
     pub accepted_candidate_ids: Vec<String>,
     pub rejected_candidates: Vec<EvaluatorCandidateRejection>,
+    pub evidence_validations: Vec<EvidenceValidationTrace>,
     pub no_op: bool,
 }
 
@@ -228,6 +229,15 @@ pub struct EvaluatorConversionReport {
 pub struct EvaluatorCandidateRejection {
     pub candidate_id: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceValidationTrace {
+    pub candidate_id: String,
+    pub evidence_validation_raw: String,
+    pub evidence_validation_normalized: String,
+    pub evidence_validation_match_source: String,
+    pub evidence_validation_result: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +279,8 @@ pub fn evaluator_output_to_engine_patch(
         "{}\n{}",
         context.latest_user_message, context.latest_narrator_response
     );
+    let user_evidence_text = context.latest_user_message.to_string();
+    let narrator_evidence_text = strip_status_block_lines(context.latest_narrator_response);
     let active_souls = context
         .active_soul_ids
         .iter()
@@ -410,6 +422,13 @@ pub fn evaluator_output_to_engine_patch(
         }
         match validate_memory_candidate(candidate, &evidence_text) {
             Ok(()) => {
+                report
+                    .evidence_validations
+                    .push(evidence_validation_trace_for_candidate(
+                        candidate,
+                        &user_evidence_text,
+                        &narrator_evidence_text,
+                    ));
                 let tags = candidate
                     .relevance_tags
                     .iter()
@@ -443,7 +462,16 @@ pub fn evaluator_output_to_engine_patch(
                 });
                 report.accepted_candidate_ids.push(candidate.candidate_id.clone());
             }
-            Err(reason) => reject(&mut report, candidate, reason),
+            Err(reason) => {
+                report
+                    .evidence_validations
+                    .push(evidence_validation_trace_for_candidate(
+                        candidate,
+                        &user_evidence_text,
+                        &narrator_evidence_text,
+                    ));
+                reject(&mut report, candidate, reason);
+            }
         }
     }
 
@@ -543,19 +571,98 @@ fn claim_has_evidence(quote: Option<&str>, evidence_text: &str) -> bool {
     let Some(quote) = quote.map(str::trim).filter(|quote| !quote.is_empty()) else {
         return false;
     };
-    let quote_lower = normalize_evidence(quote);
+    let quote_lower = normalize_evidence_quote(quote);
     if quote_lower.len() < 4 {
         return false;
     }
     let evidence_lower = normalize_evidence(evidence_text);
-    evidence_lower.contains(&quote_lower)
+    evidence_contains_quote(&evidence_lower, &quote_lower)
+}
+
+fn evidence_validation_trace_for_candidate(
+    candidate: &MemoryCandidate,
+    user_text: &str,
+    narrator_text_without_status: &str,
+) -> EvidenceValidationTrace {
+    let normalized = normalize_evidence_quote(&candidate.evidence_quote);
+    let user = normalize_evidence(user_text);
+    let narrator = normalize_evidence(narrator_text_without_status);
+    let match_source = if evidence_contains_quote(&user, &normalized) {
+        "user"
+    } else if evidence_contains_quote(&narrator, &normalized) {
+        "narrator"
+    } else {
+        "none"
+    };
+    EvidenceValidationTrace {
+        candidate_id: candidate.candidate_id.clone(),
+        evidence_validation_raw: candidate.evidence_quote.clone(),
+        evidence_validation_normalized: normalized,
+        evidence_validation_match_source: match_source.into(),
+        evidence_validation_result: match_source != "none",
+    }
+}
+
+fn evidence_contains_quote(evidence_lower: &str, quote_lower: &str) -> bool {
+    if quote_lower.len() < 4 {
+        return false;
+    }
+    if evidence_lower.contains(quote_lower) {
+        return true;
+    }
+    if quote_lower.len() < 24 {
+        return false;
+    }
+    quote_lower
+        .split("...")
+        .flat_map(|part| part.split('…'))
+        .map(str::trim)
+        .filter(|part| part.len() >= 24)
+        .any(|part| evidence_lower.contains(part))
+}
+
+fn normalize_evidence_quote(text: &str) -> String {
+    let mut cleaned = text
+        .trim()
+        .replace("\\\"", "\"")
+        .replace(['“', '”'], "\"")
+        .replace(['‘', '’'], "'");
+    loop {
+        let trimmed = cleaned.trim();
+        if trimmed.len() >= 2
+            && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+        {
+            cleaned = trimmed[1..trimmed.len() - 1].to_string();
+        } else {
+            break;
+        }
+    }
+    normalize_evidence(&cleaned)
 }
 
 fn normalize_evidence(text: &str) -> String {
-    text.to_ascii_lowercase()
+    strip_status_block_lines(text)
+        .to_ascii_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn strip_status_block_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            !lower.starts_with("scene |")
+                && !lower.starts_with("status |")
+                && !lower.starts_with("physical state:")
+                && !lower.starts_with("atmosphere:")
+                && !lower.starts_with("focus:")
+                && !lower.starts_with("```status")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_low_value_memory(content: &str) -> bool {
@@ -1047,6 +1154,59 @@ mod tests {
         );
 
         assert_eq!(report.rejected_candidates[0].reason, "missing or invalid evidence_quote");
+    }
+
+    #[test]
+    fn memory_quote_with_escaped_outer_quotes_validates() {
+        let soul = new_default_soul("Aurora");
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let mut output = base_output(&soul.character_id);
+        output.memory_candidates.push(memory_candidate(
+            &soul.character_id,
+            "escaped",
+            "Aurora remembers the visitor's return as emotionally charged.",
+            "\\\"Long time no see, Aurora.\\\"",
+        ));
+
+        let report = evaluator_output_to_engine_patch(
+            &output,
+            &context(&soul, "I walk in. Long time no see, Aurora.", "", &world),
+        );
+
+        assert_eq!(report.accepted_candidate_ids, vec!["escaped"]);
+        assert_eq!(
+            report.evidence_validations[0].evidence_validation_match_source,
+            "user"
+        );
+    }
+
+    #[test]
+    fn memory_quote_from_narrator_without_status_block_validates() {
+        let soul = new_default_soul("Aurora");
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let mut output = base_output(&soul.character_id);
+        output.memory_candidates.push(memory_candidate(
+            &soul.character_id,
+            "statusless",
+            "Aurora remembers opening the door after the knock.",
+            "She unlocks the door and pulls it open just enough to stand in the gap.",
+        ));
+
+        let report = evaluator_output_to_engine_patch(
+            &output,
+            &context(
+                &soul,
+                "I knock.",
+                "She unlocks the door and pulls it open just enough to stand in the gap.\nScene | Focus: Aurora | Physical state: Not specified",
+                &world,
+            ),
+        );
+
+        assert_eq!(report.accepted_candidate_ids, vec!["statusless"]);
+        assert_eq!(
+            report.evidence_validations[0].evidence_validation_match_source,
+            "narrator"
+        );
     }
 
     #[test]

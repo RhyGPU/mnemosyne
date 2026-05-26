@@ -67,6 +67,8 @@ pub fn run() {
             commands::list_assistant_message_variants,
             commands::select_assistant_message_variant,
             commands::delete_assistant_message_variant,
+            commands::inspect_turn_branch_integrity,
+            commands::repair_accidental_normal_send_variants,
             commands::list_llm_payload_logs,
             commands::get_llm_payload_log,
             commands::get_branch_patch_debug,

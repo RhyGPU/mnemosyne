@@ -70,6 +70,11 @@ const ANTI_REPLAY_FORCED_RETRY_ENABLED_DEFAULT: bool = false;
 const EVALUATOR_MODE_V1: &str = "evaluator_v1";
 const EVALUATOR_MODE_FORM_V1: &str = "evaluator_form_v1";
 const EVALUATOR_MODE_DUAL_COMPARE: &str = "dual_compare";
+const OP_NORMAL_SEND: &str = "normal_send";
+const OP_REGENERATE: &str = "regenerate";
+const OP_FIX_RESPONSE: &str = "fix_response";
+const OP_BASELINE_PATCH: &str = "baseline_patch";
+const OP_ENRICHMENT_PATCH: &str = "enrichment_patch";
 const NARRATOR_PROVIDER_ERROR_VISIBLE: &str =
     "[Provider error: narrator response could not be generated.]";
 const MOCK_OBSERVATION_READER_LINE: &str =
@@ -436,14 +441,12 @@ fn seed_opening_narrator_message(
         return Ok(None);
     }
     let message_id = db::insert_message_and_get_id(conn, conversation_id, "assistant", opening)?;
-    db::create_assistant_message_variant(
+    db::seed_initial_assistant_message_variant(
         conn,
         conversation_id,
         message_id,
         opening,
-        Some("opening"),
         Some("opening_seed"),
-        true,
         None,
         None,
     )?;
@@ -1628,6 +1631,325 @@ pub fn delete_assistant_message_variant(
 }
 
 #[tauri::command]
+pub fn inspect_turn_branch_integrity(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    inspect_turn_branch_integrity_with_conn(&conn, &conversation_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn repair_accidental_normal_send_variants(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    repair_accidental_normal_send_variants_with_conn(&conn, &conversation_id)
+}
+
+fn repair_accidental_normal_send_variants_with_conn(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<serde_json::Value, String> {
+    let mut repaired = Vec::new();
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT message_id
+            FROM assistant_message_variants
+            WHERE conversation_id = ?1 AND COALESCE(is_discarded, 0) = 0
+            GROUP BY message_id
+            HAVING COUNT(*) > 1
+            ",
+        )
+        .map_err(|err| err.to_string())?;
+    let message_ids = stmt
+        .query_map([conversation_id], |row| row.get::<_, i64>(0))
+        .map_err(|err| err.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|err| err.to_string())?;
+    drop(stmt);
+
+    for message_id in message_ids {
+        let variants = all_variant_rows_for_message(conn, conversation_id, message_id)
+            .map_err(|err| err.to_string())?;
+        let visible = variants
+            .iter()
+            .filter(|variant| !variant.is_discarded)
+            .collect::<Vec<_>>();
+        let has_user_requested_variant = visible.iter().any(|variant| {
+            let source = variant.source.as_deref();
+            source == Some(OP_REGENERATE)
+                || source == Some(OP_FIX_RESPONSE)
+                || source == Some("model_switch_retry")
+        });
+        if has_user_requested_variant || visible.len() <= 1 {
+            continue;
+        }
+        let selected_id = visible
+            .iter()
+            .find(|variant| variant.is_selected)
+            .or_else(|| visible.last())
+            .and_then(|variant| variant.id);
+        let Some(selected_id) = selected_id else {
+            continue;
+        };
+        let selected_content = visible
+            .iter()
+            .find(|variant| variant.id == Some(selected_id))
+            .map(|variant| variant.content.clone())
+            .unwrap_or_default();
+        for variant in visible {
+            if variant.id == Some(selected_id) {
+                continue;
+            }
+            let source = variant.source.as_deref();
+            if variant.content == selected_content
+                || source == Some("original")
+                || source == Some("api_provider")
+                || source == Some(OP_NORMAL_SEND)
+                || source == Some(OP_BASELINE_PATCH)
+                || source == Some(OP_ENRICHMENT_PATCH)
+            {
+                if let Some(id) = variant.id {
+                    conn.execute(
+                        "UPDATE assistant_message_variants SET is_discarded = 1, is_selected = 0 WHERE id = ?1",
+                        [id],
+                    )
+                    .map_err(|err| err.to_string())?;
+                    repaired.push(serde_json::json!({
+                        "message_id": message_id,
+                        "discarded_variant_id": id,
+                        "kept_variant_id": selected_id,
+                        "reason": "accidental_normal_send_duplicate"
+                    }));
+                }
+            }
+        }
+        conn.execute(
+            "UPDATE assistant_message_variants SET is_selected = 1, is_discarded = 0 WHERE id = ?1",
+            [selected_id],
+        )
+        .map_err(|err| err.to_string())?;
+    }
+
+    let inspection = inspect_turn_branch_integrity_with_conn(conn, conversation_id)
+        .map_err(|err| err.to_string())?;
+    Ok(serde_json::json!({
+        "conversation_id": conversation_id,
+        "repaired": repaired,
+        "inspection": inspection
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct VariantIntegrityRow {
+    id: Option<i64>,
+    content: String,
+    source: Option<String>,
+    is_selected: bool,
+    is_discarded: bool,
+}
+
+fn all_variant_rows_for_message(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: i64,
+) -> rusqlite::Result<Vec<VariantIntegrityRow>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT id, content, source, is_selected, COALESCE(is_discarded, 0)
+        FROM assistant_message_variants
+        WHERE conversation_id = ?1 AND message_id = ?2
+        ORDER BY id ASC
+        ",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![conversation_id, message_id], |row| {
+        Ok(VariantIntegrityRow {
+            id: Some(row.get(0)?),
+            content: row.get(1)?,
+            source: row.get(2)?,
+            is_selected: row.get::<_, i64>(3)? != 0,
+            is_discarded: row.get::<_, i64>(4)? != 0,
+        })
+    })?;
+    rows.collect()
+}
+
+fn inspect_turn_branch_integrity_with_conn(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<serde_json::Value> {
+    let messages = db::list_messages(conn, conversation_id, 100_000)?;
+    let active_user_messages = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .map(|message| {
+            serde_json::json!({
+                "message_id": message.id,
+                "content": message.content,
+                "created_at": message.created_at,
+                "status": message.status,
+                "origin": message.origin
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut assistant_pairs = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != "user" {
+            continue;
+        }
+        let assistant = messages
+            .iter()
+            .skip(index + 1)
+            .find(|candidate| candidate.role == "assistant");
+        assistant_pairs.push(serde_json::json!({
+            "user_message_id": message.id,
+            "assistant_message_id": assistant.map(|assistant| assistant.id),
+            "assistant_preview": assistant.map(|assistant| head_tail_excerpt_chars(&assistant.content, 80, 0, 80))
+        }));
+    }
+
+    let turn_commits = query_json_rows(
+        conn,
+        "
+        SELECT turn_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, branch_id, active_variant, is_active, is_discarded, is_regenerated_variant
+        FROM turn_commits
+        WHERE conversation_id = ?1
+        ORDER BY created_at ASC
+        ",
+        conversation_id,
+        |row| {
+            Ok(serde_json::json!({
+                "turn_id": row.get::<_, String>(0)?,
+                "parent_turn_id": row.get::<_, Option<String>>(1)?,
+                "user_message_id": row.get::<_, Option<i64>>(2)?,
+                "assistant_message_id": row.get::<_, Option<i64>>(3)?,
+                "state_patch_id": row.get::<_, Option<String>>(4)?,
+                "selected_variant_id": row.get::<_, Option<i64>>(5)?,
+                "branch_id": row.get::<_, String>(6)?,
+                "active_variant": row.get::<_, i64>(7)? != 0,
+                "is_active": row.get::<_, i64>(8)? != 0,
+                "is_discarded": row.get::<_, i64>(9)? != 0,
+                "is_regenerated_variant": row.get::<_, i64>(10)? != 0
+            }))
+        },
+    )?;
+    let assistant_variants = query_json_rows(
+        conn,
+        "
+        SELECT id, message_id, content, source, is_selected, COALESCE(is_discarded, 0), turn_id, state_patch_id
+        FROM assistant_message_variants
+        WHERE conversation_id = ?1
+        ORDER BY message_id ASC, id ASC
+        ",
+        conversation_id,
+        |row| {
+            Ok(serde_json::json!({
+                "variant_id": row.get::<_, i64>(0)?,
+                "message_id": row.get::<_, i64>(1)?,
+                "content_hash": stable_debug_hash(row.get::<_, String>(2)?.as_str()),
+                "source": row.get::<_, Option<String>>(3)?,
+                "is_selected": row.get::<_, i64>(4)? != 0,
+                "is_discarded": row.get::<_, i64>(5)? != 0,
+                "turn_id": row.get::<_, Option<String>>(6)?,
+                "state_patch_id": row.get::<_, Option<String>>(7)?
+            }))
+        },
+    )?;
+    let session_branches = query_json_rows(
+        conn,
+        "
+        SELECT branch_id, active_turn_id, is_active, rebuild_generation
+        FROM session_branches
+        WHERE conversation_id = ?1
+        ORDER BY created_at ASC
+        ",
+        conversation_id,
+        |row| {
+            Ok(serde_json::json!({
+                "branch_id": row.get::<_, String>(0)?,
+                "active_turn_id": row.get::<_, Option<String>>(1)?,
+                "is_active": row.get::<_, i64>(2)? != 0,
+                "rebuild_generation": row.get::<_, i64>(3)?
+            }))
+        },
+    )?;
+    let active_turn_id = db::get_active_session_branch(conn, conversation_id)
+        .ok()
+        .and_then(|branch| branch.active_turn_id);
+    let mut visible_variant_counts = Vec::new();
+    let mut suspected_duplicate_branch_causes = Vec::new();
+    for message in messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+    {
+        let variants = all_variant_rows_for_message(conn, conversation_id, message.id)?;
+        let visible = variants
+            .iter()
+            .filter(|variant| !variant.is_discarded)
+            .collect::<Vec<_>>();
+        visible_variant_counts.push(serde_json::json!({
+            "assistant_message_id": message.id,
+            "visible_variant_count": visible.len(),
+            "variant_ids": visible.iter().filter_map(|variant| variant.id).collect::<Vec<_>>(),
+            "sources": visible.iter().map(|variant| variant.source.clone()).collect::<Vec<_>>()
+        }));
+        let only_normal_sources = visible.iter().all(|variant| {
+            let source = variant.source.as_deref();
+            source.is_none()
+                || source == Some("original")
+                || source == Some("api_provider")
+                || source == Some(OP_NORMAL_SEND)
+                || source == Some("opening_seed")
+        });
+        if visible.len() > 1 && only_normal_sources {
+            suspected_duplicate_branch_causes.push(serde_json::json!({
+                "assistant_message_id": message.id,
+                "cause": "normal_send_created_multiple_visible_variants",
+                "variant_ids": visible.iter().filter_map(|variant| variant.id).collect::<Vec<_>>(),
+                "sources": visible.iter().map(|variant| variant.source.clone()).collect::<Vec<_>>()
+            }));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "conversation_id": conversation_id,
+        "active_turn_id": active_turn_id,
+        "active_user_messages": active_user_messages,
+        "assistant_pairs": assistant_pairs,
+        "turn_commits": turn_commits,
+        "assistant_variants": assistant_variants,
+        "session_branches": session_branches,
+        "visible_variant_counts": visible_variant_counts,
+        "suspected_duplicate_branch_causes": suspected_duplicate_branch_causes
+    }))
+}
+
+fn query_json_rows<F>(
+    conn: &Connection,
+    sql: &str,
+    conversation_id: &str,
+    mut map_row: F,
+) -> rusqlite::Result<Vec<serde_json::Value>>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value>,
+{
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([conversation_id], |row| map_row(row))?;
+    rows.collect()
+}
+
+fn stable_debug_hash(content: &str) -> String {
+    let mut hash = 5381u32;
+    for byte in content.trim().as_bytes() {
+        hash = hash.wrapping_mul(33) ^ (*byte as u32);
+    }
+    format!("h{hash:08x}")
+}
+
+#[tauri::command]
 pub fn list_llm_payload_logs(
     state: State<'_, AppState>,
     conversation_id: String,
@@ -2109,6 +2431,7 @@ fn send_mock_turn_with_conn(
     replacement_assistant_id: Option<i64>,
     correction_instruction: Option<String>,
 ) -> Result<TurnResult, String> {
+    let canonical_turn_id = format!("turn_{}", uuid_like_id());
     let (mut soul, snapshot_user_text, pre_turn_soul_json) =
         if let Some(message_id) = replacement_assistant_id {
             let snapshot = db::get_turn_snapshot(&conn, &conversation_id, message_id)
@@ -2220,8 +2543,9 @@ fn send_mock_turn_with_conn(
         }
         let mut ledger_patch = parsed.engine_patch.clone();
         sanitize_mock_patch_for_ledger(&mut ledger_patch);
-        db::record_turn_commit_with_patch(
+        db::record_turn_commit_with_patch_for_turn_id(
             conn,
+            &canonical_turn_id,
             &conversation_id,
             &branch.branch_id,
             ledger_parent_turn_id.as_deref(),
@@ -2318,13 +2642,14 @@ pub async fn send_api_turn(
     let mut stage_started = Instant::now();
     let context_mode = ContextMode::from_label(context_mode.as_deref());
     let request_id = uuid_like_id();
+    let canonical_turn_id = format!("turn_{request_id}");
     let gate_outcome =
         gate_pending_evaluator_jobs(&window, &state, &conversation_id, &state_updater_settings)?;
     let mut turn_trace = NarratorTurnTrace {
         request_id: request_id.clone(),
         conversation_id: conversation_id.clone(),
         branch_id: None,
-        turn_id: None,
+        turn_id: Some(canonical_turn_id.clone()),
         user_message_id: None,
         assistant_message_id: None,
         state_patch_id: None,
@@ -2505,9 +2830,6 @@ pub async fn send_api_turn(
         turn_trace.branch_id = ledger_branch
             .as_ref()
             .map(|branch| branch.branch_id.clone());
-        if ledger_branch.is_some() {
-            turn_trace.turn_id = Some(format!("turn_{request_id}"));
-        }
         emit_perf_log(
             &window,
             &conversation_id,
@@ -3522,8 +3844,9 @@ pub async fn send_api_turn(
         if let Some(branch_id) = ledger_branch_id.as_deref() {
             let conn = state.conn.lock().map_err(|err| err.to_string())?;
             let empty_patch = EnginePatch::default();
-            let (_commit, patch_record) = db::record_turn_commit_with_patch(
+            let (_commit, patch_record) = db::record_turn_commit_with_patch_for_turn_id(
                 &conn,
+                &canonical_turn_id,
                 &conversation_id,
                 branch_id,
                 ledger_parent_turn_id.as_deref(),
@@ -3604,7 +3927,8 @@ pub async fn send_api_turn(
 
     if is_normal_scene_turn && ledger_branch_id.is_some() {
         let branch_id = ledger_branch_id.as_deref().unwrap();
-        let (ev_id, baseline_patch) = construct_baseline_patch(&soul, &snapshot_user_text, &visible_response_for_updater);
+        let (ev_id, baseline_patch) =
+            construct_baseline_patch(&soul, &snapshot_user_text, &visible_response_for_updater);
         baseline_event_id = Some(ev_id);
 
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
@@ -3613,8 +3937,9 @@ pub async fn send_api_turn(
                 .map_err(|err| err.to_string())?;
         }
 
-        let (commit, patch_record) = db::record_turn_commit_with_patch(
+        let (commit, patch_record) = db::record_turn_commit_with_patch_for_turn_id(
             &conn,
+            &canonical_turn_id,
             &conversation_id,
             branch_id,
             ledger_parent_turn_id.as_deref(),
@@ -3650,7 +3975,8 @@ pub async fn send_api_turn(
     }
 
     if evaluator_background_enabled(&state_updater_settings) {
-        let entity_updater_context = build_entity_updater_context(&pre_baseline_soul, &entity_context);
+        let entity_updater_context =
+            build_entity_updater_context(&pre_baseline_soul, &entity_context);
         let memory_debug_nonce = format!("memory-debug-{}", uuid_like_id());
         let job = start_background_evaluator_job(
             app.clone(),
@@ -3660,7 +3986,10 @@ pub async fn send_api_turn(
             selected_variant_id,
             request_id.clone(),
             evaluator_request_id.clone(),
-            turn_trace.turn_id.clone(),
+            baseline_commit
+                .as_ref()
+                .map(|commit| commit.turn_id.clone())
+                .or_else(|| turn_trace.turn_id.clone()),
             context_mode.label().to_string(),
             pre_baseline_soul.clone(),
             pre_baseline_session_world.clone(),
@@ -4417,7 +4746,7 @@ pub async fn send_api_turn(
     let ledger_apply_trace: serde_json::Value;
     let ledger_rebuild_debug = if let Some(branch_id) = ledger_branch_id.as_deref() {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
-        
+
         let mut enrichment_id = None;
         let (commit_turn_id, patch_record) = if let Some(ref bp_id) = baseline_patch_id {
             let commit_id = if let Some(ref bc) = baseline_commit {
@@ -4426,8 +4755,16 @@ pub async fn send_api_turn(
                 turn_trace.turn_id.clone().unwrap_or_default()
             };
             let pr = if !engine_patch.is_empty() {
-                let rec = db::record_enrichment_patch(&conn, &commit_id, &engine_patch)
-                    .map_err(|err| err.to_string())?;
+                let rec = db::record_enrichment_patch_with_metadata(
+                    &conn,
+                    &commit_id,
+                    &engine_patch,
+                    Some(bp_id),
+                    Some(assistant_message_id),
+                    selected_variant_id,
+                    None,
+                )
+                .map_err(|err| err.to_string())?;
                 enrichment_id = Some(rec.patch_id.clone());
                 rec
             } else {
@@ -4436,11 +4773,16 @@ pub async fn send_api_turn(
             (commit_id, pr)
         } else {
             if replacement_assistant_id.is_some() {
-                db::discard_active_commits_for_assistant(&conn, &conversation_id, assistant_message_id)
-                    .map_err(|err| err.to_string())?;
+                db::discard_active_commits_for_assistant(
+                    &conn,
+                    &conversation_id,
+                    assistant_message_id,
+                )
+                .map_err(|err| err.to_string())?;
             }
-            let (commit, pr) = db::record_turn_commit_with_patch(
+            let (commit, pr) = db::record_turn_commit_with_patch_for_turn_id(
                 &conn,
+                &canonical_turn_id,
                 &conversation_id,
                 branch_id,
                 ledger_parent_turn_id.as_deref(),
@@ -4801,6 +5143,30 @@ pub async fn send_api_turn(
                 });
         }
     }
+    if let Ok(conn) = state.conn.lock() {
+        emit_turn_branch_integrity_log(
+            &window,
+            &conn,
+            &conversation_id,
+            if replacement_assistant_id.is_some() {
+                if correction_instruction
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .is_some()
+                {
+                    OP_FIX_RESPONSE
+                } else {
+                    OP_REGENERATE
+                }
+            } else {
+                OP_NORMAL_SEND
+            },
+            ledger_user_message_id,
+            assistant_message_id,
+            canonical_turn_id.as_str(),
+        );
+    }
 
     Ok(TurnResult {
         conversation_id,
@@ -4811,6 +5177,68 @@ pub async fn send_api_turn(
         consolidation_ran,
         debug,
     })
+}
+
+fn emit_turn_branch_integrity_log(
+    window: &Window,
+    conn: &Connection,
+    conversation_id: &str,
+    operation_type: &str,
+    user_message_id: Option<i64>,
+    assistant_message_id: i64,
+    turn_id: &str,
+) {
+    let variants = db::list_assistant_message_variants(conn, conversation_id, assistant_message_id)
+        .unwrap_or_default();
+    let assistant_variant_ids_for_turn = variants
+        .iter()
+        .filter_map(|variant| variant.id)
+        .collect::<Vec<_>>();
+    let active_variant_index = variants
+        .iter()
+        .position(|variant| variant.is_selected)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let branch_ids_for_turn = conn
+        .prepare(
+            "SELECT DISTINCT branch_id FROM turn_commits WHERE conversation_id = ?1 AND turn_id = ?2 ORDER BY branch_id ASC",
+        )
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map(rusqlite::params![conversation_id, turn_id], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    let turn_commit_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM turn_commits WHERE conversation_id = ?1 AND turn_id = ?2",
+            rusqlite::params![conversation_id, turn_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    emit_dev_log(
+        window,
+        if operation_type == OP_NORMAL_SEND && variants.len() > 1 {
+            "error"
+        } else {
+            "info"
+        },
+        "ledger",
+        "turn_branch_variant_invariant",
+        Some(serde_json::json!({
+            "operation_type": operation_type,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+            "turn_id": turn_id,
+            "turn_commit_id": turn_id,
+            "turn_commit_count": turn_commit_count,
+            "assistant_variant_ids_for_turn": assistant_variant_ids_for_turn,
+            "branch_ids_for_turn": branch_ids_for_turn,
+            "visible_variant_count": variants.len(),
+            "active_variant_index": active_variant_index
+        })),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4851,11 +5279,11 @@ fn save_visible_narrator_response(
                 .filter(|instruction| !instruction.is_empty())
                 .is_some()
             {
-                "fix"
+                OP_FIX_RESPONSE
             } else if replacement_assistant_id.is_some() {
-                "regenerate"
+                OP_REGENERATE
             } else {
-                "api_provider"
+                OP_NORMAL_SEND
             },
             None,
         ),
@@ -4899,18 +5327,31 @@ fn save_visible_narrator_response(
     };
 
     let variant = if replacement_assistant_id.is_some() || origin == NarratorMessageOrigin::Api {
-        db::create_assistant_message_variant(
-            conn,
-            conversation_id,
-            assistant_message_id,
-            visible_response,
-            variant_label,
-            Some(variant_source),
-            true,
-            Some(pre_turn_soul_json),
-            Some(&debug_json),
-        )
-        .map_err(|err| err.to_string())?
+        if replacement_assistant_id.is_some() {
+            db::create_assistant_message_variant(
+                conn,
+                conversation_id,
+                assistant_message_id,
+                visible_response,
+                variant_label,
+                Some(variant_source),
+                true,
+                Some(pre_turn_soul_json),
+                Some(&debug_json),
+            )
+            .map_err(|err| err.to_string())?
+        } else {
+            db::seed_initial_assistant_message_variant(
+                conn,
+                conversation_id,
+                assistant_message_id,
+                visible_response,
+                Some(OP_NORMAL_SEND),
+                Some(pre_turn_soul_json),
+                Some(&debug_json),
+            )
+            .map_err(|err| err.to_string())?
+        }
     } else {
         db::seed_initial_assistant_message_variant(
             conn,
@@ -6986,6 +7427,9 @@ fn runtime_form_trace_json(outcome: &RuntimeEvaluatorOutcome) -> serde_json::Val
             "json_extract_status": trace.json_extract_status,
             "strict_parse_failed_but_salvage_attempted": trace.strict_parse_failed_but_salvage_attempted,
             "salvage_success": trace.salvage_success,
+            "relationship_dimension_inferred_from": &trace.relationship_dimension_inferred_from,
+            "relationship_direction_inferred_from": &trace.relationship_direction_inferred_from,
+            "relationship_rows_split_count": trace.relationship_rows_split_count,
             "partial_success": outcome.partial_success,
             "partial_success_reason": outcome.partial_success_reason.as_deref(),
         })
@@ -7007,6 +7451,9 @@ fn runtime_form_trace_json(outcome: &RuntimeEvaluatorOutcome) -> serde_json::Val
             "json_extract_status": "not_applicable",
             "strict_parse_failed_but_salvage_attempted": false,
             "salvage_success": false,
+            "relationship_dimension_inferred_from": [],
+            "relationship_direction_inferred_from": [],
+            "relationship_rows_split_count": 0,
             "partial_success": outcome.partial_success,
             "partial_success_reason": outcome.partial_success_reason.as_deref(),
         })
@@ -7348,24 +7795,25 @@ fn construct_baseline_patch(
     latest_narrator_response: &str,
 ) -> (String, EnginePatch) {
     let narrator_trimmed = latest_narrator_response.trim();
-    let one_sentence = if let Some(pos) = narrator_trimmed.find(|c| c == '.' || c == '!' || c == '?') {
-        &narrator_trimmed[..=pos]
-    } else {
-        narrator_trimmed
-    };
+    let one_sentence =
+        if let Some(pos) = narrator_trimmed.find(|c| c == '.' || c == '!' || c == '?') {
+            &narrator_trimmed[..=pos]
+        } else {
+            narrator_trimmed
+        };
     let one_sentence = if one_sentence.chars().count() > 160 {
         one_sentence.chars().take(157).collect::<String>() + "..."
     } else {
         one_sentence.to_string()
     };
-    
+
     let user_trimmed = latest_user_message.trim();
     let user_part = if user_trimmed.chars().count() > 80 {
         user_trimmed.chars().take(77).collect::<String>() + "..."
     } else {
         user_trimmed.to_string()
     };
-    
+
     let summary = if !user_part.is_empty() && !one_sentence.is_empty() {
         format!("{} -> {}", user_part, one_sentence)
     } else if !one_sentence.is_empty() {
@@ -7754,7 +8202,9 @@ async fn run_background_evaluator_job(
             if let Ok(patch_record) = db::get_state_patch(&conn, bp_id) {
                 if let Ok(patch) = serde_json::from_str::<EnginePatch>(&patch_record.patch_json) {
                     found_id = patch.world_patch.and_then(|wp| {
-                        wp.event_operations.first().and_then(|op| op.recent_event_id.clone())
+                        wp.event_operations
+                            .first()
+                            .and_then(|op| op.recent_event_id.clone())
                     });
                 }
             }
@@ -8123,6 +8573,7 @@ async fn run_background_evaluator_job(
         "materialized_soul_updated": false,
         "materialized_session_world_updated": false
     });
+    let mut enrichment_stale_skipped = false;
     let apply_result: Result<(), String> = (|| {
         let state = app.state::<AppState>();
         let conn = match state.conn.lock() {
@@ -8142,39 +8593,65 @@ async fn run_background_evaluator_job(
             }
         };
         if let Some(branch_id) = ledger_branch_id.as_deref() {
-            let branch_ready = match db::get_active_session_branch(&conn, &job.conversation_id) {
-                Ok(branch) => {
-                    let expected_turn_id = if baseline_patch_id.is_some() {
-                        Some(job.turn_id.clone())
-                    } else {
-                        ledger_parent_turn_id.clone()
-                    };
-                    if branch.active_turn_id == expected_turn_id {
-                        Ok(())
-                    } else {
-                        ledger_trace["patch_apply_skipped_reason"] =
-                            serde_json::json!("branch_advanced_before_background_evaluator_completed");
-                        Err("Branch advanced before background evaluator completed".to_string())
-                    }
-                }
-                Err(err) => Err(err.to_string()),
-            };
-            if let Err(err) = branch_ready {
-                return Err(err);
+            let baseline_record = baseline_patch_id
+                .as_ref()
+                .and_then(|bp_id| db::get_state_patch(&conn, bp_id).ok());
+            let source_turn_id = baseline_record
+                .as_ref()
+                .map(|record| record.turn_id.clone())
+                .or_else(|| ledger_parent_turn_id.clone())
+                .unwrap_or_else(|| job.turn_id.clone());
+            let active_contains_source = db::active_branch_contains_turn(
+                &conn,
+                &job.conversation_id,
+                branch_id,
+                &source_turn_id,
+            )
+            .map_err(|err| err.to_string())?;
+            if !active_contains_source {
+                ledger_trace = serde_json::json!({
+                    "state_patch_id": serde_json::Value::Null,
+                    "baseline_patch_id": baseline_patch_id,
+                    "enrichment_patch_id": serde_json::Value::Null,
+                    "turn_commit_id": source_turn_id,
+                    "branch_id": branch_id,
+                    "patch_kind": "enrichment",
+                    "patch_stored": false,
+                    "patch_applied": false,
+                    "patch_apply_skipped_reason": "source_turn_not_on_active_branch",
+                    "stale_skipped": true,
+                    "branch_rebuilt": false,
+                    "applied_patch_count": 0,
+                    "skipped_patch_count": 1,
+                    "invalidated_patch_count": 0,
+                    "materialized_soul_updated": false,
+                    "materialized_session_world_updated": false
+                });
+                enrichment_stale_skipped = true;
+                return Ok(());
             }
             let mut enrichment_id = None;
             let patch_record = if let Some(ref bp_id) = baseline_patch_id {
                 if !engine_patch.is_empty() {
-                    let rec = db::record_enrichment_patch(&conn, &job.turn_id, &engine_patch)
-                        .map_err(|err| err.to_string())?;
+                    let rec = db::record_enrichment_patch_with_metadata(
+                        &conn,
+                        &source_turn_id,
+                        &engine_patch,
+                        Some(bp_id),
+                        Some(job.assistant_message_id),
+                        selected_variant_id,
+                        Some(&job.evaluator_job_id),
+                    )
+                    .map_err(|err| err.to_string())?;
                     enrichment_id = Some(rec.patch_id.clone());
                     rec
                 } else {
-                    db::get_state_patch(&conn, bp_id).map_err(|err| err.to_string())?
+                    baseline_record.ok_or_else(|| format!("Baseline patch {bp_id} not found"))?
                 }
             } else {
-                let (_commit, pr) = db::record_turn_commit_with_patch(
+                let (_commit, pr) = db::record_turn_commit_with_patch_for_turn_id(
                     &conn,
+                    &job.turn_id,
                     &job.conversation_id,
                     branch_id,
                     ledger_parent_turn_id.as_deref(),
@@ -8219,8 +8696,14 @@ async fn run_background_evaluator_job(
                 "state_patch_id": patch_record.patch_id,
                 "baseline_patch_id": baseline_patch_id,
                 "enrichment_patch_id": enrichment_id,
-                "turn_commit_id": job.turn_id,
+                "turn_commit_id": source_turn_id,
                 "branch_id": branch_id,
+                "patch_kind": if enrichment_id.is_some() { "enrichment" } else { "baseline" },
+                "parent_baseline_patch_id": baseline_patch_id,
+                "source_turn_id": source_turn_id,
+                "source_assistant_message_id": job.assistant_message_id,
+                "source_assistant_variant_id": selected_variant_id,
+                "created_by_job_id": job.evaluator_job_id,
                 "patch_stored": true,
                 "patch_applied": !engine_patch.is_empty(),
                 "patch_apply_skipped_reason": if engine_patch.is_empty() { Some("empty_patch_recorded_in_ledger") } else { None },
@@ -8347,13 +8830,13 @@ async fn run_background_evaluator_job(
     emit_per_soul_memory_written_logs(&window, &job.conversation_id, &engine_patch);
     emit_dev_log(
         &window,
-        if engine_patch.is_empty() {
+        if engine_patch.is_empty() || enrichment_stale_skipped {
             "info"
         } else {
             "success"
         },
         "evaluator",
-        if engine_patch.is_empty() {
+        if engine_patch.is_empty() || enrichment_stale_skipped {
             "evaluator_patch_apply_skipped_reason"
         } else {
             "evaluator_patch_applied"
@@ -8362,22 +8845,30 @@ async fn run_background_evaluator_job(
             "conversation_id": job.conversation_id.as_str(),
             "assistant_message_id": job.assistant_message_id,
             "evaluator_job_id": job.evaluator_job_id.as_str(),
-            "reason": if engine_patch.is_empty() { "empty_patch" } else { "background_evaluator_applied_patch" }
+            "reason": if enrichment_stale_skipped {
+                "source_turn_not_on_active_branch"
+            } else if engine_patch.is_empty() {
+                "empty_patch"
+            } else {
+                "background_evaluator_applied_patch"
+            }
         })),
     );
-    emit_dev_log(
-        &window,
-        "success",
-        "ledger",
-        "materialized_state_refreshed",
-        Some(serde_json::json!({
-            "conversation_id": job.conversation_id.as_str(),
-            "assistant_message_id": job.assistant_message_id,
-            "evaluator_job_id": job.evaluator_job_id.as_str(),
-            "soul_id": soul.character_id.as_str(),
-            "world_id": session_world.world_id.as_str()
-        })),
-    );
+    if !enrichment_stale_skipped {
+        emit_dev_log(
+            &window,
+            "success",
+            "ledger",
+            "materialized_state_refreshed",
+            Some(serde_json::json!({
+                "conversation_id": job.conversation_id.as_str(),
+                "assistant_message_id": job.assistant_message_id,
+                "evaluator_job_id": job.evaluator_job_id.as_str(),
+                "soul_id": soul.character_id.as_str(),
+                "world_id": session_world.world_id.as_str()
+            })),
+        );
+    }
     let form_trace = runtime_form_trace_json(&runtime);
     let mut final_trace = serde_json::json!({
         "evaluator_trace": {
@@ -8454,12 +8945,16 @@ async fn run_background_evaluator_job(
             let _ = update_llm_payload_pipeline_trace(&conn, log_id, &final_trace);
         };
     }
-    let final_job_status = if runtime.partial_success || baseline_patch_id.is_some() && engine_patch.is_empty() {
+    let final_job_status = if enrichment_stale_skipped {
+        "stale_skipped"
+    } else if runtime.partial_success || baseline_patch_id.is_some() && engine_patch.is_empty() {
         "partial_success"
     } else {
         "completed"
     };
-    let error_msg = if !runtime.form_rejected_rows.is_empty() {
+    let error_msg = if enrichment_stale_skipped {
+        Some("source turn is no longer on active branch")
+    } else if !runtime.form_rejected_rows.is_empty() {
         Some("some enrichment rows rejected")
     } else {
         None
@@ -8471,7 +8966,7 @@ async fn run_background_evaluator_job(
         final_job_status,
         error_msg,
         started,
-        !engine_patch.is_empty(),
+        !engine_patch.is_empty() && !enrichment_stale_skipped,
     );
 }
 
@@ -8563,6 +9058,12 @@ fn evaluator_candidate_trace_json(
                 "retrieval_strength": candidate.retrieval_strength,
                 "target_entity_ids": candidate.target_entity_ids,
                 "relevance_tags": candidate.relevance_tags,
+                "evidence_validation": conversion.evidence_validations.iter().find(|trace| trace.candidate_id == candidate.candidate_id).map(|trace| serde_json::json!({
+                    "evidence_validation_raw": trace.evidence_validation_raw,
+                    "evidence_validation_normalized": trace.evidence_validation_normalized,
+                    "evidence_validation_match_source": trace.evidence_validation_match_source,
+                    "evidence_validation_result": trace.evidence_validation_result,
+                })),
                 "accepted": accepted.contains(candidate_id),
                 "rejection_reason": rejected.get(candidate_id).copied(),
             })
@@ -10575,6 +11076,347 @@ mod tests {
         hidden_state::HiddenState,
         patch::{EnginePatch, WorldPatch},
     };
+
+    fn variant_test_setup(conversation_id: &str) -> (Connection, Soul, db::SessionBranch, i64) {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("soul");
+        db::ensure_conversation(&conn, conversation_id, &soul.character_id).expect("conversation");
+        let world = db::create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        let branch =
+            db::create_session_branch(&conn, conversation_id, &soul, &world).expect("branch");
+        let assistant_id =
+            db::insert_message_and_get_id(&conn, conversation_id, "assistant", "Aurora answers.")
+                .expect("assistant");
+        (conn, soul, branch, assistant_id)
+    }
+
+    #[test]
+    fn normal_send_starts_with_one_visible_variant() {
+        let (conn, _soul, _branch, assistant_id) = variant_test_setup("normal-one");
+        db::seed_initial_assistant_message_variant(
+            &conn,
+            "normal-one",
+            assistant_id,
+            "Aurora answers.",
+            Some(OP_NORMAL_SEND),
+            None,
+            None,
+        )
+        .expect("seed");
+
+        let variants =
+            db::list_assistant_message_variants(&conn, "normal-one", assistant_id).expect("list");
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].source.as_deref(), Some(OP_NORMAL_SEND));
+        assert!(variants[0].is_selected);
+    }
+
+    #[test]
+    fn normal_send_does_not_create_branch_alternative() {
+        let (conn, _soul, branch, assistant_id) = variant_test_setup("normal-branch");
+        let variant = db::seed_initial_assistant_message_variant(
+            &conn,
+            "normal-branch",
+            assistant_id,
+            "Aurora answers.",
+            Some(OP_NORMAL_SEND),
+            None,
+            None,
+        )
+        .expect("seed");
+        db::record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "turn_canonical_normal",
+            "normal-branch",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            variant.id,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("commit");
+
+        let inspection =
+            inspect_turn_branch_integrity_with_conn(&conn, "normal-branch").expect("inspect");
+        assert_eq!(
+            inspection["visible_variant_counts"][0]["visible_variant_count"],
+            1
+        );
+        assert!(inspection["suspected_duplicate_branch_causes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn baseline_patch_does_not_create_assistant_variant() {
+        let (conn, _soul, branch, assistant_id) = variant_test_setup("baseline-no-variant");
+        let variant = db::seed_initial_assistant_message_variant(
+            &conn,
+            "baseline-no-variant",
+            assistant_id,
+            "Aurora answers.",
+            Some(OP_NORMAL_SEND),
+            None,
+            None,
+        )
+        .expect("seed");
+        db::record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "turn_baseline_only",
+            "baseline-no-variant",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            variant.id,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("baseline");
+
+        assert_eq!(
+            db::list_assistant_message_variants(&conn, "baseline-no-variant", assistant_id)
+                .expect("variants")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn enrichment_patch_does_not_create_assistant_variant() {
+        let (conn, _soul, branch, assistant_id) = variant_test_setup("enrichment-no-variant");
+        let variant = db::seed_initial_assistant_message_variant(
+            &conn,
+            "enrichment-no-variant",
+            assistant_id,
+            "Aurora answers.",
+            Some(OP_NORMAL_SEND),
+            None,
+            None,
+        )
+        .expect("seed");
+        let (commit, baseline) = db::record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "turn_enrichment_source",
+            "enrichment-no-variant",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            variant.id,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("baseline");
+        db::record_enrichment_patch_with_metadata(
+            &conn,
+            &commit.turn_id,
+            &EnginePatch::default(),
+            Some(&baseline.patch_id),
+            Some(assistant_id),
+            variant.id,
+            Some("job-test"),
+        )
+        .expect("enrichment");
+
+        assert_eq!(
+            db::list_assistant_message_variants(&conn, "enrichment-no-variant", assistant_id)
+                .expect("variants")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn canonical_turn_id_shared_by_narrator_baseline_enrichment() {
+        let (conn, _soul, branch, assistant_id) = variant_test_setup("canonical-turn");
+        let variant = db::seed_initial_assistant_message_variant(
+            &conn,
+            "canonical-turn",
+            assistant_id,
+            "Aurora answers.",
+            Some(OP_NORMAL_SEND),
+            None,
+            None,
+        )
+        .expect("seed");
+        let (commit, baseline) = db::record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "turn_canonical_shared",
+            "canonical-turn",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            variant.id,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("baseline");
+        let enrichment = db::record_enrichment_patch_with_metadata(
+            &conn,
+            "turn_canonical_shared",
+            &EnginePatch::default(),
+            Some(&baseline.patch_id),
+            Some(assistant_id),
+            variant.id,
+            Some("job-canonical"),
+        )
+        .expect("enrichment");
+
+        assert_eq!(commit.turn_id, "turn_canonical_shared");
+        assert_eq!(
+            enrichment.source_turn_id.as_deref(),
+            Some("turn_canonical_shared")
+        );
+        assert_eq!(
+            db::list_assistant_message_variants(&conn, "canonical-turn", assistant_id)
+                .expect("variants")[0]
+                .id,
+            variant.id
+        );
+    }
+
+    #[test]
+    fn regenerate_creates_second_visible_variant() {
+        let (conn, _soul, _branch, assistant_id) = variant_test_setup("regen-variant");
+        db::seed_initial_assistant_message_variant(
+            &conn,
+            "regen-variant",
+            assistant_id,
+            "Aurora answers.",
+            Some(OP_NORMAL_SEND),
+            None,
+            None,
+        )
+        .expect("seed");
+        db::create_assistant_message_variant(
+            &conn,
+            "regen-variant",
+            assistant_id,
+            "Aurora answers differently.",
+            Some("Variant 2"),
+            Some(OP_REGENERATE),
+            true,
+            None,
+            None,
+        )
+        .expect("regenerate");
+
+        assert_eq!(
+            db::list_assistant_message_variants(&conn, "regen-variant", assistant_id)
+                .expect("variants")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn fix_response_creates_second_visible_variant() {
+        let (conn, _soul, _branch, assistant_id) = variant_test_setup("fix-variant");
+        db::seed_initial_assistant_message_variant(
+            &conn,
+            "fix-variant",
+            assistant_id,
+            "Aurora answers.",
+            Some(OP_NORMAL_SEND),
+            None,
+            None,
+        )
+        .expect("seed");
+        db::create_assistant_message_variant(
+            &conn,
+            "fix-variant",
+            assistant_id,
+            "Aurora answers with the correction applied.",
+            Some("Variant 2"),
+            Some(OP_FIX_RESPONSE),
+            true,
+            None,
+            None,
+        )
+        .expect("fix");
+
+        assert_eq!(
+            db::list_assistant_message_variants(&conn, "fix-variant", assistant_id)
+                .expect("variants")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn inspect_turn_branch_integrity_reports_variant_count() {
+        let (conn, _soul, _branch, assistant_id) = variant_test_setup("inspect-variant");
+        db::seed_initial_assistant_message_variant(
+            &conn,
+            "inspect-variant",
+            assistant_id,
+            "Aurora answers.",
+            Some(OP_NORMAL_SEND),
+            None,
+            None,
+        )
+        .expect("seed");
+
+        let inspection =
+            inspect_turn_branch_integrity_with_conn(&conn, "inspect-variant").expect("inspect");
+        assert_eq!(
+            inspection["visible_variant_counts"][0]["visible_variant_count"],
+            1
+        );
+    }
+
+    #[test]
+    fn repair_accidental_normal_send_variants_collapses_evaluator_created_variant() {
+        let (conn, _soul, _branch, assistant_id) = variant_test_setup("repair-variant");
+        db::seed_initial_assistant_message_variant(
+            &conn,
+            "repair-variant",
+            assistant_id,
+            "Aurora answers.",
+            Some("original"),
+            None,
+            None,
+        )
+        .expect("seed");
+        db::create_assistant_message_variant(
+            &conn,
+            "repair-variant",
+            assistant_id,
+            "Aurora answers.",
+            Some("Variant 2"),
+            Some("api_provider"),
+            true,
+            None,
+            None,
+        )
+        .expect("accidental variant");
+        assert_eq!(
+            db::list_assistant_message_variants(&conn, "repair-variant", assistant_id)
+                .expect("before")
+                .len(),
+            2
+        );
+
+        let repaired = repair_accidental_normal_send_variants_with_conn(&conn, "repair-variant")
+            .expect("repair");
+
+        assert_eq!(
+            repaired["inspection"]["visible_variant_counts"][0]["visible_variant_count"],
+            1
+        );
+        assert_eq!(
+            db::list_assistant_message_variants(&conn, "repair-variant", assistant_id)
+                .expect("after")
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn test_evaluator_json_normalization() {
@@ -14236,7 +15078,7 @@ mod tests {
         let soul = new_default_soul("Aurora");
         let (ev_id, patch) = construct_baseline_patch(&soul, "I walk in.", "The visitor enters.");
         assert!(ev_id.starts_with("event_baseline_"));
-        
+
         let wp = patch.world_patch.as_ref().unwrap();
         let ss = wp.scene_state.as_ref().unwrap();
         assert_eq!(ss.focus, Some("Aurora and default_player".to_string()));
@@ -14251,10 +15093,11 @@ mod tests {
         let user_text = "OOC: let's do something else";
         let user_is_ooc = is_ooc_or_gm_prefix(user_text);
         assert!(user_is_ooc);
-        
-        let pure_ooc_detected = user_is_ooc || (user_text.trim().is_empty() && is_ooc_or_gm_prefix("Sure"));
+
+        let pure_ooc_detected =
+            user_is_ooc || (user_text.trim().is_empty() && is_ooc_or_gm_prefix("Sure"));
         assert!(pure_ooc_detected);
-        
+
         let is_normal_scene_turn = !pure_ooc_detected && !user_is_ooc;
         assert!(!is_normal_scene_turn);
     }
@@ -14265,13 +15108,13 @@ mod tests {
         // results in "partial_success" status instead of failing the whole turn.
         let err_str = "parse error";
         let baseline_patch_id = Some("patch_baseline_test_123".to_string());
-        
+
         let status = if baseline_patch_id.is_some() {
             "partial_success".to_string()
         } else {
             format!("failed: {err_str}")
         };
-        
+
         assert_eq!(status, "partial_success");
     }
 
@@ -14281,11 +15124,11 @@ mod tests {
         // if we successfully recorded/applied the baseline patch, the overall turn succeeds partially.
         let baseline_patch_id = Some("patch_baseline_test_456".to_string());
         let mut partial_success = false;
-        
+
         if baseline_patch_id.is_some() {
             partial_success = true;
         }
-        
+
         assert!(partial_success);
     }
 
@@ -14302,14 +15145,12 @@ mod tests {
             is_pending: bool,
         }
 
-        let current_messages = vec![
-            MockMessage {
-                id: None,
-                request_id: Some("req_123".into()),
-                content: "Narrator prose...".into(),
-                is_pending: true,
-            }
-        ];
+        let current_messages = vec![MockMessage {
+            id: None,
+            request_id: Some("req_123".into()),
+            content: "Narrator prose...".into(),
+            is_pending: true,
+        }];
 
         // A new canonical saved message arrives with matching request_id
         let new_saved_message = MockMessage {
@@ -14345,8 +15186,14 @@ mod tests {
         }
 
         let list = vec![
-            MockMessage { id: Some(1), content: "Hello".into() },
-            MockMessage { id: Some(1), content: "Hello".into() }, // Duplicate
+            MockMessage {
+                id: Some(1),
+                content: "Hello".into(),
+            },
+            MockMessage {
+                id: Some(1),
+                content: "Hello".into(),
+            }, // Duplicate
         ];
 
         // Deduplication selector logic

@@ -259,6 +259,7 @@ export type ChatMessage = {
   request_id?: string | null;
   generation_id?: number | null;
   assistant_message_id?: number | null;
+  turn_id?: string | null;
 };
 
 export type ImageAsset = {
@@ -1304,6 +1305,22 @@ export function deleteAssistantMessageVariant(
     { conversationId, messageId, variantId },
     () => deletePreviewAssistantVariant(conversationId, messageId, variantId),
   );
+}
+
+export function inspectTurnBranchIntegrity(conversationId: string): Promise<unknown> {
+  return invokeOrPreview("inspect_turn_branch_integrity", { conversationId }, () => ({
+    conversation_id: conversationId,
+    preview: true,
+    suspected_duplicate_branch_causes: [],
+  }));
+}
+
+export function repairAccidentalNormalSendVariants(conversationId: string): Promise<unknown> {
+  return invokeOrPreview("repair_accidental_normal_send_variants", { conversationId }, () => ({
+    conversation_id: conversationId,
+    preview: true,
+    repaired: [],
+  }));
 }
 
 export function listLlmPayloadLogs(conversationId: string): Promise<LlmPayloadLog[]> {
@@ -2811,6 +2828,8 @@ declare global {
       dedupeActiveAdjacentUserMessages: (
         conversationId: string,
       ) => Promise<DedupeAdjacentUserMessagesResult>;
+      inspectTurnBranchIntegrity: (conversationId: string) => Promise<unknown>;
+      repairAccidentalNormalSendVariants: (conversationId: string) => Promise<unknown>;
     };
   }
 }
@@ -2818,5 +2837,7 @@ declare global {
 if (import.meta.env.DEV && typeof window !== "undefined") {
   window.mnemosyneDebug = {
     dedupeActiveAdjacentUserMessages,
+    inspectTurnBranchIntegrity,
+    repairAccidentalNormalSendVariants,
   };
 }
