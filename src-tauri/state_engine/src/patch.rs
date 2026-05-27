@@ -8,8 +8,8 @@ use crate::{
     memory::create_scored_memory,
     setting::SessionWorld,
     soul::{
-        current_timestamp, MemorySourceType, ObjectState, Relationship, SceneState, Soul, TruthStatus,
-        WorldEventRecord, WorldLog,
+        current_timestamp, MemorySourceType, ObjectState, Relationship, SceneState, Soul,
+        TruthStatus, WorldEventRecord, WorldLog,
     },
 };
 
@@ -169,7 +169,10 @@ pub struct WorldObjectConsistencyNotice {
 impl WorldEventOperationPatch {
     fn is_empty(&self) -> bool {
         self.operation.trim().is_empty()
-            && self.content.as_deref().map_or(true, |value| value.trim().is_empty())
+            && self
+                .content
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
             && self
                 .recent_event_id
                 .as_deref()
@@ -217,7 +220,10 @@ impl SceneStatePatch {
                 .focus
                 .as_deref()
                 .map_or(true, |value| value.trim().is_empty())
-            && self.participants.iter().all(|value| value.trim().is_empty())
+            && self
+                .participants
+                .iter()
+                .all(|value| value.trim().is_empty())
             && self
                 .last_user_action
                 .as_deref()
@@ -474,7 +480,11 @@ impl SoulPatch {
                 });
             }
         }
-        for memory in self.new_memories.iter().take(memory_patch_limit(&self.new_memories)) {
+        for memory in self
+            .new_memories
+            .iter()
+            .take(memory_patch_limit(&self.new_memories))
+        {
             if memory.operation.as_deref().is_some_and(|op| {
                 matches!(
                     normalized_operation(op).as_str(),
@@ -526,8 +536,9 @@ impl SoulPatch {
                     existing.salience = existing.salience.max(55.0).min(100.0);
                     existing.retrieval_strength = existing.retrieval_strength.max(55.0).min(100.0);
                     if existing.confidence.is_none() {
-                        existing.confidence =
-                            memory.confidence.filter(|confidence| confidence.is_finite());
+                        existing.confidence = memory
+                            .confidence
+                            .filter(|confidence| confidence.is_finite());
                     }
                     report.events.push(MemoryApplyEvent {
                         action: MemoryApplyAction::Merged,
@@ -570,8 +581,8 @@ impl SoulPatch {
             recent.objective_event_id = memory.cleaned_optional(&memory.objective_event_id);
             recent.superseded_by_memory_id = memory.cleaned_optional(&memory.supersedes_memory_id);
             recent.truth_status = memory.truth_status.unwrap_or_default();
-            recent.architecture_verified =
-                memory.architecture_verified.unwrap_or(false) && recent.truth_status.is_engine_verified();
+            recent.architecture_verified = memory.architecture_verified.unwrap_or(false)
+                && recent.truth_status.is_engine_verified();
             recent.memory_slot = memory.cleaned_optional(&memory.memory_slot);
             recent.owner_soul_id = memory.cleaned_optional(&memory.owner_soul_id);
             recent.relevance_tags = memory
@@ -623,11 +634,10 @@ impl SoulPatch {
 }
 
 fn memory_patch_limit(memories: &[MemoryPatch]) -> usize {
-    if memories
-        .iter()
-        .any(|memory| memory.source_type == Some(MemorySourceType::ImportedLog)
-            || infer_memory_source_type(&memory.content) == Some(MemorySourceType::ImportedLog))
-    {
+    if memories.iter().any(|memory| {
+        memory.source_type == Some(MemorySourceType::ImportedLog)
+            || infer_memory_source_type(&memory.content) == Some(MemorySourceType::ImportedLog)
+    }) {
         3
     } else {
         memories.len()
@@ -671,8 +681,7 @@ fn apply_memory_operation(soul: &mut Soul, memory: &MemoryPatch) -> bool {
                 if existing.id == target_id {
                     existing.is_active = false;
                     existing.is_retconned = true;
-                    existing.superseded_by_memory_id =
-                        memory.cleaned_optional(&memory.memory_id);
+                    existing.superseded_by_memory_id = memory.cleaned_optional(&memory.memory_id);
                     changed = true;
                 }
             }
@@ -715,7 +724,10 @@ impl RelationshipDelta {
 impl MemoryPatch {
     fn is_empty(&self) -> bool {
         self.content.trim().is_empty()
-            && self.operation.as_deref().map_or(true, |op| op.trim().is_empty())
+            && self
+                .operation
+                .as_deref()
+                .map_or(true, |op| op.trim().is_empty())
             && self
                 .memory_id
                 .as_deref()
@@ -913,7 +925,12 @@ fn similar_memory_index(soul: &Soul, content: &str, tag: &str, threshold: f32) -
         .recent
         .iter()
         .enumerate()
-        .skip(soul.memory.recent.len().saturating_sub(MEMORY_HYGIENE_SCAN_LIMIT))
+        .skip(
+            soul.memory
+                .recent
+                .len()
+                .saturating_sub(MEMORY_HYGIENE_SCAN_LIMIT),
+        )
         .filter(|(_, memory)| memory.tag == tag)
         .find(|(_, memory)| {
             memory_similarity(&new_tokens, &memory_token_set(&memory.content)) >= threshold
@@ -971,9 +988,9 @@ impl WorldPatch {
             .as_deref()
             .map_or(true, |location| location.trim().is_empty())
             && self
-            .time_elapsed
-            .as_deref()
-            .map_or(true, |time| time.trim().is_empty())
+                .time_elapsed
+                .as_deref()
+                .map_or(true, |time| time.trim().is_empty())
             && self
                 .scene_state
                 .as_ref()
@@ -1246,7 +1263,8 @@ fn relationship_storage_target(soul: &Soul, target: &str) -> String {
         && !soul.relationships.contains_key("default_player")
     {
         "user".into()
-    } else if target.eq_ignore_ascii_case("user") && soul.relationships.contains_key("default_player")
+    } else if target.eq_ignore_ascii_case("user")
+        && soul.relationships.contains_key("default_player")
     {
         "default_player".into()
     } else {
@@ -1290,8 +1308,7 @@ fn normalized_operation(operation: &str) -> String {
         .replace(' ', "_")
 }
 
-pub const MOCK_WORLD_FRAME_RUPTURE: &str =
-    "The conversation continued without a major rupture";
+pub const MOCK_WORLD_FRAME_RUPTURE: &str = "The conversation continued without a major rupture";
 pub const PENDING_USER_INPUT_PREFIX: &str = "pending_user_input:";
 
 /// Returns true when an event records user input as completed world truth before narration.
@@ -1410,7 +1427,13 @@ fn apply_world_event_operation(world: &mut WorldLog, operation: &WorldEventOpera
                 .as_deref()
                 .and_then(clean_str);
             let mut changed = target
-                .map(|target| invalidate_recent_event(world, target, operation.invalidated_by_patch_id.as_deref()))
+                .map(|target| {
+                    invalidate_recent_event(
+                        world,
+                        target,
+                        operation.invalidated_by_patch_id.as_deref(),
+                    )
+                })
                 .unwrap_or(false);
             if let Some(content) = operation.content.as_deref().and_then(clean_str) {
                 changed |= apply_recent_event_record_with_guard(
@@ -1429,13 +1452,21 @@ fn apply_world_event_operation(world: &mut WorldLog, operation: &WorldEventOpera
             .target_recent_event_id
             .as_deref()
             .and_then(clean_str)
-            .map(|target| invalidate_recent_event(world, target, operation.invalidated_by_patch_id.as_deref()))
+            .map(|target| {
+                invalidate_recent_event(world, target, operation.invalidated_by_patch_id.as_deref())
+            })
             .unwrap_or(false),
         "clear_recent_event_matching" => operation
             .match_text
             .as_deref()
             .and_then(clean_str)
-            .map(|needle| clear_recent_events_matching(world, needle, operation.invalidated_by_patch_id.as_deref()))
+            .map(|needle| {
+                clear_recent_events_matching(
+                    world,
+                    needle,
+                    operation.invalidated_by_patch_id.as_deref(),
+                )
+            })
             .unwrap_or(false),
         "add_correction_note" => operation
             .content
@@ -1584,15 +1615,26 @@ fn event_claims_phone_notification_activity(event: &str) -> bool {
         && contains_any(
             &lower,
             &[
-                "buzz", "vibrat", "ping", "notification", "screen woke", "screen wake",
-                "screen lit", "lit up", "wake up",
+                "buzz",
+                "vibrat",
+                "ping",
+                "notification",
+                "screen woke",
+                "screen wake",
+                "screen lit",
+                "lit up",
+                "wake up",
             ],
         )
 }
 
 fn phone_state_blocks_notification_activity(world: &WorldLog) -> Option<(Option<String>, String)> {
     for object_state in &world.object_states {
-        if !object_state.object_id.to_ascii_lowercase().contains("phone") {
+        if !object_state
+            .object_id
+            .to_ascii_lowercase()
+            .contains("phone")
+        {
             continue;
         }
         let notification_mode = object_state.notification_mode.to_ascii_lowercase();
@@ -1638,7 +1680,10 @@ fn phone_state_blocks_notification_activity(world: &WorldLog) -> Option<(Option<
             ));
         }
         if lower.contains("vibration disabled") || lower.contains("no vibration") {
-            return Some((Some(key_object.clone()), "legacy key object says no vibration".into()));
+            return Some((
+                Some(key_object.clone()),
+                "legacy key object says no vibration".into(),
+            ));
         }
         if lower.contains("screen wake disabled") || lower.contains("no screen wake") {
             return Some((
@@ -1792,8 +1837,22 @@ fn normalize_recent_event_for_dedupe(event: &str) -> String {
         .filter(|token| {
             !matches!(
                 *token,
-                "the" | "a" | "an" | "s" | "and" | "then" | "that" | "to" | "on" | "at"
-                    | "in" | "into" | "her" | "his" | "their" | "with"
+                "the"
+                    | "a"
+                    | "an"
+                    | "s"
+                    | "and"
+                    | "then"
+                    | "that"
+                    | "to"
+                    | "on"
+                    | "at"
+                    | "in"
+                    | "into"
+                    | "her"
+                    | "his"
+                    | "their"
+                    | "with"
             )
         })
         .collect::<Vec<_>>();
@@ -1804,7 +1863,9 @@ fn normalize_recent_event_for_dedupe(event: &str) -> String {
 }
 
 fn clamped_memory_score(value: Option<f32>) -> Option<f32> {
-    value.filter(|value| value.is_finite()).map(|value| value.clamp(0.0, 100.0))
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 100.0))
 }
 
 fn sync_recent_event_strings_from_records(world: &mut WorldLog) {
@@ -1824,7 +1885,10 @@ fn sync_recent_event_strings_from_records(world: &mut WorldLog) {
 }
 
 fn stable_recent_event_id(event: &str, ordinal: usize) -> String {
-    format!("recent_event_{:016x}", stable_hash(&format!("{ordinal}:{event}")))
+    format!(
+        "recent_event_{:016x}",
+        stable_hash(&format!("{ordinal}:{event}"))
+    )
 }
 
 fn stable_hash(value: &str) -> u64 {
@@ -2024,7 +2088,10 @@ mod tests {
 
         patch.apply_to_soul(&mut soul).expect("patch applies");
 
-        assert_eq!(soul.world.time_elapsed, "Late evening, just after midnight.");
+        assert_eq!(
+            soul.world.time_elapsed,
+            "Late evening, just after midnight."
+        );
     }
 
     #[test]
@@ -2112,7 +2179,9 @@ mod tests {
             ..EnginePatch::default()
         };
 
-        let report = duplicate.apply_to_soul(&mut soul).expect("duplicate applies");
+        let report = duplicate
+            .apply_to_soul(&mut soul)
+            .expect("duplicate applies");
 
         assert_eq!(report.memories_added, 0);
         assert_eq!(soul.memory.recent.len(), 1);
@@ -2346,7 +2415,9 @@ mod tests {
         assert!(session_world
             .recent_events
             .contains(&"Echo-0 crossed the lab.".into()));
-        assert!(session_world.active_plots.contains(&"Verify routing".into()));
+        assert!(session_world
+            .active_plots
+            .contains(&"Verify routing".into()));
         assert!(session_world.key_objects.contains(&"debug terminal".into()));
     }
 
@@ -2372,7 +2443,9 @@ mod tests {
             ..EnginePatch::default()
         };
 
-        let report = patch.apply_to_session(&mut soul, None).expect("patch applies");
+        let report = patch
+            .apply_to_session(&mut soul, None)
+            .expect("patch applies");
 
         assert!(report.world_updated);
         assert_eq!(soul.world.location, "Legacy fallback room");

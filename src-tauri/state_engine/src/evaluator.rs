@@ -154,6 +154,11 @@ pub struct RelationshipEvaluation {
     pub criterion_met: bool,
     pub confidence: f32,
     pub relevance_tags: RelevanceTags,
+    /// When true, this relationship delta was produced by the form evaluator
+    /// and its evidence quote was already validated at the row level during
+    /// form parsing. Skips the secondary claim_has_evidence substring check
+    /// in evaluator_output_to_engine_patch.
+    pub evidence_validated_by_form: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -252,8 +257,7 @@ pub struct EvaluatorConversionContext<'a> {
 
 impl EvaluatorOutputV1 {
     pub fn is_pure_ooc(&self) -> bool {
-        self.turn_classification.is_pure_ooc
-            || self.turn_flags_u64 & turn_flags::PURE_OOC != 0
+        self.turn_classification.is_pure_ooc || self.turn_flags_u64 & turn_flags::PURE_OOC != 0
     }
 }
 
@@ -264,10 +268,12 @@ pub fn evaluator_output_to_engine_patch(
     let mut report = EvaluatorConversionReport::default();
     if output.schema_version != EVALUATOR_SCHEMA_VERSION {
         report.no_op = true;
-        report.rejected_candidates.push(EvaluatorCandidateRejection {
-            candidate_id: "schema_version".into(),
-            reason: format!("unsupported evaluator schema {}", output.schema_version),
-        });
+        report
+            .rejected_candidates
+            .push(EvaluatorCandidateRejection {
+                candidate_id: "schema_version".into(),
+                reason: format!("unsupported evaluator schema {}", output.schema_version),
+            });
         return report;
     }
     if output.is_pure_ooc() {
@@ -319,13 +325,18 @@ pub fn evaluator_output_to_engine_patch(
         world_patch
             .active_plot_add
             .extend(change.active_plot_add.iter().filter_map(|v| clean_str(v)));
-        world_patch
-            .active_plot_resolve
-            .extend(change.active_plot_resolve.iter().filter_map(|v| clean_str(v)));
+        world_patch.active_plot_resolve.extend(
+            change
+                .active_plot_resolve
+                .iter()
+                .filter_map(|v| clean_str(v)),
+        );
     }
     for change in &output.object_changes {
         let objective_allowed = objective_object_change_has_structured_evidence(change);
-        if !objective_allowed && !claim_has_evidence(change.evidence_quote.as_deref(), &evidence_text) {
+        if !objective_allowed
+            && !claim_has_evidence(change.evidence_quote.as_deref(), &evidence_text)
+        {
             continue;
         }
         if change.confidence < 0.5 || change.object_state.object_id.trim().is_empty() {
@@ -353,18 +364,21 @@ pub fn evaluator_output_to_engine_patch(
     }
 
     let mut soul_patch = SoulPatch::default();
-    for relation in output
-        .relationship_evaluations
-        .iter()
-        .chain(output.per_soul_evaluations.iter().flat_map(|s| s.relationship_deltas.iter()))
-    {
+    for relation in output.relationship_evaluations.iter().chain(
+        output
+            .per_soul_evaluations
+            .iter()
+            .flat_map(|s| s.relationship_deltas.iter()),
+    ) {
         if relation.source_soul_id != context.active_soul_id {
             continue;
         }
         if !relation.criterion_met || relation.confidence < 0.55 {
             continue;
         }
-        if !claim_has_evidence(relation.evidence_quote.as_deref(), &evidence_text) {
+        if !relation.evidence_validated_by_form
+            && !claim_has_evidence(relation.evidence_quote.as_deref(), &evidence_text)
+        {
             continue;
         }
         soul_patch.relationship_deltas.push(RelationshipDelta {
@@ -394,16 +408,16 @@ pub fn evaluator_output_to_engine_patch(
         .memory_candidates
         .iter()
         .map(|candidate| (candidate, false))
-        .chain(
-            output
-                .per_soul_evaluations
+        .chain(output.per_soul_evaluations.iter().flat_map(|s| {
+            s.memory_candidates
                 .iter()
-                .flat_map(|s| s.memory_candidates.iter().map(|candidate| (candidate, true))),
-        );
+                .map(|candidate| (candidate, true))
+        }));
     let mut candidates = candidates.collect::<Vec<_>>();
     candidates.sort_by(|(left, left_nested), (right, right_nested)| {
-        candidate_quality_score(right, *right_nested, context, &active_souls, &evidence_text)
-            .cmp(&candidate_quality_score(left, *left_nested, context, &active_souls, &evidence_text))
+        candidate_quality_score(right, *right_nested, context, &active_souls, &evidence_text).cmp(
+            &candidate_quality_score(left, *left_nested, context, &active_souls, &evidence_text),
+        )
     });
     let mut seen_candidates = HashSet::new();
     for candidate in candidates {
@@ -414,9 +428,17 @@ pub fn evaluator_output_to_engine_patch(
         }
         if candidate.owner_soul_id != context.active_soul_id {
             if active_souls.contains(candidate.owner_soul_id.as_str()) {
-                reject(&mut report, candidate, "candidate belongs to a different active Soul");
+                reject(
+                    &mut report,
+                    candidate,
+                    "candidate belongs to a different active Soul",
+                );
             } else {
-                reject(&mut report, candidate, "candidate owner_soul_id is not active");
+                reject(
+                    &mut report,
+                    candidate,
+                    "candidate owner_soul_id is not active",
+                );
             }
             continue;
         }
@@ -460,7 +482,9 @@ pub fn evaluator_output_to_engine_patch(
                     knowledge_scope: Some(candidate.knowledge_scope.as_label().into()),
                     ..MemoryPatch::default()
                 });
-                report.accepted_candidate_ids.push(candidate.candidate_id.clone());
+                report
+                    .accepted_candidate_ids
+                    .push(candidate.candidate_id.clone());
             }
             Err(reason) => {
                 report
@@ -529,7 +553,10 @@ impl SoulPatchEvaluatorExt for SoulPatch {
     }
 }
 
-fn validate_memory_candidate(candidate: &MemoryCandidate, evidence_text: &str) -> Result<(), &'static str> {
+fn validate_memory_candidate(
+    candidate: &MemoryCandidate,
+    evidence_text: &str,
+) -> Result<(), &'static str> {
     if !candidate.criterion_met {
         return Err("criterion not met");
     }
@@ -560,11 +587,17 @@ fn validate_memory_candidate(candidate: &MemoryCandidate, evidence_text: &str) -
     Ok(())
 }
 
-fn reject(report: &mut EvaluatorConversionReport, candidate: &MemoryCandidate, reason: impl Into<String>) {
-    report.rejected_candidates.push(EvaluatorCandidateRejection {
-        candidate_id: candidate.candidate_id.clone(),
-        reason: reason.into(),
-    });
+fn reject(
+    report: &mut EvaluatorConversionReport,
+    candidate: &MemoryCandidate,
+    reason: impl Into<String>,
+) {
+    report
+        .rejected_candidates
+        .push(EvaluatorCandidateRejection {
+            candidate_id: candidate.candidate_id.clone(),
+            reason: reason.into(),
+        });
 }
 
 fn claim_has_evidence(quote: Option<&str>, evidence_text: &str) -> bool {
@@ -683,16 +716,26 @@ fn is_low_value_memory(content: &str) -> bool {
 
 fn looks_like_emotional_fact(content: &str) -> bool {
     let lower = normalize_evidence(content);
-    ["felt", "afraid", "angry", "tense", "comforted", "ashamed", "relieved"]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    [
+        "felt",
+        "afraid",
+        "angry",
+        "tense",
+        "comforted",
+        "ashamed",
+        "relieved",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn looks_like_location_fact(content: &str) -> bool {
     let lower = normalize_evidence(content);
-    ["bar", "room", "location", "door", "kitchen", "street", "where", "at "]
-        .iter()
-        .any(|needle| lower.contains(needle))
+    [
+        "bar", "room", "location", "door", "kitchen", "street", "where", "at ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn objective_object_change_has_structured_evidence(change: &ObjectChangeEvaluation) -> bool {
@@ -705,11 +748,16 @@ fn objective_object_change_has_structured_evidence(change: &ObjectChangeEvaluati
 }
 
 fn clamp_optional_score(value: Option<f32>) -> Option<f32> {
-    value.filter(|value| value.is_finite()).map(|value| value.clamp(0.0, 100.0))
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 100.0))
 }
 
 fn clean(value: &Option<String>) -> Option<&str> {
-    value.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn clean_str(value: &String) -> Option<String> {
@@ -805,7 +853,10 @@ mod tests {
         output.turn_classification.is_pure_ooc = true;
         output.no_op_reason = Some("GM-only note".into());
 
-        let report = evaluator_output_to_engine_patch(&output, &context(&soul, "(OOC) pause", "Paused.", &world));
+        let report = evaluator_output_to_engine_patch(
+            &output,
+            &context(&soul, "(OOC) pause", "Paused.", &world),
+        );
 
         assert!(report.no_op);
         assert!(report.patch.is_empty());
@@ -871,10 +922,19 @@ mod tests {
 
         let report = evaluator_output_to_engine_patch(
             &output,
-            &context(&soul, "I turn notifications off.", "The phone stays dark and silent.", &world),
+            &context(
+                &soul,
+                "I turn notifications off.",
+                "The phone stays dark and silent.",
+                &world,
+            ),
         );
 
-        let object = report.patch.world_patch.unwrap().object_observation_operations[0]
+        let object = report
+            .patch
+            .world_patch
+            .unwrap()
+            .object_observation_operations[0]
             .object_state
             .as_ref()
             .unwrap()
@@ -899,12 +959,19 @@ mod tests {
 
         let report = evaluator_output_to_engine_patch(
             &output,
-            &context(&soul, "Don't push past that boundary.", "Aurora lets the boundary hang unresolved.", &world),
+            &context(
+                &soul,
+                "Don't push past that boundary.",
+                "Aurora lets the boundary hang unresolved.",
+                &world,
+            ),
         );
 
         assert_eq!(report.accepted_candidate_ids, vec!["boundary"]);
         assert_eq!(
-            report.patch.soul_patch.unwrap().new_memories[0].memory_slot.as_deref(),
+            report.patch.soul_patch.unwrap().new_memories[0]
+                .memory_slot
+                .as_deref(),
             Some("unresolved_tension")
         );
     }
@@ -914,20 +981,27 @@ mod tests {
         let soul = new_default_soul("Aurora");
         let world = session_world_from_legacy_world("Apartment", None, &soul.world);
         let mut output = base_output(&soul.character_id);
-        output.relationship_evaluations.push(RelationshipEvaluation {
-            source_soul_id: soul.character_id.clone(),
-            target_entity_id: "default_player".into(),
-            trust: Some(2.0),
-            comfort: Some(1.0),
-            evidence_quote: Some("I promise I won't leave".into()),
-            criterion_met: true,
-            confidence: 0.8,
-            ..RelationshipEvaluation::default()
-        });
+        output
+            .relationship_evaluations
+            .push(RelationshipEvaluation {
+                source_soul_id: soul.character_id.clone(),
+                target_entity_id: "default_player".into(),
+                trust: Some(2.0),
+                comfort: Some(1.0),
+                evidence_quote: Some("I promise I won't leave".into()),
+                criterion_met: true,
+                confidence: 0.8,
+                ..RelationshipEvaluation::default()
+            });
 
         let report = evaluator_output_to_engine_patch(
             &output,
-            &context(&soul, "I promise I won't leave.", "Aurora visibly trusts the promise a little.", &world),
+            &context(
+                &soul,
+                "I promise I won't leave.",
+                "Aurora visibly trusts the promise a little.",
+                &world,
+            ),
         );
 
         assert_eq!(
@@ -941,20 +1015,27 @@ mod tests {
         let soul = new_default_soul("Aurora");
         let world = session_world_from_legacy_world("Apartment", None, &soul.world);
         let mut output = base_output(&soul.character_id);
-        output.relationship_evaluations.push(RelationshipEvaluation {
-            source_soul_id: soul.character_id.clone(),
-            target_entity_id: "default_player".into(),
-            boundary_pressure: Some(3.0),
-            conflict: Some(1.0),
-            evidence_quote: Some("ignores her no again".into()),
-            criterion_met: true,
-            confidence: 0.85,
-            ..RelationshipEvaluation::default()
-        });
+        output
+            .relationship_evaluations
+            .push(RelationshipEvaluation {
+                source_soul_id: soul.character_id.clone(),
+                target_entity_id: "default_player".into(),
+                boundary_pressure: Some(3.0),
+                conflict: Some(1.0),
+                evidence_quote: Some("ignores her no again".into()),
+                criterion_met: true,
+                confidence: 0.85,
+                ..RelationshipEvaluation::default()
+            });
 
         let report = evaluator_output_to_engine_patch(
             &output,
-            &context(&soul, "I ignore her no again.", "The user ignores her no again.", &world),
+            &context(
+                &soul,
+                "I ignore her no again.",
+                "The user ignores her no again.",
+                &world,
+            ),
         );
 
         assert_eq!(
@@ -980,7 +1061,10 @@ mod tests {
             &context(&soul, "I wait.", "She looked tense.", &world),
         );
 
-        assert_eq!(report.rejected_candidates[0].reason, "generic low-value memory");
+        assert_eq!(
+            report.rejected_candidates[0].reason,
+            "generic low-value memory"
+        );
     }
 
     #[test]
@@ -1069,11 +1153,24 @@ mod tests {
 
         let report = evaluator_output_to_engine_patch(
             &output,
-            &context(&soul, "I make a boundary promise.", "Aurora hears the boundary promise.", &world),
+            &context(
+                &soul,
+                "I make a boundary promise.",
+                "Aurora hears the boundary promise.",
+                &world,
+            ),
         );
-        report.patch.apply_to_soul(&mut soul).expect("patch applies");
+        report
+            .patch
+            .apply_to_soul(&mut soul)
+            .expect("patch applies");
 
-        let memory = soul.memory.recent.iter().find(|memory| memory.id.contains("memory_")).unwrap();
+        let memory = soul
+            .memory
+            .recent
+            .iter()
+            .find(|memory| memory.id.contains("memory_"))
+            .unwrap();
         assert_eq!(memory.salience, 97.5);
     }
 
@@ -1094,11 +1191,24 @@ mod tests {
 
         let report = evaluator_output_to_engine_patch(
             &output,
-            &context(&soul, "This should be easy to recall.", "Aurora marks it easy to recall.", &world),
+            &context(
+                &soul,
+                "This should be easy to recall.",
+                "Aurora marks it easy to recall.",
+                &world,
+            ),
         );
-        report.patch.apply_to_soul(&mut soul).expect("patch applies");
+        report
+            .patch
+            .apply_to_soul(&mut soul)
+            .expect("patch applies");
 
-        let memory = soul.memory.recent.iter().find(|memory| memory.id.contains("memory_")).unwrap();
+        let memory = soul
+            .memory
+            .recent
+            .iter()
+            .find(|memory| memory.id.contains("memory_"))
+            .unwrap();
         assert_eq!(memory.retrieval_strength, 91.0);
     }
 
@@ -1130,8 +1240,16 @@ mod tests {
         assert_eq!(patch_memory.salience, None);
         assert_eq!(patch_memory.retrieval_strength, None);
 
-        report.patch.apply_to_soul(&mut soul).expect("patch applies");
-        let memory = soul.memory.recent.iter().find(|memory| memory.id.contains("memory_")).unwrap();
+        report
+            .patch
+            .apply_to_soul(&mut soul)
+            .expect("patch applies");
+        let memory = soul
+            .memory
+            .recent
+            .iter()
+            .find(|memory| memory.id.contains("memory_"))
+            .unwrap();
         assert!(memory.salience > 0.0);
         assert!(memory.retrieval_strength > 0.0);
     }
@@ -1153,7 +1271,10 @@ mod tests {
             &context(&soul, "I sit down.", "Aurora nods.", &world),
         );
 
-        assert_eq!(report.rejected_candidates[0].reason, "missing or invalid evidence_quote");
+        assert_eq!(
+            report.rejected_candidates[0].reason,
+            "missing or invalid evidence_quote"
+        );
     }
 
     #[test]

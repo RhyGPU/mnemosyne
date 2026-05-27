@@ -3438,6 +3438,31 @@ pub fn get_latest_evaluator_job(
     conn: &Connection,
     conversation_id: &str,
 ) -> rusqlite::Result<Option<EvaluatorJob>> {
+    let active_branch_opt = get_active_session_branch(conn, conversation_id).optional()?;
+    if let Some(branch) = active_branch_opt {
+        let path =
+            active_commit_path_until(conn, &branch.branch_id, branch.active_turn_id.as_deref())?;
+        let active_turn_ids: HashSet<String> =
+            path.into_iter().map(|commit| commit.turn_id).collect();
+
+        let mut stmt = conn.prepare(
+            "SELECT evaluator_job_id, conversation_id, turn_id, assistant_message_id, status,
+                    started_at, completed_at, elapsed_ms, timeout_ms, timeout_mode,
+                    model, provider, error_message, patch_applied
+             FROM evaluator_background_jobs
+             WHERE conversation_id = ?1
+             ORDER BY started_at DESC",
+        )?;
+
+        let mut rows = stmt.query_map([conversation_id], evaluator_job_from_row)?;
+        while let Some(row_res) = rows.next() {
+            let job = row_res?;
+            if active_turn_ids.contains(&job.turn_id) {
+                return Ok(Some(job));
+            }
+        }
+    }
+
     let mut stmt = conn.prepare(
         "SELECT evaluator_job_id, conversation_id, turn_id, assistant_message_id, status,
                 started_at, completed_at, elapsed_ms, timeout_ms, timeout_mode,
@@ -5282,5 +5307,118 @@ mod tests {
             .get("Partner")
             .expect("relationship exists");
         assert_eq!(rel.trust, 10.0);
+    }
+
+    #[test]
+    fn stale_source_turn_not_on_active_branch_not_shown_as_current_failure() {
+        let conn = init_memory_connection().unwrap();
+        let conversation_id = "test-stale-convo";
+
+        let mut soul = Soul::default();
+        soul.character_id = "aurora_soul".into();
+        soul.character_name = "Aurora".into();
+        upsert_soul(&conn, &soul).unwrap();
+        ensure_conversation(&conn, conversation_id, &soul.character_id).unwrap();
+
+        let setting = SettingSoul::default_for_setting("starter_setting");
+        upsert_setting(&conn, &setting).unwrap();
+
+        let world = ensure_conversation_session_world(&conn, conversation_id, &soul, None).unwrap();
+        let branch = create_session_branch(&conn, conversation_id, &soul, &world).unwrap();
+
+        let msg1 =
+            insert_message_and_get_id(&conn, conversation_id, "assistant", "Turn 1 msg").unwrap();
+        let (commit1, _) = record_turn_commit_with_patch(
+            &conn,
+            conversation_id,
+            &branch.branch_id,
+            None,
+            None,
+            msg1,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .unwrap();
+
+        let msg2 =
+            insert_message_and_get_id(&conn, conversation_id, "assistant", "Turn 2 msg").unwrap();
+        let (commit2, _) = record_turn_commit_with_patch(
+            &conn,
+            conversation_id,
+            &branch.branch_id,
+            Some(&commit1.turn_id),
+            None,
+            msg2,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE session_branches SET active_turn_id = ?1 WHERE branch_id = ?2",
+            [&commit1.turn_id, &branch.branch_id],
+        )
+        .unwrap();
+
+        let job1 = EvaluatorJob {
+            evaluator_job_id: "job1".into(),
+            conversation_id: conversation_id.into(),
+            turn_id: commit1.turn_id.clone(),
+            assistant_message_id: msg1,
+            status: "completed".into(),
+            started_at: 1000,
+            completed_at: Some(1500),
+            elapsed_ms: Some(500),
+            timeout_ms: None,
+            timeout_mode: "finite".into(),
+            model: Some("model".into()),
+            provider: Some("provider".into()),
+            error_message: None,
+            patch_applied: true,
+        };
+
+        let job2 = EvaluatorJob {
+            evaluator_job_id: "job2".into(),
+            conversation_id: conversation_id.into(),
+            turn_id: commit2.turn_id.clone(),
+            assistant_message_id: msg2,
+            status: "failed".into(),
+            started_at: 2000,
+            completed_at: Some(2500),
+            elapsed_ms: Some(500),
+            timeout_ms: None,
+            timeout_mode: "finite".into(),
+            model: Some("model".into()),
+            provider: Some("provider".into()),
+            error_message: Some("Failed".into()),
+            patch_applied: false,
+        };
+
+        conn.execute(
+            "INSERT INTO evaluator_background_jobs (evaluator_job_id, conversation_id, turn_id, assistant_message_id, status, started_at, completed_at, elapsed_ms, timeout_ms, timeout_mode, model, provider, error_message, patch_applied)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                job1.evaluator_job_id, job1.conversation_id, job1.turn_id, job1.assistant_message_id,
+                job1.status, job1.started_at, job1.completed_at, job1.elapsed_ms, job1.timeout_ms,
+                job1.timeout_mode, job1.model, job1.provider, job1.error_message, job1.patch_applied
+            ]
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO evaluator_background_jobs (evaluator_job_id, conversation_id, turn_id, assistant_message_id, status, started_at, completed_at, elapsed_ms, timeout_ms, timeout_mode, model, provider, error_message, patch_applied)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                job2.evaluator_job_id, job2.conversation_id, job2.turn_id, job2.assistant_message_id,
+                job2.status, job2.started_at, job2.completed_at, job2.elapsed_ms, job2.timeout_ms,
+                job2.timeout_mode, job2.model, job2.provider, job2.error_message, job2.patch_applied
+            ]
+        ).unwrap();
+
+        let latest = get_latest_evaluator_job(&conn, conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.evaluator_job_id, "job1");
     }
 }

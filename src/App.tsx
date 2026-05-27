@@ -241,6 +241,18 @@ interface VisibleBubbleTraceRow {
 
 function evaluatorJobStatusText(job: EvaluatorJob) {
   if (job.status === "pending" || job.status === "running") return "Updating memory/state...";
+  if (job.status === "completed" || job.status === "partial_success") {
+    if (job.error_message && (job.error_message.startsWith("State updated") || job.error_message.includes("skipped"))) {
+      return job.error_message;
+    }
+  }
+  if (job.patch_applied) {
+    if (job.error_message && (job.error_message.startsWith("State updated") || job.error_message.includes("skipped"))) {
+      return job.error_message;
+    }
+  } else if (job.status === "failed") {
+    return "State update failed";
+  }
   if (job.status === "completed") {
     return job.patch_applied ? "Memory/state update completed" : "Memory/state update completed with no patch";
   }
@@ -263,6 +275,11 @@ function evaluatorJobStatusText(job: EvaluatorJob) {
 
 function evaluatorJobBannerTitle(job: EvaluatorJob) {
   if (job.status === "pending" || job.status === "running") return "Updating memory/state...";
+  if (job.patch_applied) {
+    if (job.error_message && (job.error_message.startsWith("State updated") || job.error_message.includes("skipped"))) {
+      return job.error_message;
+    }
+  }
   if (job.status === "completed") return "Memory/state updated";
   if (job.status === "partial_success") return evaluatorJobStatusText(job);
   if (job.status === "some_rows_rejected") return "State updated; some enrichment rows rejected";

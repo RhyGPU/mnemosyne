@@ -7,11 +7,11 @@ use crate::{
     evaluator::{
         evaluator_output_to_engine_patch, turn_flags, EvaluatorConversionContext,
         EvaluatorConversionReport, EvaluatorOutputV1, GlobalSceneEvaluation, MemoryCandidate,
-        MemorySlot, ObjectChangeEvaluation, RelevanceTags, RelationshipEvaluation,
+        MemorySlot, ObjectChangeEvaluation, RelationshipEvaluation, RelevanceTags,
         TurnClassification, WorldChangeEvaluation, EVALUATOR_SCHEMA_VERSION,
     },
     evaluator_ingest::NormalizedEvaluationDraft,
-    patch::{MemoryPatch, PATCH_PROTOCOL_VERSION, SceneStatePatch},
+    patch::{MemoryPatch, SceneStatePatch, PATCH_PROTOCOL_VERSION},
     setting::SessionWorld,
     soul::{MemorySourceType, ObjectState, Soul, TruthStatus},
 };
@@ -187,10 +187,13 @@ pub struct ObjectRow {
     pub object_id: Option<String>,
     #[serde(alias = "object_label")]
     pub new_object_label: Option<String>,
+    #[serde(alias = "change_type", alias = "object_change_type")]
+    pub change_type: Option<String>,
     #[serde(alias = "property", alias = "changed_property")]
     pub property_changed: String,
+    #[serde(alias = "old_state", alias = "previous_status")]
     pub old_value: Option<String>,
-    #[serde(alias = "value")]
+    #[serde(alias = "value", alias = "object_state", alias = "new_state", alias = "status")]
     pub new_value: String,
     pub evidence_quote: String,
     pub confidence_tier: Option<ConfidenceTier>,
@@ -215,21 +218,25 @@ pub struct ObjectRow {
 pub struct RelationshipRow {
     #[serde(alias = "event_id")]
     pub linked_event_id: String,
+    #[serde(alias = "source_entity_id")]
     pub source_soul_id: String,
     pub target_entity_id: String,
     #[serde(alias = "relationship_id", skip_serializing)]
     pub relationship_id: Option<String>,
+    #[serde(alias = "relationship_dimension", alias = "relationship_dim", alias = "relationship_metric")]
     pub dimension: Option<RelationshipDimension>,
-    #[serde(alias = "change_direction")]
+    #[serde(alias = "change_direction", alias = "shift_direction")]
     pub direction: Option<RelationshipDirection>,
     pub magnitude_tier: Option<MagnitudeTier>,
     pub importance_tier: Option<ImportanceTier>,
     pub evidence_quote: String,
     pub summary: Option<String>,
-    #[serde(alias = "tags")]
+    #[serde(alias = "tags", alias = "tag_vocabularies", alias = "relevance_tags")]
     pub selected_tags: Vec<String>,
     #[serde(alias = "shift")]
     pub shift: Option<String>,
+    #[serde(alias = "change_type")]
+    pub change_type: Option<String>,
     #[serde(skip_serializing)]
     pub associated_event_ids: Vec<String>,
 }
@@ -240,14 +247,15 @@ pub struct MemoryRow {
     #[serde(alias = "event_id")]
     pub linked_event_id: String,
     pub owner_soul_id: String,
-    #[serde(alias = "slot_id")]
+    #[serde(alias = "slot_id", alias = "memory_slot")]
     pub slot: Option<MemorySlot>,
-    #[serde(alias = "candidate_memory")]
+    #[serde(alias = "candidate_memory", alias = "candidate_summary", alias = "content_summary")]
     pub content: String,
     pub evidence_quote: String,
-    #[serde(alias = "salience")]
+    #[serde(alias = "salience", alias = "importance", alias = "importance_tier")]
     pub importance_tier: Option<ImportanceTier>,
     pub retrieval_cues: Vec<String>,
+    #[serde(alias = "tags", alias = "tag_vocabularies", alias = "relevance_tags")]
     pub selected_tags: Vec<String>,
     #[serde(skip_serializing)]
     pub summary: Option<String>,
@@ -381,7 +389,11 @@ pub fn build_eval_form_spec(
             latest_narrator_response,
             top_k,
         ),
-        existing_events: select_relevant_events(&world.recent_events, &world.recent_event_records, top_k),
+        existing_events: select_relevant_events(
+            &world.recent_events,
+            &world.recent_event_records,
+            top_k,
+        ),
         existing_object_observations: world
             .object_states
             .iter()
@@ -444,16 +456,18 @@ pub fn parse_eval_form_response_with_trace(
     match serde_json::from_str::<Value>(&extracted) {
         Ok(mut value) => {
             normalize_eval_form_value(&mut value, &mut trace);
-            let response = serde_json::from_value(value)
-                .map_err(|err| format!("invalid EvalFormResponse JSON after normalization: {err}"))?;
+            let response = serde_json::from_value(value).map_err(|err| {
+                format!("invalid EvalFormResponse JSON after normalization: {err}")
+            })?;
             trace.salvage_success = true;
             Ok((response, trace))
         }
         Err(first_err) => {
             trace.strict_parse_failed_but_salvage_attempted = true;
             let repaired = repair_common_json_drift(&extracted, &mut trace);
-            let mut value = serde_json::from_str::<Value>(&repaired)
-                .map_err(|err| format!("invalid EvalFormResponse JSON: {first_err}; repair failed: {err}"))?;
+            let mut value = serde_json::from_str::<Value>(&repaired).map_err(|err| {
+                format!("invalid EvalFormResponse JSON: {first_err}; repair failed: {err}")
+            })?;
             normalize_eval_form_value(&mut value, &mut trace);
             let response = serde_json::from_value(value)
                 .map_err(|err| format!("invalid EvalFormResponse JSON after repair: {err}"))?;
@@ -514,25 +528,120 @@ fn extract_first_balanced_json_object(raw: &str) -> Option<String> {
     None
 }
 
+fn repair_unescaped_quotes_in_field(raw: &str, field_name: &str, trace: &mut EvalFormRepairTrace) -> String {
+    let mut out = String::new();
+    let mut current_pos = 0;
+    
+    while let Some(field_pos) = raw[current_pos..].find(field_name) {
+        let absolute_field_pos = current_pos + field_pos;
+        out.push_str(&raw[current_pos..absolute_field_pos]);
+        
+        let after_field = absolute_field_pos + field_name.len();
+        if let Some(colon_offset) = raw[after_field..].find(':') {
+            let colon_pos = after_field + colon_offset;
+            if let Some(quote_offset) = raw[colon_pos..].find('"') {
+                let start_quote_pos = colon_pos + quote_offset;
+                
+                let search_start = start_quote_pos + 1;
+                let mut end_quote_pos = None;
+                
+                let bytes = raw.as_bytes();
+                for i in search_start..bytes.len() {
+                    if bytes[i] == b'"' {
+                        let mut is_escaped = false;
+                        let mut k = i;
+                        while k > search_start && bytes[k - 1] == b'\\' {
+                            is_escaped = !is_escaped;
+                            k -= 1;
+                        }
+                        if !is_escaped {
+                            let mut next = i + 1;
+                            while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                                next += 1;
+                            }
+                            if next < bytes.len() && (bytes[next] == b',' || bytes[next] == b'}' || bytes[next] == b']') {
+                                end_quote_pos = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                if let Some(end_pos) = end_quote_pos {
+                    let content = &raw[search_start..end_pos];
+                    
+                    let mut escaped_content = String::new();
+                    let content_bytes = content.as_bytes();
+                    let mut idx = 0;
+                    while idx < content_bytes.len() {
+                        if content_bytes[idx] == b'"' {
+                            let mut backslash_count = 0;
+                            let mut k = idx;
+                            while k > 0 && content_bytes[k - 1] == b'\\' {
+                                backslash_count += 1;
+                                k -= 1;
+                            }
+                            let is_escaped = backslash_count % 2 == 1;
+                            if !is_escaped {
+                                escaped_content.push('\\');
+                            }
+                            escaped_content.push('"');
+                        } else {
+                            escaped_content.push(content_bytes[idx] as char);
+                        }
+                        idx += 1;
+                    }
+                    
+                    if escaped_content != content {
+                        trace.raw_form_repair_warnings.push(format!("unescaped quotes in {} repaired", field_name));
+                        trace.raw_form_repair_applied = true;
+                    }
+                    
+                    out.push_str(&raw[absolute_field_pos..=start_quote_pos]);
+                    out.push_str(&escaped_content);
+                    out.push('"');
+                    
+                    current_pos = end_pos + 1;
+                    continue;
+                }
+            }
+        }
+        
+        out.push_str(&raw[absolute_field_pos..after_field]);
+        current_pos = after_field;
+    }
+    
+    out.push_str(&raw[current_pos..]);
+    out
+}
+
 fn repair_common_json_drift(raw: &str, trace: &mut EvalFormRepairTrace) -> String {
-    let mut repaired = raw
-        .replace(['“', '”'], "\"")
-        .replace(['‘', '’'], "'");
+    let mut repaired = raw.replace(['“', '”'], "\"").replace(['‘', '’'], "'");
     if repaired != raw {
-        trace.raw_form_repair_warnings.push("smart quotes normalized".into());
+        trace
+            .raw_form_repair_warnings
+            .push("smart quotes normalized".into());
         trace.raw_form_repair_applied = true;
     }
     let without_trailing_commas = remove_trailing_commas(&repaired);
     if without_trailing_commas != repaired {
-        trace.raw_form_repair_warnings.push("trailing commas removed".into());
+        trace
+            .raw_form_repair_warnings
+            .push("trailing commas removed".into());
         trace.raw_form_repair_applied = true;
         repaired = without_trailing_commas;
     }
     let quoted_and = repair_quoted_string_and_string(&repaired);
     if quoted_and != repaired {
-        trace.raw_form_repair_warnings.push("quoted string-and-string evidence repaired".into());
+        trace
+            .raw_form_repair_warnings
+            .push("quoted string-and-string evidence repaired".into());
         trace.raw_form_repair_applied = true;
         repaired = quoted_and;
+    }
+    let repaired_evidence = repair_unescaped_quotes_in_field(&repaired, "evidence_quote", trace);
+    if repaired_evidence != repaired {
+        repaired = repaired_evidence;
     }
     repaired
 }
@@ -642,7 +751,13 @@ fn escape_json_string(value: &str) -> String {
 fn normalize_eval_form_value(value: &mut Value, trace: &mut EvalFormRepairTrace) {
     normalize_row_array(value, "event_rows", normalize_event_row_value, trace);
     let event_ids = collect_event_ids(value);
-    normalize_child_row_array(value, "object_rows", &event_ids, normalize_object_row_value, trace);
+    normalize_child_row_array(
+        value,
+        "object_rows",
+        &event_ids,
+        normalize_object_row_value,
+        trace,
+    );
     normalize_child_row_array(
         value,
         "relationship_rows",
@@ -658,8 +773,20 @@ fn normalize_eval_form_value(value: &mut Value, trace: &mut EvalFormRepairTrace)
         normalize_relationship_row_value,
         trace,
     );
-    normalize_child_row_array(value, "memory_rows", &event_ids, normalize_memory_row_value, trace);
-    normalize_child_row_array(value, "review_rows", &event_ids, normalize_review_row_value, trace);
+    normalize_child_row_array(
+        value,
+        "memory_rows",
+        &event_ids,
+        normalize_memory_row_value,
+        trace,
+    );
+    normalize_child_row_array(
+        value,
+        "review_rows",
+        &event_ids,
+        normalize_review_row_value,
+        trace,
+    );
 }
 
 fn normalize_row_array(
@@ -702,11 +829,25 @@ fn normalize_event_row_value(
 ) {
     move_alias(row, "summary", "objective_summary", trace);
     move_alias(row, "kind", "event_type", trace);
+    move_alias(row, "type", "event_type", trace);
+    move_alias(row, "importance", "importance_tier", trace);
     normalize_event_type_value(row, "event_type", trace);
     if !row.contains_key("event_id") {
         row.insert("event_id".into(), Value::String("event_latest_turn".into()));
-        trace.raw_form_repair_warnings.push("missing event_id defaulted".into());
+        trace
+            .raw_form_repair_warnings
+            .push("missing event_id defaulted".into());
         trace.raw_form_repair_applied = true;
+    }
+    if !row.contains_key("objective_summary") {
+        if let Some(quote) = row.get("evidence_quote").and_then(Value::as_str) {
+            let summary = quote.chars().take(120).collect::<String>();
+            row.insert("objective_summary".into(), Value::String(summary));
+            trace
+                .raw_form_repair_warnings
+                .push("missing objective_summary derived from evidence_quote".into());
+            trace.raw_form_repair_applied = true;
+        }
     }
 }
 
@@ -717,13 +858,99 @@ fn normalize_object_row_value(
     move_alias(row, "event_id", "linked_event_id", trace);
     move_alias(row, "property", "property_changed", trace);
     move_alias(row, "change", "property_changed", trace);
+    move_alias(row, "changed_property", "property_changed", trace);
     move_alias(row, "value", "new_value", trace);
     move_alias(row, "summary", "new_value", trace);
     move_alias(row, "state_change", "new_value", trace);
+    move_alias(row, "new_state", "new_value", trace);
+    move_alias(row, "object_state", "new_value", trace);
+    move_alias(row, "status", "new_value", trace);
+    move_alias(row, "old_state", "old_value", trace);
+    move_alias(row, "previous_status", "old_value", trace);
+    move_alias(row, "object_label", "new_object_label", trace);
+    move_alias(row, "new_object_label", "new_object_label", trace);
+    move_alias(row, "object_change_type", "change_type", trace);
+
+    if let Some(val) = row.get_mut("change_type") {
+        if let Some(s) = val.as_str() {
+            let s_norm = s.trim().to_ascii_lowercase();
+            if s_norm == "object_change" {
+                *val = Value::String("state_change".into());
+                trace.raw_form_repair_warnings.push("change_type object_change normalized to state_change".into());
+                trace.raw_form_repair_applied = true;
+            }
+        }
+    }
+
+    // Part A: change_type-only normalizations
+    let change_type = row.get("change_type").and_then(Value::as_str).map(|s| s.trim().to_ascii_lowercase());
+    let prop_empty = row.get("property_changed").and_then(Value::as_str).unwrap_or("").trim().is_empty();
+    let val_empty = row.get("new_value").and_then(Value::as_str).unwrap_or("").trim().is_empty();
+    let evidence_quote = row.get("evidence_quote").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let new_object_label = row.get("new_object_label").and_then(Value::as_str).unwrap_or("").trim().to_string();
+
+    if prop_empty {
+        if let Some(ref ct) = change_type {
+            if ct == "state_change" {
+                row.insert("property_changed".into(), Value::String("state".into()));
+                trace.raw_form_repair_warnings.push("property_changed derived as state".into());
+                trace.raw_form_repair_applied = true;
+            } else if ct == "new_object_observation" {
+                row.insert("property_changed".into(), Value::String("presence".into()));
+                trace.raw_form_repair_warnings.push("property_changed derived as presence".into());
+                trace.raw_form_repair_applied = true;
+            }
+        }
+    }
+
+    if val_empty {
+        if let Some(ref ct) = change_type {
+            if ct == "state_change" {
+                let nv = if !evidence_quote.is_empty() {
+                    evidence_quote.clone()
+                } else {
+                    "state_changed".to_string()
+                };
+                row.insert("new_value".into(), Value::String(nv));
+                trace.raw_form_repair_warnings.push("new_value derived for state_change".into());
+                trace.raw_form_repair_applied = true;
+            } else if ct == "new_object_observation" {
+                let nv = if !new_object_label.is_empty() {
+                    new_object_label.clone()
+                } else if !evidence_quote.is_empty() {
+                    evidence_quote.clone()
+                } else {
+                    "presence_observed".to_string()
+                };
+                row.insert("new_value".into(), Value::String(nv));
+                trace.raw_form_repair_warnings.push("new_value derived for new_object_observation".into());
+                trace.raw_form_repair_applied = true;
+            }
+        }
+    }
+
+    let obj_id_empty = row.get("object_id").and_then(Value::as_str).unwrap_or("").trim().is_empty();
+    if obj_id_empty {
+        if !new_object_label.is_empty() {
+            let slug = slugify(&new_object_label);
+            row.insert("object_id".into(), Value::String(slug));
+            trace.raw_form_repair_warnings.push("object_id canonicalized from new_object_label".into());
+            trace.raw_form_repair_applied = true;
+        }
+    }
+
     if let Some(object_id) = row.get("object_id").and_then(Value::as_str) {
         if let Some(stripped) = object_id.strip_prefix("obj:") {
             row.insert("object_id".into(), Value::String(stripped.to_string()));
-            trace.raw_form_repair_warnings.push("obj: object_id canonicalized".into());
+            trace
+                .raw_form_repair_warnings
+                .push("obj: object_id canonicalized".into());
+            trace.raw_form_repair_applied = true;
+        } else if let Some(stripped) = object_id.strip_prefix("obj_") {
+            row.insert("object_id".into(), Value::String(stripped.to_string()));
+            trace
+                .raw_form_repair_warnings
+                .push("obj_ object_id canonicalized".into());
             trace.raw_form_repair_applied = true;
         }
     }
@@ -734,9 +961,29 @@ fn normalize_relationship_row_value(
     trace: &mut EvalFormRepairTrace,
 ) {
     move_alias(row, "event_id", "linked_event_id", trace);
+    move_alias(row, "source_entity_id", "source_soul_id", trace);
+    move_alias(row, "relationship_dimension", "dimension", trace);
+    move_alias(row, "relationship_dim", "dimension", trace);
+    move_alias(row, "relationship_metric", "dimension", trace);
     move_alias(row, "change_direction", "direction", trace);
+    move_alias(row, "shift_direction", "direction", trace);
+    move_alias(row, "tag_vocabularies", "selected_tags", trace);
+    move_alias(row, "relevance_tags", "selected_tags", trace);
     move_alias(row, "tags", "selected_tags", trace);
+
+    if let Some(val) = row.get_mut("change_type") {
+        if let Some(s) = val.as_str() {
+            let s_norm = s.trim().to_ascii_lowercase();
+            if s_norm == "relationship_shift" {
+                *val = Value::String("shift".into());
+                trace.raw_form_repair_warnings.push("change_type relationship_shift normalized to shift".into());
+                trace.raw_form_repair_applied = true;
+            }
+        }
+    }
+
     infer_relationship_dimension_from_tags(row, trace);
+    infer_relationship_direction_from_shift(row, trace);
     infer_relationship_direction_from_summary(row, trace);
     normalize_relationship_direction_value(row, trace);
     normalize_relationship_dimension_value(row, trace);
@@ -747,13 +994,18 @@ fn normalize_relationship_row_value(
         .and_then(Value::as_str)
         .map(str::to_string)
     {
-        let parts = relationship_id.split(':').map(str::to_string).collect::<Vec<_>>();
+        let parts = relationship_id
+            .split(':')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         if parts.len() == 3 && parts[0] == "rel" {
             row.entry("source_soul_id")
                 .or_insert_with(|| Value::String(parts[1].clone()));
             row.entry("target_entity_id")
                 .or_insert_with(|| Value::String(parts[2].clone()));
-            trace.raw_form_repair_warnings.push("relationship_id split into source and target".into());
+            trace
+                .raw_form_repair_warnings
+                .push("relationship_id split into source and target".into());
             trace.raw_form_repair_applied = true;
         }
     }
@@ -776,7 +1028,9 @@ fn normalize_relationship_tags_value(
         "selected_tags".into(),
         Value::Array(tags.into_iter().map(Value::String).collect()),
     );
-    trace.raw_form_repair_warnings.push("unknown relationship tags dropped".into());
+    trace
+        .raw_form_repair_warnings
+        .push("unknown relationship tags dropped".into());
     trace.raw_form_repair_applied = true;
 }
 
@@ -784,14 +1038,22 @@ fn infer_relationship_dimension_from_tags(
     row: &mut serde_json::Map<String, Value>,
     trace: &mut EvalFormRepairTrace,
 ) {
-    if row.get("dimension").and_then(Value::as_str).and_then(clean).is_some() {
+    if row
+        .get("dimension")
+        .and_then(Value::as_str)
+        .and_then(clean)
+        .is_some()
+    {
         return;
     }
     let Some(tag_value) = row.get("selected_tags").or_else(|| row.get("tags")) else {
         return;
     };
     let tags = relationship_tag_values(tag_value);
-    if let Some(dimension) = tags.iter().find_map(|tag| relationship_dimension_label(tag)) {
+    if let Some(dimension) = tags
+        .iter()
+        .find_map(|tag| relationship_dimension_label(tag))
+    {
         row.insert("dimension".into(), Value::String(dimension.into()));
         trace.raw_form_repair_warnings.push(format!(
             "relationship dimension inferred from tag {dimension}"
@@ -800,18 +1062,152 @@ fn infer_relationship_dimension_from_tags(
     }
 }
 
+fn infer_relationship_direction_from_shift(
+    row: &mut serde_json::Map<String, Value>,
+    trace: &mut EvalFormRepairTrace,
+) {
+    if row
+        .get("direction")
+        .and_then(Value::as_str)
+        .and_then(clean)
+        .is_some()
+    {
+        return;
+    }
+
+    let mut traditional_inferred = false;
+    if let Some(shift) = row.get("shift").and_then(Value::as_str) {
+        let normalized = normalize_token(shift);
+        let direction = if normalized.contains("increase")
+            || normalized.contains("escalation")
+            || normalized.contains("pressure_increased")
+            || normalized.contains("intensified")
+            || normalized.contains("grew")
+            || normalized.contains("growing")
+            || normalized.contains("more")
+        {
+            Some("increase")
+        } else if normalized.contains("decrease")
+            || normalized.contains("softened")
+            || normalized.contains("eased")
+            || normalized.contains("reduced")
+            || normalized.contains("less")
+            || normalized.contains("lower")
+        {
+            Some("decrease")
+        } else {
+            None
+        };
+        if let Some(direction) = direction {
+            row.insert("direction".into(), Value::String(direction.into()));
+            trace.raw_form_repair_warnings.push(format!(
+                "relationship direction inferred from shift {direction}"
+            ));
+            trace.raw_form_repair_applied = true;
+            traditional_inferred = true;
+        }
+    }
+
+    if !traditional_inferred {
+        let change_type = row.get("change_type").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+        if change_type == "shift" {
+            let dimension = row.get("dimension").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+            let evidence = row.get("evidence_quote").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+
+            let has_increase_word = evidence.contains("increase")
+                || evidence.contains("grew")
+                || evidence.contains("grow")
+                || evidence.contains("intensified")
+                || evidence.contains("warmer")
+                || evidence.contains("closer")
+                || evidence.contains("more")
+                || evidence.contains("strengthen")
+                || evidence.contains("deepen")
+                || evidence.contains("higher")
+                || evidence.contains("up")
+                || evidence.contains("escalat")
+                || evidence.contains("improv")
+                || evidence.contains("build")
+                || evidence.contains("built")
+                || evidence.contains("enhanc")
+                || evidence.contains("whisper")
+                || evidence.contains("soft")
+                || evidence.contains("drop") // drop/dropping voice
+                || evidence.contains("trust")
+                || evidence.contains("affect")
+                || evidence.contains("intim")
+                || evidence.contains("passion")
+                || evidence.contains("commit")
+                || evidence.contains("desir")
+                || evidence.contains("respect")
+                || evidence.contains("curios")
+                || evidence.contains("interest")
+                || evidence.contains("comfort");
+
+            let has_decrease_word = evidence.contains("decrease")
+                || evidence.contains("soften")
+                || evidence.contains("ease")
+                || evidence.contains("reduc")
+                || evidence.contains("less")
+                || evidence.contains("lower")
+                || evidence.contains("wither")
+                || evidence.contains("diminish")
+                || evidence.contains("fad")
+                || evidence.contains("cool")
+                || evidence.contains("pull")
+                || evidence.contains("withdraw")
+                || (evidence.contains("drop") && !evidence.contains("voice"));
+
+            if has_increase_word || has_decrease_word {
+                let has_decrease = has_decrease_word && !has_increase_word;
+                let direction = if has_decrease {
+                    Some("decrease")
+                } else if dimension == "trust" || dimension == "affection" || dimension == "intimacy" || dimension == "passion" || dimension == "commitment" || dimension == "desire" || dimension == "respect" || dimension == "curiosity" || dimension == "interest" || dimension == "comfort" {
+                    Some("increase")
+                } else if dimension == "boundary_pressure" || dimension == "boundarypressure" || dimension == "conflict" || dimension == "fear" {
+                    let has_escalation = evidence.contains("pressure") || evidence.contains("conflict") || evidence.contains("fear") || evidence.contains("tension") || evidence.contains("wary") || evidence.contains("guarded") || evidence.contains("edge") || evidence.contains("escalation")
+                        || change_type.contains("pressure") || change_type.contains("conflict") || change_type.contains("fear") || change_type.contains("tension") || change_type.contains("wary") || change_type.contains("guarded") || change_type.contains("edge") || change_type.contains("escalation");
+                    if has_escalation {
+                        Some("increase")
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(dir) = direction {
+                    row.insert("direction".into(), Value::String(dir.into()));
+                    trace.raw_form_repair_warnings.push(format!(
+                        "relationship direction inferred as {dir} for shift"
+                    ));
+                    trace.raw_form_repair_applied = true;
+                }
+            }
+        }
+    }
+}
+
 fn infer_relationship_direction_from_summary(
     row: &mut serde_json::Map<String, Value>,
     trace: &mut EvalFormRepairTrace,
 ) {
-    if row.get("direction").and_then(Value::as_str).and_then(clean).is_some() {
+    if row
+        .get("direction")
+        .and_then(Value::as_str)
+        .and_then(clean)
+        .is_some()
+    {
         return;
     }
     let Some(summary) = row.get("summary").and_then(Value::as_str) else {
         return;
     };
     let normalized = normalize_token(summary);
-    let direction = if normalized.contains("increase") || normalized.contains("increases") || normalized.contains("increased") {
+    let direction = if normalized.contains("increase")
+        || normalized.contains("increases")
+        || normalized.contains("increased")
+    {
         Some("increase")
     } else if normalized.contains("decrease")
         || normalized.contains("decreases")
@@ -834,7 +1230,12 @@ fn normalize_relationship_magnitude_from_importance(
     row: &mut serde_json::Map<String, Value>,
     trace: &mut EvalFormRepairTrace,
 ) {
-    if row.get("magnitude_tier").and_then(Value::as_str).and_then(clean).is_some() {
+    if row
+        .get("magnitude_tier")
+        .and_then(Value::as_str)
+        .and_then(clean)
+        .is_some()
+    {
         return;
     }
     let Some(importance) = row.get("importance_tier").and_then(Value::as_str) else {
@@ -917,7 +1318,9 @@ fn normalize_relationship_dimension_value(
     };
     if mapped != raw.as_str() {
         *value = Value::String(mapped.into());
-        trace.raw_form_repair_warnings.push(format!("relationship dimension {raw} normalized to {mapped}"));
+        trace.raw_form_repair_warnings.push(format!(
+            "relationship dimension {raw} normalized to {mapped}"
+        ));
         trace.raw_form_repair_applied = true;
     }
 }
@@ -927,15 +1330,33 @@ fn normalize_memory_row_value(
     trace: &mut EvalFormRepairTrace,
 ) {
     move_alias(row, "event_id", "linked_event_id", trace);
+    move_alias(row, "memory_slot", "slot", trace);
     move_alias(row, "slot_id", "slot", trace);
+    move_alias(row, "slot_type", "slot", trace);
     if let Some(kind) = row.get("kind").cloned() {
         if row.get("slot").is_none() && memory_slot_from_value(&kind).is_some() {
             row.insert("slot".into(), kind);
-            trace.raw_form_repair_warnings.push("kind normalized to memory slot".into());
+            trace
+                .raw_form_repair_warnings
+                .push("kind normalized to memory slot".into());
             trace.raw_form_repair_applied = true;
         }
     }
-    move_alias(row, "summary", "content", trace);
+    move_alias(row, "candidate_memory", "content", trace);
+    if row.get("content").is_none() {
+        move_alias(row, "candidate_summary", "content", trace);
+    }
+    if row.get("content").is_none() {
+        move_alias(row, "content_summary", "content", trace);
+    }
+    if row.get("content").is_none() {
+        move_alias(row, "summary", "content", trace);
+    }
+    move_alias(row, "importance_tier", "importance", trace);
+    move_alias(row, "salience", "importance", trace);
+    move_alias(row, "tag_vocabularies", "selected_tags", trace);
+    move_alias(row, "relevance_tags", "selected_tags", trace);
+    move_alias(row, "tags", "selected_tags", trace);
     normalize_memory_slot_value(row, "slot", trace);
     normalize_tags_value(row, trace);
 }
@@ -960,7 +1381,9 @@ fn move_alias(
     }
     if let Some(value) = row.remove(from) {
         row.insert(to.into(), value);
-        trace.raw_form_repair_warnings.push(format!("{from} normalized to {to}"));
+        trace
+            .raw_form_repair_warnings
+            .push(format!("{from} normalized to {to}"));
         trace.raw_form_repair_applied = true;
     }
 }
@@ -982,7 +1405,12 @@ fn normalize_linked_event_id_value(
     event_ids: &[String],
     trace: &mut EvalFormRepairTrace,
 ) {
-    if row.get("linked_event_id").and_then(Value::as_str).and_then(clean).is_some() {
+    if row
+        .get("linked_event_id")
+        .and_then(Value::as_str)
+        .and_then(clean)
+        .is_some()
+    {
         return;
     }
     if let Some(associated) = row
@@ -993,22 +1421,39 @@ fn normalize_linked_event_id_value(
         .filter_map(Value::as_str)
         .find(|id| event_ids.iter().any(|event_id| event_id == id))
     {
-        row.insert("linked_event_id".into(), Value::String(associated.to_string()));
-        trace.raw_form_repair_warnings.push("associated_event_ids linked child row".into());
+        row.insert(
+            "linked_event_id".into(),
+            Value::String(associated.to_string()),
+        );
+        trace
+            .raw_form_repair_warnings
+            .push("associated_event_ids linked child row".into());
         trace.raw_form_repair_applied = true;
         return;
     }
     if event_ids.len() == 1 {
-        row.insert("linked_event_id".into(), Value::String(event_ids[0].clone()));
-        trace.raw_form_repair_warnings.push("missing linked_event_id used single event".into());
+        row.insert(
+            "linked_event_id".into(),
+            Value::String(event_ids[0].clone()),
+        );
+        trace
+            .raw_form_repair_warnings
+            .push("missing linked_event_id used single event".into());
         trace.raw_form_repair_applied = true;
     } else if let Some(event_id) = event_ids.first() {
         row.insert("linked_event_id".into(), Value::String(event_id.clone()));
-        trace.raw_form_repair_warnings.push("missing linked_event_id used main event".into());
+        trace
+            .raw_form_repair_warnings
+            .push("missing linked_event_id used main event".into());
         trace.raw_form_repair_applied = true;
     } else {
-        row.insert("linked_event_id".into(), Value::String("event_latest_turn".into()));
-        trace.raw_form_repair_warnings.push("missing linked_event_id used synthesized event".into());
+        row.insert(
+            "linked_event_id".into(),
+            Value::String("event_latest_turn".into()),
+        );
+        trace
+            .raw_form_repair_warnings
+            .push("missing linked_event_id used synthesized event".into());
         trace.raw_form_repair_applied = true;
     }
 }
@@ -1038,7 +1483,9 @@ fn normalize_event_type_value(
     };
     if mapped != raw.as_str() {
         *value = Value::String(mapped.into());
-        trace.raw_form_repair_warnings.push(format!("event_type {raw} normalized to {mapped}"));
+        trace
+            .raw_form_repair_warnings
+            .push(format!("event_type {raw} normalized to {mapped}"));
         trace.raw_form_repair_applied = true;
     }
 }
@@ -1067,14 +1514,19 @@ fn normalize_relationship_direction_value(
         || normalized.contains("lower")
     {
         "decrease"
-    } else if normalized.contains("mixed") || normalized.contains("no_change") || normalized.contains("unchanged") {
+    } else if normalized.contains("mixed")
+        || normalized.contains("no_change")
+        || normalized.contains("unchanged")
+    {
         "no_change"
     } else {
         "no_change"
     };
     if mapped != raw.as_str() {
         *value = Value::String(mapped.into());
-        trace.raw_form_repair_warnings.push(format!("direction {raw} normalized to {mapped}"));
+        trace
+            .raw_form_repair_warnings
+            .push(format!("direction {raw} normalized to {mapped}"));
         trace.raw_form_repair_applied = true;
     }
 }
@@ -1089,13 +1541,17 @@ fn normalize_memory_slot_value(
     };
     let Some(mapped) = memory_slot_from_value(value) else {
         *value = Value::String("unknown".into());
-        trace.raw_form_repair_warnings.push("unknown memory slot normalized to unknown".into());
+        trace
+            .raw_form_repair_warnings
+            .push("unknown memory slot normalized to unknown".into());
         trace.raw_form_repair_applied = true;
         return;
     };
     if value.as_str() != Some(mapped) {
         *value = Value::String(mapped.into());
-        trace.raw_form_repair_warnings.push(format!("memory slot normalized to {mapped}"));
+        trace
+            .raw_form_repair_warnings
+            .push(format!("memory slot normalized to {mapped}"));
         trace.raw_form_repair_applied = true;
     }
 }
@@ -1142,13 +1598,18 @@ fn normalize_tags_value(row: &mut serde_json::Map<String, Value>, trace: &mut Ev
         seen.insert(canonical.to_string())
     });
     if tags.len() != before {
-        trace.raw_form_repair_warnings.push("unknown tags dropped".into());
+        trace
+            .raw_form_repair_warnings
+            .push("unknown tags dropped".into());
         trace.raw_form_repair_applied = true;
     }
 }
 
 fn split_relationship_dimensions(value: &mut Value, trace: &mut EvalFormRepairTrace) {
-    let Some(rows) = value.get_mut("relationship_rows").and_then(Value::as_array_mut) else {
+    let Some(rows) = value
+        .get_mut("relationship_rows")
+        .and_then(Value::as_array_mut)
+    else {
         return;
     };
     let mut expanded = Vec::new();
@@ -1168,7 +1629,9 @@ fn split_relationship_dimensions(value: &mut Value, trace: &mut EvalFormRepairTr
             }
             expanded.push(next);
         }
-        trace.raw_form_repair_warnings.push("dimensions_changed split into relationship rows".into());
+        trace
+            .raw_form_repair_warnings
+            .push("dimensions_changed split into relationship rows".into());
         trace.raw_form_repair_applied = true;
     }
     *rows = expanded;
@@ -1250,11 +1713,16 @@ pub fn compile_eval_form_response(
             trace.form_rows_accepted += 1;
             output.world_changes.push(WorldChangeEvaluation {
                 change_id: Some(row.event_id.clone()),
-                location: row.location.as_ref().and_then(|value| clean(value).map(str::to_string)),
+                location: row
+                    .location
+                    .as_ref()
+                    .and_then(|value| clean(value).map(str::to_string)),
                 event_summary: clean(&row.objective_summary).map(str::to_string),
                 scene_state: Some(scene_state_from_event(row, context)),
                 evidence_quote: clean(&row.evidence_quote).map(str::to_string),
-                confidence: confidence_from_importance(row.importance_tier.unwrap_or(ImportanceTier::Medium)),
+                confidence: confidence_from_importance(
+                    row.importance_tier.unwrap_or(ImportanceTier::Medium),
+                ),
                 relevance_tags: relevance_from_event(row),
                 ..WorldChangeEvaluation::default()
             });
@@ -1269,12 +1737,19 @@ pub fn compile_eval_form_response(
                 .object_id
                 .as_ref()
                 .and_then(|id| clean(id).map(str::to_string))
-                .or_else(|| row.new_object_label.as_ref().and_then(|id| clean(id).map(slugify)))
+                .or_else(|| {
+                    row.new_object_label
+                        .as_ref()
+                        .and_then(|id| clean(id).map(slugify))
+                })
                 .unwrap_or_else(|| "unknown_object".into());
             output.object_changes.push(ObjectChangeEvaluation {
                 change_id: Some(stable_id(
                     "object_form",
-                    &format!("{}:{}:{}", row.linked_event_id, object_id, row.property_changed),
+                    &format!(
+                        "{}:{}:{}",
+                        row.linked_event_id, object_id, row.property_changed
+                    ),
                 )),
                 object_state: ObjectState {
                     object_id: object_id.clone(),
@@ -1285,7 +1760,9 @@ pub fn compile_eval_form_response(
                         .unwrap_or_else(|| infer_object_kind(&object_id)),
                     status: row.new_value.clone(),
                     last_observed_state: format!("{}: {}", row.property_changed, row.new_value),
-                    confidence: confidence_from_confidence_tier(row.confidence_tier.unwrap_or(ConfidenceTier::Medium)),
+                    confidence: confidence_from_confidence_tier(
+                        row.confidence_tier.unwrap_or(ConfidenceTier::Medium),
+                    ),
                     location: row
                         .location
                         .clone()
@@ -1294,7 +1771,9 @@ pub fn compile_eval_form_response(
                     ..ObjectState::default()
                 },
                 evidence_quote: clean(&row.evidence_quote).map(str::to_string),
-                confidence: confidence_from_confidence_tier(row.confidence_tier.unwrap_or(ConfidenceTier::Medium)),
+                confidence: confidence_from_confidence_tier(
+                    row.confidence_tier.unwrap_or(ConfidenceTier::Medium),
+                ),
                 ..ObjectChangeEvaluation::default()
             });
             output.turn_flags_u64 |= turn_flags::OBJECT_CHANGE | turn_flags::WORLD_CHANGE;
@@ -1305,7 +1784,9 @@ pub fn compile_eval_form_response(
         if validate_relationship_row(row, spec, &allowed_entities, &event_ids, &mut rejected_rows) {
             trace.form_rows_accepted += 1;
             if row.direction != Some(RelationshipDirection::NoChange) {
-                output.relationship_evaluations.push(relationship_from_row(row));
+                output
+                    .relationship_evaluations
+                    .push(relationship_from_row(row));
                 output.turn_flags_u64 |= turn_flags::RELATIONSHIP_SHIFT;
             }
         }
@@ -1381,7 +1862,12 @@ pub fn compile_eval_form_response(
     trace.code_assigned_decay_profile = response
         .memory_rows
         .iter()
-        .map(|row| (memory_candidate_id(row), decay_profile(row.importance_tier.unwrap_or(ImportanceTier::Medium)).to_string()))
+        .map(|row| {
+            (
+                memory_candidate_id(row),
+                decay_profile(row.importance_tier.unwrap_or(ImportanceTier::Medium)).to_string(),
+            )
+        })
         .collect();
     trace.code_assigned_tag_weights = flatten_tag_weights(&output.relevance_tags);
 
@@ -1469,7 +1955,10 @@ fn normalize_eval_form_response(
     }
     for row in &mut normalized.review_rows {
         if row.candidate_id.trim().is_empty() {
-            row.candidate_id = stable_id("review_form", &format!("{}:{}", row.reason, row.evidence_quote));
+            row.candidate_id = stable_id(
+                "review_form",
+                &format!("{}:{}", row.reason, row.evidence_quote),
+            );
         }
     }
 
@@ -1491,7 +1980,10 @@ fn compact_latest_turn_summary(context: &EvaluatorConversionContext<'_>) -> Stri
     }
     let user = context.latest_user_message.trim();
     if !user.is_empty() {
-        return format!("Latest user action: {}", user.chars().take(180).collect::<String>());
+        return format!(
+            "Latest user action: {}",
+            user.chars().take(180).collect::<String>()
+        );
     }
     "The current scene advanced.".into()
 }
@@ -1535,8 +2027,13 @@ fn normalize_child_link(
 
 fn normalize_relationship_aliases(row: &mut RelationshipRow, spec: &EvalFormSpec) {
     if let Some(relationship_id) = row.relationship_id.as_deref().and_then(clean) {
-        let clean_rel = relationship_id.strip_prefix("rel:").unwrap_or(relationship_id);
-        let parts = clean_rel.split(':').map(|s| s.trim().to_string()).collect::<Vec<_>>();
+        let clean_rel = relationship_id
+            .strip_prefix("rel:")
+            .unwrap_or(relationship_id);
+        let parts = clean_rel
+            .split(':')
+            .map(|s| s.trim().to_string())
+            .collect::<Vec<_>>();
         if parts.len() == 2 {
             if row.source_soul_id.trim().is_empty() {
                 row.source_soul_id = parts[0].clone();
@@ -1564,29 +2061,37 @@ fn normalize_relationship_aliases(row: &mut RelationshipRow, spec: &EvalFormSpec
         }
     }
 
+    if !row.source_soul_id.trim().is_empty() {
+        row.source_soul_id = resolve_active_entity_id(&row.source_soul_id, spec);
+    }
+    if !row.target_entity_id.trim().is_empty() {
+        row.target_entity_id = resolve_active_entity_id(&row.target_entity_id, spec);
+    }
+
+    let has_default_player = spec.active_entities.iter().any(|e| e.entity_id == "default_player");
     if spec.active_soul_ids.len() == 1 {
         let active_soul_id = &spec.active_soul_ids[0];
-        
-        let src_is_empty = row.source_soul_id.trim().is_empty();
-        let tgt_is_empty = row.target_entity_id.trim().is_empty();
-
-        if src_is_empty {
+        if row.source_soul_id.trim().is_empty() {
             row.source_soul_id = active_soul_id.clone();
         }
-        if tgt_is_empty {
+        if row.target_entity_id.trim().is_empty() {
             row.target_entity_id = "default_player".to_string();
         }
+    } else if has_default_player {
+        if row.target_entity_id.trim().is_empty() {
+            row.target_entity_id = "default_player".to_string();
+        }
+    }
 
-        row.source_soul_id = normalize_player_id(&row.source_soul_id);
-        row.target_entity_id = normalize_player_id(&row.target_entity_id);
+    row.source_soul_id = normalize_player_id(&row.source_soul_id);
+    row.target_entity_id = normalize_player_id(&row.target_entity_id);
 
+    if spec.active_soul_ids.len() == 1 {
+        let active_soul_id = &spec.active_soul_ids[0];
         if row.source_soul_id == "default_player" {
             row.source_soul_id = active_soul_id.clone();
             row.target_entity_id = "default_player".to_string();
         }
-    } else {
-        row.source_soul_id = normalize_player_id(&row.source_soul_id);
-        row.target_entity_id = normalize_player_id(&row.target_entity_id);
     }
 }
 
@@ -1603,9 +2108,126 @@ fn normalize_relationship_defaults(row: &mut RelationshipRow) {
             }
         }
     }
+
     if row.direction.is_none() {
-        row.direction = Some(RelationshipDirection::NoChange);
+        if let Some(ref ct) = row.change_type {
+            if ct.trim().to_ascii_lowercase() == "shift" {
+                if let Some(dim) = row.dimension {
+                    let is_positive = matches!(
+                        dim,
+                        RelationshipDimension::Trust
+                            | RelationshipDimension::Affection
+                            | RelationshipDimension::Intimacy
+                            | RelationshipDimension::Passion
+                            | RelationshipDimension::Commitment
+                            | RelationshipDimension::Desire
+                            | RelationshipDimension::Respect
+                            | RelationshipDimension::Curiosity
+                            | RelationshipDimension::Comfort
+                    );
+                    
+                    let evidence_lower = row.evidence_quote.to_ascii_lowercase();
+                    let change_type_lower = ct.to_ascii_lowercase();
+                    
+                    let has_escalation_keyword =
+                        evidence_lower.contains("pressure") || evidence_lower.contains("conflict") ||
+                        evidence_lower.contains("fear") || evidence_lower.contains("tension") ||
+                        evidence_lower.contains("wary") || evidence_lower.contains("guarded") ||
+                        evidence_lower.contains("edge") || evidence_lower.contains("escalation") ||
+                        change_type_lower.contains("pressure") || change_type_lower.contains("conflict") ||
+                        change_type_lower.contains("fear") || change_type_lower.contains("tension") ||
+                        change_type_lower.contains("wary") || change_type_lower.contains("guarded") ||
+                        change_type_lower.contains("edge") || change_type_lower.contains("escalation");
+                        
+                    let has_deescalation_keyword =
+                        evidence_lower.contains("softened") || evidence_lower.contains("eased") ||
+                        evidence_lower.contains("reduced") || evidence_lower.contains("decreased") ||
+                        evidence_lower.contains("less") || evidence_lower.contains("lower") ||
+                        change_type_lower.contains("softened") || change_type_lower.contains("eased") ||
+                        change_type_lower.contains("reduced") || change_type_lower.contains("decreased") ||
+                        change_type_lower.contains("less") || change_type_lower.contains("lower");
+
+                    let has_increase_keyword =
+                        evidence_lower.contains("increase") || evidence_lower.contains("grew") ||
+                        evidence_lower.contains("grow") || evidence_lower.contains("intensified") ||
+                        evidence_lower.contains("warmer") || evidence_lower.contains("closer") ||
+                        evidence_lower.contains("more") || evidence_lower.contains("strengthen") ||
+                        evidence_lower.contains("deepen") || evidence_lower.contains("higher") ||
+                        evidence_lower.contains("up") || evidence_lower.contains("improving") ||
+                        evidence_lower.contains("improved") || evidence_lower.contains("building") ||
+                        evidence_lower.contains("built") || evidence_lower.contains("enhanced") ||
+                        evidence_lower.contains("drop") || evidence_lower.contains("whisper") ||
+                        evidence_lower.contains("soft") || evidence_lower.contains("trust") ||
+                        evidence_lower.contains("affect") || evidence_lower.contains("intim") ||
+                        evidence_lower.contains("passion") || evidence_lower.contains("commit") ||
+                        evidence_lower.contains("desir") || evidence_lower.contains("respect") ||
+                        evidence_lower.contains("curios") || evidence_lower.contains("interest") ||
+                        evidence_lower.contains("comfort") ||
+                        change_type_lower.contains("increase") || change_type_lower.contains("grew") ||
+                        change_type_lower.contains("grow") || change_type_lower.contains("intensified") ||
+                        change_type_lower.contains("warmer") || change_type_lower.contains("closer") ||
+                        change_type_lower.contains("more") || change_type_lower.contains("strengthen") ||
+                        change_type_lower.contains("deepen") || change_type_lower.contains("higher") ||
+                        change_type_lower.contains("up") || change_type_lower.contains("improving") ||
+                        change_type_lower.contains("improved") || change_type_lower.contains("building") ||
+                        change_type_lower.contains("built") || change_type_lower.contains("enhanced") ||
+                        change_type_lower.contains("drop") || change_type_lower.contains("whisper") ||
+                        change_type_lower.contains("soft") || change_type_lower.contains("trust") ||
+                        change_type_lower.contains("affect") || change_type_lower.contains("intim") ||
+                        change_type_lower.contains("passion") || change_type_lower.contains("commit") ||
+                        change_type_lower.contains("desir") || change_type_lower.contains("respect") ||
+                        change_type_lower.contains("curios") || change_type_lower.contains("interest") ||
+                        change_type_lower.contains("comfort");
+
+                    let strongly_implied = has_increase_keyword || has_escalation_keyword || has_deescalation_keyword;
+
+                    if strongly_implied {
+                        if is_positive {
+                            if has_deescalation_keyword && !has_escalation_keyword {
+                                row.direction = Some(RelationshipDirection::Decrease);
+                            } else {
+                                row.direction = Some(RelationshipDirection::Increase);
+                            }
+                        } else {
+                            if has_escalation_keyword {
+                                row.direction = Some(RelationshipDirection::Increase);
+                            } else if has_deescalation_keyword {
+                                row.direction = Some(RelationshipDirection::Decrease);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    if row.magnitude_tier.is_none() {
+        if let Some(ref shift_str) = row.shift {
+            let clean_shift = shift_str.trim().trim_start_matches('+');
+            if let Ok(val) = clean_shift.parse::<f32>() {
+                let abs_val = val.abs();
+                row.magnitude_tier = Some(if abs_val >= 3.0 {
+                    MagnitudeTier::Large
+                } else if abs_val >= 2.0 {
+                    MagnitudeTier::Medium
+                } else {
+                    MagnitudeTier::Small
+                });
+            }
+        }
+        
+        if row.magnitude_tier.is_none() {
+            if let Some(importance) = row.importance_tier {
+                row.magnitude_tier = Some(match importance {
+                    ImportanceTier::Trivial | ImportanceTier::Low => MagnitudeTier::Small,
+                    ImportanceTier::Medium => MagnitudeTier::Small,
+                    ImportanceTier::High => MagnitudeTier::Medium,
+                    ImportanceTier::Critical => MagnitudeTier::Large,
+                });
+            }
+        }
+    }
+
     if row.magnitude_tier.is_none() {
         row.magnitude_tier = Some(MagnitudeTier::Small);
     }
@@ -1616,8 +2238,49 @@ fn normalize_object_aliases(row: &mut ObjectRow) {
     let change = row.change.as_deref().and_then(clean);
     let state_change = row.state_change.as_deref().and_then(clean);
     let location_observation = row.location_observation.as_deref().and_then(clean);
+
     if row.property_changed.trim().is_empty() {
-        if let Some(value) = change.or(state_change).or(location_observation).or(summary) {
+        if let Some(ref ct) = row.change_type {
+            let ct_norm = ct.trim().to_ascii_lowercase();
+            if ct_norm == "state_change" {
+                row.property_changed = "state".to_string();
+            } else if ct_norm == "new_object_observation" {
+                row.property_changed = "presence".to_string();
+            }
+        }
+    }
+
+    if row.new_value.trim().is_empty() {
+        if let Some(ref ct) = row.change_type {
+            let ct_norm = ct.trim().to_ascii_lowercase();
+            if ct_norm == "state_change" {
+                row.new_value = if !row.evidence_quote.trim().is_empty() {
+                    row.evidence_quote.clone()
+                } else {
+                    "state_changed".to_string()
+                };
+            } else if ct_norm == "new_object_observation" {
+                row.new_value = if let Some(ref label) = row.new_object_label {
+                    label.clone()
+                } else if !row.evidence_quote.trim().is_empty() {
+                    row.evidence_quote.clone()
+                } else {
+                    "presence_observed".to_string()
+                };
+            }
+        }
+    }
+
+    if row.object_id.as_deref().and_then(clean).is_none() {
+        if let Some(label) = row.new_object_label.as_deref().and_then(clean) {
+            row.object_id = Some(slugify(label));
+        }
+    }
+
+    if row.property_changed.trim().is_empty() {
+        if !row.new_value.trim().is_empty() {
+            row.property_changed = "state".to_string();
+        } else if let Some(value) = change.or(state_change).or(location_observation).or(summary) {
             row.property_changed = value.to_string();
         } else {
             row.property_changed = "state".to_string();
@@ -1645,6 +2308,8 @@ fn normalize_memory_aliases(
     if row.content.trim().is_empty() {
         if let Some(summary) = row.summary.as_deref().and_then(clean) {
             row.content = summary.to_string();
+        } else if let Some(evidence) = Some(&row.evidence_quote).and_then(|e| clean(e)) {
+            row.content = evidence.to_string();
         } else if let Some(summary) = event_summaries.get(row.linked_event_id.trim()) {
             let slot = row.slot.map(|slot| slot.as_label()).unwrap_or("unknown");
             row.content = format!("{slot}: {summary}");
@@ -1653,6 +2318,15 @@ fn normalize_memory_aliases(
     if row.owner_soul_id.trim().is_empty() {
         row.owner_soul_id = match row.slot.unwrap_or(MemorySlot::Unknown) {
             MemorySlot::WorldLocationMemory => "session_world".into(),
+            MemorySlot::RelationshipMemory
+            | MemorySlot::CurrentPlotMemory
+            | MemorySlot::UnresolvedTension
+            | MemorySlot::RecentEmotionalState
+            | MemorySlot::CharacterIdentityMemory => spec
+                .active_soul_ids
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "session_world".into()),
             _ => spec
                 .active_soul_ids
                 .first()
@@ -1692,12 +2366,20 @@ fn validate_event_row(
 ) -> bool {
     let row_id = row.event_id.clone();
     if clean(&row.event_id).is_none() || clean(&row.objective_summary).is_none() {
-        return reject_row(rejected, "event", &row_id, "event_id and objective_summary are required");
+        return reject_row(
+            rejected,
+            "event",
+            &row_id,
+            "event_id and objective_summary are required",
+        );
     }
     if clean(&row.evidence_quote).is_none() {
         return reject_row(rejected, "event", &row_id, "evidence_quote is required");
     }
-    if !row.event_type.is_some_and(|event_type| spec.allowed_event_types.contains(&event_type)) {
+    if !row
+        .event_type
+        .is_some_and(|event_type| spec.allowed_event_types.contains(&event_type))
+    {
         return reject_row(rejected, "event", &row_id, "event_type is not allowed");
     }
     for participant in &row.participants {
@@ -1722,12 +2404,22 @@ fn validate_object_row(
         return reject_row(rejected, "object", &row_id, "evidence_quote is required");
     }
     if clean(&row.property_changed).is_none() || clean(&row.new_value).is_none() {
-        return reject_row(rejected, "object", &row_id, "property_changed and new_value are required");
+        return reject_row(
+            rejected,
+            "object",
+            &row_id,
+            "property_changed and new_value are required",
+        );
     }
     if row.object_id.as_deref().and_then(clean).is_none()
         && row.new_object_label.as_deref().and_then(clean).is_none()
     {
-        return reject_row(rejected, "object", &row_id, "object_id or new_object_label is required");
+        return reject_row(
+            rejected,
+            "object",
+            &row_id,
+            "object_id or new_object_label is required",
+        );
     }
     true
 }
@@ -1739,21 +2431,64 @@ fn validate_relationship_row(
     event_ids: &HashSet<&str>,
     rejected: &mut Vec<EvalFormRowRejection>,
 ) -> bool {
-    let row_id = format!("{}:{}:{}", row.linked_event_id, row.source_soul_id, row.target_entity_id);
+    let row_id = format!(
+        "{}:{}:{}",
+        row.linked_event_id, row.source_soul_id, row.target_entity_id
+    );
     if !event_ids.contains(row.linked_event_id.as_str()) {
-        return reject_row(rejected, "relationship", &row_id, "linked_event_id is unknown");
+        return reject_row(
+            rejected,
+            "relationship",
+            &row_id,
+            "linked_event_id is unknown",
+        );
     }
     if clean(&row.evidence_quote).is_none() {
-        return reject_row(rejected, "relationship", &row_id, "evidence_quote is required");
+        return reject_row(
+            rejected,
+            "relationship",
+            &row_id,
+            "evidence_quote is required",
+        );
     }
-    if !spec.active_soul_ids.iter().any(|id| id == &row.source_soul_id) {
-        return reject_row(rejected, "relationship", &row_id, "source_soul_id is not an active Soul");
+    if !spec
+        .active_soul_ids
+        .iter()
+        .any(|id| id == &row.source_soul_id)
+    {
+        return reject_row(
+            rejected,
+            "relationship",
+            &row_id,
+            "source_soul_id is not an active Soul",
+        );
     }
     if !allowed_entities.contains(row.target_entity_id.as_str()) {
-        return reject_row(rejected, "relationship", &row_id, "unknown target_entity_id");
+        return reject_row(
+            rejected,
+            "relationship",
+            &row_id,
+            "unknown target_entity_id",
+        );
     }
-    if !row.dimension.is_some_and(|dimension| spec.allowed_relationship_dimensions.contains(&dimension)) {
-        return reject_row(rejected, "relationship", &row_id, "relationship dimension is not allowed");
+    if !row
+        .dimension
+        .is_some_and(|dimension| spec.allowed_relationship_dimensions.contains(&dimension))
+    {
+        return reject_row(
+            rejected,
+            "relationship",
+            &row_id,
+            "relationship dimension is not allowed",
+        );
+    }
+    if row.direction.is_none() {
+        return reject_row(
+            rejected,
+            "relationship",
+            &row_id,
+            "direction_missing_uncertain",
+        );
     }
     true
 }
@@ -1774,14 +2509,31 @@ fn validate_memory_row(
     if clean(&row.content).is_none() {
         return reject_row(rejected, "memory", &row_id, "content is required");
     }
-    if row.owner_soul_id != "session_world" && !spec.active_soul_ids.iter().any(|id| id == &row.owner_soul_id) {
-        return reject_row(rejected, "memory", &row_id, "owner_soul_id is neither active Soul nor session_world");
+    if row.owner_soul_id != "session_world"
+        && !spec
+            .active_soul_ids
+            .iter()
+            .any(|id| id == &row.owner_soul_id)
+    {
+        return reject_row(
+            rejected,
+            "memory",
+            &row_id,
+            "owner_soul_id is neither active Soul nor session_world",
+        );
     }
-    if !row.slot.is_some_and(|slot| spec.allowed_memory_slots.contains(&slot)) {
+    if !row
+        .slot
+        .is_some_and(|slot| spec.allowed_memory_slots.contains(&slot))
+    {
         return reject_row(rejected, "memory", &row_id, "memory slot is not allowed");
     }
     for tag in &row.selected_tags {
-        if !spec.allowed_tag_vocabularies.iter().any(|allowed| allowed == tag) {
+        if !spec
+            .allowed_tag_vocabularies
+            .iter()
+            .any(|allowed| allowed == tag)
+        {
             return reject_row(rejected, "memory", &row_id, "selected tag is not allowed");
         }
     }
@@ -1798,7 +2550,9 @@ fn validate_review_row(
         return reject_row(rejected, "review", &row_id, "candidate_id is required");
     }
     if clean(&row.evidence_quote).is_none() {
-        return reject_row(rejected, "review", &row_id, "evidence_quote is required");
+        // Do not let review row rejection poison the whole evaluator result.
+        // Ignore review_rows without evidence_quote as advisory only.
+        return true;
     }
     if matches!(
         row.decision,
@@ -1810,10 +2564,20 @@ fn validate_review_row(
         )
     ) {
         let Some(existing_id) = row.existing_id.as_deref().and_then(clean) else {
-            return reject_row(rejected, "review", &row_id, "existing_id is required for this decision");
+            return reject_row(
+                rejected,
+                "review",
+                &row_id,
+                "existing_id is required for this decision",
+            );
         };
         if !existing_id_allowed(spec, existing_id) {
-            return reject_row(rejected, "review", &row_id, "existing_id is not in form spec");
+            return reject_row(
+                rejected,
+                "review",
+                &row_id,
+                "existing_id is not in form spec",
+            );
         }
     }
     true
@@ -1854,6 +2618,7 @@ fn relationship_from_row(row: &RelationshipRow) -> RelationshipEvaluation {
         evidence_quote: Some(row.evidence_quote.clone()),
         criterion_met: row.direction != Some(RelationshipDirection::NoChange),
         confidence: 0.75,
+        evidence_validated_by_form: true,
         ..RelationshipEvaluation::default()
     };
     match row.dimension.unwrap_or(RelationshipDimension::Trust) {
@@ -1936,7 +2701,10 @@ fn apply_review_memory_operations(
     conversion.no_op = false;
 }
 
-fn scene_state_from_event(row: &EventRow, context: &EvaluatorConversionContext<'_>) -> SceneStatePatch {
+fn scene_state_from_event(
+    row: &EventRow,
+    context: &EvaluatorConversionContext<'_>,
+) -> SceneStatePatch {
     SceneStatePatch {
         scene_state_id: Some(stable_id("scene_form", &row.event_id)),
         current_scene: clean(&row.objective_summary).map(str::to_string),
@@ -1952,11 +2720,17 @@ fn apply_event_flags(output: &mut EvaluatorOutputV1, row: &EventRow) {
     output.turn_flags_u64 |= turn_flags::SCENE_TURN | turn_flags::USER_ACTION_PRESENT;
     match row.event_type.unwrap_or(EventType::SceneEvent) {
         EventType::LocationChange => output.turn_flags_u64 |= turn_flags::WORLD_CHANGE,
-        EventType::ObjectChange => output.turn_flags_u64 |= turn_flags::OBJECT_CHANGE | turn_flags::WORLD_CHANGE,
+        EventType::ObjectChange => {
+            output.turn_flags_u64 |= turn_flags::OBJECT_CHANGE | turn_flags::WORLD_CHANGE
+        }
         EventType::RelationshipShift => output.turn_flags_u64 |= turn_flags::RELATIONSHIP_SHIFT,
-        EventType::CurrentPlotAdvanced => output.turn_flags_u64 |= turn_flags::CURRENT_PLOT_ADVANCED,
+        EventType::CurrentPlotAdvanced => {
+            output.turn_flags_u64 |= turn_flags::CURRENT_PLOT_ADVANCED
+        }
         EventType::UnresolvedTension => output.turn_flags_u64 |= turn_flags::UNRESOLVED_TENSION,
-        EventType::RecentEmotionalState => output.turn_flags_u64 |= turn_flags::RECENT_EMOTIONAL_STATE,
+        EventType::RecentEmotionalState => {
+            output.turn_flags_u64 |= turn_flags::RECENT_EMOTIONAL_STATE
+        }
         EventType::Correction => output.turn_flags_u64 |= turn_flags::RETCON_OR_CORRECTION,
         EventType::SceneEvent => {}
     }
@@ -1986,15 +2760,18 @@ fn compute_turn_flags(output: &EvaluatorOutputV1) -> u64 {
 fn global_scene_from_output(output: &EvaluatorOutputV1) -> GlobalSceneEvaluation {
     GlobalSceneEvaluation {
         scene_event_occurred: output.turn_flags_u64 & turn_flags::SCENE_TURN != 0,
-        location_changed: output
-            .world_changes
-            .iter()
-            .any(|change| change.location.as_ref().is_some_and(|location| !location.trim().is_empty())),
+        location_changed: output.world_changes.iter().any(|change| {
+            change
+                .location
+                .as_ref()
+                .is_some_and(|location| !location.trim().is_empty())
+        }),
         object_state_changed: !output.object_changes.is_empty(),
         relationship_changed: !output.relationship_evaluations.is_empty(),
         unresolved_tension: output.turn_flags_u64 & turn_flags::UNRESOLVED_TENSION != 0,
         current_plot_advanced: output.turn_flags_u64 & turn_flags::CURRENT_PLOT_ADVANCED != 0,
-        recent_emotional_state_changed: output.turn_flags_u64 & turn_flags::RECENT_EMOTIONAL_STATE != 0,
+        recent_emotional_state_changed: output.turn_flags_u64 & turn_flags::RECENT_EMOTIONAL_STATE
+            != 0,
         evidence_quote: output
             .world_changes
             .first()
@@ -2017,7 +2794,10 @@ fn draft_from_output(
         scene_evaluation: output.global_scene_evaluation.clone(),
         memory_candidate_count: output.memory_candidates.len(),
         world_event_count: output.world_changes.len(),
-        scene_state_present: output.world_changes.iter().any(|change| change.scene_state.is_some()),
+        scene_state_present: output
+            .world_changes
+            .iter()
+            .any(|change| change.scene_state.is_some()),
         relationship_delta_count: output.relationship_evaluations.len(),
         object_observation_count: output.object_changes.len(),
         warnings: rejected_rows
@@ -2039,20 +2819,25 @@ fn draft_from_output(
 fn aggregate_relevance_tags(output: &EvaluatorOutputV1) -> RelevanceTags {
     let mut tags = RelevanceTags::default();
     for change in &output.world_changes {
-        tags.event_type_tags.extend(change.relevance_tags.event_type_tags.clone());
+        tags.event_type_tags
+            .extend(change.relevance_tags.event_type_tags.clone());
     }
     for candidate in &output.memory_candidates {
         for tag in &candidate.relevance_tags {
             tags.memory_slot_tags.insert(tag.clone(), 80);
         }
-        tags.memory_slot_tags.insert(candidate.slot.as_label().into(), 80);
+        tags.memory_slot_tags
+            .insert(candidate.slot.as_label().into(), 80);
     }
     tags
 }
 
 fn relevance_from_event(row: &EventRow) -> RelevanceTags {
     let mut tags = RelevanceTags::default();
-    tags.event_type_tags.insert(format!("{:?}", row.event_type.unwrap_or(EventType::SceneEvent)).to_ascii_lowercase(), 80);
+    tags.event_type_tags.insert(
+        format!("{:?}", row.event_type.unwrap_or(EventType::SceneEvent)).to_ascii_lowercase(),
+        80,
+    );
     tags
 }
 
@@ -2314,6 +3099,93 @@ fn clean(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }
 
+fn resolve_active_entity_id(raw_id: &str, spec: &EvalFormSpec) -> String {
+    let clean_raw = raw_id.trim();
+    if clean_raw.is_empty() {
+        return clean_raw.to_string();
+    }
+    
+    let normalized_raw = normalize_token(clean_raw);
+    
+    for entity in &spec.active_entities {
+        if entity.entity_id == clean_raw {
+            return entity.entity_id.clone();
+        }
+        
+        if normalize_token(&entity.display_name) == normalized_raw {
+            return entity.entity_id.clone();
+        }
+        
+        if normalize_token(&entity.entity_id) == normalized_raw {
+            return entity.entity_id.clone();
+        }
+    }
+    
+    if normalized_raw == "user" || normalized_raw == "default_player" || normalized_raw == "player" {
+        return "default_player".to_string();
+    }
+    
+    clean_raw.to_string()
+}
+
+pub fn format_honest_ui_status(
+    patch_applied: bool,
+    materialized_soul_updated: bool,
+    materialized_session_world_updated: bool,
+    rejected_rows: &[EvalFormRowRejection],
+) -> String {
+    let was_applied = patch_applied && materialized_soul_updated && materialized_session_world_updated;
+    let rows_rejected = rejected_rows.len();
+
+    if was_applied {
+        if rows_rejected == 0 {
+            "State updated".to_string()
+        } else {
+            let mut object_count = 0;
+            let mut relationship_count = 0;
+            let mut memory_count = 0;
+            let mut event_count = 0;
+            let mut review_count = 0;
+
+            for r in rejected_rows {
+                match r.row_kind.as_str() {
+                    "object" => object_count += 1,
+                    "relationship" => relationship_count += 1,
+                    "memory" => memory_count += 1,
+                    "event" => event_count += 1,
+                    "review" => review_count += 1,
+                    _ => {}
+                }
+            }
+
+            let mut kinds = Vec::new();
+            if object_count > 0 {
+                kinds.push(format!("{} object row{}", object_count, if object_count == 1 { "" } else { "s" }));
+            }
+            if relationship_count > 0 {
+                kinds.push(format!("{} relationship row{}", relationship_count, if relationship_count == 1 { "" } else { "s" }));
+            }
+            if memory_count > 0 {
+                kinds.push(format!("{} memory row{}", memory_count, if memory_count == 1 { "" } else { "s" }));
+            }
+            if event_count > 0 {
+                kinds.push(format!("{} event row{}", event_count, if event_count == 1 { "" } else { "s" }));
+            }
+            if review_count > 0 {
+                kinds.push(format!("{} review row{}", review_count, if review_count == 1 { "" } else { "s" }));
+            }
+
+            if kinds.len() == 1 {
+                format!("State updated; {} skipped", kinds[0])
+            } else {
+                format!("State updated; {} evaluator rows skipped", rows_rejected)
+            }
+        }
+    } else {
+        "State update failed".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2423,7 +3295,11 @@ mod tests {
         );
         let response = EvalFormResponse {
             event_rows: vec![
-                event("entry", "The visitor entered Aurora's apartment.", "walks in"),
+                event(
+                    "entry",
+                    "The visitor entered Aurora's apartment.",
+                    "walks in",
+                ),
                 event("close", "The visitor closed the door.", "closes the door"),
             ],
             ..EvalFormResponse::default()
@@ -2480,7 +3356,11 @@ mod tests {
             "I walk in.",
             "The visitor walks in after knocking.",
         );
-        let memory = memory("entry", "Aurora remembers that the visitor knocked before entering.", "walks in");
+        let memory = memory(
+            "entry",
+            "Aurora remembers that the visitor knocked before entering.",
+            "walks in",
+        );
         let candidate_id = memory_candidate_id(&memory);
         let response = EvalFormResponse {
             event_rows: vec![event("entry", "The visitor entered.", "walks in")],
@@ -2497,14 +3377,22 @@ mod tests {
         };
         let result = compile_eval_form_response(&spec, &response, &context);
         assert!(result.output.memory_candidates.is_empty());
-        assert_eq!(result.trace.form_dedupe_decisions[0].candidate_id, candidate_id);
+        assert_eq!(
+            result.trace.form_dedupe_decisions[0].candidate_id,
+            candidate_id
+        );
     }
 
     #[test]
     fn form_dedupe_marks_update_existing() {
         let (soul, world) = soul_and_world();
-        let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
-        let memory = memory("entry", "Aurora updates the entry beat with the visitor inside.", "walks in");
+        let (spec, context) =
+            spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+        let memory = memory(
+            "entry",
+            "Aurora updates the entry beat with the visitor inside.",
+            "walks in",
+        );
         let candidate_id = memory_candidate_id(&memory);
         let result = compile_eval_form_response(
             &spec,
@@ -2537,12 +3425,17 @@ mod tests {
     #[test]
     fn form_memory_row_compiles_to_normalized_draft() {
         let (soul, world) = soul_and_world();
-        let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+        let (spec, context) =
+            spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
         let result = compile_eval_form_response(
             &spec,
             &EvalFormResponse {
                 event_rows: vec![event("entry", "The visitor entered.", "walks in")],
-                memory_rows: vec![memory("entry", "Aurora remembers the visitor came inside.", "walks in")],
+                memory_rows: vec![memory(
+                    "entry",
+                    "Aurora remembers the visitor came inside.",
+                    "walks in",
+                )],
                 ..EvalFormResponse::default()
             },
             &context,
@@ -2554,11 +3447,20 @@ mod tests {
     #[test]
     fn form_relationship_row_compiles_to_delta() {
         let (soul, world) = soul_and_world();
-        let (spec, context) = spec_and_context(&soul, &world, "Long time no see.", "Aurora warms at the greeting.");
+        let (spec, context) = spec_and_context(
+            &soul,
+            &world,
+            "Long time no see.",
+            "Aurora warms at the greeting.",
+        );
         let result = compile_eval_form_response(
             &spec,
             &EvalFormResponse {
-                event_rows: vec![event("greeting", "The visitor greeted Aurora.", "Long time no see")],
+                event_rows: vec![event(
+                    "greeting",
+                    "The visitor greeted Aurora.",
+                    "Long time no see",
+                )],
                 relationship_rows: vec![RelationshipRow {
                     linked_event_id: "greeting".into(),
                     source_soul_id: "aurora_soul".into(),
@@ -2603,7 +3505,10 @@ mod tests {
             },
             &context,
         );
-        assert_eq!(result.output.object_changes[0].object_state.object_id, "apartment_door");
+        assert_eq!(
+            result.output.object_changes[0].object_state.object_id,
+            "apartment_door"
+        );
         assert!(result
             .conversion
             .patch
@@ -2618,7 +3523,8 @@ mod tests {
     #[test]
     fn code_computes_turn_flags_not_llm() {
         let (soul, world) = soul_and_world();
-        let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+        let (spec, context) =
+            spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
         let result = compile_eval_form_response(
             &spec,
             &EvalFormResponse {
@@ -2634,8 +3540,13 @@ mod tests {
     #[test]
     fn code_assigns_decay_profile_not_llm() {
         let (soul, world) = soul_and_world();
-        let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
-        let memory = memory("entry", "Aurora remembers the visitor came inside.", "walks in");
+        let (spec, context) =
+            spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+        let memory = memory(
+            "entry",
+            "Aurora remembers the visitor came inside.",
+            "walks in",
+        );
         let candidate_id = memory_candidate_id(&memory);
         let result = compile_eval_form_response(
             &spec,
@@ -2647,7 +3558,11 @@ mod tests {
             &context,
         );
         assert_eq!(
-            result.trace.code_assigned_decay_profile.get(&candidate_id).map(String::as_str),
+            result
+                .trace
+                .code_assigned_decay_profile
+                .get(&candidate_id)
+                .map(String::as_str),
             Some("slow")
         );
     }
@@ -2687,7 +3602,11 @@ mod tests {
             "The visitor walks in after knocking.",
         );
         assert_eq!(spec.existing_memories.len(), 1);
-        let memory = memory("entry", "Aurora remembers that the visitor knocked before entering.", "walks in");
+        let memory = memory(
+            "entry",
+            "Aurora remembers that the visitor knocked before entering.",
+            "walks in",
+        );
         let candidate_id = memory_candidate_id(&memory);
         let result = compile_eval_form_response(
             &spec,
@@ -2777,7 +3696,8 @@ mod tests {
     #[test]
     fn form_accepts_slot_id_alias_for_slot() {
         let (soul, world) = soul_and_world();
-        let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+        let (spec, context) =
+            spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
         let response = parse_eval_form_response(
             r#"{
                 "event_rows": [{
@@ -2853,7 +3773,8 @@ mod tests {
     #[test]
     fn form_memory_content_can_derive_from_linked_event() {
         let (soul, world) = soul_and_world();
-        let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+        let (spec, context) =
+            spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
         let response = parse_eval_form_response(
             r#"{
                 "event_rows": [{
@@ -2879,7 +3800,7 @@ mod tests {
         assert_eq!(result.trace.form_rows_rejected, 0);
         assert!(result.output.memory_candidates[0]
             .content
-            .contains("The visitor entered Aurora's apartment."));
+            .contains("I walk in."));
     }
 
     #[test]
@@ -2915,7 +3836,9 @@ mod tests {
 
         assert_eq!(result.trace.form_rows_rejected, 0);
         assert_eq!(
-            result.output.object_changes[0].object_state.last_observed_state,
+            result.output.object_changes[0]
+                .object_state
+                .last_observed_state,
             "open_state: open"
         );
     }
@@ -3005,8 +3928,14 @@ mod tests {
         .expect("dimensions split");
 
         assert_eq!(parsed.relationship_rows.len(), 2);
-        assert_eq!(parsed.relationship_rows[0].dimension, Some(RelationshipDimension::Comfort));
-        assert_eq!(parsed.relationship_rows[1].dimension, Some(RelationshipDimension::Curiosity));
+        assert_eq!(
+            parsed.relationship_rows[0].dimension,
+            Some(RelationshipDimension::Comfort)
+        );
+        assert_eq!(
+            parsed.relationship_rows[1].dimension,
+            Some(RelationshipDimension::Curiosity)
+        );
     }
 
     #[test]
@@ -3069,7 +3998,12 @@ mod tests {
         };
         let result = compile_eval_form_response(&spec, &response, &context);
 
-        assert_eq!(result.output.memory_candidates[0].candidate_id.contains("major"), false);
+        assert_eq!(
+            result.output.memory_candidates[0]
+                .candidate_id
+                .contains("major"),
+            false
+        );
         assert_eq!(result.trace.form_rows_rejected, 0);
     }
 
@@ -3095,7 +4029,10 @@ mod tests {
         )
         .expect("summary content");
 
-        assert_eq!(parsed.memory_rows[0].content, "Aurora saw the visitor enter.");
+        assert_eq!(
+            parsed.memory_rows[0].content,
+            "Aurora saw the visitor enter."
+        );
     }
 
     #[test]
@@ -3210,7 +4147,10 @@ mod tests {
         };
         let result = compile_eval_form_response(&spec, &response, &context);
         assert_eq!(result.trace.form_rows_rejected, 0);
-        assert_eq!(result.normalized_response.relationship_rows[0].linked_event_id, "event_baseline_xyz");
+        assert_eq!(
+            result.normalized_response.relationship_rows[0].linked_event_id,
+            "event_baseline_xyz"
+        );
     }
 
     #[test]
@@ -3238,7 +4178,10 @@ mod tests {
         };
         let result = compile_eval_form_response(&spec, &response, &context);
         assert_eq!(result.trace.form_rows_rejected, 0);
-        assert_eq!(result.normalized_response.memory_rows[0].linked_event_id, "event_baseline_xyz");
+        assert_eq!(
+            result.normalized_response.memory_rows[0].linked_event_id,
+            "event_baseline_xyz"
+        );
     }
 
     fn soul_aurora() -> Soul {
@@ -3278,7 +4221,10 @@ mod tests {
         )
         .expect("parse");
 
-        assert_eq!(parsed.relationship_rows[0].dimension, Some(RelationshipDimension::Curiosity));
+        assert_eq!(
+            parsed.relationship_rows[0].dimension,
+            Some(RelationshipDimension::Curiosity)
+        );
         assert_eq!(parsed.relationship_rows[0].selected_tags, vec!["curiosity"]);
     }
 
@@ -3298,15 +4244,32 @@ mod tests {
         )
         .expect("parse");
 
-        assert_eq!(parsed.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
-        assert_eq!(parsed.relationship_rows[0].magnitude_tier, Some(MagnitudeTier::Medium));
+        assert_eq!(
+            parsed.relationship_rows[0].direction,
+            Some(RelationshipDirection::Increase)
+        );
+        assert_eq!(
+            parsed.relationship_rows[0].magnitude_tier,
+            Some(MagnitudeTier::Medium)
+        );
     }
 
     #[test]
     fn relationship_unknown_tag_dropped_not_fatal() {
         let (soul, world) = soul_and_world();
-        let spec = build_eval_form_spec(&soul, Some(&world), "Long time no see.", "Aurora studies the visitor with cautious curiosity.", 8);
-        let context = live_fixture_context(&soul, &world, "Long time no see.", "Aurora studies the visitor with cautious curiosity.");
+        let spec = build_eval_form_spec(
+            &soul,
+            Some(&world),
+            "Long time no see.",
+            "Aurora studies the visitor with cautious curiosity.",
+            8,
+        );
+        let context = live_fixture_context(
+            &soul,
+            &world,
+            "Long time no see.",
+            "Aurora studies the visitor with cautious curiosity.",
+        );
         let response = parse_eval_form_response(
             r#"{
               "event_rows":[{"event_id":"evt","event_type":"scene_event","summary":"Aurora studies the visitor.","participants":["aurora_soul","default_player"],"evidence_quote":"Long time no see."}],
@@ -3322,7 +4285,10 @@ mod tests {
         let result = compile_eval_form_response(&spec, &response, &context);
 
         assert!(result.rejected_rows.is_empty());
-        assert_eq!(result.output.relationship_evaluations[0].curiosity, Some(1.0));
+        assert_eq!(
+            result.output.relationship_evaluations[0].curiosity,
+            Some(1.0)
+        );
     }
 
     #[test]
@@ -3349,7 +4315,17 @@ mod tests {
         .expect("parse");
         let result = compile_eval_form_response(&spec, &response, &context);
 
-        assert_eq!(result.conversion.patch.soul_patch.as_ref().unwrap().relationship_deltas[0].curiosity, Some(1.0));
+        assert_eq!(
+            result
+                .conversion
+                .patch
+                .soul_patch
+                .as_ref()
+                .unwrap()
+                .relationship_deltas[0]
+                .curiosity,
+            Some(1.0)
+        );
     }
 
     #[test]
@@ -3392,7 +4368,8 @@ mod tests {
         let soul = soul_aurora();
         let world = session_world_from_legacy_world("Apartment", None, &soul.world);
         let user = "I walk in. Long time no see, Aurora.";
-        let narrator = "Aurora shifts from waiting alone to playful engagement after the visitor enters.";
+        let narrator =
+            "Aurora shifts from waiting alone to playful engagement after the visitor enters.";
         let spec = build_eval_form_spec(&soul, Some(&world), user, narrator, 8);
         let context = live_fixture_context(&soul, &world, user, narrator);
         let response = parse_eval_form_response(&format!(
@@ -3532,10 +4509,9 @@ mod tests {
         };
         let response = parse_eval_form_response(PAYLOAD4_JSON).expect("parse payload 4");
         let result = compile_eval_form_response(&spec, &response, &context);
-        
-        assert_eq!(result.trace.form_rows_rejected, 2);
-        assert_eq!(result.rejected_rows[0].row_kind, "review");
-        assert_eq!(result.rejected_rows[1].row_kind, "review");
+
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert!(result.rejected_rows.is_empty());
         assert_eq!(result.output.object_changes.len(), 1);
         let object_change = &result.output.object_changes[0];
         assert_eq!(object_change.object_state.object_id, "cigarette_mug");
@@ -3558,18 +4534,38 @@ mod tests {
         };
         let response = parse_eval_form_response(PAYLOAD4_JSON).expect("parse payload 4");
         let result = compile_eval_form_response(&spec, &response, &context);
-        
+
         assert_eq!(result.output.relationship_evaluations.len(), 2);
-        
-        let rel_affection = result.output.relationship_evaluations.iter().find(|r| r.affection.is_some()).unwrap();
+
+        let rel_affection = result
+            .output
+            .relationship_evaluations
+            .iter()
+            .find(|r| r.affection.is_some())
+            .unwrap();
         assert_eq!(rel_affection.affection, Some(2.0));
-        assert_eq!(rel_affection.source_soul_id, "e0ee4936-2e71-4ab9-8631-4c22be68ec72");
+        assert_eq!(
+            rel_affection.source_soul_id,
+            "e0ee4936-2e71-4ab9-8631-4c22be68ec72"
+        );
         assert_eq!(rel_affection.target_entity_id, "default_player");
-        assert!(rel_affection.evidence_quote.as_ref().unwrap().contains("A faint smile"));
-        
-        let rel_comfort = result.output.relationship_evaluations.iter().find(|r| r.comfort.is_some()).unwrap();
+        assert!(rel_affection
+            .evidence_quote
+            .as_ref()
+            .unwrap()
+            .contains("A faint smile"));
+
+        let rel_comfort = result
+            .output
+            .relationship_evaluations
+            .iter()
+            .find(|r| r.comfort.is_some())
+            .unwrap();
         assert_eq!(rel_comfort.comfort, Some(3.0));
-        assert_eq!(rel_comfort.source_soul_id, "e0ee4936-2e71-4ab9-8631-4c22be68ec72");
+        assert_eq!(
+            rel_comfort.source_soul_id,
+            "e0ee4936-2e71-4ab9-8631-4c22be68ec72"
+        );
         assert_eq!(rel_comfort.target_entity_id, "default_player");
     }
 
@@ -3588,11 +4584,22 @@ mod tests {
         };
         let response = parse_eval_form_response(PAYLOAD4_JSON).expect("parse payload 4");
         let result = compile_eval_form_response(&spec, &response, &context);
-        
+
         assert!(result.output.memory_candidates.len() > 0);
-        let rel_mem = result.output.memory_candidates.iter().find(|m| m.slot == MemorySlot::RelationshipMemory).unwrap();
-        assert_eq!(rel_mem.owner_soul_id, "e0ee4936-2e71-4ab9-8631-4c22be68ec72");
-        assert_eq!(rel_mem.target_entity_ids, vec!["default_player".to_string()]);
+        let rel_mem = result
+            .output
+            .memory_candidates
+            .iter()
+            .find(|m| m.slot == MemorySlot::RelationshipMemory)
+            .unwrap();
+        assert_eq!(
+            rel_mem.owner_soul_id,
+            "e0ee4936-2e71-4ab9-8631-4c22be68ec72"
+        );
+        assert_eq!(
+            rel_mem.target_entity_ids,
+            vec!["default_player".to_string()]
+        );
     }
 
     #[test]
@@ -3610,7 +4617,7 @@ mod tests {
         };
         let response = parse_eval_form_response(PAYLOAD4_JSON).expect("parse payload 4");
         let result = compile_eval_form_response(&spec, &response, &context);
-        
+
         for change in &result.output.world_changes {
             if let Some(ref summary) = change.event_summary {
                 assert!(!summary.contains("Aurora welcomes User"));
@@ -3634,9 +4641,1109 @@ mod tests {
         };
         let response = parse_eval_form_response(PAYLOAD4_JSON).expect("parse payload 4");
         let result = compile_eval_form_response(&spec, &response, &context);
-        
+
         assert!(!result.output.memory_candidates.is_empty());
         assert!(!result.output.object_changes.is_empty());
         assert!(!result.output.relationship_evaluations.is_empty());
+    }
+
+    #[test]
+    fn payload4_relationship_comfort_boundary_pressure_compiles() {
+        let soul = soul_aurora();
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let user = "I walk in. Long time no see, Aurora.";
+        let narrator = "The visitor enters Aurora's apartment after knocking. Aurora opens the door with a warm, slightly nervous greeting.";
+        let spec = build_eval_form_spec(&soul, Some(&world), user, narrator, 8);
+        let context = live_fixture_context(&soul, &world, user, narrator);
+        let response = parse_eval_form_response(PAYLOAD4_JSON).expect("parse payload 4");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        let rel_comfort = result
+            .output
+            .relationship_evaluations
+            .iter()
+            .find(|r| r.comfort.is_some())
+            .unwrap();
+        assert_eq!(rel_comfort.comfort, Some(3.0));
+        assert_eq!(rel_comfort.source_soul_id, soul.character_id);
+        assert_eq!(rel_comfort.target_entity_id, "default_player");
+        assert!(rel_comfort.criterion_met);
+    }
+
+    #[test]
+    fn payload4_relationship_conflict_potential_escalation_compiles() {
+        let soul = soul_aurora();
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let user = "I walk in. Long time no see, Aurora.";
+        let narrator = "The visitor enters Aurora's apartment after knocking. Aurora opens the door with a warm, slightly nervous greeting.";
+        let spec = build_eval_form_spec(&soul, Some(&world), user, narrator, 8);
+        let context = live_fixture_context(&soul, &world, user, narrator);
+        let response = parse_eval_form_response(PAYLOAD4_JSON).expect("parse payload 4");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        let payload_json: serde_json::Value = serde_json::from_str(PAYLOAD4_JSON).unwrap();
+        let has_conflict = payload_json["relationship_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["dimension"]
+                    .as_str()
+                    .map(|d| d == "conflict")
+                    .unwrap_or(false)
+            });
+
+        if has_conflict {
+            let rel_conflict = result
+                .output
+                .relationship_evaluations
+                .iter()
+                .find(|r| r.conflict.is_some());
+            assert!(
+                rel_conflict.is_some(),
+                "conflict relationship should be compiled"
+            );
+            let rel_conflict = rel_conflict.unwrap();
+            assert!(
+                rel_conflict.conflict.unwrap() > 0.0,
+                "conflict should be positive"
+            );
+        }
+    }
+
+    #[test]
+    fn payload4_memory_preserves_candidate_text() {
+        let soul = soul_aurora();
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let user = "I walk in. Long time no see, Aurora.";
+        let narrator = "The visitor enters Aurora's apartment after knocking. Aurora opens the door with a warm, slightly nervous greeting.";
+        let spec = build_eval_form_spec(&soul, Some(&world), user, narrator, 8);
+        let context = live_fixture_context(&soul, &world, user, narrator);
+        let response = parse_eval_form_response(PAYLOAD4_JSON).expect("parse payload 4");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        let rel_mem = result
+            .output
+            .memory_candidates
+            .iter()
+            .find(|m| m.slot == MemorySlot::RelationshipMemory)
+            .unwrap();
+        assert!(
+            !rel_mem.content.is_empty(),
+            "memory content should not be empty"
+        );
+        assert!(
+            rel_mem.content.contains("Aurora")
+                && (rel_mem.content.contains("welcomes")
+                    || rel_mem.content.contains("warm")
+                    || rel_mem.content.contains("nervous")),
+            "memory content should preserve candidate text, got: {}",
+            rel_mem.content
+        );
+    }
+
+    #[test]
+    fn payload4_exports_relationship_delta_or_changed_summary() {
+        let soul = soul_aurora();
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let user = "I walk in. Long time no see, Aurora.";
+        let narrator = "The visitor enters Aurora's apartment after knocking. Aurora opens the door with a warm, slightly nervous greeting.";
+        let spec = build_eval_form_spec(&soul, Some(&world), user, narrator, 8);
+        let context = live_fixture_context(&soul, &world, user, narrator);
+        let response = parse_eval_form_response(PAYLOAD4_JSON).expect("parse payload 4");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert!(
+            !result.output.relationship_evaluations.is_empty(),
+            "relationship evaluations should not be empty"
+        );
+        assert_eq!(
+            result.draft.relationship_delta_count,
+            result.output.relationship_evaluations.len(),
+            "draft relationship_delta_count should match evaluations count"
+        );
+    }
+
+    #[test]
+    fn payload4_next_prompt_retrieves_written_memory() {
+        let soul = soul_aurora();
+        let world = session_world_from_legacy_world("Apartment", None, &soul.world);
+        let user = "I walk in. Long time no see, Aurora.";
+        let narrator = "The visitor enters Aurora's apartment after knocking. Aurora opens the door with a warm, slightly nervous greeting.";
+        let spec = build_eval_form_spec(&soul, Some(&world), user, narrator, 8);
+        let context = live_fixture_context(&soul, &world, user, narrator);
+        let response = parse_eval_form_response(PAYLOAD4_JSON).expect("parse payload 4");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert!(
+            result.draft.memory_candidate_count > 0,
+            "draft should have memory candidates"
+        );
+        assert!(
+            !result.output.memory_candidates.is_empty(),
+            "output should have memory candidates"
+        );
+        let has_relationship_memory = result
+            .output
+            .memory_candidates
+            .iter()
+            .any(|m| m.slot == MemorySlot::RelationshipMemory);
+        assert!(
+            has_relationship_memory,
+            "should have at least one relationship memory candidate"
+        );
+    }
+
+    #[test]
+    fn form_validated_relationship_bypasses_second_evidence_check_only_for_that_row() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "I knock.", "Door opens.");
+        let result = compile_eval_form_response(
+            &spec,
+            &EvalFormResponse {
+                event_rows: vec![event("evt_knock", "The visitor knocks", "I knock.")],
+                relationship_rows: vec![RelationshipRow {
+                    linked_event_id: "evt_knock".into(),
+                    source_soul_id: soul.character_id.clone(),
+                    target_entity_id: "default_player".into(),
+                    dimension: Some(RelationshipDimension::Comfort),
+                    direction: Some(RelationshipDirection::Increase),
+                    magnitude_tier: Some(MagnitudeTier::Small),
+                    importance_tier: Some(ImportanceTier::Medium),
+                    evidence_quote: "A faint smile touches her mouth, half anticipation".into(),
+                    ..RelationshipRow::default()
+                }],
+                ..EvalFormResponse::default()
+            },
+            &context,
+        );
+        assert_eq!(
+            result.output.relationship_evaluations.len(),
+            1,
+            "form-validated relationship should compile"
+        );
+        assert!(
+            result.output.relationship_evaluations[0].evidence_validated_by_form,
+            "flag should be true for form path"
+        );
+        let conversion = evaluator_output_to_engine_patch(
+            &result.output,
+            &EvaluatorConversionContext {
+                active_soul_id: &soul.character_id,
+                active_soul_ids: vec![soul.character_id.clone()],
+                latest_user_message: "I knock.",
+                latest_narrator_response: "Door opens.",
+                session_world: Some(&world),
+                baseline_recent_event_id: None,
+            },
+        );
+        assert!(
+            conversion.patch.soul_patch.is_some(),
+            "soul patch should exist from form-validated row"
+        );
+        assert!(
+            !conversion
+                .patch
+                .soul_patch
+                .as_ref()
+                .unwrap()
+                .relationship_deltas
+                .is_empty(),
+            "relationship delta should survive evidence check"
+        );
+        let mut bad_output = result.output.clone();
+        bad_output
+            .relationship_evaluations
+            .push(RelationshipEvaluation {
+                source_soul_id: soul.character_id.clone(),
+                target_entity_id: "default_player".into(),
+                comfort: Some(3.0),
+                evidence_quote: Some("A faint smile touches her mouth, half anticipation".into()),
+                criterion_met: true,
+                confidence: 0.75,
+                evidence_validated_by_form: false,
+                ..RelationshipEvaluation::default()
+            });
+        let bad_conversion = evaluator_output_to_engine_patch(
+            &bad_output,
+            &EvaluatorConversionContext {
+                active_soul_id: &soul.character_id,
+                active_soul_ids: vec![soul.character_id.clone()],
+                latest_user_message: "I knock.",
+                latest_narrator_response: "Door opens.",
+                session_world: Some(&world),
+                baseline_recent_event_id: None,
+            },
+        );
+        assert_eq!(bad_conversion.patch.soul_patch.as_ref().unwrap().relationship_deltas.len(), 1, "only the form-validated row should survive; non-form row with same bad quote should be rejected");
+    }
+
+    #[test]
+    fn latest_payload_event_row_without_id_or_summary_compiles() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(
+            &soul,
+            &world,
+            "I knock.",
+            "A firm, three-rap knock echoes in the hallway.",
+        );
+        let response = parse_eval_form_response(
+            r#"{
+              "event_rows": [{
+                "type": "scene_event",
+                "importance": "medium",
+                "tags": ["scene_event", "doorway"],
+                "evidence_quote": "A firm, three-rap knock echoes in the hallway, cutting through the low hum of the ambient music."
+              }],
+              "relationship_rows": [],
+              "memory_rows": [],
+              "review_rows": []
+            }"#,
+        ).expect("parse should succeed");
+        let event_row = &response.event_rows[0];
+        assert_eq!(
+            event_row.event_type,
+            Some(EventType::SceneEvent),
+            "type should normalize to event_type"
+        );
+        assert_eq!(
+            event_row.importance_tier,
+            Some(ImportanceTier::Medium),
+            "importance should normalize to importance_tier"
+        );
+        assert_eq!(
+            event_row.event_id, "event_latest_turn",
+            "missing event_id should default"
+        );
+        assert!(
+            event_row.objective_summary.contains("knock echoes"),
+            "missing objective_summary should derive from evidence_quote"
+        );
+    }
+
+    #[test]
+    fn latest_payload_object_property_new_state_compiles() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(
+            &soul,
+            &world,
+            "I set it down.",
+            "She sets her wine glass down on the table.",
+        );
+        let response = parse_eval_form_response(
+            r#"{
+              "event_rows": [{
+                "event_id": "evt_wine_glass",
+                "event_type": "scene_event",
+                "summary": "User sets wine glass down",
+                "evidence_quote": "She sets her wine glass down on the table."
+              }],
+              "object_rows": [{
+                "object_id": "wine_glass",
+                "property": "location",
+                "old_state": "being held",
+                "new_state": "on surface",
+                "evidence_quote": "She sets her wine glass down on the table."
+              }],
+              "relationship_rows": [],
+              "memory_rows": [],
+              "review_rows": []
+            }"#,
+        )
+        .expect("parse should succeed");
+        let object_row = &response.object_rows[0];
+        assert_eq!(
+            object_row.property_changed, "location",
+            "property should normalize to property_changed"
+        );
+        assert_eq!(
+            object_row.new_value, "on surface",
+            "new_state should normalize to new_value"
+        );
+        assert_eq!(
+            object_row.old_value,
+            Some("being held".into()),
+            "old_state should normalize to old_value"
+        );
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(
+            result.output.object_changes.len(),
+            1,
+            "object change should compile"
+        );
+        assert_eq!(
+            result.output.object_changes[0].object_state.object_id,
+            "wine_glass"
+        );
+    }
+
+    const LIVE_POOLSIDE_JSON: &str = r#"{
+      "event_rows": [
+        {
+          "event_id": "event_latest_turn",
+          "event_type": "scene_event",
+          "objective_summary": "Aurora and User reunite warm",
+          "participants": ["aurora_soul", "default_player"],
+          "evidence_quote": "She smiles warm and lets you inside."
+        }
+      ],
+      "relationship_rows": [
+        {
+          "relationship_dimension": "trust",
+          "change_direction": "increased",
+          "evidence_quote": "She smiles warm and lets you inside.",
+          "tag_vocabularies": ["relationship", "reunion"]
+        },
+        {
+          "relationship_dimension": "fear",
+          "change_direction": "decreased",
+          "evidence_quote": "She smiles warm and lets you inside.",
+          "tag_vocabularies": ["relationship", "reunion"]
+        }
+      ],
+      "memory_rows": [
+        {
+          "memory_slot": "relationship_memory",
+          "importance_tier": "high",
+          "evidence_quote": "She smiles warm and lets you inside.",
+          "candidate_summary": "Reunion with someone familiar who previously inspired Aurora's sketching"
+        }
+      ],
+      "review_rows": [
+        {
+          "per_soul_evaluation": {
+            "soul_id": "aurora_soul",
+            "soul_perceived_event": true,
+            "soul_knows": []
+          }
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn live_poolside_relationship_dimension_alias_compiles() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+        let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.relationship_evaluations.len(), 2);
+        
+        let trust_delta = result.output.relationship_evaluations.iter().find(|r| r.trust.is_some()).unwrap();
+        assert!(trust_delta.trust.unwrap() > 0.0);
+
+        let fear_delta = result.output.relationship_evaluations.iter().find(|r| r.fear.is_some()).unwrap();
+        assert!(fear_delta.fear.unwrap() < 0.0);
+    }
+
+    #[test]
+    fn live_poolside_memory_slot_alias_compiles() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+        let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.memory_candidates.len(), 1);
+        assert_eq!(result.output.memory_candidates[0].slot, MemorySlot::RelationshipMemory);
+    }
+
+    #[test]
+    fn live_poolside_candidate_summary_becomes_content() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+        let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert_eq!(result.output.memory_candidates[0].content, "Reunion with someone familiar who previously inspired Aurora's sketching");
+    }
+
+    #[test]
+    fn live_poolside_missing_owner_defaults_to_active_soul() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+        let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert_eq!(result.output.memory_candidates[0].owner_soul_id, "aurora_soul");
+    }
+
+    #[test]
+    fn live_poolside_review_without_evidence_is_advisory_not_fatal() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+        let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert!(result.rejected_rows.is_empty());
+    }
+
+    #[test]
+    fn live_poolside_fixture_accepts_more_than_one_row() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+        let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        // 1 event row + 2 relationship rows + 1 memory row + 1 review row = 5 rows accepted
+        assert_eq!(result.trace.form_rows_accepted, 5);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+    }
+
+    #[test]
+    fn live_poolside_fixture_writes_memory_and_relationship_delta() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+        let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
+        let result = compile_eval_form_response(&spec, &response, &context);
+
+        assert!(result.draft.memory_candidate_count > 0);
+        assert!(result.draft.relationship_delta_count > 0);
+        
+        // Also verify the converted report writes memories and relationship deltas
+        let patch = &result.conversion.patch;
+        let soul_patch = patch.soul_patch.as_ref().unwrap();
+        assert_eq!(soul_patch.new_memories.len(), 1);
+        assert_eq!(soul_patch.relationship_deltas.len(), 2);
+    }
+
+    #[test]
+    fn live_unescaped_evidence_quote_repairs_and_parses() {
+        let raw_json = r#"{
+          "event_rows": [{
+            "event_id": "evt_dialogue",
+            "event_type": "scene_event",
+            "objective_summary": "Aurora warns User",
+            "participants": ["aurora_soul", "default_player"],
+            "evidence_quote": "You better not be late" she calls back, voice low and rough with wine"
+          }]
+        }"#;
+        let response = parse_eval_form_response(raw_json).expect("should repair unescaped quotes and parse successfully");
+        assert_eq!(response.event_rows[0].evidence_quote, "You better not be late\" she calls back, voice low and rough with wine");
+    }
+
+    #[test]
+    fn live_shift_direction_relationship_compiles_to_delta() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Warm smiles.");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "source_entity_id": "aurora_soul",
+                "target_entity_id": "default_player",
+                "dimension": "trust",
+                "shift_direction": "increased",
+                "evidence_quote": "Warm smiles."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.output.relationship_evaluations.len(), 1);
+        assert!(result.output.relationship_evaluations[0].trust.unwrap() > 0.0);
+    }
+
+    #[test]
+    fn live_source_entity_id_maps_to_source_soul_id() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Warm smiles.");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "source_entity_id": "aurora_soul",
+                "target_entity_id": "default_player",
+                "dimension": "trust",
+                "shift_direction": "increased",
+                "evidence_quote": "Warm smiles."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.normalized_response.relationship_rows[0].source_soul_id, "aurora_soul");
+    }
+
+    #[test]
+    fn live_relationship_change_type_without_direction_infers_increase_when_dimension_boundary_pressure() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "increased tension, pressure, and conflict");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "source_entity_id": "aurora_soul",
+                "target_entity_id": "default_player",
+                "dimension": "boundary_pressure",
+                "change_type": "shift",
+                "evidence_quote": "increased tension, pressure, and conflict"
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.output.relationship_evaluations.len(), 1);
+        assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+    }
+
+    #[test]
+    fn live_object_state_new_object_label_compiles_to_object_patch() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Fabric drips.");
+        let response = parse_eval_form_response(
+            r#"{
+              "object_rows": [{
+                "entity_id": "jacket",
+                "new_object_label": "wet jacket",
+                "object_state": "placed on chair",
+                "evidence_quote": "Fabric drips."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.output.object_changes.len(), 1);
+        assert_eq!(result.output.object_changes[0].object_state.object_id, "wet_jacket");
+        assert_eq!(result.output.object_changes[0].object_state.status, "placed on chair");
+    }
+
+    #[test]
+    fn live_object_state_defaults_property_changed_state() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Fabric drips.");
+        let response = parse_eval_form_response(
+            r#"{
+              "object_rows": [{
+                "entity_id": "jacket",
+                "new_object_label": "wet jacket",
+                "object_state": "placed on chair",
+                "evidence_quote": "Fabric drips."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.normalized_response.object_rows[0].property_changed, "state");
+    }
+
+    #[test]
+    fn live_content_summary_preserved_in_memory_content() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Fabric drips.");
+        let response = parse_eval_form_response(
+            r#"{
+              "memory_rows": [{
+                "memory_slot": "relationship_memory",
+                "importance_tier": "high",
+                "evidence_quote": "Fabric drips.",
+                "content_summary": "Reunion with someone familiar"
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.output.memory_candidates[0].content, "Reunion with someone familiar");
+    }
+
+    #[test]
+    fn live_candidate_summary_preserved_in_memory_content() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Fabric drips.");
+        let response = parse_eval_form_response(
+            r#"{
+              "memory_rows": [{
+                "memory_slot": "relationship_memory",
+                "importance_tier": "high",
+                "evidence_quote": "Fabric drips.",
+                "candidate_summary": "Reunion with someone familiar who previously inspired Aurora"
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.output.memory_candidates[0].content, "Reunion with someone familiar who previously inspired Aurora");
+    }
+
+    #[test]
+    fn live_memory_does_not_fallback_to_event_summary_when_candidate_exists() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Fabric drips.");
+        let response = parse_eval_form_response(
+            r#"{
+              "memory_rows": [{
+                "memory_slot": "relationship_memory",
+                "importance_tier": "high",
+                "evidence_quote": "Fabric drips.",
+                "candidate_summary": "Reunion with someone familiar who previously inspired Aurora"
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.output.memory_candidates[0].content, "Reunion with someone familiar who previously inspired Aurora");
+    }
+
+    #[test]
+    fn live_full_poolside_payload_writes_memory_relationship_and_object() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "I knock at the door", "Fabric drips.");
+        let response = parse_eval_form_response(
+            r#"{
+              "event_rows": [{
+                "event_id": "event_latest_turn",
+                "event_type": "scene_event",
+                "objective_summary": "User arrives wet at Aurora's door",
+                "participants": ["aurora_soul", "default_player"],
+                "evidence_quote": "Fabric drips."
+              }],
+              "relationship_rows": [{
+                "source_entity_id": "aurora_soul",
+                "target_entity_id": "default_player",
+                "dimension": "boundary_pressure",
+                "shift_direction": "increased",
+                "evidence_quote": "Fabric drips."
+              }],
+              "object_rows": [{
+                "entity_id": "jacket",
+                "new_object_label": "wet jacket",
+                "object_state": "placed on chair",
+                "evidence_quote": "Fabric drips."
+              }],
+              "memory_rows": [{
+                "memory_slot": "relationship_memory",
+                "importance_tier": "high",
+                "evidence_quote": "Fabric drips.",
+                "candidate_summary": "Reunion with someone familiar who previously inspired Aurora's sketching"
+              }],
+              "review_rows": [{
+                "candidate_id": "review_test",
+                "reason": "already verified",
+                "evidence_quote": "Fabric drips."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        
+        let result = compile_eval_form_response(&spec, &response, &context);
+        
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert!(result.trace.form_rows_accepted > 1);
+        assert!(result.draft.memory_candidate_count > 0);
+        assert!(result.draft.relationship_delta_count > 0);
+        
+        let patch = &result.conversion.patch;
+        let soul_patch = patch.soul_patch.as_ref().unwrap();
+        let world_patch = patch.world_patch.as_ref().unwrap();
+        
+        assert!(soul_patch.new_memories.len() > 0);
+        assert!(soul_patch.relationship_deltas.len() > 0);
+        assert!(world_patch.object_observation_operations.len() > 0);
+    }
+
+    #[test]
+    fn relationship_source_slug_aurora_schwarz_resolves_to_active_soul_uuid() {
+        let (mut soul, world) = soul_and_world();
+        soul.character_name = "Aurora Schwarz".into();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Warm smiles.");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "source_entity_id": "aurora_schwarz",
+                "target_entity_id": "default_player",
+                "dimension": "trust",
+                "shift_direction": "increased",
+                "evidence_quote": "Warm smiles."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.relationship_evaluations.len(), 1);
+        assert_eq!(result.output.relationship_evaluations[0].source_soul_id, "aurora_soul");
+    }
+
+    #[test]
+    fn relationship_source_display_name_resolves_to_active_soul_uuid() {
+        let (mut soul, world) = soul_and_world();
+        soul.character_name = "Aurora Schwarz".into();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Warm smiles.");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "source_entity_id": "Aurora Schwarz",
+                "target_entity_id": "default_player",
+                "dimension": "trust",
+                "shift_direction": "increased",
+                "evidence_quote": "Warm smiles."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.relationship_evaluations.len(), 1);
+        assert_eq!(result.output.relationship_evaluations[0].source_soul_id, "aurora_soul");
+    }
+
+    #[test]
+    fn live_payload6_relationship_row_no_longer_rejected() {
+        let (mut soul, world) = soul_and_world();
+        soul.character_name = "Aurora Schwarz".into();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Didn't expect you to actually show up");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "source_entity_id": "aurora_schwarz",
+                "target_entity_id": "default_player",
+                "dimension": "boundary_pressure",
+                "shift_direction": "increased",
+                "evidence_quote": "Didn't expect you to actually show up"
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.relationship_evaluations.len(), 1);
+        assert_eq!(result.output.relationship_evaluations[0].source_soul_id, "aurora_soul");
+        assert_eq!(result.output.relationship_evaluations[0].target_entity_id, "default_player");
+    }
+
+    #[test]
+    fn object_status_alias_becomes_new_value() {
+        let response = parse_eval_form_response(
+            r#"{
+              "object_rows": [{
+                "object_id": "wet_jacket",
+                "new_object_label": "wet jacket",
+                "status": "placed_on_chair",
+                "evidence_quote": "and place a wet jacket over the chair."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        assert_eq!(response.object_rows[0].new_value, "placed_on_chair");
+    }
+
+    #[test]
+    fn object_status_defaults_property_changed_state() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "and place a wet jacket over the chair.");
+        let response = parse_eval_form_response(
+            r#"{
+              "object_rows": [{
+                "object_id": "wet_jacket",
+                "new_object_label": "wet jacket",
+                "status": "placed_on_chair",
+                "evidence_quote": "and place a wet jacket over the chair."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.object_changes.len(), 1);
+        assert_eq!(result.normalized_response.object_rows[0].property_changed, "state");
+    }
+
+    #[test]
+    fn live_payload8_object_rows_compile() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "water darkens the fabric");
+        let response = parse_eval_form_response(
+            r#"{
+              "object_rows": [
+                {
+                  "object_id": "wet_jacket",
+                  "new_object_label": "wet jacket",
+                  "status": "placed_on_chair",
+                  "evidence_quote": "and place a wet jacket over the chair."
+                },
+                {
+                  "object_id": "chair",
+                  "status": "wet_from_jacket_drip",
+                  "evidence_quote": "water darkens the fabric before dripping onto the chair's arm"
+                }
+              ]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.object_changes.len(), 2);
+        assert_eq!(result.output.object_changes[0].object_state.object_id, "wet_jacket");
+        assert_eq!(result.output.object_changes[0].object_state.status, "placed_on_chair");
+        assert_eq!(result.output.object_changes[1].object_state.object_id, "chair");
+        assert_eq!(result.output.object_changes[1].object_state.status, "wet_from_jacket_drip");
+    }
+
+    #[test]
+    fn memory_summary_alias_no_unreachable_pattern_warning() {
+        let response = parse_eval_form_response(
+            r#"{
+              "memory_rows": [{
+                "linked_event_id": "evt",
+                "owner_soul_id": "aurora_soul",
+                "memory_slot": "relationship_memory",
+                "summary": "Reunion with someone familiar",
+                "evidence_quote": "fabric drips"
+              }]
+            }"#
+        ).expect("parse should succeed");
+        assert_eq!(response.memory_rows[0].content, "Reunion with someone familiar");
+    }
+
+    #[test]
+    fn patch_applied_with_rejected_rows_is_not_failure_status() {
+        let rejected = vec![EvalFormRowRejection {
+            row_kind: "object".into(),
+            row_id: "obj1".into(),
+            reason: "invalid".into(),
+        }];
+        let status = format_honest_ui_status(true, true, true, &rejected);
+        assert_eq!(status, "State updated; 1 object row skipped");
+    }
+
+    #[test]
+    fn ui_status_reports_rows_skipped_not_enrichment_failed() {
+        let rejected = vec![
+            EvalFormRowRejection {
+                row_kind: "object".into(),
+                row_id: "obj1".into(),
+                reason: "invalid".into(),
+            },
+            EvalFormRowRejection {
+                row_kind: "relationship".into(),
+                row_id: "rel1".into(),
+                reason: "invalid".into(),
+            }
+        ];
+        let status = format_honest_ui_status(true, true, true, &rejected);
+        assert_eq!(status, "State updated; 2 evaluator rows skipped");
+    }
+
+    #[test]
+    fn live_payload11_chain_lock_change_type_state_change_compiles() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "The chain lock still clicks softly...");
+        let response = parse_eval_form_response(
+            r#"{
+              "object_rows": [{
+                "object_id": "chain_lock",
+                "change_type": "state_change",
+                "importance_tier": "medium",
+                "evidence_quote": "The chain lock still clicks softly against the doorframe..."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.object_changes.len(), 1);
+        assert_eq!(result.output.object_changes[0].object_state.object_id, "chain_lock");
+        assert_eq!(result.output.object_changes[0].object_state.status, "The chain lock still clicks softly against the doorframe...");
+    }
+
+    #[test]
+    fn live_payload11_wet_jacket_new_object_observation_compiles() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "You hang your soaked jacket...");
+        let response = parse_eval_form_response(
+            r#"{
+              "object_rows": [{
+                "object_id": "wet_jacket",
+                "change_type": "new_object_observation",
+                "importance_tier": "low",
+                "evidence_quote": "You hang your soaked jacket on the back of the kitchen chair...",
+                "new_object_label": "wet_jacket"
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.object_changes.len(), 1);
+        assert_eq!(result.output.object_changes[0].object_state.object_id, "wet_jacket");
+        assert_eq!(result.output.object_changes[0].object_state.status, "wet_jacket");
+    }
+
+    #[test]
+    fn object_change_type_defaults_property_and_value() {
+        let response = parse_eval_form_response(
+            r#"{
+              "object_rows": [
+                {
+                  "object_id": "chain_lock",
+                  "change_type": "state_change",
+                  "evidence_quote": "clicks softly"
+                },
+                {
+                  "object_id": "wet_jacket",
+                  "change_type": "new_object_observation",
+                  "new_object_label": "wet_jacket",
+                  "evidence_quote": "hang soaked jacket"
+                }
+              ]
+            }"#
+        ).expect("parse should succeed");
+        assert_eq!(response.object_rows[0].property_changed, "state");
+        assert_eq!(response.object_rows[0].new_value, "clicks softly");
+        assert_eq!(response.object_rows[1].property_changed, "presence");
+        assert_eq!(response.object_rows[1].new_value, "wet_jacket");
+    }
+
+    #[test]
+    fn live_payload11_intimacy_shift_infers_increase() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Suit yourself");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "relationship_dimension": "intimacy",
+                "change_type": "shift",
+                "importance_tier": "high",
+                "evidence_quote": "\"Suit yourself,\" she says, voice dropping..."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.relationship_evaluations.len(), 1);
+        assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+        assert_eq!(result.output.relationship_evaluations[0].intimacy.is_some(), true);
+    }
+
+    #[test]
+    fn live_payload11_trust_shift_infers_increase() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Suit yourself");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "relationship_dimension": "trust",
+                "change_type": "shift",
+                "importance_tier": "high",
+                "evidence_quote": "\"Suit yourself,\" she says, voice dropping..."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.relationship_evaluations.len(), 1);
+        assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+        assert_eq!(result.output.relationship_evaluations[0].trust.is_some(), true);
+    }
+
+    #[test]
+    fn relationship_shift_without_direction_compiles_for_positive_dimension() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Suit yourself");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "relationship_dimension": "affection",
+                "change_type": "shift",
+                "importance_tier": "high",
+                "evidence_quote": "closer connection and deeper affection"
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+    }
+
+    #[test]
+    fn relationship_missing_direction_rejects_as_uncertain() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Suit yourself");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "relationship_dimension": "trust",
+                "change_type": "shift",
+                "importance_tier": "high",
+                "evidence_quote": "generic uninformative quote"
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 1);
+        assert_eq!(result.rejected_rows[0].reason, "direction_missing_uncertain");
+    }
+
+    #[test]
+    fn live_exact_object_change_row_compiles() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "draping it over the back of the chair");
+        let response = parse_eval_form_response(
+            r#"{
+              "object_rows": [{
+                "object_id": "wet_jacket",
+                "change_type": "object_change",
+                "importance_tier": "low",
+                "evidence_quote": "I watch as you shake water from your jacket before draping it over the back of the chair nearest the couch."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.object_changes.len(), 1);
+        
+        let report = evaluator_output_to_engine_patch(&result.output, &context);
+        assert!(!report.patch.is_empty());
+        let world_patch = report.patch.world_patch.as_ref().unwrap();
+        assert!(world_patch.object_observation_operations.len() > 0);
+    }
+
+    #[test]
+    fn live_exact_relationship_shift_row_compiles() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Figured you'd never show... Sorry. Been... been a long time since anyone came by. Your presence brings comfort.");
+        let response = parse_eval_form_response(
+            r#"{
+              "relationship_rows": [{
+                "relationship_dimension": "comfort",
+                "change_type": "relationship_shift",
+                "importance_tier": "medium",
+                "evidence_quote": "Figured you'd never show... Sorry. Been... been a long time since anyone came by. Your presence brings comfort."
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.relationship_evaluations.len(), 1);
+        assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+
+        let report = evaluator_output_to_engine_patch(&result.output, &context);
+        assert!(!report.patch.is_empty());
+        let soul_patch = report.patch.soul_patch.as_ref().unwrap();
+        assert!(soul_patch.relationship_deltas.len() > 0);
+    }
+
+    #[test]
+    fn live_exact_slot_type_memory_row_compiles() {
+        let (soul, world) = soul_and_world();
+        let (spec, context) = spec_and_context(&soul, &world, "Hey", "Aurora's cigarette trembles slightly in her fingers");
+        let response = parse_eval_form_response(
+            r#"{
+              "memory_rows": [{
+                "slot_type": "recent_emotional_state",
+                "importance_tier": "medium",
+                "evidence_quote": "Aurora's cigarette trembles slightly in her fingers",
+                "content_summary": "Aurora is feeling highly anxious and emotional"
+              }]
+            }"#
+        ).expect("parse should succeed");
+        let result = compile_eval_form_response(&spec, &response, &context);
+        assert_eq!(result.trace.form_rows_rejected, 0);
+        assert_eq!(result.output.memory_candidates.len(), 1);
+
+        let report = evaluator_output_to_engine_patch(&result.output, &context);
+        assert!(!report.patch.is_empty());
+        let soul_patch = report.patch.soul_patch.as_ref().unwrap();
+        assert!(soul_patch.new_memories.len() > 0);
+    }
+
+    #[test]
+    fn patch_applied_with_row_skips_does_not_show_hard_failure() {
+        let rejected = vec![
+            EvalFormRowRejection {
+                row_kind: "relationship".into(),
+                row_id: "event_latest_turn:aurora_soul:default_player".into(),
+                reason: "direction_missing_uncertain".into(),
+            }
+        ];
+        let honest_status = format_honest_ui_status(
+            true, // patch_applied
+            true, // materialized_soul_updated
+            true, // materialized_session_world_updated
+            &rejected,
+        );
+        assert_eq!(honest_status, "State updated; 1 relationship row skipped");
     }
 }

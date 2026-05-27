@@ -1,13 +1,13 @@
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::evaluator::{
-    EvaluatorOutputV1, TurnClassification, GlobalSceneEvaluation, PerSoulEvaluation,
-    KnowledgeScope, WorldChangeEvaluation, ObjectChangeEvaluation, RelationshipEvaluation,
-    MemorySlot, MemoryCandidate, RelevanceTags,
+    EvaluatorOutputV1, GlobalSceneEvaluation, KnowledgeScope, MemoryCandidate, MemorySlot,
+    ObjectChangeEvaluation, PerSoulEvaluation, RelationshipEvaluation, RelevanceTags,
+    TurnClassification, WorldChangeEvaluation,
 };
 use crate::patch::SceneStatePatch;
-use crate::soul::{MemorySourceType, TruthStatus, ObjectState};
+use crate::soul::{MemorySourceType, ObjectState, TruthStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvaluatorParseResult {
@@ -251,7 +251,12 @@ fn joined_action_details(action: Option<String>, details: Option<String>) -> Opt
     }
 }
 
-fn stable_candidate_id(owner_or_scope: &str, slot: MemorySlot, evidence: &str, content: &str) -> String {
+fn stable_candidate_id(
+    owner_or_scope: &str,
+    slot: MemorySlot,
+    evidence: &str,
+    content: &str,
+) -> String {
     let source = format!(
         "{}|{}|{}|{}",
         owner_or_scope.trim(),
@@ -275,7 +280,10 @@ fn parse_lax_float_with_warning(
         serde_json::Value::Number(n) => {
             let f = n.as_f64()? as f32;
             if f > 1.0 {
-                warnings.push(format!("{field_name} (Number) > 1.0 ({f}) normalized to {}", f / 100.0));
+                warnings.push(format!(
+                    "{field_name} (Number) > 1.0 ({f}) normalized to {}",
+                    f / 100.0
+                ));
                 Some((f / 100.0).clamp(0.0, 1.0))
             } else {
                 Some(f.clamp(0.0, 1.0))
@@ -285,16 +293,24 @@ fn parse_lax_float_with_warning(
             let s_trim = s.trim();
             if s_trim.ends_with('%') {
                 if let Ok(pct) = s_trim.trim_end_matches('%').trim().parse::<f32>() {
-                    warnings.push(format!("{field_name} percentage string {s:?} normalized to {}", pct / 100.0));
+                    warnings.push(format!(
+                        "{field_name} percentage string {s:?} normalized to {}",
+                        pct / 100.0
+                    ));
                     return Some((pct / 100.0).clamp(0.0, 1.0));
                 }
             }
             if let Ok(f) = s_trim.parse::<f32>() {
                 if f > 1.0 {
-                    warnings.push(format!("{field_name} numeric string {s:?} > 1.0 normalized to {}", f / 100.0));
+                    warnings.push(format!(
+                        "{field_name} numeric string {s:?} > 1.0 normalized to {}",
+                        f / 100.0
+                    ));
                     return Some((f / 100.0).clamp(0.0, 1.0));
                 } else {
-                    warnings.push(format!("{field_name} numeric string {s:?} normalized to float {f}"));
+                    warnings.push(format!(
+                        "{field_name} numeric string {s:?} normalized to float {f}"
+                    ));
                     return Some(f.clamp(0.0, 1.0));
                 }
             }
@@ -307,14 +323,20 @@ fn parse_lax_float_with_warning(
                 _ => None,
             };
             if let Some(m) = mapped {
-                warnings.push(format!("{field_name} semantic string {s:?} normalized to {m}"));
+                warnings.push(format!(
+                    "{field_name} semantic string {s:?} normalized to {m}"
+                ));
             } else {
-                warnings.push(format!("Failed to parse float for field {field_name} from value {val:?}"));
+                warnings.push(format!(
+                    "Failed to parse float for field {field_name} from value {val:?}"
+                ));
             }
             mapped
         }
         _ => {
-            warnings.push(format!("Failed to parse float for field {field_name} from value {val:?}"));
+            warnings.push(format!(
+                "Failed to parse float for field {field_name} from value {val:?}"
+            ));
             None
         }
     }
@@ -338,12 +360,16 @@ fn parse_lax_float_unscaled_with_warning(
             let s_trim = s.trim();
             if s_trim.ends_with('%') {
                 if let Ok(pct) = s_trim.trim_end_matches('%').trim().parse::<f32>() {
-                    warnings.push(format!("{field_name} percentage string {s:?} normalized to unscaled {pct}"));
+                    warnings.push(format!(
+                        "{field_name} percentage string {s:?} normalized to unscaled {pct}"
+                    ));
                     return Some(pct);
                 }
             }
             if let Ok(f) = s_trim.parse::<f32>() {
-                warnings.push(format!("{field_name} numeric string {s:?} parsed as float {f}"));
+                warnings.push(format!(
+                    "{field_name} numeric string {s:?} parsed as float {f}"
+                ));
                 return Some(f);
             }
             let s_lower = s_trim.to_lowercase();
@@ -355,20 +381,30 @@ fn parse_lax_float_unscaled_with_warning(
                 _ => None,
             };
             if let Some(m) = mapped {
-                warnings.push(format!("{field_name} semantic string {s:?} normalized to unscaled {m}"));
+                warnings.push(format!(
+                    "{field_name} semantic string {s:?} normalized to unscaled {m}"
+                ));
             } else {
-                warnings.push(format!("Failed to parse unscaled float for field {field_name} from value {val:?}"));
+                warnings.push(format!(
+                    "Failed to parse unscaled float for field {field_name} from value {val:?}"
+                ));
             }
             mapped
         }
         _ => {
-            warnings.push(format!("Failed to parse unscaled float for field {field_name} from value {val:?}"));
+            warnings.push(format!(
+                "Failed to parse unscaled float for field {field_name} from value {val:?}"
+            ));
             None
         }
     }
 }
 
-fn parse_lax_slot(val: Option<&serde_json::Value>, warnings: &mut Vec<String>, path: &str) -> MemorySlot {
+fn parse_lax_slot(
+    val: Option<&serde_json::Value>,
+    warnings: &mut Vec<String>,
+    path: &str,
+) -> MemorySlot {
     let Some(val) = val else {
         return MemorySlot::Unknown;
     };
@@ -395,7 +431,7 @@ fn parse_lax_slot(val: Option<&serde_json::Value>, warnings: &mut Vec<String>, p
     } else {
         MemorySlot::Unknown
     };
-    
+
     if mapped != MemorySlot::Unknown {
         let expected = mapped.as_label();
         if s_clean != expected {
@@ -407,7 +443,11 @@ fn parse_lax_slot(val: Option<&serde_json::Value>, warnings: &mut Vec<String>, p
     mapped
 }
 
-fn parse_lax_knowledge_scope(val: Option<&serde_json::Value>, warnings: &mut Vec<String>, path: &str) -> KnowledgeScope {
+fn parse_lax_knowledge_scope(
+    val: Option<&serde_json::Value>,
+    warnings: &mut Vec<String>,
+    path: &str,
+) -> KnowledgeScope {
     let Some(val) = val else {
         return KnowledgeScope::NotKnown;
     };
@@ -417,7 +457,9 @@ fn parse_lax_knowledge_scope(val: Option<&serde_json::Value>, warnings: &mut Vec
     };
     let normalized = s.trim().to_ascii_lowercase().replace("-", "_");
     let mapped = match normalized.as_str() {
-        "full" | "observed" | "direct" | "full_observation" => Some(KnowledgeScope::DirectlyObserved),
+        "full" | "observed" | "direct" | "full_observation" => {
+            Some(KnowledgeScope::DirectlyObserved)
+        }
         "hearsay" => Some(KnowledgeScope::HeardAbout),
         "unknown" | "none" => Some(KnowledgeScope::NotKnown),
         "partial" | "partial_knowledge" => Some(KnowledgeScope::Inferred),
@@ -430,7 +472,9 @@ fn parse_lax_knowledge_scope(val: Option<&serde_json::Value>, warnings: &mut Vec
     if let Some(ks) = mapped {
         let expected = ks.as_label();
         if normalized != expected {
-            warnings.push(format!("{path} knowledge_scope alias {s:?} normalized to {expected}"));
+            warnings.push(format!(
+                "{path} knowledge_scope alias {s:?} normalized to {expected}"
+            ));
         }
         ks
     } else {
@@ -439,7 +483,11 @@ fn parse_lax_knowledge_scope(val: Option<&serde_json::Value>, warnings: &mut Vec
     }
 }
 
-fn parse_lax_bool(val: Option<&serde_json::Value>, field_name: &str, warnings: &mut Vec<String>) -> bool {
+fn parse_lax_bool(
+    val: Option<&serde_json::Value>,
+    field_name: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
     let Some(val) = val else {
         return false;
     };
@@ -453,7 +501,9 @@ fn parse_lax_bool(val: Option<&serde_json::Value>, field_name: &str, warnings: &
         serde_json::Value::String(s) => {
             let s_clean = s.trim().to_lowercase();
             let is_true = s_clean == "true" || s_clean == "yes" || s_clean == "1";
-            warnings.push(format!("{field_name} string {s:?} parsed as bool: {is_true}"));
+            warnings.push(format!(
+                "{field_name} string {s:?} parsed as bool: {is_true}"
+            ));
             is_true
         }
         _ => false,
@@ -475,14 +525,22 @@ fn parse_lax_tag_map(
                 let u_val = match v {
                     serde_json::Value::Number(n) => n.as_u64().unwrap_or(1) as u8,
                     serde_json::Value::String(s) => s.trim().parse::<u8>().unwrap_or(1),
-                    serde_json::Value::Bool(b) => if *b { 1 } else { 0 },
+                    serde_json::Value::Bool(b) => {
+                        if *b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                     _ => 1,
                 };
                 map.insert(k.clone(), u_val);
             }
         }
         serde_json::Value::Array(arr) => {
-            warnings.push(format!("{field_name} was parsed from Array instead of Object"));
+            warnings.push(format!(
+                "{field_name} was parsed from Array instead of Object"
+            ));
             for item in arr {
                 if let Some(s) = item.as_str() {
                     map.insert(s.to_string(), 1);
@@ -490,7 +548,9 @@ fn parse_lax_tag_map(
             }
         }
         serde_json::Value::String(s) => {
-            warnings.push(format!("{field_name} was parsed from String instead of Object"));
+            warnings.push(format!(
+                "{field_name} was parsed from String instead of Object"
+            ));
             map.insert(s.to_string(), 1);
         }
         _ => {}
@@ -540,10 +600,24 @@ fn map_turn_classification(
         return TurnClassification::default();
     };
     TurnClassification {
-        is_pure_ooc: parse_lax_bool(lax.is_pure_ooc.as_ref(), "turn_classification.is_pure_ooc", warnings),
-        scene_event_occurred: parse_lax_bool(lax.scene_event_occurred.as_ref(), "turn_classification.scene_event_occurred", warnings),
-        is_retcon_or_correction: parse_lax_bool(lax.is_retcon_or_correction.as_ref(), "turn_classification.is_retcon_or_correction", warnings),
-        human_summary: lax.human_summary.as_ref()
+        is_pure_ooc: parse_lax_bool(
+            lax.is_pure_ooc.as_ref(),
+            "turn_classification.is_pure_ooc",
+            warnings,
+        ),
+        scene_event_occurred: parse_lax_bool(
+            lax.scene_event_occurred.as_ref(),
+            "turn_classification.scene_event_occurred",
+            warnings,
+        ),
+        is_retcon_or_correction: parse_lax_bool(
+            lax.is_retcon_or_correction.as_ref(),
+            "turn_classification.is_retcon_or_correction",
+            warnings,
+        ),
+        human_summary: lax
+            .human_summary
+            .as_ref()
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_default(),
     }
@@ -557,17 +631,60 @@ fn map_global_scene_evaluation(
         return GlobalSceneEvaluation::default();
     };
     GlobalSceneEvaluation {
-        scene_event_occurred: parse_lax_bool(lax.scene_event_occurred.as_ref(), "global_scene_evaluation.scene_event_occurred", warnings),
-        location_changed: parse_lax_bool(lax.location_changed.as_ref(), "global_scene_evaluation.location_changed", warnings),
-        object_state_changed: parse_lax_bool(lax.object_state_changed.as_ref(), "global_scene_evaluation.object_state_changed", warnings),
-        relationship_changed: parse_lax_bool(lax.relationship_changed.as_ref(), "global_scene_evaluation.relationship_changed", warnings),
-        unresolved_tension: parse_lax_bool(lax.unresolved_tension.as_ref(), "global_scene_evaluation.unresolved_tension", warnings),
-        current_plot_advanced: parse_lax_bool(lax.current_plot_advanced.as_ref(), "global_scene_evaluation.current_plot_advanced", warnings),
-        character_identity_changed: parse_lax_bool(lax.character_identity_changed.as_ref(), "global_scene_evaluation.character_identity_changed", warnings),
-        recent_emotional_state_changed: parse_lax_bool(lax.recent_emotional_state_changed.as_ref(), "global_scene_evaluation.recent_emotional_state_changed", warnings),
-        contradiction_detected: parse_lax_bool(lax.contradiction_detected.as_ref(), "global_scene_evaluation.contradiction_detected", warnings),
-        evidence_quote: lax.evidence_quote.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())),
-        summary: lax.summary.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default(),
+        scene_event_occurred: parse_lax_bool(
+            lax.scene_event_occurred.as_ref(),
+            "global_scene_evaluation.scene_event_occurred",
+            warnings,
+        ),
+        location_changed: parse_lax_bool(
+            lax.location_changed.as_ref(),
+            "global_scene_evaluation.location_changed",
+            warnings,
+        ),
+        object_state_changed: parse_lax_bool(
+            lax.object_state_changed.as_ref(),
+            "global_scene_evaluation.object_state_changed",
+            warnings,
+        ),
+        relationship_changed: parse_lax_bool(
+            lax.relationship_changed.as_ref(),
+            "global_scene_evaluation.relationship_changed",
+            warnings,
+        ),
+        unresolved_tension: parse_lax_bool(
+            lax.unresolved_tension.as_ref(),
+            "global_scene_evaluation.unresolved_tension",
+            warnings,
+        ),
+        current_plot_advanced: parse_lax_bool(
+            lax.current_plot_advanced.as_ref(),
+            "global_scene_evaluation.current_plot_advanced",
+            warnings,
+        ),
+        character_identity_changed: parse_lax_bool(
+            lax.character_identity_changed.as_ref(),
+            "global_scene_evaluation.character_identity_changed",
+            warnings,
+        ),
+        recent_emotional_state_changed: parse_lax_bool(
+            lax.recent_emotional_state_changed.as_ref(),
+            "global_scene_evaluation.recent_emotional_state_changed",
+            warnings,
+        ),
+        contradiction_detected: parse_lax_bool(
+            lax.contradiction_detected.as_ref(),
+            "global_scene_evaluation.contradiction_detected",
+            warnings,
+        ),
+        evidence_quote: lax
+            .evidence_quote
+            .as_ref()
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
+        summary: lax
+            .summary
+            .as_ref()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default(),
     }
 }
 
@@ -580,14 +697,46 @@ fn map_relevance_tags(
         return RelevanceTags::default();
     };
     RelevanceTags {
-        setting_tags: parse_lax_tag_map(lax.setting_tags.as_ref(), &format!("{path}.setting_tags"), warnings),
-        location_tags: parse_lax_tag_map(lax.location_tags.as_ref(), &format!("{path}.location_tags"), warnings),
-        interacted_entities: parse_lax_tag_map(lax.interacted_entities.as_ref(), &format!("{path}.interacted_entities"), warnings),
-        event_type_tags: parse_lax_tag_map(lax.event_type_tags.as_ref(), &format!("{path}.event_type_tags"), warnings),
-        object_tags: parse_lax_tag_map(lax.object_tags.as_ref(), &format!("{path}.object_tags"), warnings),
-        emotional_tags: parse_lax_tag_map(lax.emotional_tags.as_ref(), &format!("{path}.emotional_tags"), warnings),
-        memory_slot_tags: parse_lax_tag_map(lax.memory_slot_tags.as_ref(), &format!("{path}.memory_slot_tags"), warnings),
-        per_soul_relevance: parse_lax_tag_map(lax.per_soul_relevance.as_ref(), &format!("{path}.per_soul_relevance"), warnings),
+        setting_tags: parse_lax_tag_map(
+            lax.setting_tags.as_ref(),
+            &format!("{path}.setting_tags"),
+            warnings,
+        ),
+        location_tags: parse_lax_tag_map(
+            lax.location_tags.as_ref(),
+            &format!("{path}.location_tags"),
+            warnings,
+        ),
+        interacted_entities: parse_lax_tag_map(
+            lax.interacted_entities.as_ref(),
+            &format!("{path}.interacted_entities"),
+            warnings,
+        ),
+        event_type_tags: parse_lax_tag_map(
+            lax.event_type_tags.as_ref(),
+            &format!("{path}.event_type_tags"),
+            warnings,
+        ),
+        object_tags: parse_lax_tag_map(
+            lax.object_tags.as_ref(),
+            &format!("{path}.object_tags"),
+            warnings,
+        ),
+        emotional_tags: parse_lax_tag_map(
+            lax.emotional_tags.as_ref(),
+            &format!("{path}.emotional_tags"),
+            warnings,
+        ),
+        memory_slot_tags: parse_lax_tag_map(
+            lax.memory_slot_tags.as_ref(),
+            &format!("{path}.memory_slot_tags"),
+            warnings,
+        ),
+        per_soul_relevance: parse_lax_tag_map(
+            lax.per_soul_relevance.as_ref(),
+            &format!("{path}.per_soul_relevance"),
+            warnings,
+        ),
     }
 }
 
@@ -598,9 +747,11 @@ fn map_memory_candidate(
     path: &str,
 ) -> MemoryCandidate {
     // 1. owner_soul_id mapping
-    let mut owner = lax.owner_soul_id.as_ref()
+    let mut owner = lax
+        .owner_soul_id
+        .as_ref()
         .and_then(|v| v.as_str().map(|s| s.to_string()));
-    
+
     if owner.is_none() {
         for alias in [&lax.soul_id, &lax.primary_soul, &lax.soul, &lax.owner] {
             if let Some(val) = alias {
@@ -614,19 +765,27 @@ fn map_memory_candidate(
     }
     if owner.is_none() {
         if let Some(target_souls) = &lax.target_souls {
-            if let Some(first) = target_souls.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()) {
+            if let Some(first) = target_souls
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+            {
                 owner = Some(first.to_string());
-                warnings.push(format!("{path} target_souls[0] normalized to owner_soul_id"));
+                warnings.push(format!(
+                    "{path} target_souls[0] normalized to owner_soul_id"
+                ));
             }
         }
     }
-    
+
     // Inherit from parent soul ID if empty
     let owner_soul_id = match owner {
         Some(o) if !o.trim().is_empty() => o,
         _ => {
             if let Some(parent) = parent_soul_id {
-                warnings.push(format!("{path} owner_soul_id was missing; inherited parent soul_id {parent:?}"));
+                warnings.push(format!(
+                    "{path} owner_soul_id was missing; inherited parent soul_id {parent:?}"
+                ));
                 parent.to_string()
             } else {
                 "".to_string()
@@ -635,19 +794,43 @@ fn map_memory_candidate(
     };
 
     // 2. estimated_strength / confidence / salience / retrieval_strength mapping
-    let mut confidence = parse_lax_float_with_warning(lax.confidence.as_ref(), &format!("{path}.confidence"), warnings);
-    let mut salience = parse_lax_float_unscaled_with_warning(lax.salience.as_ref(), &format!("{path}.salience"), warnings);
-    let mut retrieval_strength = parse_lax_float_unscaled_with_warning(lax.retrieval_strength.as_ref(), &format!("{path}.retrieval_strength"), warnings);
+    let mut confidence = parse_lax_float_with_warning(
+        lax.confidence.as_ref(),
+        &format!("{path}.confidence"),
+        warnings,
+    );
+    let mut salience = parse_lax_float_unscaled_with_warning(
+        lax.salience.as_ref(),
+        &format!("{path}.salience"),
+        warnings,
+    );
+    let mut retrieval_strength = parse_lax_float_unscaled_with_warning(
+        lax.retrieval_strength.as_ref(),
+        &format!("{path}.retrieval_strength"),
+        warnings,
+    );
 
     if let Some(est_val) = &lax.estimated_strength {
         if confidence.is_none() {
-            confidence = parse_lax_float_with_warning(Some(est_val), &format!("{path}.estimated_strength"), warnings);
+            confidence = parse_lax_float_with_warning(
+                Some(est_val),
+                &format!("{path}.estimated_strength"),
+                warnings,
+            );
         }
         if salience.is_none() {
-            salience = parse_lax_float_unscaled_with_warning(Some(est_val), &format!("{path}.estimated_strength"), warnings);
+            salience = parse_lax_float_unscaled_with_warning(
+                Some(est_val),
+                &format!("{path}.estimated_strength"),
+                warnings,
+            );
         }
         if retrieval_strength.is_none() {
-            retrieval_strength = parse_lax_float_unscaled_with_warning(Some(est_val), &format!("{path}.estimated_strength"), warnings);
+            retrieval_strength = parse_lax_float_unscaled_with_warning(
+                Some(est_val),
+                &format!("{path}.estimated_strength"),
+                warnings,
+            );
         }
     }
 
@@ -710,13 +893,25 @@ fn map_memory_candidate(
                         payload_string(Some(payload), "details"),
                     );
                     if found_content.is_some() {
-                        warnings.push(format!("{path}.payload.action/details normalized to content"));
+                        warnings.push(format!(
+                            "{path}.payload.action/details normalized to content"
+                        ));
                     }
-                    for key in ["content", "details", "summary", "specifics", "interpretation", "action"] {
+                    for key in [
+                        "content",
+                        "details",
+                        "summary",
+                        "specifics",
+                        "interpretation",
+                        "action",
+                    ] {
                         if found_content.is_some() {
                             break;
                         }
-                        if let Some(s) = payload_obj.get(key).and_then(|v| clean_value_string(Some(v))) {
+                        if let Some(s) = payload_obj
+                            .get(key)
+                            .and_then(|v| clean_value_string(Some(v)))
+                        {
                             found_content = Some(s);
                             warnings.push(format!("{path}.payload.{key} normalized to content"));
                             break;
@@ -732,7 +927,11 @@ fn map_memory_candidate(
     };
 
     // 5. actor / target_entity_ids mapping
-    let mut target_entity_ids = parse_lax_string_array_or_keys(lax.target_entity_ids.as_ref(), &format!("{path}.target_entity_ids"), warnings);
+    let mut target_entity_ids = parse_lax_string_array_or_keys(
+        lax.target_entity_ids.as_ref(),
+        &format!("{path}.target_entity_ids"),
+        warnings,
+    );
     if target_entity_ids.is_empty() {
         if let Some(actor) = &lax.actor {
             match actor {
@@ -754,15 +953,24 @@ fn map_memory_candidate(
     }
 
     // 6. tags / relevance_tags mapping
-    let mut relevance_tags = parse_lax_string_array_or_keys(lax.relevance_tags.as_ref(), &format!("{path}.relevance_tags"), warnings);
+    let mut relevance_tags = parse_lax_string_array_or_keys(
+        lax.relevance_tags.as_ref(),
+        &format!("{path}.relevance_tags"),
+        warnings,
+    );
     if relevance_tags.is_empty() {
         if let Some(tags) = &lax.tags {
-            relevance_tags = parse_lax_string_array_or_keys(Some(tags), &format!("{path}.tags"), warnings);
+            relevance_tags =
+                parse_lax_string_array_or_keys(Some(tags), &format!("{path}.tags"), warnings);
         }
     }
 
     // 7. memory_id / candidate_id mapping
-    let evidence_quote = lax.evidence_quote.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
+    let evidence_quote = lax
+        .evidence_quote
+        .as_ref()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
     let candidate_id = if let Some(cid) = lax.candidate_id.as_ref().and_then(|v| v.as_str()) {
         cid.to_string()
     } else if let Some(mid) = lax.memory_id.as_ref().and_then(|v| v.as_str()) {
@@ -770,7 +978,9 @@ fn map_memory_candidate(
         mid.to_string()
     } else {
         let candidate_id = stable_candidate_id(&owner_soul_id, slot, &evidence_quote, &content);
-        warnings.push(format!("{path}.candidate_id generated from owner/slot/evidence/content: {candidate_id}"));
+        warnings.push(format!(
+            "{path}.candidate_id generated from owner/slot/evidence/content: {candidate_id}"
+        ));
         candidate_id
     };
 
@@ -791,7 +1001,9 @@ fn map_memory_candidate(
                         "system_generated" => MemorySourceType::SystemGenerated,
                         "persistent_core" => MemorySourceType::PersistentCore,
                         _ => {
-                            warnings.push(format!("{path}.source_type unknown: {s:?}; defaulting to CurrentSession"));
+                            warnings.push(format!(
+                                "{path}.source_type unknown: {s:?}; defaulting to CurrentSession"
+                            ));
                             MemorySourceType::CurrentSession
                         }
                     }
@@ -820,7 +1032,9 @@ fn map_memory_candidate(
                         "verified_engine" => TruthStatus::VerifiedEngine,
                         "actual_system_event" => TruthStatus::ActualSystemEvent,
                         _ => {
-                            warnings.push(format!("{path}.truth_status unknown: {s:?}; defaulting to SceneEvent"));
+                            warnings.push(format!(
+                                "{path}.truth_status unknown: {s:?}; defaulting to SceneEvent"
+                            ));
                             TruthStatus::SceneEvent
                         }
                     }
@@ -834,7 +1048,11 @@ fn map_memory_candidate(
     };
 
     // 10. knowledge_scope
-    let knowledge_scope = parse_lax_knowledge_scope(lax.knowledge_scope.as_ref(), warnings, &format!("{path}.knowledge_scope"));
+    let knowledge_scope = parse_lax_knowledge_scope(
+        lax.knowledge_scope.as_ref(),
+        warnings,
+        &format!("{path}.knowledge_scope"),
+    );
 
     MemoryCandidate {
         candidate_id,
@@ -842,11 +1060,18 @@ fn map_memory_candidate(
         slot,
         content,
         evidence_quote,
-        criterion_met: parse_lax_bool(lax.criterion_met.as_ref(), &format!("{path}.criterion_met"), warnings),
+        criterion_met: parse_lax_bool(
+            lax.criterion_met.as_ref(),
+            &format!("{path}.criterion_met"),
+            warnings,
+        ),
         confidence: confidence.unwrap_or(0.7),
         salience,
         retrieval_strength,
-        perceived_by_entity_id: lax.perceived_by_entity_id.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())),
+        perceived_by_entity_id: lax
+            .perceived_by_entity_id
+            .as_ref()
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
         target_entity_ids,
         source_type,
         truth_status,
@@ -868,7 +1093,9 @@ fn map_object_change(
 
     // 2. Map top-level aliases to state_obj
     if let Some(obj_val) = &lax.object {
-        warnings.push(format!("{path}.object normalized to object_state.object_id"));
+        warnings.push(format!(
+            "{path}.object normalized to object_state.object_id"
+        ));
         if !state_obj.contains_key("object_id") {
             state_obj.insert("object_id".into(), obj_val.clone());
         }
@@ -878,14 +1105,18 @@ fn map_object_change(
     }
 
     if let Some(change_val) = &lax.change {
-        warnings.push(format!("{path}.change normalized to object_state.last_observed_state"));
+        warnings.push(format!(
+            "{path}.change normalized to object_state.last_observed_state"
+        ));
         if !state_obj.contains_key("last_observed_state") {
             state_obj.insert("last_observed_state".into(), change_val.clone());
         }
     }
 
     if let Some(prev_val) = &lax.previous_state {
-        warnings.push(format!("{path}.previous_state preserved under object_state.properties.previous_state"));
+        warnings.push(format!(
+            "{path}.previous_state preserved under object_state.properties.previous_state"
+        ));
         let mut props_map = match state_obj.get("properties") {
             Some(serde_json::Value::Object(m)) => m.clone(),
             _ => serde_json::Map::new(),
@@ -899,7 +1130,9 @@ fn map_object_change(
     }
 
     if let Some(ent_val) = &lax.entity_id {
-        warnings.push(format!("{path}.entity_id normalized to object_state.owner_entity_id"));
+        warnings.push(format!(
+            "{path}.entity_id normalized to object_state.owner_entity_id"
+        ));
         if !state_obj.contains_key("owner_entity_id") {
             state_obj.insert("owner_entity_id".into(), ent_val.clone());
         }
@@ -907,22 +1140,40 @@ fn map_object_change(
 
     // Apply defaults to state_obj
     if !state_obj.contains_key("object_id") {
-        state_obj.insert("object_id".into(), serde_json::Value::String("unknown_object".to_string()));
+        state_obj.insert(
+            "object_id".into(),
+            serde_json::Value::String("unknown_object".to_string()),
+        );
     }
     if !state_obj.contains_key("object_kind") {
-        state_obj.insert("object_kind".into(), serde_json::Value::String("unknown".to_string()));
+        state_obj.insert(
+            "object_kind".into(),
+            serde_json::Value::String("unknown".to_string()),
+        );
     }
     if !state_obj.contains_key("status") {
-        state_obj.insert("status".into(), serde_json::Value::String("unknown".to_string()));
+        state_obj.insert(
+            "status".into(),
+            serde_json::Value::String("unknown".to_string()),
+        );
     }
     if !state_obj.contains_key("power_state") {
-        state_obj.insert("power_state".into(), serde_json::Value::String("unknown".to_string()));
+        state_obj.insert(
+            "power_state".into(),
+            serde_json::Value::String("unknown".to_string()),
+        );
     }
     if !state_obj.contains_key("notification_mode") {
-        state_obj.insert("notification_mode".into(), serde_json::Value::String("unknown".to_string()));
+        state_obj.insert(
+            "notification_mode".into(),
+            serde_json::Value::String("unknown".to_string()),
+        );
     }
     if !state_obj.contains_key("last_observed_state") {
-        state_obj.insert("last_observed_state".into(), serde_json::Value::String("".to_string()));
+        state_obj.insert(
+            "last_observed_state".into(),
+            serde_json::Value::String("".to_string()),
+        );
     }
     if !state_obj.contains_key("location") {
         state_obj.insert("location".into(), serde_json::Value::String("".to_string()));
@@ -932,53 +1183,71 @@ fn map_object_change(
     }
 
     // Deserialize state_obj into ObjectState
-    let object_state: ObjectState = match serde_json::from_value(serde_json::Value::Object(state_obj)) {
-        Ok(os) => os,
-        Err(e) => {
-            warnings.push(format!("Failed to deserialize ObjectState: {e:?}"));
-            ObjectState {
-                object_observation_id: None,
-                object_id: "unknown_object".to_string(),
-                object_kind: "unknown".to_string(),
-                owner_entity_id: None,
-                location: "".to_string(),
-                status: "unknown".to_string(),
-                open_state: None,
-                lock_state: None,
-                sealed: None,
-                contents_known: None,
-                contents_summary: None,
-                properties: HashMap::new(),
-                power_state: "unknown".to_string(),
-                notification_mode: "unknown".to_string(),
-                vibrate_enabled: None,
-                screen_wake_enabled: None,
-                can_receive_calls: None,
-                can_receive_texts: None,
-                last_observed_state: "".to_string(),
-                confidence: 0.7,
+    let object_state: ObjectState =
+        match serde_json::from_value(serde_json::Value::Object(state_obj)) {
+            Ok(os) => os,
+            Err(e) => {
+                warnings.push(format!("Failed to deserialize ObjectState: {e:?}"));
+                ObjectState {
+                    object_observation_id: None,
+                    object_id: "unknown_object".to_string(),
+                    object_kind: "unknown".to_string(),
+                    owner_entity_id: None,
+                    location: "".to_string(),
+                    status: "unknown".to_string(),
+                    open_state: None,
+                    lock_state: None,
+                    sealed: None,
+                    contents_known: None,
+                    contents_summary: None,
+                    properties: HashMap::new(),
+                    power_state: "unknown".to_string(),
+                    notification_mode: "unknown".to_string(),
+                    vibrate_enabled: None,
+                    screen_wake_enabled: None,
+                    can_receive_calls: None,
+                    can_receive_texts: None,
+                    last_observed_state: "".to_string(),
+                    confidence: 0.7,
+                }
             }
-        }
-    };
+        };
 
     let change_id = if let Some(cid) = lax.change_id.as_ref().and_then(|v| v.as_str()) {
         Some(cid.to_string())
     } else {
-        let evidence_str = lax.evidence_quote.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+        let evidence_str = lax
+            .evidence_quote
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let fb = format!("obj_norm_{}", rand_str_from_evidence(evidence_str));
-        warnings.push(format!("{path}.change_id generated from evidence hash: {fb}"));
+        warnings.push(format!(
+            "{path}.change_id generated from evidence hash: {fb}"
+        ));
         Some(fb)
     };
 
-    let confidence = parse_lax_float_with_warning(lax.confidence.as_ref(), &format!("{path}.confidence"), warnings)
-        .unwrap_or(0.7);
+    let confidence = parse_lax_float_with_warning(
+        lax.confidence.as_ref(),
+        &format!("{path}.confidence"),
+        warnings,
+    )
+    .unwrap_or(0.7);
 
-    let relevance_tags = map_relevance_tags(lax.relevance_tags.as_ref(), warnings, &format!("{path}.relevance_tags"));
+    let relevance_tags = map_relevance_tags(
+        lax.relevance_tags.as_ref(),
+        warnings,
+        &format!("{path}.relevance_tags"),
+    );
 
     ObjectChangeEvaluation {
         change_id,
         object_state,
-        evidence_quote: lax.evidence_quote.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())),
+        evidence_quote: lax
+            .evidence_quote
+            .as_ref()
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
         confidence,
         relevance_tags,
     }
@@ -993,29 +1262,35 @@ fn map_relationship_evaluation(
     let mut changes_obj = None;
     for changes_alias in [&lax.changes, &lax.deltas] {
         if let Some(serde_json::Value::Object(m)) = changes_alias {
-            warnings.push(format!("{path} changes/deltas nested object flattened to relationship evaluation"));
+            warnings.push(format!(
+                "{path} changes/deltas nested object flattened to relationship evaluation"
+            ));
             changes_obj = Some(m.clone());
             break;
         }
     }
 
-    let get_lax_val = |field: &str, primary: Option<&serde_json::Value>| -> Option<serde_json::Value> {
-        if let Some(v) = primary {
-            if !v.is_null() {
-                return Some(v.clone());
-            }
-        }
-        if let Some(changes) = &changes_obj {
-            if let Some(v) = changes.get(field) {
+    let get_lax_val =
+        |field: &str, primary: Option<&serde_json::Value>| -> Option<serde_json::Value> {
+            if let Some(v) = primary {
                 if !v.is_null() {
                     return Some(v.clone());
                 }
             }
-        }
-        None
-    };
+            if let Some(changes) = &changes_obj {
+                if let Some(v) = changes.get(field) {
+                    if !v.is_null() {
+                        return Some(v.clone());
+                    }
+                }
+            }
+            None
+        };
 
-    let parse_field = |field: &str, primary: Option<&serde_json::Value>, warnings: &mut Vec<String>| -> Option<f32> {
+    let parse_field = |field: &str,
+                       primary: Option<&serde_json::Value>,
+                       warnings: &mut Vec<String>|
+     -> Option<f32> {
         let val = get_lax_val(field, primary);
         parse_lax_float_unscaled_with_warning(val.as_ref(), &format!("{path}.{field}"), warnings)
     };
@@ -1032,12 +1307,18 @@ fn map_relationship_evaluation(
     let dependency = parse_field("dependency", lax.dependency.as_ref(), warnings);
     let curiosity = parse_field("curiosity", lax.curiosity.as_ref(), warnings);
     let comfort = parse_field("comfort", lax.comfort.as_ref(), warnings);
-    let boundary_pressure = parse_field("boundary_pressure", lax.boundary_pressure.as_ref(), warnings);
+    let boundary_pressure = parse_field(
+        "boundary_pressure",
+        lax.boundary_pressure.as_ref(),
+        warnings,
+    );
 
     // 2. source_soul_id Mapping
-    let mut source_soul_id = lax.source_soul_id.as_ref()
+    let mut source_soul_id = lax
+        .source_soul_id
+        .as_ref()
         .and_then(|v| v.as_str().map(|s| s.to_string()));
-    
+
     if source_soul_id.is_none() {
         for alias in [&lax.soul_id, &lax.source] {
             if let Some(val) = alias {
@@ -1052,9 +1333,11 @@ fn map_relationship_evaluation(
     let source_soul_id = source_soul_id.unwrap_or_default();
 
     // 3. target_entity_id Mapping
-    let mut target_entity_id = lax.target_entity_id.as_ref()
+    let mut target_entity_id = lax
+        .target_entity_id
+        .as_ref()
         .and_then(|v| v.as_str().map(|s| s.to_string()));
-    
+
     if target_entity_id.is_none() {
         for alias in [&lax.target, &lax.entity_id, &lax.actor] {
             if let Some(val) = alias {
@@ -1069,21 +1352,35 @@ fn map_relationship_evaluation(
     let target_entity_id = target_entity_id.unwrap_or_default();
 
     // 4. evidence quote
-    let evidence_quote = lax.evidence_quote.as_ref().and_then(|v| v.as_str().map(|s| s.to_string()));
+    let evidence_quote = lax
+        .evidence_quote
+        .as_ref()
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
 
     // 5. criterion met
     let criterion_met = if let Some(cm) = &lax.criterion_met {
         parse_lax_bool(Some(cm), &format!("{path}.criterion_met"), warnings)
     } else {
-        evidence_quote.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
+        evidence_quote
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
     };
 
     // 6. confidence
-    let confidence = parse_lax_float_with_warning(lax.confidence.as_ref(), &format!("{path}.confidence"), warnings)
-        .unwrap_or(0.65);
+    let confidence = parse_lax_float_with_warning(
+        lax.confidence.as_ref(),
+        &format!("{path}.confidence"),
+        warnings,
+    )
+    .unwrap_or(0.65);
 
     // 7. relevance tags
-    let relevance_tags = map_relevance_tags(lax.relevance_tags.as_ref(), warnings, &format!("{path}.relevance_tags"));
+    let relevance_tags = map_relevance_tags(
+        lax.relevance_tags.as_ref(),
+        warnings,
+        &format!("{path}.relevance_tags"),
+    );
 
     RelationshipEvaluation {
         source_soul_id,
@@ -1105,6 +1402,7 @@ fn map_relationship_evaluation(
         criterion_met,
         confidence,
         relevance_tags,
+        evidence_validated_by_form: false,
     }
 }
 
@@ -1116,17 +1414,35 @@ fn map_world_change(
     let change_id = if let Some(cid) = lax.change_id.as_ref().and_then(|v| v.as_str()) {
         Some(cid.to_string())
     } else {
-        let evidence_str = lax.evidence_quote.as_ref().and_then(|v| v.as_str()).unwrap_or("");
+        let evidence_str = lax
+            .evidence_quote
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let fb = format!("world_norm_{}", rand_str_from_evidence(evidence_str));
-        warnings.push(format!("{path}.change_id generated from evidence hash: {fb}"));
+        warnings.push(format!(
+            "{path}.change_id generated from evidence hash: {fb}"
+        ));
         Some(fb)
     };
 
-    let confidence = parse_lax_float_with_warning(lax.confidence.as_ref(), &format!("{path}.confidence"), warnings)
-        .unwrap_or(0.7);
+    let confidence = parse_lax_float_with_warning(
+        lax.confidence.as_ref(),
+        &format!("{path}.confidence"),
+        warnings,
+    )
+    .unwrap_or(0.7);
 
-    let active_plot_add = parse_lax_string_array_or_keys(lax.active_plot_add.as_ref(), &format!("{path}.active_plot_add"), warnings);
-    let active_plot_resolve = parse_lax_string_array_or_keys(lax.active_plot_resolve.as_ref(), &format!("{path}.active_plot_resolve"), warnings);
+    let active_plot_add = parse_lax_string_array_or_keys(
+        lax.active_plot_add.as_ref(),
+        &format!("{path}.active_plot_add"),
+        warnings,
+    );
+    let active_plot_resolve = parse_lax_string_array_or_keys(
+        lax.active_plot_resolve.as_ref(),
+        &format!("{path}.active_plot_resolve"),
+        warnings,
+    );
 
     let scene_state: Option<SceneStatePatch> = if let Some(ss_val) = &lax.scene_state {
         match serde_json::from_value(ss_val.clone()) {
@@ -1140,32 +1456,48 @@ fn map_world_change(
         None
     };
 
-    let relevance_tags = map_relevance_tags(lax.relevance_tags.as_ref(), warnings, &format!("{path}.relevance_tags"));
+    let relevance_tags = map_relevance_tags(
+        lax.relevance_tags.as_ref(),
+        warnings,
+        &format!("{path}.relevance_tags"),
+    );
 
-    let event_summary = lax.event_summary.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())).or_else(|| {
-        let parts = [
-            clean_value_string(lax.change_type.as_ref()),
-            clean_value_string(lax.target.as_ref()),
-            clean_value_string(lax.new_state.as_ref()),
-            clean_value_string(lax.evidence_quote.as_ref()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-        (!parts.is_empty()).then(|| {
-            warnings.push(format!("{path}.event_summary synthesized from change_type/target/new_state/evidence"));
-            parts.join(": ")
-        })
-    });
+    let event_summary = lax
+        .event_summary
+        .as_ref()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .or_else(|| {
+            let parts = [
+                clean_value_string(lax.change_type.as_ref()),
+                clean_value_string(lax.target.as_ref()),
+                clean_value_string(lax.new_state.as_ref()),
+                clean_value_string(lax.evidence_quote.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| {
+                warnings.push(format!(
+                    "{path}.event_summary synthesized from change_type/target/new_state/evidence"
+                ));
+                parts.join(": ")
+            })
+        });
 
     WorldChangeEvaluation {
         change_id,
-        location: lax.location.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())),
+        location: lax
+            .location
+            .as_ref()
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
         event_summary,
         scene_state,
         active_plot_add,
         active_plot_resolve,
-        evidence_quote: lax.evidence_quote.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())),
+        evidence_quote: lax
+            .evidence_quote
+            .as_ref()
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
         confidence,
         relevance_tags,
     }
@@ -1176,7 +1508,10 @@ fn map_per_soul_evaluation(
     warnings: &mut Vec<String>,
     path: &str,
 ) -> PerSoulEvaluation {
-    let mut soul_id_opt = lax.soul_id.as_ref().and_then(|v| v.as_str().map(|s| s.to_string()));
+    let mut soul_id_opt = lax
+        .soul_id
+        .as_ref()
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
     if soul_id_opt.is_none() {
         for alias in [&lax.primary_soul, &lax.soul, &lax.owner] {
             if let Some(val) = alias {
@@ -1192,33 +1527,69 @@ fn map_per_soul_evaluation(
 
     let observed = parse_lax_bool(lax.observed.as_ref(), &format!("{path}.observed"), warnings);
 
-    let knowledge_scope = parse_lax_knowledge_scope(lax.knowledge_scope.as_ref(), warnings, &format!("{path}.knowledge_scope"));
+    let knowledge_scope = parse_lax_knowledge_scope(
+        lax.knowledge_scope.as_ref(),
+        warnings,
+        &format!("{path}.knowledge_scope"),
+    );
 
     let relationship_deltas = if let Some(deltas) = &lax.relationship_deltas {
-        deltas.iter().enumerate().map(|(idx, d)| {
-            map_relationship_evaluation(d, warnings, &format!("{path}.relationship_deltas[{idx}]"))
-        }).collect()
+        deltas
+            .iter()
+            .enumerate()
+            .map(|(idx, d)| {
+                map_relationship_evaluation(
+                    d,
+                    warnings,
+                    &format!("{path}.relationship_deltas[{idx}]"),
+                )
+            })
+            .collect()
     } else {
         Vec::new()
     };
 
-    let parent_soul_id_ref = if !soul_id.is_empty() { Some(soul_id.as_str()) } else { None };
+    let parent_soul_id_ref = if !soul_id.is_empty() {
+        Some(soul_id.as_str())
+    } else {
+        None
+    };
     let memory_candidates = if let Some(candidates) = &lax.memory_candidates {
-        candidates.iter().enumerate().map(|(idx, c)| {
-            map_memory_candidate(c, parent_soul_id_ref, warnings, &format!("{path}.memory_candidates[{idx}]"))
-        }).collect()
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| {
+                map_memory_candidate(
+                    c,
+                    parent_soul_id_ref,
+                    warnings,
+                    &format!("{path}.memory_candidates[{idx}]"),
+                )
+            })
+            .collect()
     } else {
         Vec::new()
     };
 
-    let relevance_tags = map_relevance_tags(lax.relevance_tags.as_ref(), warnings, &format!("{path}.relevance_tags"));
+    let relevance_tags = map_relevance_tags(
+        lax.relevance_tags.as_ref(),
+        warnings,
+        &format!("{path}.relevance_tags"),
+    );
 
     PerSoulEvaluation {
         soul_id,
         observed,
         knowledge_scope,
-        subjective_interpretation: lax.subjective_interpretation.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default(),
-        emotional_state: lax.emotional_state.as_ref().and_then(|v| v.as_str().map(|s| s.to_string())),
+        subjective_interpretation: lax
+            .subjective_interpretation
+            .as_ref()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        emotional_state: lax
+            .emotional_state
+            .as_ref()
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
         relationship_deltas,
         memory_candidates,
         relevance_tags,
@@ -1229,17 +1600,24 @@ pub fn map_evaluator_output(
     lax: LaxEvaluatorOutput,
     warnings: &mut Vec<String>,
 ) -> EvaluatorOutputV1 {
-    let schema_version = lax.schema_version.as_ref()
+    let schema_version = lax
+        .schema_version
+        .as_ref()
         .and_then(|v| match v {
             serde_json::Value::Number(n) => n.as_u64().map(|x| x as u32),
             serde_json::Value::String(s) => s.trim().parse::<u32>().ok(),
             _ => None,
         })
         .unwrap_or(1);
-    
-    let thought_process = lax.thought_process.as_ref().and_then(|v| v.as_str().map(|s| s.to_string()));
 
-    let turn_flags_u64 = lax.turn_flags_u64.as_ref()
+    let thought_process = lax
+        .thought_process
+        .as_ref()
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
+
+    let turn_flags_u64 = lax
+        .turn_flags_u64
+        .as_ref()
         .and_then(|v| match v {
             serde_json::Value::Number(n) => n.as_u64(),
             serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
@@ -1249,51 +1627,71 @@ pub fn map_evaluator_output(
 
     let turn_classification = map_turn_classification(lax.turn_classification.as_ref(), warnings);
 
-    let global_scene_evaluation = map_global_scene_evaluation(lax.global_scene_evaluation.as_ref(), warnings);
+    let global_scene_evaluation =
+        map_global_scene_evaluation(lax.global_scene_evaluation.as_ref(), warnings);
 
     let per_soul_evaluations = if let Some(pse) = &lax.per_soul_evaluations {
-        pse.iter().enumerate().map(|(idx, se)| {
-            map_per_soul_evaluation(se, warnings, &format!("per_soul_evaluations[{idx}]"))
-        }).collect()
+        pse.iter()
+            .enumerate()
+            .map(|(idx, se)| {
+                map_per_soul_evaluation(se, warnings, &format!("per_soul_evaluations[{idx}]"))
+            })
+            .collect()
     } else {
         Vec::new()
     };
 
     let world_changes = if let Some(wc) = &lax.world_changes {
-        wc.iter().enumerate().map(|(idx, c)| {
-            map_world_change(c, warnings, &format!("world_changes[{idx}]"))
-        }).collect()
+        wc.iter()
+            .enumerate()
+            .map(|(idx, c)| map_world_change(c, warnings, &format!("world_changes[{idx}]")))
+            .collect()
     } else {
         Vec::new()
     };
 
     let object_changes = if let Some(oc) = &lax.object_changes {
-        oc.iter().enumerate().map(|(idx, c)| {
-            map_object_change(c, warnings, &format!("object_changes[{idx}]"))
-        }).collect()
+        oc.iter()
+            .enumerate()
+            .map(|(idx, c)| map_object_change(c, warnings, &format!("object_changes[{idx}]")))
+            .collect()
     } else {
         Vec::new()
     };
 
     let relationship_evaluations = if let Some(re) = &lax.relationship_evaluations {
-        re.iter().enumerate().map(|(idx, e)| {
-            map_relationship_evaluation(e, warnings, &format!("relationship_evaluations[{idx}]"))
-        }).collect()
+        re.iter()
+            .enumerate()
+            .map(|(idx, e)| {
+                map_relationship_evaluation(
+                    e,
+                    warnings,
+                    &format!("relationship_evaluations[{idx}]"),
+                )
+            })
+            .collect()
     } else {
         Vec::new()
     };
 
     let memory_candidates = if let Some(mc) = &lax.memory_candidates {
-        mc.iter().enumerate().map(|(idx, c)| {
-            map_memory_candidate(c, None, warnings, &format!("memory_candidates[{idx}]"))
-        }).collect()
+        mc.iter()
+            .enumerate()
+            .map(|(idx, c)| {
+                map_memory_candidate(c, None, warnings, &format!("memory_candidates[{idx}]"))
+            })
+            .collect()
     } else {
         Vec::new()
     };
 
-    let relevance_tags = map_relevance_tags(lax.relevance_tags.as_ref(), warnings, "relevance_tags");
+    let relevance_tags =
+        map_relevance_tags(lax.relevance_tags.as_ref(), warnings, "relevance_tags");
 
-    let no_op_reason = lax.no_op_reason.as_ref().and_then(|v| v.as_str().map(|s| s.to_string()));
+    let no_op_reason = lax
+        .no_op_reason
+        .as_ref()
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
 
     EvaluatorOutputV1 {
         schema_version,
@@ -1321,7 +1719,11 @@ fn is_active_soul(context: Option<&EvaluatorDraftContext>, entity_id: &str) -> b
 
 fn has_world_effect(output: &EvaluatorOutputV1) -> bool {
     output.world_changes.iter().any(|change| {
-        change.event_summary.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        change
+            .event_summary
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
             || change.scene_state.is_some()
             || !change.active_plot_add.is_empty()
             || !change.active_plot_resolve.is_empty()
@@ -1353,7 +1755,10 @@ fn minimal_scene_state(context: &EvaluatorDraftContext, summary: &str) -> SceneS
             &current_scene,
         )),
         current_scene: Some(current_scene),
-        focus: Some(format!("{} and default_player", context.active_soul_display_name)),
+        focus: Some(format!(
+            "{} and default_player",
+            context.active_soul_display_name
+        )),
         participants: vec![context.active_soul_id.clone(), "default_player".into()],
         last_user_action: (!context.latest_user_message.trim().is_empty())
             .then(|| context.latest_user_message.trim().to_string()),
@@ -1381,7 +1786,11 @@ fn route_top_level_world_memories(
             ));
             output.world_changes.push(WorldChangeEvaluation {
                 change_id: Some(stable_candidate_id(
-                    if owner.is_empty() { "session_world" } else { owner },
+                    if owner.is_empty() {
+                        "session_world"
+                    } else {
+                        owner
+                    },
                     candidate.slot,
                     &candidate.evidence_quote,
                     &candidate.content,
@@ -1436,7 +1845,8 @@ fn add_relationship_delta_from_memory(
         });
     relation.source_soul_id = Some(serde_json::Value::String(candidate.owner_soul_id.clone()));
     relation.evidence_quote = Some(serde_json::Value::String(candidate.evidence_quote.clone()));
-    if relation.target_entity_id.is_none() && relation.target.is_none() && relation.actor.is_none() {
+    if relation.target_entity_id.is_none() && relation.target.is_none() && relation.actor.is_none()
+    {
         relation.target_entity_id = clean_value_string(lax.target.as_ref())
             .or_else(|| clean_value_string(lax.actor.as_ref()))
             .or_else(|| Some("default_player".into()))
@@ -1458,7 +1868,10 @@ fn add_recent_emotional_state_candidate(
     draft: &mut NormalizedEvaluationDraft,
     context: Option<&EvaluatorDraftContext>,
 ) {
-    if !output.global_scene_evaluation.recent_emotional_state_changed {
+    if !output
+        .global_scene_evaluation
+        .recent_emotional_state_changed
+    {
         return;
     }
     let Some(context) = context else {
@@ -1468,13 +1881,24 @@ fn add_recent_emotional_state_candidate(
         if per_soul.soul_id != context.active_soul_id {
             continue;
         }
-        let Some(emotional_state) = per_soul.emotional_state.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        let Some(emotional_state) = per_soul
+            .emotional_state
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
             continue;
         };
-        let Some(evidence) = output.global_scene_evaluation.evidence_quote.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
-            draft.candidate_quality_decisions.push(
-                "recent emotional state rejected: missing evidence_quote".into(),
-            );
+        let Some(evidence) = output
+            .global_scene_evaluation
+            .evidence_quote
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            draft
+                .candidate_quality_decisions
+                .push("recent emotional state rejected: missing evidence_quote".into());
             continue;
         };
         if emotional_state.len() < 12 || emotional_state.eq_ignore_ascii_case("tense") {
@@ -1509,9 +1933,9 @@ fn add_recent_emotional_state_candidate(
             relevance_tags: vec!["recent_emotional_state".into()],
             knowledge_scope: KnowledgeScope::DirectlyObserved,
         });
-        draft.candidate_quality_decisions.push(
-            "recent emotional state candidate created with evidence".into(),
-        );
+        draft
+            .candidate_quality_decisions
+            .push("recent emotional state candidate created with evidence".into());
     }
 }
 
@@ -1571,11 +1995,7 @@ fn create_normalized_draft(
 
     if scene_turn_detected(output) && !has_world_effect(output) {
         if let Some(context) = context {
-            let summary = output
-                .global_scene_evaluation
-                .summary
-                .trim()
-                .to_string();
+            let summary = output.global_scene_evaluation.summary.trim().to_string();
             let fallback_summary = if summary.is_empty() {
                 context.latest_user_message.clone()
             } else {
@@ -1585,7 +2005,11 @@ fn create_normalized_draft(
                 change_id: Some(stable_candidate_id(
                     "session_world",
                     MemorySlot::CurrentPlotMemory,
-                    output.global_scene_evaluation.evidence_quote.as_deref().unwrap_or(""),
+                    output
+                        .global_scene_evaluation
+                        .evidence_quote
+                        .as_deref()
+                        .unwrap_or(""),
                     &fallback_summary,
                 )),
                 event_summary: Some(fallback_summary.clone()),
@@ -1599,8 +2023,10 @@ fn create_normalized_draft(
                 ..WorldChangeEvaluation::default()
             });
             draft.state_effect_guarantee_applied = true;
-            draft.state_effect_guarantee_reason =
-                Some("scene turn had no usable world effect; synthesized recent_event and scene_state".into());
+            draft.state_effect_guarantee_reason = Some(
+                "scene turn had no usable world effect; synthesized recent_event and scene_state"
+                    .into(),
+            );
         }
     }
 
@@ -1611,7 +2037,10 @@ fn create_normalized_draft(
             .map(|soul| soul.memory_candidates.len())
             .sum::<usize>();
     draft.world_event_count = output.world_changes.len();
-    draft.scene_state_present = output.world_changes.iter().any(|change| change.scene_state.is_some());
+    draft.scene_state_present = output
+        .world_changes
+        .iter()
+        .any(|change| change.scene_state.is_some());
     draft.relationship_delta_count = output.relationship_evaluations.len()
         + output
             .per_soul_evaluations
@@ -1844,7 +2273,9 @@ mod tests {
         })
         .to_string();
         let parsed = parse_evaluator_output_with_context(&raw, Some(&ctx())).unwrap();
-        assert!(parsed.output.per_soul_evaluations[0].memory_candidates.is_empty());
+        assert!(parsed.output.per_soul_evaluations[0]
+            .memory_candidates
+            .is_empty());
         assert!(parsed
             .draft
             .candidate_quality_decisions

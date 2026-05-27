@@ -3093,8 +3093,8 @@ pub async fn send_api_turn(
         }
     };
     let mut active_provider_completion = provider_completion;
-    let raw_response = active_provider_completion.raw_text.clone();
-    let parsed = match parse_hidden_state(&raw_response) {
+    let mut raw_response = active_provider_completion.raw_text.clone();
+    let mut parsed = match parse_hidden_state(&raw_response) {
         Ok(parsed) => parsed,
         Err(err) => {
             emit_dev_log(
@@ -3110,6 +3110,78 @@ pub async fn send_api_turn(
             return Err(err.to_string());
         }
     };
+
+    let without_hidden = strip_hidden_state_blocks(&parsed.visible_text);
+    let (without_engine_patch, _) = strip_engine_patch_payloads(&without_hidden);
+    let (body, _, _) = remove_status_blocks(&without_engine_patch);
+
+    if is_body_only_markers(&body) {
+        emit_dev_log(
+            &window,
+            "warning",
+            "narrator",
+            "Narrator body consists only of status or assistant markers. Retrying narrator generation once.",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "bad_body": body.trim()
+            })),
+        );
+
+        stream_chunk_count.store(0, Ordering::Relaxed);
+        stream_byte_count.store(0, Ordering::Relaxed);
+
+        let retry_started = Instant::now();
+        match provider
+            .complete_streaming_messages(
+                &narrator_settings,
+                narrator_payload.messages.clone(),
+                |chunk| {
+                    stream_chunk_count_for_callback.fetch_add(1, Ordering::Relaxed);
+                    stream_byte_count_for_callback
+                        .fetch_add(chunk.as_bytes().len() as u64, Ordering::Relaxed);
+                    window
+                        .emit(
+                            "api-chunk",
+                            StreamChunk {
+                                conversation_id: stream_conversation_id.clone(),
+                                chunk: chunk.to_string(),
+                            },
+                        )
+                        .map_err(|err| err.to_string())
+                },
+            )
+            .await
+        {
+            Ok(new_completion) => {
+                emit_perf_log(
+                    &window,
+                    &conversation_id,
+                    "narrator API retry call",
+                    retry_started.elapsed(),
+                );
+                active_provider_completion = new_completion;
+                raw_response = active_provider_completion.raw_text.clone();
+                parsed = match parse_hidden_state(&raw_response) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        return Err(format!("Narrator retry response parse failed: {err}"));
+                    }
+                };
+
+                let without_hidden_retry = strip_hidden_state_blocks(&parsed.visible_text);
+                let (without_engine_patch_retry, _) =
+                    strip_engine_patch_payloads(&without_hidden_retry);
+                let (body_retry, _, _) = remove_status_blocks(&without_engine_patch_retry);
+
+                if is_body_only_markers(&body_retry) {
+                    return Err("bad narrator output, regenerate".to_string());
+                }
+            }
+            Err(err) => {
+                return Err(format!("Narrator retry failed: {err}"));
+            }
+        }
+    }
     let mut retry_response_score = 0.0f32;
     let mut selected_response_source = "original".to_string();
     let mut ooc_detection_reason = "scene_turn".to_string();
@@ -5661,6 +5733,63 @@ fn recent_assistant_replay_sources(messages: &[ChatMessage], limit: usize) -> Ve
             content: message.content.clone(),
         })
         .collect()
+}
+
+fn is_body_only_markers(body: &str) -> bool {
+    let trimmed_body = body.trim();
+    if trimmed_body.is_empty() {
+        return true;
+    }
+
+    for line in trimmed_body.lines() {
+        let line_trimmed = line.trim();
+        if line_trimmed.is_empty() {
+            continue;
+        }
+
+        let lower = line_trimmed.to_lowercase();
+
+        if is_status_summary_line(&lower) {
+            continue;
+        }
+
+        let clean_assistant = lower.trim_matches(|c: char| !c.is_alphabetic());
+        if clean_assistant == "assistant" {
+            continue;
+        }
+
+        let words: Vec<&str> = lower.split_whitespace().collect();
+        let mut line_is_marker = true;
+        for word in words {
+            let clean_word = word.trim_matches(|c: char| !c.is_alphabetic());
+            if clean_word.is_empty() {
+                continue;
+            }
+            if clean_word != "assistant"
+                && clean_word != "status"
+                && clean_word != "scene"
+                && clean_word != "focus"
+                && clean_word != "physical"
+                && clean_word != "state"
+                && clean_word != "atmosphere"
+                && clean_word != "not"
+                && clean_word != "specified"
+                && clean_word != "unspecified"
+                && clean_word != "unknown"
+            {
+                line_is_marker = false;
+                break;
+            }
+        }
+
+        if line_is_marker {
+            continue;
+        }
+
+        return false;
+    }
+
+    true
 }
 
 fn guard_narrator_visible_response(
@@ -8952,10 +9081,17 @@ async fn run_background_evaluator_job(
     } else {
         "completed"
     };
+    let honest_status_str;
     let error_msg = if enrichment_stale_skipped {
         Some("source turn is no longer on active branch")
     } else if !runtime.form_rejected_rows.is_empty() {
-        Some("some enrichment rows rejected")
+        honest_status_str = state_engine::evaluator_form::format_honest_ui_status(
+            !engine_patch.is_empty(),
+            true,
+            true,
+            &runtime.form_rejected_rows,
+        );
+        Some(honest_status_str.as_str())
     } else {
         None
     };
@@ -11070,6 +11206,19 @@ fn llm_payload_response_update_from_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_body_only_markers() {
+        assert_eq!(is_body_only_markers(""), true);
+        assert_eq!(is_body_only_markers("   "), true);
+        assert_eq!(is_body_only_markers("Assistant"), true);
+        assert_eq!(is_body_only_markers("[Assistant]"), true);
+        assert_eq!(is_body_only_markers("Scene | Focus: chain_lock"), true);
+        assert_eq!(
+            is_body_only_markers("The chain lock clicked against the doorframe."),
+            false
+        );
+    }
     use state_engine::{
         context_compiler::estimate_tokens,
         evaluator_ingest::parse_evaluator_output,

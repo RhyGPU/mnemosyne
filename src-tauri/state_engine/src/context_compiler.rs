@@ -16,7 +16,8 @@ const USER_RECENT_CHAT_CHARS: usize = 500;
 const LATEST_ASSISTANT_EXCHANGE_CHARS: usize = 1_200;
 const LATEST_USER_EXCHANGE_CHARS: usize = 1_000;
 const LATEST_EXCHANGE_INSTRUCTION: &str = "Continue from this section first. If older context conflicts with this section, ignore older context. Continue from the final state of the last narrator response and the latest user input. Do not replay earlier beats.";
-const CURRENT_USER_FOLLOWS_LINE: &str = "The current user message follows as the next user message.";
+const CURRENT_USER_FOLLOWS_LINE: &str =
+    "The current user message follows as the next user message.";
 const FILLER_MEMORY_PHRASES: &[&str] = &[
     "neutral exchange added texture",
     "context cue",
@@ -203,7 +204,12 @@ pub fn compile_context_for_session_separate_user_message(
     session_world: Option<&SessionWorld>,
     messages: &[ContextMessage],
 ) -> ContextPreview {
-    compile_context_for_session_separate_user_message_with_pending(soul, session_world, messages, None)
+    compile_context_for_session_separate_user_message_with_pending(
+        soul,
+        session_world,
+        messages,
+        None,
+    )
 }
 
 pub fn compile_context_for_session_separate_user_message_with_pending(
@@ -237,7 +243,15 @@ pub fn compile_context_with_budget_and_world(
     messages: &[ContextMessage],
     budget: &ContextBudget,
 ) -> ContextPreview {
-    compile_context_with_budget_and_options(soul, session_world, messages, budget, false, false, None)
+    compile_context_with_budget_and_options(
+        soul,
+        session_world,
+        messages,
+        budget,
+        false,
+        false,
+        None,
+    )
 }
 
 pub fn compile_context_for_session_with_debug_replies(
@@ -518,7 +532,8 @@ fn score_memory_for_slot<'a>(
     soul: &Soul,
     source_query_active: bool,
 ) -> ScoredMemory<'a> {
-    let mut scored = score_recent_memory(memory, query_terms, soul.turn_counter, source_query_active);
+    let mut scored =
+        score_recent_memory(memory, query_terms, soul.turn_counter, source_query_active);
     if evaluator_slot_matches(memory, slot) {
         scored.score += 36.0;
     }
@@ -573,8 +588,18 @@ fn slot_matches_memory(
             let relationship_text = contains_any(
                 &lower,
                 &[
-                    "trust", "distrust", "affection", "fear of", "bond", "betray",
-                    "relationship", "promise", "boundary", "owes", "forgave", "conflict",
+                    "trust",
+                    "distrust",
+                    "affection",
+                    "fear of",
+                    "bond",
+                    "betray",
+                    "relationship",
+                    "promise",
+                    "boundary",
+                    "owes",
+                    "forgave",
+                    "conflict",
                     "argued",
                 ],
             ) || tag.contains("relationship")
@@ -592,8 +617,17 @@ fn slot_matches_memory(
             contains_any(
                 &lower,
                 &[
-                    "plot", "goal", "testing", "developing", "trying to", "investigate",
-                    "current", "mission", "task", "intention", "future",
+                    "plot",
+                    "goal",
+                    "testing",
+                    "developing",
+                    "trying to",
+                    "investigate",
+                    "current",
+                    "mission",
+                    "task",
+                    "intention",
+                    "future",
                 ],
             ) || tag.contains("plot")
                 || plot_matches_memory(memory, query_terms, world_terms)
@@ -602,8 +636,16 @@ fn slot_matches_memory(
             contains_any(
                 &lower,
                 &[
-                    "identity", "is an", "is a", "role", "self-concept", "name",
-                    "analysis agent", "test subject", "purpose", "belongs to",
+                    "identity",
+                    "is an",
+                    "is a",
+                    "role",
+                    "self-concept",
+                    "name",
+                    "analysis agent",
+                    "test subject",
+                    "purpose",
+                    "belongs to",
                 ],
             ) || tag.contains("identity")
                 || tag.contains("schema")
@@ -612,8 +654,18 @@ fn slot_matches_memory(
             contains_any(
                 &lower,
                 &[
-                    "unresolved", "tension", "betray", "promise", "commitment", "boundary",
-                    "conflict", "guilt", "concern", "afraid", "owed", "not resolved",
+                    "unresolved",
+                    "tension",
+                    "betray",
+                    "promise",
+                    "commitment",
+                    "boundary",
+                    "conflict",
+                    "guilt",
+                    "concern",
+                    "afraid",
+                    "owed",
+                    "not resolved",
                     "argued",
                 ],
             ) || tag.contains("conflict")
@@ -623,8 +675,18 @@ fn slot_matches_memory(
             contains_any(
                 &lower,
                 &[
-                    "location", "world", "room", "cell", "lab", "testing room", "kitchen",
-                    "door", "hallway", "object", "terminal", "white room",
+                    "location",
+                    "world",
+                    "room",
+                    "cell",
+                    "lab",
+                    "testing room",
+                    "kitchen",
+                    "door",
+                    "hallway",
+                    "object",
+                    "terminal",
+                    "white room",
                 ],
             ) || plot_matches_memory(memory, query_terms, world_terms)
                 || tag.contains("orientation")
@@ -633,8 +695,17 @@ fn slot_matches_memory(
             contains_any(
                 &lower,
                 &[
-                    "feels", "felt", "afraid", "angry", "concerned", "guilt", "ashamed",
-                    "diagnostic mode", "guarded", "distressed", "relieved",
+                    "feels",
+                    "felt",
+                    "afraid",
+                    "angry",
+                    "concerned",
+                    "guilt",
+                    "ashamed",
+                    "diagnostic mode",
+                    "guarded",
+                    "distressed",
+                    "relieved",
                 ],
             ) || tag.contains("emotion")
                 || tag.contains("trauma")
@@ -689,7 +760,9 @@ fn entity_matches_active_soul(memory: &MemoryEntry, soul: &Soul) -> bool {
     memory
         .perceived_by_entity_id
         .as_deref()
-        .map(|entity| entity.eq_ignore_ascii_case(active) || entity.eq_ignore_ascii_case(active_name))
+        .map(|entity| {
+            entity.eq_ignore_ascii_case(active) || entity.eq_ignore_ascii_case(active_name)
+        })
         .unwrap_or(true)
 }
 
@@ -755,7 +828,9 @@ fn plot_matches_memory(
     world_terms: &HashSet<String>,
 ) -> bool {
     let memory_terms = token_set(&memory.content);
-    memory_terms.iter().any(|term| world_terms.contains(term) || query_terms.contains(term))
+    memory_terms
+        .iter()
+        .any(|term| world_terms.contains(term) || query_terms.contains(term))
 }
 
 fn world_memory_terms(soul: &Soul) -> HashSet<String> {
@@ -789,23 +864,30 @@ fn is_durable_memory_text(text: &str) -> bool {
     contains_any(
         &text.to_ascii_lowercase(),
         &[
-            "promise", "betray", "identity", "boundary", "future intention", "resolved",
-            "unresolved", "turning point", "important", "prefers", "refuses", "commitment",
-            "testing memory", "building mnemosyne",
+            "promise",
+            "betray",
+            "identity",
+            "boundary",
+            "future intention",
+            "resolved",
+            "unresolved",
+            "turning point",
+            "important",
+            "prefers",
+            "refuses",
+            "commitment",
+            "testing memory",
+            "building mnemosyne",
         ],
     )
 }
 
 fn build_verified_memory_layer_reply_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
-    let Some(reply) = soul
-        .debug_memory_layer_replies
-        .iter()
-        .find(|reply| {
-            reply.architecture_verified
-                && !reply.nonce.trim().is_empty()
-                && !reply.content.trim().is_empty()
-        })
-    else {
+    let Some(reply) = soul.debug_memory_layer_replies.iter().find(|reply| {
+        reply.architecture_verified
+            && !reply.nonce.trim().is_empty()
+            && !reply.content.trim().is_empty()
+    }) else {
         return BuiltSection {
             text: String::new(),
             truncated: false,
@@ -847,10 +929,7 @@ fn build_world_section(
     let mut lines = vec![
         format!("Source: {source}"),
         format!("World: {}", fallback(setting_name, "Unnamed World")),
-        format!(
-            "Location: {}",
-            fallback(&world.location, "Unspecified")
-        ),
+        format!("Location: {}", fallback(&world.location, "Unspecified")),
         format!(
             "Time elapsed: {}",
             normalize_time_elapsed_display(fallback(&world.time_elapsed, "Unknown"))
@@ -879,8 +958,10 @@ fn build_world_section(
         .background_plots
         .iter()
         .filter(|plot| {
-            matches!(plot.status, PlotStatus::Background | PlotStatus::Stale | PlotStatus::Unknown)
-                && !plot.title.trim().is_empty()
+            matches!(
+                plot.status,
+                PlotStatus::Background | PlotStatus::Stale | PlotStatus::Unknown
+            ) && !plot.title.trim().is_empty()
         })
         .take(3)
         .map(|plot| format!("{} ({})", plot.title.trim(), plot.status.as_label()))
@@ -1244,11 +1325,13 @@ fn score_recent_memory<'a>(
         .filter(|confidence| confidence.is_finite())
         .map(|confidence| if confidence < 0.55 { 20.0 } else { 0.0 })
         .unwrap_or(0.0);
-    let score =
-        memory.salience + (memory.retrieval_strength * 0.35) + (overlap * 20.0) + recency_bonus
-            + source_adjustment
-            - repetition_penalty
-            - confidence_penalty;
+    let score = memory.salience
+        + (memory.retrieval_strength * 0.35)
+        + (overlap * 20.0)
+        + recency_bonus
+        + source_adjustment
+        - repetition_penalty
+        - confidence_penalty;
 
     ScoredMemory {
         memory,
@@ -1773,13 +1856,11 @@ mod tests {
     #[test]
     fn first_turn_no_premature_recent_event_in_context() {
         let soul = new_default_soul("Aurora");
-        let mut session_world =
-            crate::setting::session_world_from_setting(&crate::setting::new_default_setting(
-                "Aurora Apartment",
-            ));
-        session_world.recent_events = vec![
-            "The conversation continued without a major rupture: I knock on the door".into(),
-        ];
+        let mut session_world = crate::setting::session_world_from_setting(
+            &crate::setting::new_default_setting("Aurora Apartment"),
+        );
+        session_world.recent_events =
+            vec!["The conversation continued without a major rupture: I knock on the door".into()];
         let preview = compile_context_for_session_separate_user_message_with_pending(
             &soul,
             Some(&session_world),
@@ -2228,15 +2309,18 @@ mod tests {
     #[test]
     fn verified_memory_layer_reply_appears_in_debug_section() {
         let mut soul = new_default_soul("Echo-0");
-        soul.debug_memory_layer_replies.push(crate::soul::MemoryLayerReply {
-            nonce: "nonce-123".into(),
-            content: "Debug memory-layer nonce reply received.".into(),
-            created_at: 10,
-            architecture_verified: true,
-        });
+        soul.debug_memory_layer_replies
+            .push(crate::soul::MemoryLayerReply {
+                nonce: "nonce-123".into(),
+                content: "Debug memory-layer nonce reply received.".into(),
+                created_at: 10,
+                architecture_verified: true,
+            });
 
         let preview = compile_context_for_messages(&soul, &[]);
-        assert!(!preview.text.contains("[MEMORY LAYER REPLY - VERIFIED DEBUG]"));
+        assert!(!preview
+            .text
+            .contains("[MEMORY LAYER REPLY - VERIFIED DEBUG]"));
 
         let debug_preview = compile_context_for_session_with_debug_replies(&soul, None, &[]);
         assert!(debug_preview
@@ -2326,8 +2410,9 @@ mod tests {
                 content: "We talk about the quiet testing room.".into(),
             }],
         );
-        assert!(!section_text(&normal.text, "[RECENT EMOTIONAL STATE]")
-            .contains("memory-like trace"));
+        assert!(
+            !section_text(&normal.text, "[RECENT EMOTIONAL STATE]").contains("memory-like trace")
+        );
 
         let referenced = compile_context_for_messages(
             &soul,
@@ -2425,7 +2510,9 @@ mod tests {
         bar_memory.memory_slot = Some("relationship_memory".into());
         bar_memory.knowledge_scope = Some("directly_observed".into());
         bar_memory.target_entity_ids = vec!["x".into()];
-        bar_memory.relevance_tags.insert("Blue Lantern bar".into(), 95);
+        bar_memory
+            .relevance_tags
+            .insert("Blue Lantern bar".into(), 95);
         bar_memory.relevance_tags.insert("x".into(), 90);
         soul.memory.recent.push(bar_memory);
         soul.world.location = "Blue Lantern bar".into();
@@ -2459,7 +2546,9 @@ mod tests {
         bar_memory.memory_slot = Some("relationship_memory".into());
         bar_memory.knowledge_scope = Some("directly_observed".into());
         bar_memory.target_entity_ids = vec!["x".into()];
-        bar_memory.relevance_tags.insert("Blue Lantern bar".into(), 95);
+        bar_memory
+            .relevance_tags
+            .insert("Blue Lantern bar".into(), 95);
         persona_b.memory.recent.push(bar_memory);
         persona_b.world.location = "Blue Lantern bar".into();
 
@@ -2498,10 +2587,10 @@ mod tests {
 
         let preview = compile_context_for_messages(&soul, &[]);
 
-        assert!(section_text(&preview.text, "[CHARACTER IDENTITY MEMORY]")
-            .contains("analysis agent"));
-        assert!(section_text(&preview.text, "[CURRENT PLOT MEMORY]")
-            .contains("memory retrieval"));
+        assert!(
+            section_text(&preview.text, "[CHARACTER IDENTITY MEMORY]").contains("analysis agent")
+        );
+        assert!(section_text(&preview.text, "[CURRENT PLOT MEMORY]").contains("memory retrieval"));
     }
 
     #[test]

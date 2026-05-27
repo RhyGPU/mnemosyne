@@ -177,7 +177,10 @@ impl TruthStatus {
     }
 
     pub fn is_engine_verified(self) -> bool {
-        matches!(self, TruthStatus::VerifiedEngine | TruthStatus::ActualSystemEvent)
+        matches!(
+            self,
+            TruthStatus::VerifiedEngine | TruthStatus::ActualSystemEvent
+        )
     }
 }
 
@@ -784,7 +787,10 @@ mod tests {
 
         assert_ne!(session.character_id, soul.character_id);
         assert_eq!(session.soul_kind, "session_clone");
-        assert_eq!(session.source_soul_id.as_deref(), Some(soul.character_id.as_str()));
+        assert_eq!(
+            session.source_soul_id.as_deref(),
+            Some(soul.character_id.as_str())
+        );
         assert_eq!(
             session.source_savepoint_id.as_deref(),
             Some(soul.character_id.as_str())
@@ -796,7 +802,10 @@ mod tests {
         assert_eq!(session.character_name, soul.character_name);
         assert_eq!(session.profile, soul.profile);
         assert_eq!(session.turn_counter, soul.turn_counter);
-        assert_eq!(session.turns_since_consolidation, soul.turns_since_consolidation);
+        assert_eq!(
+            session.turns_since_consolidation,
+            soul.turns_since_consolidation
+        );
         assert_eq!(session.global, soul.global);
         assert_eq!(session.trauma, soul.trauma);
         assert_eq!(session.relationships, soul.relationships);
