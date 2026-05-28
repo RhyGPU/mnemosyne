@@ -6166,8 +6166,9 @@ fn apply_output_contract_guard_core(
 ) -> OutputContractResult {
     let mut warnings = Vec::new();
     let mut repair_action = None;
-    let without_hidden = strip_hidden_state_blocks(content);
-    if without_hidden.trim_end() != content.trim_end() {
+    let cleaned_entry = state_engine::hidden_state::strip_assistant_close_tag(content);
+    let without_hidden = strip_hidden_state_blocks(&cleaned_entry);
+    if without_hidden.trim_end() != cleaned_entry.trim_end() {
         warnings.push("hidden state stripped");
     }
     let (without_engine_patch, engine_patch_stripped) =
@@ -6206,7 +6207,8 @@ fn apply_output_contract_guard_core(
     if status_blocks.len() > 1 {
         warnings.push("multiple status blocks normalized");
     }
-    let mut normalized = body.trim().to_string();
+    let cleaned_body = state_engine::hidden_state::strip_assistant_close_tag(&body);
+    let mut normalized = cleaned_body.trim().to_string();
 
     // Pure OOC Turn classification (priority primarily on user message)
     let user_is_ooc = is_ooc_or_gm_prefix(user_text);
@@ -6242,8 +6244,10 @@ fn apply_output_contract_guard_core(
         repair_action = Some("appended_unknown_fallback".to_string());
     }
 
+    let finalized_text = state_engine::hidden_state::strip_assistant_close_tag(&normalized);
+
     OutputContractResult {
-        text: normalized.trim_end().to_string(),
+        text: finalized_text.trim_end().to_string(),
         warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
         status_repair_action: repair_action,
     }
@@ -16565,5 +16569,55 @@ mod tests {
         trace.finalize_timing(500);
 
         assert_eq!(trace.total_elapsed_ms, 5000);
+    }
+
+    #[test]
+    fn narrator_visible_response_strips_trailing_assistant_close_tag() {
+        let input = "Aurora steps onto the damp sidewalk.</assistant>";
+        let out = apply_output_contract_guard(input, "I look around");
+        assert_eq!(out.text.trim(), "Aurora steps onto the damp sidewalk.\n\n```status\nScene | Focus: Unknown | Physical state: Not specified | Atmosphere: Not specified\n```");
+    }
+
+    #[test]
+    fn ooc_response_strips_trailing_assistant_close_tag() {
+        let input = "OOC: Understood, we can proceed with that.</assistant>";
+        let out = apply_output_contract_guard(input, "OOC: Let's do it");
+        assert_eq!(
+            out.text.trim(),
+            "OOC: Understood, we can proceed with that."
+        );
+    }
+
+    #[test]
+    fn status_block_response_strips_assistant_tag_but_preserves_status() {
+        let input = "Aurora nods.\n\n```status\nScene | Focus: Aurora | Physical state: Damp | Atmosphere: Rainy\n```</assistant>";
+        let out = apply_output_contract_guard(input, "I smile");
+        assert!(out.text.contains("Focus: Aurora"));
+        assert!(!out.text.contains("</assistant>"));
+        assert!(out.text.ends_with("```"));
+    }
+
+    #[test]
+    fn evaluator_json_with_outer_assistant_tag_still_parses() {
+        let raw_json = r#"{"schema_version":1,"event_rows":[],"relationship_rows":[],"memory_rows":[],"object_rows":[]}</assistant>"#;
+        let parsed = parse_eval_form_response_with_trace(raw_json);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn repeated_trailing_tags_are_stripped() {
+        let input = "Aurora nods.</assistant>  </assistant>\n</assistant>";
+        let out = apply_output_contract_guard(input, "I smile");
+        assert!(!out.text.contains("</assistant>"));
+    }
+
+    #[test]
+    fn status_block_repair_strips_assistant_tag_between_body_and_status() {
+        let input = "Aurora nods.</assistant>\n\n```status\nScene | Focus: Aurora | Physical state: Damp | Atmosphere: Rainy\n```";
+        let out = apply_output_contract_guard(input, "I smile");
+        assert!(out.text.contains("Aurora nods."));
+        assert!(!out.text.contains("</assistant>"));
+        let expected = "Aurora nods.\n\n```status\nScene | Focus: Aurora | Physical state: Damp | Atmosphere: Rainy\n```";
+        assert_eq!(out.text.trim(), expected);
     }
 }

@@ -1,7 +1,13 @@
+use std::collections::HashMap;
+
 use super::*;
 use crate::{
-    setting::session_world_from_legacy_world,
-    soul::{new_default_soul, MemoryEntry},
+    evaluator::{
+        evaluator_output_to_engine_patch, turn_flags, EvaluatorConversionContext, MemorySlot,
+        RelationshipEvaluation,
+    },
+    setting::{session_world_from_legacy_world, SessionWorld},
+    soul::{new_default_soul, MemoryEntry, MemorySourceType, ObjectState, Soul, TruthStatus},
 };
 
 fn soul_and_world() -> (Soul, SessionWorld) {
@@ -2686,4 +2692,236 @@ fn accepted_relationship_row_without_delta_is_reported_non_delta() {
     
     let key = format!("event_latest_turn:aurora_soul:default_player:trust");
     assert_eq!(result.trace.relationship_row_results.get(&key), Some(&"non_delta_no_change".to_string()));
+}
+
+// ---- Object-row defaulting tests (Gap 1 & Gap 2 fixes) ----
+
+#[test]
+fn object_row_empty_new_value_derives_from_evidence_quote() {
+    // Gap 1: property_changed = "state" already set, new_value empty.
+    // normalize_object_aliases (struct-level, called inside compile) should
+    // fill new_value from evidence_quote before the validator runs.
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "I hang the jacket.",
+        "The wet jacket drips onto the floor.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "event_rows": [{
+            "event_id": "jacket_hang",
+            "event_type": "scene_event",
+            "summary": "The visitor hung up the wet jacket.",
+            "participants": ["aurora_soul", "default_player"],
+            "evidence_quote": "The wet jacket drips onto the floor."
+          }],
+          "object_rows": [{
+            "linked_event_id": "jacket_hang",
+            "object_id": "wet_jacket",
+            "property_changed": "state",
+            "evidence_quote": "The wet jacket drips onto the floor."
+          }]
+        }"#,
+    )
+    .expect("parse should succeed");
+
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    // Verify struct-level normalization derived new_value
+    let norm_row = &result.normalized_response.object_rows[0];
+    assert!(
+        !norm_row.new_value.trim().is_empty(),
+        "new_value should be derived from evidence_quote after normalization, got empty"
+    );
+    assert_eq!(norm_row.new_value, "The wet jacket drips onto the floor.");
+
+    assert_eq!(
+        result.trace.form_rows_rejected, 0,
+        "row should pass validation after new_value is derived"
+    );
+    assert_eq!(result.output.object_changes.len(), 1);
+    assert_eq!(
+        result.output.object_changes[0].object_state.object_id,
+        "wet_jacket"
+    );
+    // compiler_result in row trace must be object_patch_created
+    let obj_trace = result
+        .trace
+        .evaluator_row_traces
+        .iter()
+        .find(|t| t.row_kind == "object")
+        .expect("object row trace should exist");
+    assert_eq!(obj_trace.compiler_result, "object_patch_created");
+}
+
+#[test]
+fn object_row_missing_id_infers_wet_jacket_from_evidence() {
+    // Gap 2: object_id and new_object_label both missing.
+    // Evidence contains "wet jacket" → after struct-level normalize_object_aliases
+    // the normalized row should have object_id containing "jacket".
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "I hang my jacket.",
+        "You hang your soaked jacket on the back of the kitchen chair.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "change_type": "state_change",
+            "evidence_quote": "You hang your soaked wet jacket on the back of the kitchen chair."
+          }]
+        }"#,
+    )
+    .expect("parse should succeed");
+
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    // Check normalized row for inferred id
+    let norm_row = &result.normalized_response.object_rows[0];
+    assert!(
+        norm_row.object_id.as_deref().map(|id| id.contains("jacket")).unwrap_or(false)
+            || norm_row.new_object_label.as_deref().map(|l| l.contains("jacket")).unwrap_or(false),
+        "object_id or new_object_label should contain 'jacket' after normalization, got object_id={:?} label={:?}",
+        norm_row.object_id,
+        norm_row.new_object_label
+    );
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.output.object_changes.len(), 1);
+    let obj_id = &result.output.object_changes[0].object_state.object_id;
+    assert!(
+        obj_id.contains("jacket"),
+        "compiled object_id should contain 'jacket', got {obj_id}"
+    );
+}
+
+#[test]
+fn object_row_missing_id_infers_chair_from_evidence() {
+    // Gap 2 with a different noun: evidence mentions "chair".
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "I pull out the chair.",
+        "The wooden chair scrapes against the floor.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "change_type": "state_change",
+            "evidence_quote": "The wooden chair scrapes against the floor."
+          }]
+        }"#,
+    )
+    .expect("parse should succeed");
+
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    let norm_row = &result.normalized_response.object_rows[0];
+    assert!(
+        norm_row.object_id.as_deref().map(|id| id.contains("chair")).unwrap_or(false)
+            || norm_row.new_object_label.as_deref().map(|l| l.contains("chair")).unwrap_or(false),
+        "should infer 'chair' after normalization, got object_id={:?} label={:?}",
+        norm_row.object_id,
+        norm_row.new_object_label
+    );
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.output.object_changes.len(), 1);
+    assert!(result.output.object_changes[0].object_state.object_id.contains("chair"));
+}
+
+#[test]
+fn object_row_without_physical_object_still_rejects() {
+    // Abstract evidence with no known physical noun — must still be rejected.
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "The atmosphere shifts.",
+        "Tension fills the room.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "change_type": "state_change",
+            "evidence_quote": "Tension fills the room."
+          }]
+        }"#,
+    )
+    .expect("parse should succeed");
+
+    let result = compile_eval_form_response(&spec, &response, &context);
+    // No physical noun found → object_id still missing → validator rejects
+    assert!(
+        result.trace.form_rows_rejected > 0 || result.output.object_changes.is_empty(),
+        "abstract-only evidence should not produce an object change"
+    );
+    if !result.rejected_rows.is_empty() {
+        assert!(
+            result.rejected_rows.iter().any(|r| r.row_kind == "object"),
+            "rejection should be for the object row"
+        );
+    }
+}
+
+#[test]
+fn live_wet_jacket_chair_rows_create_object_patch() {
+    // End-to-end: two minimal object rows (wet jacket + chair) from a real
+    // live payload where the LLM omitted object_id and new_value.
+    // Both should produce object_patch_created in the row trace.
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "I hang my jacket on the chair.",
+        "You drape your soaked wet jacket over the back of the wooden chair.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "event_rows": [{
+            "event_id": "jacket_placed",
+            "event_type": "scene_event",
+            "summary": "The visitor draped wet jacket over chair.",
+            "participants": ["aurora_soul", "default_player"],
+            "evidence_quote": "You drape your soaked wet jacket over the back of the wooden chair."
+          }],
+          "object_rows": [
+            {
+              "linked_event_id": "jacket_placed",
+              "change_type": "state_change",
+              "evidence_quote": "You drape your soaked wet jacket over the back of the wooden chair."
+            },
+            {
+              "linked_event_id": "jacket_placed",
+              "change_type": "state_change",
+              "evidence_quote": "The wooden chair now has the visitor's wet jacket draped over it."
+            }
+          ]
+        }"#,
+    )
+    .expect("parse should succeed");
+
+    let result = compile_eval_form_response(&spec, &response, &context);
+    assert_eq!(
+        result.trace.form_rows_rejected, 0,
+        "both rows should pass validation, rejected: {:?}",
+        result.rejected_rows
+    );
+    assert_eq!(result.output.object_changes.len(), 2, "expected 2 object patches");
+
+    let object_patch_count = result
+        .trace
+        .evaluator_row_traces
+        .iter()
+        .filter(|t| t.row_kind == "object" && t.compiler_result == "object_patch_created")
+        .count();
+    assert_eq!(
+        object_patch_count, 2,
+        "both object rows should show compiler_result = object_patch_created"
+    );
 }

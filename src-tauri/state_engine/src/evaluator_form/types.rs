@@ -4,10 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    evaluator::{
-        EvaluatorConversionReport, EvaluatorOutputV1, GlobalSceneEvaluation, MemoryCandidate,
-        MemorySlot, RelevanceTags, TurnClassification,
-    },
+    evaluator::{EvaluatorConversionReport, EvaluatorOutputV1, MemorySlot},
     evaluator_ingest::NormalizedEvaluationDraft,
 };
 

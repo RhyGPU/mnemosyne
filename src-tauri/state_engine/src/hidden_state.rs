@@ -61,9 +61,23 @@ pub fn encode_hidden_state(hidden_state: &HiddenState) -> String {
     )
 }
 
+pub fn strip_assistant_close_tag(s: &str) -> String {
+    let tag = "</assistant>";
+    let mut current = s.to_string();
+    loop {
+        let trimmed = current.trim_end();
+        if let Some(stripped) = trimmed.strip_suffix(tag) {
+            current = stripped.to_string();
+        } else {
+            break;
+        }
+    }
+    current.trim_end().to_string()
+}
+
 pub fn parse_hidden_state(raw: &str) -> Result<ParsedProviderResponse, serde_json::Error> {
     if let Some(start) = raw.find(HIDDEN_STATE_JSON_START) {
-        let visible_text = raw[..start].trim().to_string();
+        let visible_text = strip_assistant_close_tag(&raw[..start]);
         let hidden_start = start + HIDDEN_STATE_JSON_START.len();
         let hidden_part = if let Some(end) = raw[hidden_start..].find(HIDDEN_STATE_JSON_END) {
             &raw[hidden_start..hidden_start + end]
@@ -81,12 +95,12 @@ pub fn parse_hidden_state(raw: &str) -> Result<ParsedProviderResponse, serde_jso
 
     let Some(start) = raw.find(HIDDEN_STATE_MARKER) else {
         return Ok(ParsedProviderResponse {
-            visible_text: raw.trim().to_string(),
+            visible_text: strip_assistant_close_tag(raw),
             hidden_state: HiddenState::default(),
             engine_patch: EnginePatch::default(),
         });
     };
-    let visible_text = raw[..start].trim().to_string();
+    let visible_text = strip_assistant_close_tag(&raw[..start]);
     let hidden_part = raw[start + HIDDEN_STATE_MARKER.len()..].trim();
     let (hidden_state, engine_patch) = decode_hidden_payload(hidden_part)?;
     Ok(ParsedProviderResponse {

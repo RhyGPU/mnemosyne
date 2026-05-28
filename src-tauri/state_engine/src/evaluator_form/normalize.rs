@@ -5,10 +5,9 @@ use serde_json::Value;
 use crate::{
     evaluator::{EvaluatorConversionContext, MemorySlot},
     evaluator_form::{
-        clean, resolve_active_entity_id, slugify, stable_id,
-        ConfidenceTier, EvalFormRepairTrace, EvalFormResponse, EvalFormSpec, EventRow, EventType,
-        ImportanceTier, MagnitudeTier, MemoryRow, ObjectRow, RelationshipDimension, RelationshipDirection,
-        RelationshipRow, ReviewRow,
+        clean, resolve_active_entity_id, slugify, stable_id, EvalFormRepairTrace,
+        EvalFormResponse, EvalFormSpec, EventRow, EventType, ImportanceTier, MagnitudeTier,
+        MemoryRow, ObjectRow, RelationshipDimension, RelationshipDirection, RelationshipRow,
     },
 };
 
@@ -1375,6 +1374,17 @@ pub fn normalize_object_aliases(row: &mut ObjectRow) {
         }
     }
 
+    // Gap 2: both object_id and new_object_label missing — try conservative noun extraction
+    if row.object_id.as_deref().and_then(clean).is_none()
+        && row.new_object_label.as_deref().and_then(clean).is_none()
+    {
+        let search_text = format!("{} {}", row.evidence_quote, row.new_value);
+        if let Some(noun) = infer_physical_object_from_evidence(&search_text) {
+            row.new_object_label = Some(noun.replace(' ', "_"));
+            row.object_id = Some(slugify(noun));
+        }
+    }
+
     if row.property_changed.trim().is_empty() {
         if !row.new_value.trim().is_empty() {
             row.property_changed = "state".to_string();
@@ -1389,6 +1399,15 @@ pub fn normalize_object_aliases(row: &mut ObjectRow) {
             row.new_value = value.to_string();
         }
     }
+
+    // Gap 1: property_changed is already "state" but new_value is still empty —
+    // derive from evidence_quote as a last resort.
+    if row.new_value.trim().is_empty() && row.property_changed == "state" {
+        if !row.evidence_quote.trim().is_empty() {
+            row.new_value = row.evidence_quote.clone();
+        }
+    }
+
     if let Some(object_id) = row.object_id.as_mut() {
         if let Some(stripped) = object_id.strip_prefix("obj:") {
             *object_id = stripped.to_string();
@@ -1462,4 +1481,52 @@ pub fn normalize_player_id(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// Try to extract a single conservative physical-object noun from `evidence`.
+///
+/// Returns `None` if no known physical noun is found, so that abstract-only
+/// evidence ("warmth increased", "nervous energy", …) never produces a fake
+/// object ID.
+///
+/// The noun list is intentionally small and concrete.  Add entries only for
+/// objects that appear regularly in scene narration.
+pub(crate) fn infer_physical_object_from_evidence(evidence: &str) -> Option<&'static str> {
+    let lower = evidence.to_ascii_lowercase();
+
+    // Ordered: longer / more-specific phrases first so they beat single words.
+    const PHYSICAL_NOUNS: &[&str] = &[
+        // multi-word first
+        "wet jacket",
+        "wine glass",
+        "chain lock",
+        "cigarette",
+        // single-word
+        "jacket",
+        "coat",
+        "door",
+        "chair",
+        "table",
+        "glass",
+        "mug",
+        "phone",
+        "window",
+        "lock",
+        "bag",
+        "book",
+        "candle",
+        "bottle",
+        "key",
+        "knife",
+        "lamp",
+        "pen",
+        "cup",
+    ];
+
+    for &noun in PHYSICAL_NOUNS {
+        if lower.contains(noun) {
+            return Some(noun);
+        }
+    }
+    None
 }
