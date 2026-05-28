@@ -1004,6 +1004,39 @@ export function listenEvaluatorJobStatusChanged(
   return listen<EvaluatorJob>("evaluator-job-status-changed", (event) => callback(event.payload));
 }
 
+export type PipelineStageTrace = {
+  stage_id: string;
+  stage_name: string;
+  status: "success" | "warning" | "skipped" | "failed";
+  elapsed_ms: number;
+  input_summary?: string | null;
+  output_summary?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  repair_action?: string | null;
+  artifact_ref?: string | null;
+};
+
+export type TurnPipelineTrace = {
+  request_id: string;
+  turn_id?: string | null;
+  conversation_id: string;
+  started_at: number;
+  total_elapsed_ms: number;
+  final_status: "success" | "partial_success" | "failed" | "canceled" | "running";
+  failing_stage?: string | null;
+  suggested_debug_action?: string | null;
+  stages: PipelineStageTrace[];
+};
+
+export function listenPipelineTraceUpdated(
+  callback: (payload: TurnPipelineTrace) => void,
+): Promise<() => void> {
+  if (!hasTauriRuntime()) return Promise.resolve(() => undefined);
+  return listen<TurnPipelineTrace>("pipeline-trace-updated", (event) => callback(event.payload));
+}
+
+
 export function listProviderProfiles(): Promise<ProviderProfile[]> {
   return invokeOrPreview("list_provider_profiles", {}, () => browserProviderProfiles);
 }

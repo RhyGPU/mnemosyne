@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod db;
+pub mod pipeline_trace;
 pub mod providers;
 
 use std::sync::Mutex;

@@ -30,6 +30,8 @@ import {
   DevLogLevel,
   EvaluatorJob,
   LlmPayloadPreview,
+  TurnPipelineTrace,
+  PipelineStageTrace,
   ImageAsset,
   ProviderProfile,
   SettingSoul,
@@ -79,6 +81,7 @@ import {
   listenChatMessageSaved,
   listenDevLog,
   listenEvaluatorJobStatusChanged,
+  listenPipelineTraceUpdated,
   previewApiPayload,
   rebuildSessionFromLedger,
   repairAccidentalNormalSendVariants,
@@ -469,6 +472,7 @@ export function App() {
   );
   const [settingsTab, setSettingsTab] = useState<SettingsTab>(loadStoredSettingsTab);
   const [devConsoleOpen, setDevConsoleOpen] = useState(false);
+  const [latestPipelineTrace, setLatestPipelineTrace] = useState<TurnPipelineTrace | null>(null);
   const [devLogs, setDevLogs] = useState<DevLogEntry[]>([]);
   const [devConsolePaused, setDevConsolePaused] = useState(() =>
     loadStoredBoolean(DEV_CONSOLE_PAUSED_STORAGE_KEY, false),
@@ -846,6 +850,29 @@ export function App() {
     return () => {
       active = false;
       listenerRegistrationRef.current.evaluatorJobStatusChanged = false;
+      if (cleanupFn) {
+        cleanupFn();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let cleanupFn: (() => void) | undefined;
+
+    void listenPipelineTraceUpdated((trace) => {
+      if (!active) return;
+      if (trace.conversation_id !== currentConversationIdRef.current) return;
+      setLatestPipelineTrace(trace);
+    }).then((cleanup) => {
+      cleanupFn = cleanup;
+      if (!active) {
+        cleanup();
+      }
+    });
+
+    return () => {
+      active = false;
       if (cleanupFn) {
         cleanupFn();
       }
@@ -3286,6 +3313,61 @@ export function App() {
           Close
         </button>
       </header>
+      {latestPipelineTrace && (
+        <div className="dev-pipeline-trace-panel" style={{ padding: "12px 16px", backgroundColor: "#111827", borderBottom: "1px solid #1f2937", fontSize: "12px", fontFamily: "monospace", color: "#d1d5db" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
+            <span style={{ color: "#10b981", fontWeight: "bold", fontSize: "13px" }}>
+              Turn Pipeline Trace (Status: {latestPipelineTrace.final_status})
+            </span>
+            <button
+              type="button"
+              style={{ padding: "2px 8px", fontSize: "11px", backgroundColor: "#374151", color: "#f3f4f6", border: "none", borderRadius: "3px", cursor: "pointer" }}
+              onClick={() => {
+                void navigator.clipboard.writeText(JSON.stringify(latestPipelineTrace, null, 2));
+              }}
+            >
+              Copy Trace
+            </button>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "6px", marginBottom: "8px", fontSize: "11px", color: "#9ca3af" }}>
+            <div>Request ID: <span style={{ color: "#f3f4f6" }}>{latestPipelineTrace.request_id.slice(0, 8)}...</span></div>
+            <div>Elapsed: <span style={{ color: "#f3f4f6" }}>{latestPipelineTrace.total_elapsed_ms}ms</span></div>
+            {latestPipelineTrace.failing_stage && (
+              <div style={{ color: "#f87171", fontWeight: "bold" }}>Failing Stage: {latestPipelineTrace.failing_stage}</div>
+            )}
+          </div>
+          {latestPipelineTrace.suggested_debug_action && (
+            <div style={{ padding: "6px 8px", backgroundColor: "#7f1d1d", color: "#fca5a5", borderRadius: "4px", marginBottom: "8px", fontSize: "11px" }}>
+              <strong>Debug Suggestion:</strong> {latestPipelineTrace.suggested_debug_action}
+            </div>
+          )}
+          <div style={{ display: "flex", gap: "6px", overflowX: "auto", paddingBottom: "4px", maxHeight: "120px" }}>
+            {latestPipelineTrace.stages.map((stage) => {
+              let badgeColor = "#10b981";
+              if (stage.status === "failed") badgeColor = "#ef4444";
+              else if (stage.status === "warning") badgeColor = "#f59e0b";
+              else if (stage.status === "skipped") badgeColor = "#6b7280";
+
+              return (
+                <div key={stage.stage_name} style={{ flexShrink: 0, padding: "6px 8px", backgroundColor: "#1f2937", border: `1px solid ${stage.status === "failed" ? "#ef4444" : "#374151"}`, borderRadius: "4px", width: "160px" }}>
+                  <div style={{ fontWeight: "bold", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", color: "#f3f4f6" }} title={stage.stage_name}>
+                    {stage.stage_name}
+                  </div>
+                  <div style={{ fontSize: "10px", marginTop: "2px", display: "flex", justifyContent: "space-between" }}>
+                    <span style={{ color: badgeColor }}>{stage.status}</span>
+                    <span>{stage.elapsed_ms}ms</span>
+                  </div>
+                  {stage.error_message && (
+                    <div style={{ fontSize: "9px", color: "#fca5a5", marginTop: "4px", maxHeight: "40px", overflow: "hidden", textOverflow: "ellipsis" }} title={stage.error_message}>
+                      {stage.error_message}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
       {import.meta.env.DEV && renderTrace && (
         <div className="dev-render-trace-banner" style={{ padding: "10px 16px", backgroundColor: "#1e293b", borderBottom: "1px solid #334155", fontSize: "11px", fontFamily: "monospace", color: "#94a3b8" }}>
           <div style={{ color: "#38bdf8", fontWeight: "bold", marginBottom: "4px" }}>
@@ -5378,7 +5460,50 @@ export function App() {
           </section>
         </section>
 
-        <footer className="status-line">{status}</footer>
+        <footer className="status-line">
+          <span>{status}</span>
+          {latestPipelineTrace &&
+            (status.toLowerCase().includes("skipped") || status.toLowerCase().includes("failed")) && (
+              <>
+                {latestPipelineTrace.failing_stage ? (
+                  <span
+                    className="status-stage-tag"
+                    style={{ marginLeft: "10px", color: "#f87171", fontWeight: "bold" }}
+                  >
+                    (Failing Stage: {latestPipelineTrace.failing_stage})
+                  </span>
+                ) : (
+                  (() => {
+                    const warningStage = latestPipelineTrace.stages.find((s) => s.status === "warning");
+                    return warningStage ? (
+                      <span
+                        className="status-stage-tag"
+                        style={{ marginLeft: "10px", color: "#fbbf24", fontWeight: "bold" }}
+                      >
+                        (Warning Stage: {warningStage.stage_name})
+                      </span>
+                    ) : null;
+                  })()
+                )}
+                <button
+                  type="button"
+                  style={{
+                    marginLeft: "8px",
+                    padding: "2px 6px",
+                    fontSize: "11px",
+                    border: "1px solid #4b5563",
+                    background: "none",
+                    color: "#9ca3af",
+                    cursor: "pointer",
+                    borderRadius: "3px",
+                  }}
+                  onClick={() => setDevConsoleOpen(true)}
+                >
+                  Open trace
+                </button>
+              </>
+            )}
+        </footer>
       </section>
       <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
       {settingsDrawerPanel}

@@ -48,6 +48,7 @@ use crate::{
         self, AssistantMessageVariant, ChatMessage, ConversationSummary, EntityRecord, ImageAsset,
         LlmPayloadLog, ProviderProfile, RestoreInactiveMessagesResult, SettingSummary, SoulSummary,
     },
+    pipeline_trace::{PipelineErrorCode, TurnPipelineTrace},
     providers::{
         api::{
             build_evaluator_form_prompt, build_evaluator_prompt, build_narrator_system_prompt,
@@ -2643,6 +2644,12 @@ pub async fn send_api_turn(
     let context_mode = ContextMode::from_label(context_mode.as_deref());
     let request_id = uuid_like_id();
     let canonical_turn_id = format!("turn_{request_id}");
+    let mut pipeline_trace = TurnPipelineTrace::new(
+        request_id.clone(),
+        Some(canonical_turn_id.clone()),
+        conversation_id.clone(),
+        db::now_ts(),
+    );
     let gate_outcome =
         gate_pending_evaluator_jobs(&window, &state, &conversation_id, &state_updater_settings)?;
     let mut turn_trace = NarratorTurnTrace {
@@ -2742,6 +2749,7 @@ pub async fn send_api_turn(
             );
             (fallback_soul, session_world, None)
         };
+        let user_message_started = Instant::now();
         let ledger_user_message_id = if replacement_assistant_id.is_none() {
             let existing_id =
                 db::find_reusable_active_user_message(&conn, &conversation_id, &user_text)
@@ -2781,12 +2789,27 @@ pub async fn send_api_turn(
                 stage_started.elapsed(),
             );
             stage_started = Instant::now();
+            pipeline_trace.record_stage(
+                "user_message_saved",
+                "success",
+                user_message_started.elapsed().as_millis() as u64,
+                None,
+                Some(format!("Message ID: {}", id)),
+            );
             Some(id)
         } else {
+            pipeline_trace.record_stage(
+                "user_message_saved",
+                "skipped",
+                0,
+                None,
+                Some("Bypassed because this is a regenerated/replacement variant".to_string()),
+            );
             old_commit
                 .as_ref()
                 .and_then(|commit| commit.user_message_id)
         };
+        let context_started = Instant::now();
         let entity_context =
             resolve_speaker_for_turn(&conn, &conversation_id, &soul, &snapshot_user_text)
                 .map_err(|err| err.to_string())?;
@@ -2852,6 +2875,16 @@ pub async fn send_api_turn(
             );
         }
         let pre_turn_soul_json = serde_json::to_string(&soul).map_err(|err| err.to_string())?;
+        pipeline_trace.record_stage(
+            "context_compiled",
+            "success",
+            context_started.elapsed().as_millis() as u64,
+            Some(format!("Context mode: {}", context_mode.label())),
+            Some(format!(
+                "Estimated tokens: {}",
+                context_preview.estimated_tokens
+            )),
+        );
         (
             soul,
             session_world,
@@ -2965,7 +2998,10 @@ pub async fn send_api_turn(
                 fallback_reason: None,
                 provider_request_id: None,
                 provider_response_id: None,
-                pipeline_trace_json: None,
+                pipeline_trace_json: Some(
+                    serde_json::to_string(&serde_json::json!({ "pipeline_trace": pipeline_trace }))
+                        .unwrap_or_default(),
+                ),
             },
         )
         .map_err(|err| err.to_string())?
@@ -3004,6 +3040,7 @@ pub async fn send_api_turn(
             "payload_log_id": payload_log_id
         })),
     );
+    let narrator_called_timer = Instant::now();
     let narrator_call_started = Instant::now();
     let provider_completion = match provider
         .complete_streaming_messages(
@@ -3063,11 +3100,24 @@ pub async fn send_api_turn(
             completion
         }
         Err(err) => {
+            pipeline_trace.record_stage_error(
+                "narrator_called",
+                narrator_called_timer.elapsed().as_millis() as u64,
+                PipelineErrorCode::NarratorCallError,
+                err.clone(),
+                Some("Check LLM provider settings or availability".to_string()),
+            );
+            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
             let _ = state
                 .conn
                 .lock()
                 .map_err(|err| err.to_string())
                 .and_then(|conn| {
+                    let _ = update_llm_payload_pipeline_trace(
+                        &conn,
+                        payload_log_id,
+                        &serde_json::json!({ "pipeline_trace": pipeline_trace }),
+                    );
                     db::update_llm_payload_log_response(
                         &conn,
                         payload_log_id,
@@ -3097,6 +3147,21 @@ pub async fn send_api_turn(
     let mut parsed = match parse_hidden_state(&raw_response) {
         Ok(parsed) => parsed,
         Err(err) => {
+            pipeline_trace.record_stage_error(
+                "narrator_called",
+                narrator_called_timer.elapsed().as_millis() as u64,
+                PipelineErrorCode::NarratorParseError,
+                err.to_string(),
+                Some("Narrator failed to output valid hidden state tags".to_string()),
+            );
+            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+            if let Ok(conn) = state.conn.lock() {
+                let _ = update_llm_payload_pipeline_trace(
+                    &conn,
+                    payload_log_id,
+                    &serde_json::json!({ "pipeline_trace": pipeline_trace }),
+                );
+            }
             emit_dev_log(
                 &window,
                 "error",
@@ -3164,6 +3229,24 @@ pub async fn send_api_turn(
                 parsed = match parse_hidden_state(&raw_response) {
                     Ok(parsed) => parsed,
                     Err(err) => {
+                        pipeline_trace.record_stage_error(
+                            "narrator_called",
+                            narrator_called_timer.elapsed().as_millis() as u64,
+                            PipelineErrorCode::NarratorParseError,
+                            format!("Narrator retry response parse failed: {err}"),
+                            Some(
+                                "Narrator failed to output valid hidden state tags on retry"
+                                    .to_string(),
+                            ),
+                        );
+                        window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+                        if let Ok(conn) = state.conn.lock() {
+                            let _ = update_llm_payload_pipeline_trace(
+                                &conn,
+                                payload_log_id,
+                                &serde_json::json!({ "pipeline_trace": pipeline_trace }),
+                            );
+                        }
                         return Err(format!("Narrator retry response parse failed: {err}"));
                     }
                 };
@@ -3174,14 +3257,45 @@ pub async fn send_api_turn(
                 let (body_retry, _, _) = remove_status_blocks(&without_engine_patch_retry);
 
                 if is_body_only_markers(&body_retry) {
+                    pipeline_trace.record_stage_error(
+                        "narrator_called",
+                        narrator_called_timer.elapsed().as_millis() as u64,
+                        PipelineErrorCode::NarratorParseError,
+                        "bad narrator output, regenerate on retry".to_string(),
+                        Some("Narrator returned empty body on retry".to_string()),
+                    );
+                    window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+                    if let Ok(conn) = state.conn.lock() {
+                        let _ = update_llm_payload_pipeline_trace(
+                            &conn,
+                            payload_log_id,
+                            &serde_json::json!({ "pipeline_trace": pipeline_trace }),
+                        );
+                    }
                     return Err("bad narrator output, regenerate".to_string());
                 }
             }
             Err(err) => {
+                pipeline_trace.record_stage_error(
+                    "narrator_called",
+                    narrator_called_timer.elapsed().as_millis() as u64,
+                    PipelineErrorCode::NarratorCallError,
+                    format!("Narrator retry failed: {err}"),
+                    Some("Check LLM provider settings".to_string()),
+                );
+                window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+                if let Ok(conn) = state.conn.lock() {
+                    let _ = update_llm_payload_pipeline_trace(
+                        &conn,
+                        payload_log_id,
+                        &serde_json::json!({ "pipeline_trace": pipeline_trace }),
+                    );
+                }
                 return Err(format!("Narrator retry failed: {err}"));
             }
         }
     }
+    let guard_timer = Instant::now();
     let mut retry_response_score = 0.0f32;
     let mut selected_response_source = "original".to_string();
     let mut ooc_detection_reason = "scene_turn".to_string();
@@ -3249,6 +3363,16 @@ pub async fn send_api_turn(
         );
     }
 
+    let phone_call_guard =
+        sanitize_phone_call_state_violation(&visible_response, &snapshot_user_text, &session_world);
+    if phone_call_guard.repaired {
+        visible_response = phone_call_guard.text;
+        output_contract_warning = append_output_warning(
+            output_contract_warning,
+            "phone call state violation repaired",
+        );
+    }
+
     let original_response_score = evaluate_response_quality(
         &visible_response,
         &snapshot_user_text,
@@ -3271,6 +3395,13 @@ pub async fn send_api_turn(
     let mut anti_replay_retry_suppressed_by_default = false;
     let mut anti_replay_retry_count = 0u8;
 
+    let original_has_violation = has_hard_violation(
+        &visible_response,
+        &snapshot_user_text,
+        &session_world,
+        &replay_sources,
+    );
+
     if let Some(warning) = output_contract_warning.as_ref() {
         emit_dev_log(
             &window,
@@ -3279,12 +3410,15 @@ pub async fn send_api_turn(
             "Output contract guard normalized narrator response",
             Some(serde_json::json!({
                 "conversation_id": conversation_id.as_str(),
-                "warning": warning
+                "warning": warning,
+                "phone_call_state_violation": has_phone_call_state_violation(&visible_response, &snapshot_user_text, &session_world)
             })),
         );
     }
 
-    if replay_guard.replay_detected {
+    let trigger_retry = replay_guard.replay_detected || original_has_violation;
+
+    if trigger_retry {
         emit_dev_log(
             &window,
             "warn",
@@ -3294,7 +3428,8 @@ pub async fn send_api_turn(
                 "conversation_id": conversation_id.as_str(),
                 "score": replay_guard.replay_score,
                 "reason": replay_guard.replay_reason.as_deref(),
-                "compared_against_message_id": replay_guard.compared_against_message_id
+                "compared_against_message_id": replay_guard.compared_against_message_id,
+                "phone_call_state_violation": has_phone_call_state_violation(&visible_response, &snapshot_user_text, &session_world)
             })),
         );
         if !anti_replay_retry_enabled {
@@ -3315,7 +3450,8 @@ pub async fn send_api_turn(
                         ReplaySeverity::ObjectStateViolation => "object_state_violation",
                     },
                     "reason": replay_guard.replay_reason.as_deref(),
-                    "compared_against_message_id": replay_guard.compared_against_message_id
+                    "compared_against_message_id": replay_guard.compared_against_message_id,
+                    "phone_call_state_violation": has_phone_call_state_violation(&visible_response, &snapshot_user_text, &session_world)
                 })),
             );
             debug_replay_reason = replay_guard.replay_reason.clone();
@@ -3431,6 +3567,19 @@ pub async fn send_api_turn(
                             retry_output_warning = append_output_warning(
                                 retry_output_warning,
                                 "phone notification contradiction repaired",
+                            );
+                        }
+
+                        let retry_phone_call_guard = sanitize_phone_call_state_violation(
+                            &retry_visible_response,
+                            &snapshot_user_text,
+                            &session_world,
+                        );
+                        if retry_phone_call_guard.repaired {
+                            retry_visible_response = retry_phone_call_guard.text;
+                            retry_output_warning = append_output_warning(
+                                retry_output_warning,
+                                "phone call state violation repaired",
                             );
                         }
 
@@ -3630,6 +3779,39 @@ pub async fn send_api_turn(
         );
     }
 
+    let final_narrator_elapsed = narrator_called_timer.elapsed().as_millis() as u64;
+    pipeline_trace.record_stage(
+        "narrator_called",
+        "success",
+        final_narrator_elapsed,
+        None,
+        Some(format!(
+            "Narrator selected response from: {}",
+            selected_response_source
+        )),
+    );
+
+    let mut guard_status = "success";
+    if phone_guard.repaired || phone_call_guard.repaired || trigger_retry {
+        guard_status = "warning";
+    }
+    let guard_elapsed = guard_timer.elapsed().as_millis() as u64;
+    pipeline_trace.record_stage(
+        "narrator_output_guarded",
+        guard_status,
+        guard_elapsed,
+        Some(format!(
+            "Selected source: {}, Replay detected: {}",
+            selected_response_source, debug_replay_detected
+        )),
+        Some(
+            output_contract_warning
+                .clone()
+                .unwrap_or_else(|| "No violations detected".to_string()),
+        ),
+    );
+    window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+
     if visible_response.trim().is_empty() {
         emit_dev_log(
             &window,
@@ -3733,7 +3915,7 @@ pub async fn send_api_turn(
         fallback_used: false,
         fallback_reason: None,
     };
-    let (assistant_message_id, selected_variant_id) = {
+    let (assistant_message_id, selected_variant_id) = match {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         save_visible_narrator_response(
             &conn,
@@ -3746,7 +3928,27 @@ pub async fn send_api_turn(
             payload_log_id,
             NarratorMessageOrigin::Api,
             Some(&pre_save_debug),
-        )?
+        )
+    } {
+        Ok(val) => val,
+        Err(err) => {
+            pipeline_trace.record_stage_error(
+                "assistant_saved",
+                save_narrator_started.elapsed().as_millis() as u64,
+                PipelineErrorCode::DatabaseError,
+                err.to_string(),
+                Some("Check database integrity or connection".to_string()),
+            );
+            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+            if let Ok(conn) = state.conn.lock() {
+                let _ = update_llm_payload_pipeline_trace(
+                    &conn,
+                    payload_log_id,
+                    &serde_json::json!({ "pipeline_trace": pipeline_trace }),
+                );
+            }
+            return Err(err.to_string());
+        }
     };
     turn_trace.assistant_message_id = Some(assistant_message_id);
     emit_perf_log(
@@ -3755,6 +3957,17 @@ pub async fn send_api_turn(
         "save narrator response",
         save_narrator_started.elapsed(),
     );
+    pipeline_trace.record_stage(
+        "assistant_saved",
+        "success",
+        save_narrator_started.elapsed().as_millis() as u64,
+        None,
+        Some(format!(
+            "Message ID: {}, Variant ID: {:?}",
+            assistant_message_id, selected_variant_id
+        )),
+    );
+    window.emit("pipeline-trace-updated", &pipeline_trace).ok();
     {
         let saved_message = state
             .conn
@@ -3861,13 +4074,29 @@ pub async fn send_api_turn(
             "stale_state_send": gate_outcome.stale_state_send,
             "compiled_with_pending_evaluator": gate_outcome.compiled_with_pending_evaluator,
             "pending_evaluator_job_ids": gate_outcome.pending_job_ids
-        }
+        },
+        "pipeline_trace": pipeline_trace
     });
     if let Ok(conn) = state.conn.lock() {
         let _ = update_llm_payload_pipeline_trace(&conn, payload_log_id, &narrator_pipeline_trace);
     }
 
     if !integrity_ok {
+        pipeline_trace.record_stage_error(
+            "assistant_saved",
+            save_narrator_started.elapsed().as_millis() as u64,
+            PipelineErrorCode::NarratorParseError,
+            "Response integrity mismatch".to_string(),
+            Some("Re-generation might be needed".to_string()),
+        );
+        window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+        if let Ok(conn) = state.conn.lock() {
+            let _ = update_llm_payload_pipeline_trace(
+                &conn,
+                payload_log_id,
+                &serde_json::json!({ "pipeline_trace": pipeline_trace }),
+            );
+        }
         let mut failed_debug = pre_save_debug;
         failed_debug.state_updater_status = "integrity_mismatch".into();
         failed_debug.assistant_message_id = Some(assistant_message_id);
@@ -3906,6 +4135,21 @@ pub async fn send_api_turn(
         && correction_instruction.is_none();
 
     if should_bypass_evaluator {
+        pipeline_trace.record_stage(
+            "evaluator_job_started",
+            "skipped",
+            0,
+            None,
+            Some("Bypassed because evaluator is not required for OOC meta turn".to_string()),
+        );
+        pipeline_trace.final_status = "success".into();
+        pipeline_trace.total_elapsed_ms = turn_started.elapsed().as_millis() as u64;
+        window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+        if let Ok(conn) = state.conn.lock() {
+            let mut trace_val = narrator_pipeline_trace.clone();
+            trace_val["pipeline_trace"] = serde_json::to_value(&pipeline_trace).unwrap_or_default();
+            let _ = update_llm_payload_pipeline_trace(&conn, payload_log_id, &trace_val);
+        }
         let mut debug = pre_save_debug;
         debug.assistant_message_id = Some(assistant_message_id);
         debug.selected_variant_id = selected_variant_id;
@@ -3997,40 +4241,72 @@ pub async fn send_api_turn(
     let pre_baseline_soul = soul.clone();
     let pre_baseline_session_world = session_world.clone();
 
+    let baseline_start = Instant::now();
     if is_normal_scene_turn && ledger_branch_id.is_some() {
         let branch_id = ledger_branch_id.as_deref().unwrap();
         let (ev_id, baseline_patch) =
             construct_baseline_patch(&soul, &snapshot_user_text, &visible_response_for_updater);
         baseline_event_id = Some(ev_id);
 
-        let conn = state.conn.lock().map_err(|err| err.to_string())?;
-        if replacement_assistant_id.is_some() {
-            db::discard_active_commits_for_assistant(&conn, &conversation_id, assistant_message_id)
+        let commit_res: Result<(db::TurnCommit, db::StatePatchRecord, db::LedgerRebuild), String> =
+            (|| {
+                let conn = state.conn.lock().map_err(|err| err.to_string())?;
+                if replacement_assistant_id.is_some() {
+                    db::discard_active_commits_for_assistant(
+                        &conn,
+                        &conversation_id,
+                        assistant_message_id,
+                    )
+                    .map_err(|err| err.to_string())?;
+                }
+
+                let (commit, patch_record) = db::record_turn_commit_with_patch_for_turn_id(
+                    &conn,
+                    &canonical_turn_id,
+                    &conversation_id,
+                    branch_id,
+                    ledger_parent_turn_id.as_deref(),
+                    ledger_user_message_id,
+                    assistant_message_id,
+                    selected_variant_id,
+                    &baseline_patch,
+                    replacement_assistant_id.is_some(),
+                )
                 .map_err(|err| err.to_string())?;
-        }
 
-        let (commit, patch_record) = db::record_turn_commit_with_patch_for_turn_id(
-            &conn,
-            &canonical_turn_id,
-            &conversation_id,
-            branch_id,
-            ledger_parent_turn_id.as_deref(),
-            ledger_user_message_id,
-            assistant_message_id,
-            selected_variant_id,
-            &baseline_patch,
-            replacement_assistant_id.is_some(),
-        )
-        .map_err(|err| err.to_string())?;
+                let rebuilt = db::rebuild_session_state(&conn, &conversation_id, branch_id)
+                    .map_err(|err| err.to_string())?;
 
+                Ok((commit, patch_record, rebuilt))
+            })();
+
+        let (commit, patch_record, rebuilt) = match commit_res {
+            Ok(val) => val,
+            Err(err) => {
+                pipeline_trace.record_stage_error(
+                    "baseline_patch_committed",
+                    baseline_start.elapsed().as_millis() as u64,
+                    PipelineErrorCode::DatabaseError,
+                    err.clone(),
+                    Some("Check database integrity or connection".to_string()),
+                );
+                window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+                if let Ok(conn) = state.conn.lock() {
+                    let _ = update_llm_payload_pipeline_trace(
+                        &conn,
+                        payload_log_id,
+                        &serde_json::json!({ "pipeline_trace": pipeline_trace }),
+                    );
+                }
+                return Err(err);
+            }
+        };
+
+        soul = rebuilt.soul;
+        session_world = rebuilt.session_world;
         baseline_commit = Some(commit.clone());
         baseline_patch_id = Some(patch_record.patch_id.clone());
         turn_trace.state_patch_id = Some(patch_record.patch_id.clone());
-
-        let rebuilt = db::rebuild_session_state(&conn, &conversation_id, branch_id)
-            .map_err(|err| err.to_string())?;
-        soul = rebuilt.soul;
-        session_world = rebuilt.session_world;
 
         emit_dev_log(
             &window,
@@ -4044,13 +4320,35 @@ pub async fn send_api_turn(
                 "baseline_patch_id": patch_record.patch_id.as_str(),
             })),
         );
+
+        pipeline_trace.record_stage(
+            "baseline_patch_committed",
+            "success",
+            baseline_start.elapsed().as_millis() as u64,
+            Some(format!("Event: {:?}", baseline_event_id)),
+            Some(format!("Baseline patch ID: {:?}", baseline_patch_id)),
+        );
+        window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+    } else {
+        pipeline_trace.record_stage(
+            "baseline_patch_committed",
+            "skipped",
+            0,
+            None,
+            Some(
+                "Bypassed because it is not a normal scene turn or ledger branch is disabled"
+                    .to_string(),
+            ),
+        );
+        window.emit("pipeline-trace-updated", &pipeline_trace).ok();
     }
 
+    let job_start = Instant::now();
     if evaluator_background_enabled(&state_updater_settings) {
         let entity_updater_context =
             build_entity_updater_context(&pre_baseline_soul, &entity_context);
         let memory_debug_nonce = format!("memory-debug-{}", uuid_like_id());
-        let job = start_background_evaluator_job(
+        let job = match start_background_evaluator_job(
             app.clone(),
             window.clone(),
             conversation_id.clone(),
@@ -4077,7 +4375,39 @@ pub async fn send_api_turn(
             replacement_assistant_id.is_some(),
             before_state_summary.clone(),
             baseline_patch_id.clone(),
-        )?;
+        ) {
+            Ok(job) => job,
+            Err(err) => {
+                pipeline_trace.record_stage_error(
+                    "evaluator_job_started",
+                    job_start.elapsed().as_millis() as u64,
+                    PipelineErrorCode::EvaluatorSpawnError,
+                    err.to_string(),
+                    Some("Failed to spawn background evaluator job".to_string()),
+                );
+                window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+                if let Ok(conn) = state.conn.lock() {
+                    let mut trace_val = narrator_pipeline_trace.clone();
+                    trace_val["pipeline_trace"] =
+                        serde_json::to_value(&pipeline_trace).unwrap_or_default();
+                    let _ = update_llm_payload_pipeline_trace(&conn, payload_log_id, &trace_val);
+                }
+                return Err(err);
+            }
+        };
+        pipeline_trace.record_stage(
+            "evaluator_job_started",
+            "success",
+            job_start.elapsed().as_millis() as u64,
+            Some(format!("Assistant Message ID: {}", assistant_message_id)),
+            Some(format!("Evaluator Job ID: {}", job.evaluator_job_id)),
+        );
+        window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+        if let Ok(conn) = state.conn.lock() {
+            let mut trace_val = narrator_pipeline_trace.clone();
+            trace_val["pipeline_trace"] = serde_json::to_value(&pipeline_trace).unwrap_or_default();
+            let _ = update_llm_payload_pipeline_trace(&conn, payload_log_id, &trace_val);
+        }
         let mut debug = pre_save_debug;
         debug.assistant_message_id = Some(assistant_message_id);
         debug.selected_variant_id = selected_variant_id;
@@ -6300,6 +6630,128 @@ fn phone_state_blocks_visible_notification(session_world: &SessionWorld) -> bool
     })
 }
 
+fn user_text_mentions_call(user_text: &str) -> bool {
+    let lower = user_text.to_ascii_lowercase();
+    lower.contains("call") || lower.contains("dial") || lower.contains("ring")
+}
+
+fn world_phone_state_has_active_call(session_world: &SessionWorld) -> bool {
+    let world = session_world.world_log();
+    world.object_states.iter().any(|object| {
+        let object_id_lower = object.object_id.to_ascii_lowercase();
+        if object_id_lower.contains("phone") {
+            let status_lower = object.status.to_ascii_lowercase();
+            let is_call_status = status_lower.contains("active_call")
+                || status_lower.contains("incoming_call")
+                || status_lower.contains("active call")
+                || status_lower.contains("incoming call")
+                || status_lower.contains("ringing");
+
+            let is_call_prop = object.properties.iter().any(|(k, v)| {
+                let k_lower = k.to_ascii_lowercase();
+                let v_lower = v.to_ascii_lowercase();
+                k_lower.contains("call") || v_lower.contains("call")
+            });
+
+            is_call_status || is_call_prop
+        } else {
+            false
+        }
+    }) || world.key_objects.iter().any(|object| {
+        let lower = object.to_ascii_lowercase();
+        lower.contains("phone")
+            && (lower.contains("active_call")
+                || lower.contains("incoming_call")
+                || lower.contains("active call")
+                || lower.contains("incoming call")
+                || lower.contains("ringing"))
+    })
+}
+
+fn has_phone_call_state_violation(
+    response: &str,
+    user_text: &str,
+    session_world: &SessionWorld,
+) -> bool {
+    let user_mentions = user_text_mentions_call(user_text);
+    let world_has = world_phone_state_has_active_call(session_world);
+    if !user_mentions && !world_has {
+        let lower = response.to_ascii_lowercase();
+        contains_any_text(
+            &lower,
+            &[
+                "call notification",
+                "call screen",
+                "ringing",
+                "incoming call",
+                "active call",
+                "phone call",
+            ],
+        )
+    } else {
+        false
+    }
+}
+
+fn sanitize_phone_call_state_violation(
+    response: &str,
+    user_text: &str,
+    session_world: &SessionWorld,
+) -> PhoneContradictionGuard {
+    if !has_phone_call_state_violation(response, user_text, session_world) {
+        return PhoneContradictionGuard {
+            text: response.to_string(),
+            repaired: false,
+        };
+    }
+
+    let (body, status_blocks, _) = remove_status_blocks(response);
+    let mut repaired_sentences = Vec::new();
+    let mut repaired = false;
+
+    for sentence in split_visible_sentences(&body) {
+        let lower = sentence.to_ascii_lowercase();
+        let has_violation = contains_any_text(
+            &lower,
+            &[
+                "call notification",
+                "call screen",
+                "ringing",
+                "incoming call",
+                "active call",
+                "phone call",
+            ],
+        );
+        if has_violation {
+            repaired = true;
+        } else {
+            repaired_sentences.push(sentence.trim().to_string());
+        }
+    }
+
+    let mut text = repaired_sentences
+        .into_iter()
+        .filter(|sentence| !sentence.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if let Some(status) = status_blocks
+        .iter()
+        .rev()
+        .find(|status| status_block_has_valid_line(status))
+    {
+        if !text.trim().is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&normalize_status_block(status));
+    }
+
+    PhoneContradictionGuard {
+        text: text.trim_end().to_string(),
+        repaired,
+    }
+}
+
 fn text_claims_phone_chime_or_screen_wake(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("phone")
@@ -6419,11 +6871,20 @@ fn compare_replay_against_source_with_context(
         && phone_state_blocks_visible_notification(session_world)
         && text_claims_phone_chime_or_screen_wake(new_response);
 
+    let phone_call_contradiction =
+        has_phone_call_state_violation(new_response, user_text, session_world);
+
     let (severity, replay_detected, final_reason) = if phone_contradiction {
         (
             ReplaySeverity::ObjectStateViolation,
             true,
             "chime/buzz when phone notifications/screen wake disabled".to_string(),
+        )
+    } else if phone_call_contradiction {
+        (
+            ReplaySeverity::ObjectStateViolation,
+            true,
+            "call notification/call screen/ringing when no active call".to_string(),
         )
     } else if base_detected {
         // Evaluate if this is just mild overlap of scene anchoring markers
@@ -6502,6 +6963,9 @@ fn evaluate_response_quality(
     if has_object_state_violation(response, user_text, session_world) {
         score -= 40.0;
     }
+    if has_phone_call_state_violation(response, user_text, session_world) {
+        score -= 40.0;
+    }
 
     // 4. Emptiness check
     if response.trim().is_empty() {
@@ -6521,6 +6985,9 @@ fn has_hard_violation(
         return true;
     }
     if has_object_state_violation(text, user_text, session_world) {
+        return true;
+    }
+    if has_phone_call_state_violation(text, user_text, session_world) {
         return true;
     }
     if user_text_mentions_texting(user_text)
@@ -8324,6 +8791,84 @@ async fn run_background_evaluator_job(
     baseline_patch_id: Option<String>,
 ) {
     let started = Instant::now();
+    let parent_payload_log = {
+        let state = app.state::<AppState>();
+        state.conn.lock().ok().and_then(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, pipeline_trace_json FROM llm_payload_logs WHERE request_id = ?1",
+                )
+                .ok()?;
+            let row = stmt
+                .query_row(rusqlite::params![parent_narrator_request_id], |r| {
+                    let id: i64 = r.get(0)?;
+                    let pipeline_trace_json: Option<String> = r.get(1)?;
+                    Ok((id, pipeline_trace_json))
+                })
+                .ok();
+            row
+        })
+    };
+
+    let (narrator_log_id, mut pipeline_trace) = match parent_payload_log {
+        Some((id, Some(json_str))) => {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                if let Some(pt_val) = val.get("pipeline_trace") {
+                    if let Ok(trace) = serde_json::from_value::<TurnPipelineTrace>(pt_val.clone()) {
+                        (Some(id), trace)
+                    } else {
+                        (
+                            Some(id),
+                            TurnPipelineTrace::new(
+                                evaluator_request_id.clone(),
+                                turn_id.clone(),
+                                job.conversation_id.clone(),
+                                db::now_ts(),
+                            ),
+                        )
+                    }
+                } else {
+                    (
+                        Some(id),
+                        TurnPipelineTrace::new(
+                            evaluator_request_id.clone(),
+                            turn_id.clone(),
+                            job.conversation_id.clone(),
+                            db::now_ts(),
+                        ),
+                    )
+                }
+            } else {
+                (
+                    Some(id),
+                    TurnPipelineTrace::new(
+                        evaluator_request_id.clone(),
+                        turn_id.clone(),
+                        job.conversation_id.clone(),
+                        db::now_ts(),
+                    ),
+                )
+            }
+        }
+        Some((id, None)) => (
+            Some(id),
+            TurnPipelineTrace::new(
+                evaluator_request_id.clone(),
+                turn_id.clone(),
+                job.conversation_id.clone(),
+                db::now_ts(),
+            ),
+        ),
+        None => (
+            None,
+            TurnPipelineTrace::new(
+                evaluator_request_id.clone(),
+                turn_id.clone(),
+                job.conversation_id.clone(),
+                db::now_ts(),
+            ),
+        ),
+    };
     let baseline_recent_event_id = if let Some(ref bp_id) = baseline_patch_id {
         let state = app.state::<AppState>();
         let mut found_id = None;
@@ -8467,6 +9012,45 @@ async fn run_background_evaluator_job(
     .await;
     let call_elapsed = call_started.elapsed();
     let raw_response = response_result.as_ref().ok().cloned();
+
+    let received_elapsed = call_elapsed.as_millis() as u64;
+    match &response_result {
+        Ok(_) => {
+            pipeline_trace.record_stage(
+                "evaluator_response_received",
+                "success",
+                received_elapsed,
+                None,
+                Some("Evaluator response received".to_string()),
+            );
+            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+            if let Some(n_id) = narrator_log_id {
+                if let Ok(conn) = app.state::<AppState>().conn.lock() {
+                    let trace_val = serde_json::json!({ "pipeline_trace": &pipeline_trace });
+                    let _ = update_llm_payload_pipeline_trace(&conn, n_id, &trace_val);
+                }
+            }
+        }
+        Err(err) => {
+            pipeline_trace.record_stage_error(
+                "evaluator_response_received",
+                received_elapsed,
+                PipelineErrorCode::EvaluatorCallError,
+                err.to_string(),
+                Some("Check LLM provider settings or availability".to_string()),
+            );
+            pipeline_trace.final_status = "failed".into();
+            pipeline_trace.failing_stage = Some("evaluator_response_received".to_string());
+            pipeline_trace.total_elapsed_ms = started.elapsed().as_millis() as u64;
+            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+            if let Some(n_id) = narrator_log_id {
+                if let Ok(conn) = app.state::<AppState>().conn.lock() {
+                    let trace_val = serde_json::json!({ "pipeline_trace": &pipeline_trace });
+                    let _ = update_llm_payload_pipeline_trace(&conn, n_id, &trace_val);
+                }
+            }
+        }
+    }
     if let (Some(log_id), Ok(response)) = (updater_log_id, response_result.as_ref()) {
         let state = app.state::<AppState>();
         if let Ok(conn) = state.conn.lock() {
@@ -8512,9 +9096,110 @@ async fn run_background_evaluator_job(
             {
                 output.comparison_trace = Some(comparison_trace);
             }
+            pipeline_trace.record_stage(
+                "evaluator_response_parsed",
+                "success",
+                0,
+                None,
+                Some("JSON parsed successfully".to_string()),
+            );
+            pipeline_trace.record_stage(
+                "evaluator_response_normalized",
+                "success",
+                0,
+                None,
+                Some("Normalized output generated".to_string()),
+            );
+            pipeline_trace.record_stage(
+                "evaluator_response_validated",
+                "success",
+                0,
+                None,
+                Some("Validation constraints satisfied".to_string()),
+            );
+            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
             output
         }
         Err(err) => {
+            let err_str = err.to_string();
+            let failing_stage = if err_str.contains("parse")
+                || err_str.contains("JSON")
+                || err_str.contains("syntax")
+            {
+                "evaluator_response_parsed"
+            } else if err_str.contains("normalize") || err_str.contains("normalization") {
+                "evaluator_response_normalized"
+            } else {
+                "evaluator_response_validated"
+            };
+
+            if failing_stage == "evaluator_response_parsed" {
+                pipeline_trace.record_stage_error(
+                    "evaluator_response_parsed",
+                    0,
+                    PipelineErrorCode::EvaluatorParseError,
+                    err_str.clone(),
+                    Some("Check LLM response formatting".to_string()),
+                );
+                pipeline_trace.record_stage(
+                    "evaluator_response_normalized",
+                    "skipped",
+                    0,
+                    None,
+                    None,
+                );
+                pipeline_trace.record_stage(
+                    "evaluator_response_validated",
+                    "skipped",
+                    0,
+                    None,
+                    None,
+                );
+            } else if failing_stage == "evaluator_response_normalized" {
+                pipeline_trace.record_stage("evaluator_response_parsed", "success", 0, None, None);
+                pipeline_trace.record_stage_error(
+                    "evaluator_response_normalized",
+                    0,
+                    PipelineErrorCode::EvaluatorNormalizeError,
+                    err_str.clone(),
+                    Some("Check evaluator output normalization rules".to_string()),
+                );
+                pipeline_trace.record_stage(
+                    "evaluator_response_validated",
+                    "skipped",
+                    0,
+                    None,
+                    None,
+                );
+            } else {
+                pipeline_trace.record_stage("evaluator_response_parsed", "success", 0, None, None);
+                pipeline_trace.record_stage(
+                    "evaluator_response_normalized",
+                    "success",
+                    0,
+                    None,
+                    None,
+                );
+                pipeline_trace.record_stage_error(
+                    "evaluator_response_validated",
+                    0,
+                    PipelineErrorCode::EvaluatorValidationError,
+                    err_str.clone(),
+                    Some("Check constraints, required keys, or type specifications".to_string()),
+                );
+            }
+
+            pipeline_trace.final_status = "failed".into();
+            pipeline_trace.failing_stage = Some(failing_stage.to_string());
+            pipeline_trace.total_elapsed_ms = started.elapsed().as_millis() as u64;
+            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+            if let Some(n_id) = narrator_log_id {
+                if let Ok(conn) = app.state::<AppState>().conn.lock() {
+                    let trace_val = serde_json::json!({ "pipeline_trace": &pipeline_trace });
+                    let _ = update_llm_payload_pipeline_trace(&conn, n_id, &trace_val);
+                }
+            }
+
             let status = if baseline_patch_id.is_some() {
                 "partial_success"
             } else if evaluator_timed_out(&err, call_elapsed, &state_updater_settings) {
@@ -8558,6 +9243,8 @@ async fn run_background_evaluator_job(
                 }
             });
             let mut trace = trace;
+            pipeline_trace.finalize_timing(started.elapsed().as_millis() as u64);
+            trace["pipeline_trace"] = serde_json::to_value(&pipeline_trace).unwrap_or_default();
             if let Some(evaluator_trace) = trace.get_mut("evaluator_trace") {
                 insert_json_object_fields(evaluator_trace, &form_trace);
             }
@@ -8592,6 +9279,9 @@ async fn run_background_evaluator_job(
             return;
         }
     };
+    if let Some(ref trace) = runtime.form_trace {
+        pipeline_trace.evaluator_row_traces = trace.evaluator_row_traces.clone();
+    }
     let evaluator_output = runtime.output.clone();
     let conversion = runtime.conversion.clone();
 
@@ -8638,6 +9328,7 @@ async fn run_background_evaluator_job(
     }
 
     let candidate_trace = evaluator_candidate_trace_json(&evaluator_output, &conversion);
+    let patch_compile_start = Instant::now();
     let mut engine_patch = sanitize_state_updater_patch(
         conversion.patch.clone(),
         &soul,
@@ -8649,6 +9340,25 @@ async fn run_background_evaluator_job(
         &snapshot_user_text,
         &visible_response_for_updater,
     );
+    let patch_elapsed = patch_compile_start.elapsed().as_millis() as u64;
+    let mut patch_status = "success";
+    if !conversion.rejected_candidates.is_empty() {
+        patch_status = "warning";
+    }
+    pipeline_trace.record_stage(
+        "engine_patch_compiled",
+        patch_status,
+        patch_elapsed,
+        Some(format!(
+            "Rejected count: {}",
+            conversion.rejected_candidates.len()
+        )),
+        Some(format!(
+            "Accepted count: {}",
+            conversion.accepted_candidate_ids.len()
+        )),
+    );
+    window.emit("pipeline-trace-updated", &pipeline_trace).ok();
     let converter_trace = evaluator_converter_trace_json(&engine_patch, &conversion);
     emit_dev_log(
         &window,
@@ -8806,12 +9516,25 @@ async fn run_background_evaluator_job(
                     "patch_empty": engine_patch.is_empty()
                 })),
             );
+            let rebuild_start = Instant::now();
             let rebuilt = db::rebuild_session_state(&conn, &job.conversation_id, branch_id)
                 .map_err(|err| err.to_string())?;
             soul = rebuilt.soul;
             session_world = rebuilt.session_world;
             db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
             db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
+            let rebuild_elapsed = rebuild_start.elapsed().as_millis() as u64;
+            pipeline_trace.record_stage(
+                "session_state_rebuilt",
+                "success",
+                rebuild_elapsed,
+                Some(format!(
+                    "Applied patches: {}",
+                    rebuilt.debug.applied_patches.len()
+                )),
+                Some(format!("Rebuilt Soul turn counter: {}", soul.turn_counter)),
+            );
+            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
             if let Some(log_id) = updater_log_id {
                 let _ = db::set_llm_payload_log_ledger_metadata(
                     &conn,
@@ -8845,6 +9568,7 @@ async fn run_background_evaluator_job(
             });
             Ok(())
         } else {
+            let rebuild_start = Instant::now();
             let report = engine_patch
                 .apply_to_session(&mut soul, Some(&mut session_world))
                 .map_err(|err| format!("{err:?}"))?;
@@ -8852,6 +9576,18 @@ async fn run_background_evaluator_job(
             soul.turns_since_consolidation += 1;
             db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
             db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
+            let rebuild_elapsed = rebuild_start.elapsed().as_millis() as u64;
+            pipeline_trace.record_stage(
+                "session_state_rebuilt",
+                "success",
+                rebuild_elapsed,
+                None,
+                Some(format!(
+                    "Rebuilt directly Soul turn counter: {}",
+                    soul.turn_counter
+                )),
+            );
+            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
             emit_relationship_delta_logs(&window, &job.conversation_id, &engine_patch);
             emit_memory_apply_logs(&window, &job.conversation_id, &report.memory_events);
             ledger_trace = serde_json::json!({
@@ -8873,6 +9609,20 @@ async fn run_background_evaluator_job(
     })();
 
     if let Err(err) = apply_result {
+        pipeline_trace.record_stage_error(
+            "session_state_rebuilt",
+            0,
+            PipelineErrorCode::DatabaseError,
+            err.clone(),
+            Some("Check database integrity or constraints".to_string()),
+        );
+        pipeline_trace.record_stage("memory_delta_extracted", "skipped", 0, None, None);
+        pipeline_trace.record_stage("memory_patch_committed", "skipped", 0, None, None);
+        pipeline_trace.record_stage("relationship_consolidation_ran", "skipped", 0, None, None);
+        pipeline_trace.final_status = "failed".into();
+        pipeline_trace.failing_stage = Some("session_state_rebuilt".to_string());
+        pipeline_trace.total_elapsed_ms = started.elapsed().as_millis() as u64;
+        window.emit("pipeline-trace-updated", &pipeline_trace).ok();
         let form_trace = runtime_form_trace_json(&runtime);
         let mut trace = serde_json::json!({
             "evaluator_trace": {
@@ -8929,6 +9679,8 @@ async fn run_background_evaluator_job(
                 "after": serde_json::Value::Null
             }
         });
+        pipeline_trace.finalize_timing(started.elapsed().as_millis() as u64);
+        trace["pipeline_trace"] = serde_json::to_value(&pipeline_trace).unwrap_or_default();
         if let Some(evaluator_trace) = trace.get_mut("evaluator_trace") {
             insert_json_object_fields(evaluator_trace, &form_trace);
         }
@@ -8955,6 +9707,53 @@ async fn run_background_evaluator_job(
         );
         return;
     }
+
+    let memory_candidates_count = engine_patch
+        .soul_patch
+        .as_ref()
+        .map(|sp| sp.new_memories.len() + sp.memory_operations.len())
+        .unwrap_or(0);
+    let memory_extract_status = if memory_candidates_count > 0 {
+        "success"
+    } else {
+        "skipped"
+    };
+    pipeline_trace.record_stage(
+        "memory_delta_extracted",
+        memory_extract_status,
+        0,
+        Some(format!(
+            "Extracted memories count: {memory_candidates_count}"
+        )),
+        Some(format!(
+            "Memory patch has {} operations",
+            memory_candidates_count
+        )),
+    );
+
+    let memory_commit_status = if memory_candidates_count > 0 {
+        "success"
+    } else {
+        "skipped"
+    };
+    pipeline_trace.record_stage(
+        "memory_patch_committed",
+        memory_commit_status,
+        0,
+        Some(format!(
+            "Committed memories count: {memory_candidates_count}"
+        )),
+        Some(format!("Saved memory updates: {}", memory_candidates_count)),
+    );
+
+    pipeline_trace.record_stage(
+        "relationship_consolidation_ran",
+        "skipped",
+        0,
+        None,
+        Some("Bypassed because consolidation was not triggered for this turn".to_string()),
+    );
+    window.emit("pipeline-trace-updated", &pipeline_trace).ok();
 
     emit_per_soul_memory_written_logs(&window, &job.conversation_id, &engine_patch);
     emit_dev_log(
@@ -9064,6 +9863,15 @@ async fn run_background_evaluator_job(
             "after": compact_state_summary_json(&soul, &session_world)
         }
     });
+    pipeline_trace.final_status = if enrichment_stale_skipped {
+        "canceled".to_string()
+    } else if runtime.partial_success || baseline_patch_id.is_some() && engine_patch.is_empty() {
+        "partial_success".to_string()
+    } else {
+        "success".to_string()
+    };
+    pipeline_trace.finalize_timing(started.elapsed().as_millis() as u64);
+    final_trace["pipeline_trace"] = serde_json::to_value(&pipeline_trace).unwrap_or_default();
     if let Some(evaluator_trace) = final_trace.get_mut("evaluator_trace") {
         insert_json_object_fields(evaluator_trace, &form_trace);
     }
@@ -10390,11 +11198,69 @@ fn render_llm_payload_history(logs: &[LlmPayloadLog]) -> String {
             .as_deref()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         {
+            let mut evaluator_row_traces = Vec::new();
+            if let Some(pt_val) = trace.get("pipeline_trace") {
+                if let Ok(pipeline_trace) =
+                    serde_json::from_value::<TurnPipelineTrace>(pt_val.clone())
+                {
+                    evaluator_row_traces = pipeline_trace.evaluator_row_traces.clone();
+                    lines.push(String::new());
+                    lines.push("### PIPELINE TRACE".to_string());
+                    lines.push(format!(
+                        "total_elapsed_ms: {}",
+                        pipeline_trace.total_elapsed_ms
+                    ));
+                    if let Some(failing) = &pipeline_trace.failing_stage {
+                        lines.push(format!("failing_stage: {}", failing));
+                    }
+                    for stage in &pipeline_trace.stages {
+                        lines.push(format!(
+                            "- Stage: {}, Status: {}, Elapsed: {}ms",
+                            stage.stage_name, stage.status, stage.elapsed_ms
+                        ));
+                    }
+                }
+            }
+
+            if evaluator_row_traces.is_empty() {
+                if let Some(ert_val) = trace.get("evaluator_row_traces") {
+                    if let Ok(rows) = serde_json::from_value::<
+                        Vec<state_engine::evaluator_form::EvalRowTrace>,
+                    >(ert_val.clone())
+                    {
+                        evaluator_row_traces = rows;
+                    }
+                }
+            }
+
             if let Some(value) = trace.get("narrator_trace") {
                 push_payload_trace_section(&mut lines, "NARRATOR TRACE", value);
             }
             if let Some(value) = trace.get("evaluator_trace") {
                 push_payload_trace_section(&mut lines, "EVALUATOR TRACE", value);
+            }
+
+            if !evaluator_row_traces.is_empty() {
+                lines.push(String::new());
+                lines.push("### EVALUATOR ROW TRACE".to_string());
+                for (idx, row) in evaluator_row_traces.iter().enumerate() {
+                    lines.push(format!("Row {}:", idx + 1));
+                    lines.push(format!("- row_kind: {}", row.row_kind));
+                    lines.push(format!("- row_index: {}", row.row_index));
+                    lines.push(format!(
+                        "- raw_row: {}",
+                        serde_json::to_string(&row.raw_row).unwrap_or_default()
+                    ));
+                    lines.push(format!(
+                        "- normalized_row: {}",
+                        serde_json::to_string(&row.normalized_row).unwrap_or_default()
+                    ));
+                    lines.push(format!("- validation_status: {}", row.validation_status));
+                    if let Some(reason) = &row.rejection_reason {
+                        lines.push(format!("- rejection_reason: {}", reason));
+                    }
+                    lines.push(format!("- compiler_result: {}", row.compiler_result));
+                }
             }
             if let Some(value) = trace.get("evaluator_raw_response").or_else(|| {
                 trace
@@ -11206,6 +12072,7 @@ fn llm_payload_response_update_from_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline_trace::PipelineStageTrace;
 
     #[test]
     fn test_is_body_only_markers() {
@@ -13610,6 +14477,96 @@ mod tests {
     }
 
     #[test]
+    fn payload_history_renders_pipeline_trace() {
+        let trace = TurnPipelineTrace {
+            request_id: "req-123".to_string(),
+            turn_id: Some("turn-456".to_string()),
+            conversation_id: "conv-789".to_string(),
+            started_at: 1000,
+            total_elapsed_ms: 1500,
+            final_status: "success".to_string(),
+            failing_stage: None,
+            suggested_debug_action: None,
+            stages: vec![
+                PipelineStageTrace {
+                    stage_id: "stage-1".to_string(),
+                    stage_name: "context_compiled".to_string(),
+                    status: "success".to_string(),
+                    elapsed_ms: 50,
+                    input_summary: None,
+                    output_summary: None,
+                    error_code: None,
+                    error_message: None,
+                    repair_action: None,
+                    artifact_ref: None,
+                },
+                PipelineStageTrace {
+                    stage_id: "stage-2".to_string(),
+                    stage_name: "narrator_called".to_string(),
+                    status: "warning".to_string(),
+                    elapsed_ms: 250,
+                    input_summary: None,
+                    output_summary: None,
+                    error_code: None,
+                    error_message: None,
+                    repair_action: None,
+                    artifact_ref: None,
+                },
+            ],
+            evaluator_row_traces: vec![],
+        };
+
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "pipeline_trace": trace
+        }))]);
+
+        assert!(exported.contains("### PIPELINE TRACE"));
+        assert!(exported.contains("total_elapsed_ms: 1500"));
+        assert!(exported.contains("- Stage: context_compiled, Status: success, Elapsed: 50ms"));
+        assert!(exported.contains("- Stage: narrator_called, Status: warning, Elapsed: 250ms"));
+    }
+
+    #[test]
+    fn payload_history_renders_evaluator_row_trace() {
+        let trace = TurnPipelineTrace {
+            request_id: "req-123".to_string(),
+            turn_id: Some("turn-456".to_string()),
+            conversation_id: "conv-789".to_string(),
+            started_at: 1000,
+            total_elapsed_ms: 1500,
+            final_status: "failed".to_string(),
+            failing_stage: Some("evaluator_response_validated".to_string()),
+            suggested_debug_action: Some("Fix constraints".to_string()),
+            stages: vec![],
+            evaluator_row_traces: vec![state_engine::evaluator_form::EvalRowTrace {
+                row_kind: "object".to_string(),
+                row_index: 0,
+                raw_row: serde_json::json!({ "id": "door", "state": "broken" }),
+                normalized_row: serde_json::json!({ "id": "door", "change_type": "state_change" }),
+                validation_status: "rejected".to_string(),
+                rejection_reason: Some("missing property_changed".to_string()),
+                compiler_result: "rejected".to_string(),
+            }],
+        };
+
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "pipeline_trace": trace
+        }))]);
+
+        assert!(exported.contains("### PIPELINE TRACE"));
+        assert!(exported.contains("failing_stage: evaluator_response_validated"));
+        assert!(exported.contains("### EVALUATOR ROW TRACE"));
+        assert!(exported.contains("- row_kind: object"));
+        assert!(exported.contains("- row_index: 0"));
+        assert!(exported.contains("- raw_row: {\"id\":\"door\",\"state\":\"broken\"}"));
+        assert!(exported
+            .contains("- normalized_row: {\"change_type\":\"state_change\",\"id\":\"door\"}"));
+        assert!(exported.contains("- validation_status: rejected"));
+        assert!(exported.contains("- rejection_reason: missing property_changed"));
+        assert!(exported.contains("- compiler_result: rejected"));
+    }
+
+    #[test]
     fn payload_export_includes_converted_patch() {
         let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
             "converted_engine_patch": {
@@ -15383,5 +16340,230 @@ mod tests {
 
         assert_eq!(active_listener_count, 1);
         assert!(is_registered);
+    }
+
+    #[test]
+    fn narrator_cannot_invent_call_notification_without_call_event() {
+        let dummy_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+        // No active call mentions in user text or world state
+        let user_text = "I study the books on the shelf.";
+        let response = "The call notification glows on the screen.";
+        assert!(has_phone_call_state_violation(
+            response,
+            user_text,
+            &dummy_world
+        ));
+
+        let repaired = sanitize_phone_call_state_violation(response, user_text, &dummy_world);
+        assert!(repaired.repaired);
+        assert!(!repaired.text.contains("call notification"));
+    }
+
+    #[test]
+    fn phone_ooc_explanation_does_not_create_active_call_state() {
+        let dummy_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+        // clarifying phone behavior does not count as active call state
+        assert!(!world_phone_state_has_active_call(&dummy_world));
+    }
+
+    #[test]
+    fn call_notification_requires_active_call_or_latest_user_call() {
+        let mut dummy_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Aurora"));
+
+        // Scenario A: User mentions calling
+        let user_text_call = "I call your phone to check in.";
+        let response = "The incoming call screen wakes up.";
+        assert!(!has_phone_call_state_violation(
+            response,
+            user_text_call,
+            &dummy_world
+        ));
+
+        // Scenario B: World state has active call
+        let mut phone_state = state_engine::soul::ObjectState::default();
+        phone_state.object_id = "aurora_phone".to_string();
+        phone_state.status = "incoming_call".to_string();
+        dummy_world.object_states.push(phone_state);
+
+        let user_text_idle = "I wait in silence.";
+        assert!(!has_phone_call_state_violation(
+            response,
+            user_text_idle,
+            &dummy_world
+        ));
+    }
+
+    #[test]
+    fn payload_history_renders_evaluator_row_trace_for_object_reject() {
+        let trace = TurnPipelineTrace {
+            request_id: "req-123".to_string(),
+            turn_id: Some("turn-456".to_string()),
+            conversation_id: "conv-789".to_string(),
+            started_at: 1000,
+            total_elapsed_ms: 1500,
+            final_status: "failed".to_string(),
+            failing_stage: Some("evaluator_response_validated".to_string()),
+            suggested_debug_action: None,
+            stages: vec![],
+            evaluator_row_traces: vec![state_engine::evaluator_form::EvalRowTrace {
+                row_kind: "object".to_string(),
+                row_index: 1,
+                raw_row: serde_json::json!({ "id": "door", "state": "broken" }),
+                normalized_row: serde_json::json!({ "id": "door", "change_type": "state_change" }),
+                validation_status: "rejected".to_string(),
+                rejection_reason: Some("object_id or new_object_label is required".to_string()),
+                compiler_result: "rejected".to_string(),
+            }],
+        };
+
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "pipeline_trace": trace
+        }))]);
+
+        assert!(exported.contains("### EVALUATOR ROW TRACE"));
+        assert!(exported.contains("- row_kind: object"));
+        assert!(exported.contains("- rejection_reason: object_id or new_object_label is required"));
+    }
+
+    #[test]
+    fn payload_history_renders_evaluator_row_trace_for_relationship_reject() {
+        let trace = TurnPipelineTrace {
+            request_id: "req-123".to_string(),
+            turn_id: Some("turn-456".to_string()),
+            conversation_id: "conv-789".to_string(),
+            started_at: 1000,
+            total_elapsed_ms: 1500,
+            final_status: "failed".to_string(),
+            failing_stage: Some("evaluator_response_validated".to_string()),
+            suggested_debug_action: None,
+            stages: vec![],
+            evaluator_row_traces: vec![state_engine::evaluator_form::EvalRowTrace {
+                row_kind: "relationship".to_string(),
+                row_index: 2,
+                raw_row: serde_json::json!({ "source": "A", "target": "B" }),
+                normalized_row: serde_json::json!({ "source": "A", "target": "B" }),
+                validation_status: "rejected".to_string(),
+                rejection_reason: Some("direction_missing_uncertain".to_string()),
+                compiler_result: "rejected".to_string(),
+            }],
+        };
+
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "pipeline_trace": trace
+        }))]);
+
+        assert!(exported.contains("### EVALUATOR ROW TRACE"));
+        assert!(exported.contains("- row_kind: relationship"));
+        assert!(exported.contains("- rejection_reason: direction_missing_uncertain"));
+    }
+
+    #[test]
+    fn payload_history_row_trace_includes_raw_and_normalized_row() {
+        let trace = TurnPipelineTrace {
+            request_id: "req-123".to_string(),
+            turn_id: Some("turn-456".to_string()),
+            conversation_id: "conv-789".to_string(),
+            started_at: 1000,
+            total_elapsed_ms: 1500,
+            final_status: "success".to_string(),
+            failing_stage: None,
+            suggested_debug_action: None,
+            stages: vec![],
+            evaluator_row_traces: vec![state_engine::evaluator_form::EvalRowTrace {
+                row_kind: "event".to_string(),
+                row_index: 0,
+                raw_row: serde_json::json!({ "raw_field": "val" }),
+                normalized_row: serde_json::json!({ "norm_field": "val" }),
+                validation_status: "accepted".to_string(),
+                rejection_reason: None,
+                compiler_result: "world_event_created".to_string(),
+            }],
+        };
+
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "pipeline_trace": trace
+        }))]);
+
+        assert!(exported.contains("- raw_row: {\"raw_field\":\"val\"}"));
+        assert!(exported.contains("- normalized_row: {\"norm_field\":\"val\"}"));
+    }
+
+    #[test]
+    fn form_rows_rejected_count_matches_row_trace_rejected_count() {
+        let trace = TurnPipelineTrace {
+            request_id: "req-123".to_string(),
+            turn_id: Some("turn-456".to_string()),
+            conversation_id: "conv-789".to_string(),
+            started_at: 1000,
+            total_elapsed_ms: 1500,
+            final_status: "success".to_string(),
+            failing_stage: None,
+            suggested_debug_action: None,
+            stages: vec![],
+            evaluator_row_traces: vec![
+                state_engine::evaluator_form::EvalRowTrace {
+                    row_kind: "event".to_string(),
+                    row_index: 0,
+                    raw_row: serde_json::json!({}),
+                    normalized_row: serde_json::json!({}),
+                    validation_status: "rejected".to_string(),
+                    rejection_reason: Some("error 1".to_string()),
+                    compiler_result: "rejected".to_string(),
+                },
+                state_engine::evaluator_form::EvalRowTrace {
+                    row_kind: "object".to_string(),
+                    row_index: 1,
+                    raw_row: serde_json::json!({}),
+                    normalized_row: serde_json::json!({}),
+                    validation_status: "rejected".to_string(),
+                    rejection_reason: Some("error 2".to_string()),
+                    compiler_result: "rejected".to_string(),
+                },
+                state_engine::evaluator_form::EvalRowTrace {
+                    row_kind: "relationship".to_string(),
+                    row_index: 2,
+                    raw_row: serde_json::json!({}),
+                    normalized_row: serde_json::json!({}),
+                    validation_status: "accepted".to_string(),
+                    rejection_reason: None,
+                    compiler_result: "relationship_delta_created".to_string(),
+                },
+            ],
+        };
+
+        let rejected_count = trace
+            .evaluator_row_traces
+            .iter()
+            .filter(|r| r.validation_status == "rejected")
+            .count();
+        assert_eq!(rejected_count, 2);
+    }
+
+    #[test]
+    fn pipeline_trace_total_elapsed_nonzero_when_stage_elapsed_exists() {
+        let mut trace =
+            TurnPipelineTrace::new("req-123".to_string(), None, "conv-789".to_string(), 1000);
+        trace.record_stage("narrator_called", "success", 1500, None, None);
+        trace.record_stage("evaluator_response_received", "success", 2500, None, None);
+
+        trace.finalize_timing(0);
+
+        assert_ne!(trace.total_elapsed_ms, 0);
+        assert_eq!(trace.total_elapsed_ms, 4000);
+    }
+
+    #[test]
+    fn async_pipeline_trace_total_elapsed_includes_evaluator_response_received() {
+        let mut trace =
+            TurnPipelineTrace::new("req-123".to_string(), None, "conv-789".to_string(), 1000);
+        trace.record_stage("narrator_called", "success", 2000, None, None);
+        trace.record_stage("evaluator_response_received", "success", 3000, None, None);
+
+        trace.finalize_timing(500);
+
+        assert_eq!(trace.total_elapsed_ms, 5000);
     }
 }
