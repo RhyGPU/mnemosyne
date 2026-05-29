@@ -5,71 +5,61 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Devlog 000, Before the Repository | RhyGPU</title>
   <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0d12;
+      --text: #e8e8e8;
+      --muted: #9aa3b8;
+      --soft: #c7cad3;
+      --line: #252a36;
+      --accent: #8ab4ff;
+    }
+
     body {
       margin: 0;
-      background: #0b0d12;
-      color: #e8e8e8;
-      font-family: Arial, sans-serif;
+      background: radial-gradient(circle at top left, #151b2a 0, var(--bg) 34rem);
+      color: var(--text);
+      font-family: Arial, Helvetica, sans-serif;
       line-height: 1.7;
     }
 
     main {
-      max-width: 760px;
+      max-width: 780px;
       margin: 0 auto;
-      padding: 56px 24px 80px;
+      padding: 56px 24px 84px;
     }
 
-    a {
-      color: #8ab4ff;
-      text-decoration: none;
-    }
-
-    a:hover {
-      text-decoration: underline;
-    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
 
     .back {
-      color: #8b92a6;
+      color: var(--muted);
       font-size: 0.95rem;
-      margin-bottom: 40px;
+      margin-bottom: 42px;
       display: inline-block;
     }
 
     h1 {
-      font-size: 2.6rem;
-      line-height: 1.15;
-      margin-bottom: 0.5rem;
+      font-size: clamp(2.2rem, 8vw, 3.5rem);
+      line-height: 1.05;
+      margin: 0 0 0.75rem;
+      letter-spacing: -0.04em;
     }
 
-    .meta {
-      color: #8b92a6;
-      margin-bottom: 3rem;
-    }
-
-    p {
-      color: #c7cad3;
-      font-size: 1.08rem;
-      margin: 1.25rem 0;
-    }
+    .meta { color: var(--muted); margin-bottom: 3rem; }
+    p { color: var(--soft); font-size: 1.08rem; margin: 1.25rem 0; }
 
     blockquote {
-      border-left: 3px solid #8ab4ff;
-      padding-left: 18px;
+      border-left: 3px solid var(--accent);
+      padding: 0.4rem 0 0.4rem 1.2rem;
       color: #ffffff;
-      margin: 2rem 0;
-      font-size: 1.15rem;
+      margin: 2.2rem 0;
+      font-size: 1.18rem;
+      background: rgba(138, 180, 255, 0.045);
     }
 
-    hr {
-      border: none;
-      border-top: 1px solid #252a36;
-      margin: 3rem 0;
-    }
-
-    .note {
-      color: #8b92a6;
-      font-size: 0.95rem;
-    }
+    hr { border: none; border-top: 1px solid var(--line); margin: 3rem 0; }
+    .note { color: var(--muted); font-size: 0.95rem; }
   </style>
 </head>
 <body>
@@ -80,13 +70,14 @@
     <div class="meta">May 2026 · Origin notes · Mnemosyne</div>
 
     <p>
-      Before Mnemosyne was a repository, it was a frustration I kept running into.
+      Before Mnemosyne was a repository, it was frustration.
     </p>
 
     <p>
       I was using AI roleplay platforms, trying different bots, different prompts,
-      and different formats. At first, I thought the problem was just that I needed
-      a better prompt. Then I realized the problem was deeper.
+      different formats, and eventually different AI coding tools. At first, I thought
+      the problem was just that I needed a better prompt. Then I realized the problem
+      was deeper.
     </p>
 
     <p>
@@ -97,9 +88,8 @@
     <p>
       Characters changed too fast. Trust jumped too quickly. Fear disappeared because
       the scene needed to move forward. Shame got solved by one good speech. A character
-      could go from guarded to devoted in a handful of messages, not because the
-      relationship had earned it, but because the model wanted to satisfy the current
-      direction of the scene.
+      could go from guarded to devoted in a handful of messages, not because the relationship
+      had earned it, but because the model wanted to satisfy the current direction of the scene.
     </p>
 
     <p>
@@ -107,25 +97,26 @@
     </p>
 
     <p>
-      I did not want a character that only reacted well in the moment. I wanted a
-      character that carried the weight of what had happened before.
+      I did not want a character that only reacted well in the moment. I wanted a character
+      that carried the weight of what had happened before.
     </p>
 
     <p>
-      My first solution was crude. I used a prompt-based tracking system: a code block
-      at the end of the chat that acted like a compact scene memory format. It tracked
-      status, scene state, memories, atmosphere, physical condition, sensory details,
-      and character position.
+      My first solution was crude. I made prompt-based tracking systems. At the end of the
+      chat, I had the AI append a compact code block, almost like a little scene compile
+      format. It tracked things like status, scene state, memories, atmosphere, physical
+      condition, sensory details, and character position.
     </p>
 
     <p>
-      It was not a real engine. It was a hack.
+      It was not a state engine. It was not a database. It was not a proper memory system.
+      It was just a code block.
     </p>
 
     <p>
-      But it worked better than nothing, and that bothered me even more. If a rough
-      code block could make the experience better, then the real missing piece was not
-      just better prose. The missing piece was structure.
+      But it worked better than nothing, and that bothered me even more. If a rough code block
+      could improve continuity, then the missing piece was probably not just better prose.
+      The missing piece was structure.
     </p>
 
     <p>
@@ -133,20 +124,16 @@
     </p>
 
     <p>
-      Not just a summary. Not just a longer context window. Not just "remember this
-      character likes coffee." I wanted something closer to a Soul.
-    </p>
-
-    <p>
-      A system that could track what changed inside a character over time.
+      Not just a summary. Not just a longer context window. Not just “remember this character
+      likes coffee.” I wanted something closer to a Soul: a compact record of what changed
+      inside a character over time.
     </p>
 
     <p>
       Trust should not be the same as affection. Fear should not be the same as shame.
-      Attraction should not be the same as commitment. A character can like someone and
-      still distrust them. They can feel safe in one place and terrified in another.
-      They can forget an ordinary conversation but remember one small sentence forever
-      because it hit the right wound.
+      Attraction should not be the same as commitment. A character can like someone and still
+      distrust them. They can feel safe in one place and terrified in another. They can forget
+      an ordinary conversation but remember one small sentence forever because it hit the right wound.
     </p>
 
     <p>
@@ -154,10 +141,10 @@
     </p>
 
     <p>
-      A universal character state system. Something that could work for a dating sim,
-      a Minecraft NPC, a fantasy companion, a robot, a villain, or a long-form roleplay
-      character. The genre did not matter. The foundation was the same: a character
-      should not be a static prompt. A character should evolve.
+      A universal character state tracker. Something genre-agnostic enough to work for a dating sim,
+      a Minecraft NPC, a fantasy companion, a robot, a villain, or a long-form roleplay character.
+      The genre did not matter. The foundation was the same: a character should not be a static prompt.
+      A character should evolve.
     </p>
 
     <p>
@@ -165,25 +152,19 @@
     </p>
 
     <p>
-      I did not trust platform auto-summaries. They often flattened the wrong things,
-      skipped important emotional turns, or preserved facts without preserving meaning.
-      My workaround was manual: copy the whole chat, paste it into another model, and
-      ask it to summarize the session myself.
+      I did not trust platform auto-summaries. They often flattened the wrong things, skipped important
+      emotional turns, or preserved facts without preserving meaning. My workaround was manual: copy the
+      whole chat, paste it into another model, and ask it to summarize the session myself.
     </p>
 
     <p>
-      That worked better, but it was still manual labor.
+      That worked better, but it was still manual labor. It also proved something important: a memory system
+      should not save everything equally.
     </p>
 
     <p>
-      It also proved something important: a memory system should not save everything
-      equally.
-    </p>
-
-    <p>
-      Humans do not remember like databases. We forget most things. We keep fragments.
-      We keep emotional landmarks. We remember what surprised us, hurt us, helped us,
-      threatened us, or changed how we saw someone.
+      Humans do not remember like databases. We forget most things. We keep fragments. We keep emotional
+      landmarks. We remember what surprised us, hurt us, helped us, threatened us, or changed how we saw someone.
     </p>
 
     <p>
@@ -191,42 +172,32 @@
     </p>
 
     <p>
-      Mnemosyne was not supposed to be a transcript machine.
+      Mnemosyne was not supposed to be a transcript machine. It was supposed to track what mattered.
+    </p>
+
+    <blockquote>
+      Make the AI remember like a character, not like a transcript.
+    </blockquote>
+
+    <p>
+      That led to the flagging idea. Important events and dialogue should be marked based on character-specific
+      salience. A betrayal matters more to a character who values loyalty. A small act of protection matters more
+      to someone who has not felt safe. A casual joke might vanish, but the same joke said during fear or grief
+      might become unforgettable.
     </p>
 
     <p>
-      It was supposed to track what mattered.
+      The system needed to decide what a character would remember, what they would misremember, and what they would forget.
     </p>
 
     <p>
-      That led to the flagging idea. Important events and dialogue should be marked
-      based on character-specific salience. A betrayal matters more to a character who
-      values loyalty. A small act of protection matters more to someone who has not felt
-      safe. A casual joke might vanish, but the same joke said during fear or grief might
-      become unforgettable.
+      It also needed to let characters grow slowly. No instant trust. No instant healing. No emotional teleportation.
+      If a relationship changed, the system had to ask: was there enough time, enough evidence, enough pressure,
+      enough consistency? If not, the character should resist the change, even if the scene wanted it.
     </p>
 
     <p>
-      The system needed to decide what a character would remember, what they would
-      misremember, and what they would forget.
-    </p>
-
-    <p>
-      It also needed to let characters grow slowly.
-    </p>
-
-    <p>
-      No instant trust. No instant healing. No emotional teleportation.
-    </p>
-
-    <p>
-      If a relationship changed, the system had to ask: was there enough time, enough
-      evidence, enough pressure, enough consistency? If not, the character should resist
-      the change, even if the scene wanted it.
-    </p>
-
-    <p>
-      That was when the project stopped being "I need a better RP prompt."
+      That was when the project stopped being “I need a better RP prompt.”
     </p>
 
     <blockquote>
@@ -234,30 +205,26 @@
     </blockquote>
 
     <p>
-      From there, the shape of Mnemosyne started to form.
-    </p>
-
-    <blockquote>
-      A narrator writes the scene. A memory layer watches what changes. A Soul remembers what mattered.
-    </blockquote>
-
-    <p>
-      At this point, there was no polished app. No clean UI. No roadmap. No alpha. No
-      domain. No proper repository history yet.
+      From there, the shape of Mnemosyne started to form. Not all at once. Not as a clean architecture diagram.
+      It started as a crude tracking block, then a hidden status format, then a thought about memory flags, then
+      a larger idea about Souls and continuity.
     </p>
 
     <p>
-      There was only the feeling that the current platforms were not enough, and that
-      maybe the fix was not another character card.
+      At this point, there was no polished app. No clean UI. No roadmap. No alpha. No domain. No proper repository history yet.
     </p>
 
     <p>
+      There was only the feeling that the current platforms were not enough, and that maybe the fix was not another character card.
       Maybe it was an engine.
     </p>
 
     <p>
-      That is where Mnemosyne started. Not with code, but with the suspicion that AI
-      characters needed a memory system built around change, not chat history.
+      That is where Mnemosyne started.
+    </p>
+
+    <p>
+      Not with code. With a code block that got out of hand.
     </p>
 
     <hr />
