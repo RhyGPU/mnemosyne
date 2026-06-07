@@ -22,7 +22,7 @@ pub fn format_honest_ui_status(
             for r in rejected_rows {
                 match r.row_kind.as_str() {
                     "object" => object_count += 1,
-                    "relationship" => relationship_count += 1,
+                    "relationship" | "relationship_event" => relationship_count += 1,
                     "memory" => memory_count += 1,
                     "event" => event_count += 1,
                     "review" => review_count += 1,

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use state_engine::{
     evaluator::{turn_flags, EVALUATOR_SCHEMA_VERSION},
-    evaluator_form::{build_eval_form_spec, EvalFormResponse},
+    evaluator_form::{build_eval_form_spec, build_hard_eval_form_template},
     setting::SessionWorld,
     soul::Soul,
 };
@@ -1056,14 +1056,14 @@ pub fn build_evaluator_form_prompt(
         latest_narrator_response,
         8,
     );
-    let empty_response = EvalFormResponse::default();
+    let hard_form_template = build_hard_eval_form_template(&spec);
     format!(
-        "{}\n\nReturn valid evaluator_form_v1 JSON only. Fill EvalFormResponse rows using only ids and enum values from the form spec. Do not output bitmasks, decay scores, numeric salience, numeric retrieval strength, or final EnginePatch JSON. Every non-empty row requires evidence_quote. Unknown entity ids are invalid unless an object row uses new_object_label.\n\n[LATEST EXCHANGE]\nUser: {}\nNarrator: {}\n\n[FORM SPEC]\n{}\n\n[EMPTY RESPONSE SHAPE]\n{}",
+        "{}\n\nYou are filling a provided JSON evaluation sheet. Do not invent keys. Do not rename keys. Do not remove required keys. Do not add alternate row shapes. For rows with no evidence, leave row_enabled as 0 and keep numeric fields at 0. For rows with evidence, set row_enabled to 1 and fill every numeric field with an integer in the required range.\n\nThe output must use the exact keys from the provided form. Unknown keys are invalid. Missing keys are invalid.\n\nNever output axis_trust, axis_fear, axis_comfort, axis_boundary_pressure, modifier_trust, modifier_fear, modifier_comfort, or modifier_boundary_pressure.\n\nReturn valid evaluator_form_v1 JSON only. Return the same top-level evaluator_form_v1 object from the provided sheet, with values filled in. Do not output final EnginePatch JSON. Every enabled row requires evidence_quote. Unknown entity ids are invalid unless an object row uses new_object_label. For relationship_event_rows, every axis field must be an integer from -5 to +5. Every modifier field must be an integer from 0 to 100. The required numeric bitmask field is event_flags_u64. If no evidence exists for a field, use 0, not null or a string. Do not decide final relationship deltas. Only score observable event evidence.\n\n[LATEST EXCHANGE]\nUser: {}\nNarrator: {}\n\n[FORM SPEC]\n{}\n\n[HARD FILLABLE FORM TEMPLATE]\n{}",
         EVALUATOR_SYSTEM_PROMPT,
         latest_user_message,
         latest_narrator_response,
         serde_json::to_string_pretty(&spec).unwrap_or_default(),
-        serde_json::to_string_pretty(&empty_response).unwrap_or_default(),
+        serde_json::to_string_pretty(&hard_form_template).unwrap_or_default(),
     )
 }
 
@@ -1247,9 +1247,37 @@ mod tests {
         assert!(prompt.contains("[LATEST EXCHANGE]"));
         assert!(prompt.contains("I walk in. Long time no see, Aurora."));
         assert!(prompt.contains("[FORM SPEC]"));
-        assert!(prompt.contains("[EMPTY RESPONSE SHAPE]"));
-        assert!(prompt.contains("Do not output bitmasks"));
+        assert!(prompt.contains("[HARD FILLABLE FORM TEMPLATE]"));
+        assert!(prompt.contains("You are filling a provided JSON evaluation sheet"));
+        assert!(prompt.contains("Unknown keys are invalid. Missing keys are invalid."));
+        assert!(prompt.contains("event_flags_u64"));
+        assert!(prompt.contains("Never output axis_trust"));
+        assert!(prompt.contains("relationship_event_rows"));
         assert!(prompt.contains("review_rows"));
+    }
+
+    #[test]
+    fn prompt_includes_hard_relationship_event_template() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let prompt = build_evaluator_form_prompt(
+            &soul,
+            None,
+            "I wait outside.",
+            "Aurora watches from behind the chain.",
+        );
+
+        assert!(prompt.contains("[HARD FILLABLE FORM TEMPLATE]"));
+        assert!(prompt.contains("\"row_enabled\": 0"));
+        assert!(prompt.contains("\"actor_entity_id\": \"default_player\""));
+        assert!(prompt.contains("\"relationship_source_soul_id\""));
+        assert!(prompt.contains("\"relationship_target_entity_id\": \"default_player\""));
+        assert!(prompt.contains("\"intent\": 0"));
+        assert!(prompt.contains("\"salience\": 0"));
+        assert!(prompt.contains("\"event_flags_u64\": 0"));
+        assert!(prompt.contains("\"new_character_rows\""));
+        assert!(prompt.contains("\"scene_participants\""));
+        assert!(!prompt.contains("\"axis_trust\""));
+        assert!(!prompt.contains("\"modifier_trust\""));
     }
 
     #[test]

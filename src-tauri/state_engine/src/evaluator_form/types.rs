@@ -10,11 +10,13 @@ use crate::{
 
 pub const EVALUATOR_FORM_VERSION: &str = "evaluator_form_v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvalFormSpec {
     pub form_version: String,
     pub active_entities: Vec<FormEntityOption>,
     pub active_soul_ids: Vec<String>,
+    #[serde(default)]
+    pub active_relationship_states: Vec<FormRelationshipState>,
     pub known_object_ids: Vec<String>,
     pub allowed_memory_slots: Vec<MemorySlot>,
     pub allowed_relationship_dimensions: Vec<RelationshipDimension>,
@@ -32,6 +34,39 @@ pub struct FormEntityOption {
     pub entity_id: String,
     pub display_name: String,
     pub entity_type: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FormRelationshipState {
+    pub source_soul_id: String,
+    pub target_entity_id: String,
+    pub trust: f32,
+    pub affection: f32,
+    pub intimacy: f32,
+    pub passion: f32,
+    pub commitment: f32,
+    pub fear: f32,
+    pub desire: f32,
+    pub respect: f32,
+    pub conflict: f32,
+    pub dependency: f32,
+    pub curiosity: f32,
+    pub comfort: f32,
+    pub boundary_pressure: f32,
+    pub trustable_bias: f32,
+    pub untrustworthy_bias: f32,
+    pub asshole_bias: f32,
+    pub care_bias: f32,
+    pub danger_bias: f32,
+    pub competence_bias: f32,
+    pub autonomy_respect_bias: f32,
+    pub attachment_pull: f32,
+    pub schema_threat: f32,
+    pub first_impression_strength: f32,
+    pub first_impression_confidence: f32,
+    pub reappraisal_debt: f32,
+    pub reappraisal_state_code: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,11 +186,35 @@ pub enum ReviewDecision {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct EvalFormResponse {
+    pub scene_participants: Vec<SceneParticipantRow>,
+    pub new_character_rows: Vec<NewCharacterRow>,
     pub event_rows: Vec<EventRow>,
     pub object_rows: Vec<ObjectRow>,
     pub relationship_rows: Vec<RelationshipRow>,
+    pub relationship_event_rows: Vec<RelationshipEventRow>,
     pub memory_rows: Vec<MemoryRow>,
     pub review_rows: Vec<ReviewRow>,
+}
+
+pub type RelationshipEventRow = Value;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SceneParticipantRow {
+    pub entity_id: String,
+    pub display_name: String,
+    pub present: u8,
+    pub newly_introduced: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NewCharacterRow {
+    pub row_enabled: u8,
+    pub temporary_label: String,
+    pub display_name: String,
+    pub role_code: u8,
+    pub evidence_quote: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -233,9 +292,40 @@ pub struct RelationshipRow {
     pub associated_event_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ValidatedRelationshipEventRow {
+    pub event_id: String,
+    pub source_entity_id: String,
+    pub target_entity_id: String,
+    pub perceived_by_entity_id: String,
+    pub relationship_source_soul_id: String,
+    pub relationship_target_entity_id: String,
+    pub evidence_quote: String,
+    pub intent: i32,
+    pub honesty: i32,
+    pub reliability: i32,
+    pub boundary_treatment: i32,
+    pub responsiveness: i32,
+    pub power_use: i32,
+    pub evaluation_tone: i32,
+    pub competence: i32,
+    pub disclosure: i32,
+    pub reciprocity: i32,
+    pub repair: i32,
+    pub predictability: i32,
+    pub salience: u32,
+    pub certainty: u32,
+    pub directness: u32,
+    pub costliness: u32,
+    pub stakes: u32,
+    pub repetition: u32,
+    pub event_flags_u64: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct MemoryRow {
+    pub row_enabled: Option<u8>,
     #[serde(alias = "event_id")]
     pub linked_event_id: String,
     pub owner_soul_id: String,
@@ -299,6 +389,12 @@ pub struct EvalFormTrace {
     pub relationship_rows_split_count: usize,
     #[serde(default)]
     pub relationship_row_results: HashMap<String, String>,
+    #[serde(default)]
+    pub relationship_event_row_results: HashMap<String, String>,
+    #[serde(default)]
+    pub relationship_delta_source: HashMap<String, String>,
+    #[serde(default)]
+    pub relationship_event_template_version: String,
     #[serde(default)]
     pub relationship_non_delta_count: usize,
     #[serde(default)]

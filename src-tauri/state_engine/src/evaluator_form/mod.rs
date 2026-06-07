@@ -12,6 +12,12 @@ pub use raw_repair::*;
 pub mod normalize;
 pub use normalize::*;
 
+pub mod relationship_event;
+pub use relationship_event::*;
+
+pub mod template;
+pub use template::*;
+
 pub mod validate;
 pub use validate::*;
 

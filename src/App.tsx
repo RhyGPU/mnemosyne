@@ -1,10 +1,12 @@
 import {
+  Archive,
   ArrowLeft,
   Brain,
   ChevronDown,
   Clipboard,
   Database,
   FileDown,
+  FolderOpen,
   FileUp,
   Image as ImageIcon,
   MessageSquareText,
@@ -52,9 +54,15 @@ import {
   createDefaultSetting,
   dedupeActiveAdjacentUserMessages,
   deleteConversation,
+  restoreConversation,
   deleteMessage,
   deleteProviderProfile,
-  deleteSetting,
+  archiveProviderProfile,
+  restoreProviderProfile,
+  listArchivedProviderProfiles,
+  archiveSetting,
+  restoreSetting,
+  listArchivedSettings,
   deleteSoul,
   exportLlmPayloadHistory,
   exportCharacterSoulMne,
@@ -71,7 +79,12 @@ import {
   inspectTurnBranchIntegrity,
   importImageAssetFromFile,
   importMneBundle,
+  validateMneBundle,
+  previewMneImport,
+  importMneAsNew,
   listConversations,
+  listArchivedSessions,
+  openSessionDataLocation,
   listProviderProfiles,
   listAssistantMessageVariants,
   listConversationMessages,
@@ -112,6 +125,7 @@ const SETTINGS_DRAWER_TAB_STORAGE_KEY = "mnemosyne:settings_drawer_tab";
 const SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY = "mnemosyne:settings_first_launch_seen_v1";
 const CHAT_START_MODE_STORAGE_KEY = "mnemosyne:chat_start_mode";
 const SHOW_ARCHIVED_SESSIONS_STORAGE_KEY = "mnemosyne:show_archived_sessions";
+const SESSIONS_PER_PAGE = 10;
 const DEV_CONSOLE_PAUSED_STORAGE_KEY = "mnemosyne:dev_console_paused";
 const DEV_LOG_LEVEL_FILTER_STORAGE_KEY = "mnemosyne:dev_log_level_filter";
 const DEV_LOG_CATEGORY_FILTER_STORAGE_KEY = "mnemosyne:dev_log_category_filter";
@@ -387,6 +401,20 @@ export function App() {
   const [souls, setSouls] = useState<SoulSummary[]>([]);
   const [settings, setSettings] = useState<SettingSummary[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  async function refreshConversations() {
+    try {
+      const [active, archived] = await Promise.all([
+        listConversations(),
+        listArchivedSessions(),
+      ]);
+      setConversations([...active, ...archived]);
+    } catch (err) {
+      console.error(err);
+      try {
+        setConversations(await listConversations());
+      } catch (_) {}
+    }
+  }
   const [soul, setSoul] = useState<Soul | null>(null);
   const [setting, setSetting] = useState<SettingSoul | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -412,10 +440,11 @@ export function App() {
   const [settingEditorOpen, setSettingEditorOpen] = useState(false);
   const [soulEditorOpen, setSoulEditorOpen] = useState(false);
   const [psycheOpen, setPsycheOpen] = useState(false);
-  const [provider, setProvider] = useState<ProviderKind>("Mock");
+  const [provider, setProvider] = useState<ProviderKind>("API");
   const [mode, setMode] = useState<NarrativeMode>("Reader");
   const [contextMode, setContextMode] = useState<ContextMode>("brief");
   const [providerProfiles, setProviderProfiles] = useState<ProviderProfile[]>([]);
+  const [archivedProviderProfiles, setArchivedProviderProfiles] = useState<ProviderProfile[]>([]);
   const [narratorProviderProfileName, setNarratorProviderProfileName] = useState("Narrator API");
   const [updaterProviderProfileName, setUpdaterProviderProfileName] = useState("Updater API");
   const [selectedProviderProfileId, setSelectedProviderProfileId] = useState(() =>
@@ -498,9 +527,11 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [stateUpdating, setStateUpdating] = useState(false);
   const [activeEvaluatorJob, setActiveEvaluatorJob] = useState<EvaluatorJob | null>(null);
+  const [evaluatorJobBannerDismissed, setEvaluatorJobBannerDismissed] = useState(false);
   const [showArchivedSessions, setShowArchivedSessions] = useState(() =>
     loadStoredBoolean(SHOW_ARCHIVED_SESSIONS_STORAGE_KEY, false),
   );
+  const [sessionListPage, setSessionListPage] = useState(1);
   const didBootstrap = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const settingImportInputRef = useRef<HTMLInputElement>(null);
@@ -525,7 +556,7 @@ export function App() {
     () =>
       conversations.filter((conversation) => {
         if (!soul) return false;
-        const archived = conversation.title.startsWith("[Archived] ");
+        const archived = Boolean(conversation.archived_at) || conversation.title.startsWith("[Archived] ");
         if (archived !== showArchivedSessions) return false;
         return (
           conversation.soul_id === soul.character_id ||
@@ -536,6 +567,11 @@ export function App() {
       }),
     [conversations, showArchivedSessions, soul?.character_id, soul?.source_savepoint_id],
   );
+  const sessionListTotalPages = Math.max(1, Math.ceil(visibleConversations.length / SESSIONS_PER_PAGE));
+  const paginatedConversations = useMemo(() => {
+    const start = (sessionListPage - 1) * SESSIONS_PER_PAGE;
+    return visibleConversations.slice(start, start + SESSIONS_PER_PAGE);
+  }, [visibleConversations, sessionListPage]);
   const selectedCharacterCount = selectedCharacterIds.filter((id) =>
     souls.some((item) => item.character_id === id),
   ).length;
@@ -652,6 +688,14 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(SHOW_ARCHIVED_SESSIONS_STORAGE_KEY, showArchivedSessions ? "true" : "false");
   }, [showArchivedSessions]);
+
+  useEffect(() => {
+    setSessionListPage(1);
+  }, [showArchivedSessions, soul?.character_id]);
+
+  useEffect(() => {
+    setSessionListPage((page) => Math.min(page, sessionListTotalPages));
+  }, [sessionListTotalPages]);
 
   useEffect(() => {
     localStorage.setItem(DEV_CONSOLE_PAUSED_STORAGE_KEY, devConsolePaused ? "true" : "false");
@@ -889,6 +933,10 @@ export function App() {
       .catch(() => undefined);
   }, [activeConversationId]);
 
+  useEffect(() => {
+    setEvaluatorJobBannerDismissed(false);
+  }, [activeConversationId, activeEvaluatorJob?.evaluator_job_id]);
+
   function setCreatorFieldsFromSoul(nextSoul: Soul) {
     setCharacterName(nextSoul.character_name);
     setCharacterDescription(nextSoul.profile.description);
@@ -1057,14 +1105,15 @@ export function App() {
   }
 
   async function bootstrap() {
-    const [existingSouls, existingSettings, existingConversations] = await Promise.all([
+    const [existingSouls, existingSettings, existingConversations, existingArchived] = await Promise.all([
       listSouls(),
       listSettings(),
       listConversations(),
+      listArchivedSessions(),
     ]);
     setSouls(existingSouls);
     setSettings(existingSettings);
-    setConversations(existingConversations);
+    setConversations([...existingConversations, ...existingArchived]);
     void loadProviderProfiles();
 
     let activeSetting: SettingSoul;
@@ -1100,6 +1149,7 @@ export function App() {
     try {
       const existingProviderProfiles = await listProviderProfiles();
       setProviderProfiles(existingProviderProfiles);
+      setArchivedProviderProfiles(await listArchivedProviderProfiles());
       if (existingProviderProfiles.length === 0) {
         const firstLaunchSeen = localStorage.getItem(SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY) === "true";
         if (!firstLaunchSeen) {
@@ -1420,7 +1470,7 @@ export function App() {
       setContext(result.context_preview);
       setLastTurnDebug(result.debug);
       setSouls(await listSouls());
-      setConversations(await listConversations());
+      await refreshConversations();
       setStateUpdating(false);
       const replayStatus = result.debug.replay_detected
         ? result.debug.replay_reason?.includes("regenerated before save")
@@ -1506,7 +1556,7 @@ export function App() {
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key !== "Enter" || !event.shiftKey || event.nativeEvent.isComposing) {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
       return;
     }
     event.preventDefault();
@@ -1581,6 +1631,60 @@ export function App() {
     logDev("info", "app", "Dev Console logs exported", { entries: devLogs.length });
   }
 
+  async function handleValidateMne() {
+    const path = window.prompt("Enter absolute path to the .mne file to validate:");
+    if (!path) return;
+    try {
+      setStatus("Validating bundle...");
+      const report = await validateMneBundle(path);
+      logDev("info", "app", "MNE Validation Report", report);
+      if (report.valid) {
+        window.alert(`Bundle is VALID!\n\nSoul: ${report.summary.soul_name || "N/A"}\nWorld: ${report.summary.world_name || "N/A"}\nMessages: ${report.summary.message_count}\nMemories: ${report.summary.memory_count}\nRelationships: ${report.summary.relationship_count}`);
+      } else {
+        window.alert(`Bundle is INVALID!\n\nErrors:\n${report.errors.join("\n")}`);
+      }
+    } catch (err: any) {
+      window.alert(`Validation Error: ${err}`);
+      logDev("error", "app", "MNE Validation Failed", { error: err.toString() });
+    } finally {
+      setStatus("");
+    }
+  }
+
+  async function handlePreviewMne() {
+    const path = window.prompt("Enter absolute path to the .mne file to preview:");
+    if (!path) return;
+    try {
+      setStatus("Previewing bundle...");
+      const report = await previewMneImport(path);
+      logDev("info", "app", "MNE Preview Report", report);
+      window.alert(`MNE Preview:\n\nSoul: ${report.summary.soul_name || "N/A"} (${report.summary.soul_id || "N/A"})\nWorld: ${report.summary.world_name || "N/A"} (${report.summary.world_id || "N/A"})\nMessages: ${report.summary.message_count}\nMemories: ${report.summary.memory_count}\nObject States: ${report.summary.object_state_count}\nRelationships: ${report.summary.relationship_count}\nPayload Logs: ${report.summary.payload_log_count}`);
+    } catch (err: any) {
+      window.alert(`Preview Error: ${err}`);
+      logDev("error", "app", "MNE Preview Failed", { error: err.toString() });
+    } finally {
+      setStatus("");
+    }
+  }
+
+  async function handleImportMneAsNew() {
+    const path = window.prompt("Enter absolute path to the .mne file to import as new copy:");
+    if (!path) return;
+    try {
+      setStatus("Importing bundle...");
+      const result = await importMneAsNew(path);
+      logDev("info", "app", "MNE Import Result", result);
+      window.alert(`Import Successful!\n\nSummary: ${result.summary}\nRemapped IDs count: ${Object.keys(result.remapped_ids).length}`);
+      setSouls(await listSouls());
+      await refreshConversations();
+    } catch (err: any) {
+      window.alert(`Import Error: ${err}`);
+      logDev("error", "app", "MNE Import Failed", { error: err.toString() });
+    } finally {
+      setStatus("");
+    }
+  }
+
   async function handleExportVisibleChatLog() {
     if (!currentConversationId) return;
     setBusy(true);
@@ -1647,7 +1751,7 @@ export function App() {
       setContext(await compileContext(nextSoul.character_id, conversationId));
     }
     setSouls(await listSouls());
-    setConversations(await listConversations());
+    await refreshConversations();
     await refreshAssistantVariants(conversationId, nextMessages);
   }
 
@@ -1765,7 +1869,7 @@ export function App() {
       setMessages(session.messages);
       setContext(await compileContext(sessionSoul.character_id, nextConversationId));
       setSouls(await listSouls());
-      setConversations(await listConversations());
+      await refreshConversations();
       setLastTurnDebug(null);
       setSessionContinuityLabel("Isolated Session; source savepoints remain unchanged");
       setCurrentSessionTitle(session.conversation.title);
@@ -1891,7 +1995,7 @@ export function App() {
       const nextMessages = await createUserImageMessageFromFile(currentConversationId, file, draft);
       setDraft("");
       setMessages(nextMessages);
-      setConversations(await listConversations());
+      await refreshConversations();
       setContext(await compileContext(soul.character_id, currentConversationId));
       setStatus("Image attached to chat");
       logDev("success", "db", "chat_image_attached", {
@@ -1999,7 +2103,7 @@ export function App() {
       await deleteMessage(message.conversation_id, message.id);
       const nextMessages = await listConversationMessages(message.conversation_id);
       setMessages(nextMessages);
-      setConversations(await listConversations());
+      await refreshConversations();
       if (soul) {
         setContext(await compileContext(soul.character_id, message.conversation_id));
       }
@@ -2022,7 +2126,7 @@ export function App() {
       const restore = await restoreInactiveMessages(currentConversationId);
       const nextMessages = restore.messages;
       setMessages(nextMessages);
-      setConversations(await listConversations());
+      await refreshConversations();
       if (soul) {
         setContext(await compileContext(soul.character_id, currentConversationId));
       }
@@ -2119,6 +2223,10 @@ export function App() {
     }
   }
 
+  function handleDismissEvaluatorJobBanner() {
+    setEvaluatorJobBannerDismissed(true);
+  }
+
   async function handleRetryEvaluatorJob() {
     if (!activeEvaluatorJob) return;
     try {
@@ -2166,13 +2274,11 @@ export function App() {
     setBusy(true);
     try {
       await deleteConversation(conversationId);
-      const nextConversations = await listConversations();
-      setConversations(nextConversations);
+      await refreshConversations();
       if (deletingActiveConversation) {
-        const archived = nextConversations.find(
-          (conversation) => conversation.conversation_id === conversationId,
-        );
-        if (archived) setCurrentSessionTitle(archived.title);
+        if (!currentSessionTitle.startsWith("[Archived] ")) {
+          setCurrentSessionTitle(`[Archived] ${currentSessionTitle}`);
+        }
       }
       setLastTurnDebug(null);
       setStatus("Session archived; data kept and recoverable");
@@ -2183,10 +2289,44 @@ export function App() {
     }
   }
 
+  async function handleRestoreSession(conversationId = currentConversationId) {
+    if (!soul || !conversationId) return;
+    const confirmed = window.confirm(
+      "Restore this archived session to your active chats?",
+    );
+    if (!confirmed) return;
+
+    setBusy(true);
+    try {
+      await restoreConversation(conversationId);
+      await refreshConversations();
+      if (currentConversationId === conversationId) {
+        if (currentSessionTitle.startsWith("[Archived] ")) {
+          setCurrentSessionTitle(currentSessionTitle.replace("[Archived] ", ""));
+        }
+      }
+      setStatus("Session restored successfully");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleOpenSessionDataLocation() {
+    try {
+      const path = await openSessionDataLocation();
+      setStatus(`Opened session data folder: ${path}`);
+      logDev("info", "app", "Opened session data folder", { path });
+    } catch (error) {
+      reportError(error, "Failed to open session data folder", "error");
+    }
+  }
+
   async function handleDeleteSoul() {
     if (!soul) return;
     const confirmed = window.confirm(
-      `Delete ${soul.character_name} and all local chats for this Soul? This cannot be undone.`,
+      `Archive ${soul.character_name}? Local chats and savepoint history remain safe and recoverable.`,
     );
     if (!confirmed) return;
 
@@ -2195,7 +2335,7 @@ export function App() {
       await deleteSoul(soul.character_id);
       const remaining = await listSouls();
       setSouls(remaining);
-      setConversations(await listConversations());
+      await refreshConversations();
       setActiveConversationId(null);
       setSelectedCharacterIds((current) => current.filter((id) => id !== soul.character_id));
 
@@ -2203,7 +2343,7 @@ export function App() {
         setSoul(null);
         setMessages([]);
         setContext(null);
-        setStatus("Soul deleted");
+        setStatus("Soul archived");
         return;
       }
 
@@ -2217,7 +2357,7 @@ export function App() {
       setCreatorFieldsFromSoul(nextSoul);
       setMessages([]);
       setContext(null);
-      setStatus("Soul deleted; selected next local Soul");
+      setStatus("Soul archived; selected next local Soul");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -2225,16 +2365,33 @@ export function App() {
     }
   }
 
-  async function handleDeleteSetting() {
+  async function handleArchiveSetting() {
     if (!setting) return;
+
+    const activeSettingIds: string[] = [];
+    if (settings.length <= 1) {
+      activeSettingIds.push(setting.setting_id);
+    }
+    if (activeConversationId) {
+      const activeConv = conversations.find((c) => c.conversation_id === activeConversationId);
+      if (activeConv?.source_setting_id) {
+        activeSettingIds.push(activeConv.source_setting_id);
+      }
+    }
+
+    if (activeSettingIds.includes(setting.setting_id)) {
+      window.alert("Cannot archive the active/default setting. Switch settings first.");
+      return;
+    }
+
     const confirmed = window.confirm(
-      `Delete ${setting.setting_name}? Local chats for this Setting remain orphaned until chat cleanup is added.`,
+      `Archive ${setting.setting_name}? Local chats and world settings remain safe and recoverable.`,
     );
     if (!confirmed) return;
 
     setBusy(true);
     try {
-      await deleteSetting(setting.setting_id);
+      await archiveSetting(setting.setting_id, activeSettingIds);
       const remaining = await listSettings();
       setSettings(remaining);
 
@@ -2245,7 +2402,7 @@ export function App() {
         setEditorFieldsFromSetting(nextSetting);
         setSettings(await listSettings());
         setMessages([]);
-        setStatus("Setting deleted; created starter Setting");
+        setStatus("Setting archived; created starter Setting");
         return;
       }
 
@@ -2254,9 +2411,9 @@ export function App() {
       setEditorFieldsFromSetting(nextSetting);
       setActiveConversationId(null);
       setMessages([]);
-      setStatus("Setting deleted; selected next local Setting");
+      setStatus("Setting archived; selected next local Setting");
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
+      reportError(error, "Setting archive failed", "error");
     } finally {
       setBusy(false);
     }
@@ -2370,32 +2527,53 @@ export function App() {
     }
   }
 
-  async function handleDeleteNarratorProviderProfile() {
-    if (busy || !selectedProviderProfileId) return;
+  async function handleArchiveProviderProfile(profileId: string) {
+    if (busy || !profileId) return;
+    const activeIds = [];
+    if (selectedProviderProfileId) activeIds.push(selectedProviderProfileId);
+    if (selectedStateUpdaterProfileId) activeIds.push(selectedStateUpdaterProfileId);
+    if (activeIds.includes(profileId)) {
+      window.alert("Cannot archive the active provider profile. Switch profiles first.");
+      return;
+    }
+    setBusy(true);
     try {
-      await deleteProviderProfile(selectedProviderProfileId);
-      setSelectedProviderProfileId("");
-      setNarratorProviderProfileName("Narrator API");
+      await archiveProviderProfile(profileId, activeIds);
       setProviderProfiles(await listProviderProfiles());
-      setStatus("Narrator profile deleted");
-      logDev("warn", "warning", "Narrator provider profile deleted");
+      setArchivedProviderProfiles(await listArchivedProviderProfiles());
+      setStatus("Provider profile archived");
+      logDev("warn", "warning", `Provider profile ${profileId} archived`);
     } catch (error) {
-      reportError(error, "Narrator provider profile delete failed", "error");
+      reportError(error, "Provider profile archive failed", "error");
+    } finally {
+      setBusy(false);
     }
   }
 
-  async function handleDeleteStateUpdaterProviderProfile() {
-    if (busy || !selectedStateUpdaterProfileId) return;
+  async function handleRestoreProviderProfile(profileId: string) {
+    if (busy || !profileId) return;
+    setBusy(true);
     try {
-      await deleteProviderProfile(selectedStateUpdaterProfileId);
-      setSelectedStateUpdaterProfileId("");
-      setUpdaterProviderProfileName("Updater API");
+      await restoreProviderProfile(profileId);
       setProviderProfiles(await listProviderProfiles());
-      setStatus("State updater profile deleted");
-      logDev("warn", "warning", "State updater provider profile deleted");
+      setArchivedProviderProfiles(await listArchivedProviderProfiles());
+      setStatus("Provider profile restored");
+      logDev("success", "app", `Provider profile ${profileId} restored`);
     } catch (error) {
-      reportError(error, "State updater provider profile delete failed", "error");
+      reportError(error, "Provider profile restore failed", "error");
+    } finally {
+      setBusy(false);
     }
+  }
+
+  async function handleDeleteNarratorProviderProfile() {
+    if (!selectedProviderProfileId) return;
+    await handleArchiveProviderProfile(selectedProviderProfileId);
+  }
+
+  async function handleDeleteStateUpdaterProviderProfile() {
+    if (!selectedStateUpdaterProfileId) return;
+    await handleArchiveProviderProfile(selectedStateUpdaterProfileId);
   }
 
   async function handleCreateSnapshot() {
@@ -2654,6 +2832,7 @@ export function App() {
   };
   const activeEvaluatorJobIsLive =
     activeEvaluatorJob?.status === "pending" || activeEvaluatorJob?.status === "running";
+  const showEvaluatorJobBanner = Boolean(activeEvaluatorJob) && !evaluatorJobBannerDismissed;
   const filteredDevLogs = useMemo(
     () =>
       devLogs.filter(
@@ -2677,21 +2856,6 @@ export function App() {
   const providerModeControls = (
     <div className="settings-grid">
       <label className="field">
-        <span>Provider</span>
-        <select
-          value={provider}
-          onChange={(event) => {
-            const nextProvider = event.target.value as ProviderKind;
-            setProvider(nextProvider);
-            logDev("info", "app", "Provider mode changed", { provider: nextProvider });
-          }}
-          disabled={busy}
-        >
-          <option>Mock</option>
-          <option>API</option>
-        </select>
-      </label>
-      <label className="field">
         <span>Narration Mode</span>
         <select
           value={mode}
@@ -2713,7 +2877,7 @@ export function App() {
             setContextMode(nextMode);
             logDev("info", "context", "Context mode changed", { context_mode: nextMode });
           }}
-          disabled={busy || provider !== "API"}
+          disabled={busy}
         >
           <option value="brief">Mnemosyne Brief</option>
           <option value="full_chat">Full Chat</option>
@@ -2733,7 +2897,7 @@ export function App() {
             View Disclaimer
           </button>
         </div>
-        <p className="settings-note">Mock remains usable without configuration. API presets are saved in the existing local provider profile store.</p>
+        <p className="settings-note">API presets are saved in the existing local provider profile store.</p>
         {providerModeControls}
       </section>
 
@@ -2856,8 +3020,8 @@ export function App() {
                 onClick={handleDeleteNarratorProviderProfile}
                 disabled={busy || !selectedProviderProfileId}
               >
-                <Trash2 size={16} />
-                <span>Delete</span>
+                <Archive size={16} />
+                <span>Archive Profile</span>
               </button>
             </div>
           </section>
@@ -3044,11 +3208,94 @@ export function App() {
                     onClick={handleDeleteStateUpdaterProviderProfile}
                     disabled={busy || !selectedStateUpdaterProfileId}
                   >
-                    <Trash2 size={16} />
-                    <span>Delete</span>
+                    <Archive size={16} />
+                    <span>Archive Profile</span>
                   </button>
                 </div>
               </>
+            )}
+          </section>
+
+          <section className="settings-section provider-pass-card">
+            <div className="settings-section-heading">
+              <div>
+                <span className="eyebrow">Profiles</span>
+                <h3>Saved Provider Profiles</h3>
+              </div>
+            </div>
+            
+            {providerProfiles.length === 0 && archivedProviderProfiles.length === 0 ? (
+              <p className="settings-note">No profiles saved yet.</p>
+            ) : (
+              <div className="provider-profiles-list" style={{ marginTop: "1rem" }}>
+                {providerProfiles.map((p) => {
+                  const isNarratorActive = selectedProviderProfileId === p.id;
+                  const isUpdaterActive = selectedStateUpdaterProfileId === p.id;
+                  const isActive = isNarratorActive || isUpdaterActive;
+                  return (
+                    <div key={p.id} className="profile-list-item" style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      padding: "0.5rem 0",
+                      borderBottom: "1px solid var(--border-color, #333)",
+                    }}>
+                      <div>
+                        <strong style={{ color: "var(--text-color, #eee)" }}>{p.name}</strong>
+                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted, #888)", marginLeft: "0.5rem" }}>
+                          ({p.model})
+                        </span>
+                        {isNarratorActive && <span className="provider-status-pill" style={{ marginLeft: "0.5rem", fontSize: "0.7rem", padding: "2px 6px" }}>Active Narrator</span>}
+                        {isUpdaterActive && <span className="provider-status-pill" style={{ marginLeft: "0.5rem", fontSize: "0.7rem", padding: "2px 6px" }}>Active Updater</span>}
+                      </div>
+                      <button
+                        type="button"
+                        className="ghost-action compact-ghost"
+                        onClick={() => handleArchiveProviderProfile(p.id)}
+                        disabled={busy || isActive}
+                        title={isActive ? "Cannot archive active profile" : "Archive profile"}
+                        style={{ fontSize: "0.8rem", padding: "2px 8px" }}
+                      >
+                        <Archive size={12} style={{ marginRight: "4px" }} />
+                        <span>Archive</span>
+                      </button>
+                    </div>
+                  );
+                })}
+
+                {archivedProviderProfiles.length > 0 && (
+                  <div style={{ marginTop: "1.5rem" }}>
+                    <span className="eyebrow">Archived</span>
+                    <h4 style={{ margin: "0.5rem 0", color: "var(--text-muted, #888)" }}>Archived Profiles</h4>
+                    {archivedProviderProfiles.map((p) => (
+                      <div key={p.id} className="profile-list-item" style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        padding: "0.5rem 0",
+                        borderBottom: "1px solid var(--border-color, #333)",
+                      }}>
+                        <div>
+                          <span style={{ color: "var(--text-muted, #888)", textDecoration: "line-through" }}>{p.name}</span>
+                          <span style={{ fontSize: "0.8rem", color: "var(--text-muted, #666)", marginLeft: "0.5rem" }}>
+                            ({p.model})
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="ghost-action compact-ghost"
+                          onClick={() => handleRestoreProviderProfile(p.id)}
+                          disabled={busy}
+                          style={{ fontSize: "0.8rem", padding: "2px 8px" }}
+                        >
+                          <RefreshCcw size={12} style={{ marginRight: "4px" }} />
+                          <span>Restore</span>
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
           </section>
         </>
@@ -3134,7 +3381,7 @@ export function App() {
                 />
                 <span>Show archived sessions by default</span>
               </label>
-              <p className="settings-note">Composer shortcut remains Shift+Enter to send for this pass.</p>
+              <p className="settings-note">Composer shortcut: Enter to send, Shift+Enter for a new line.</p>
             </section>
             <section className="settings-section">
               <div className="settings-section-heading">
@@ -3451,6 +3698,20 @@ export function App() {
           <span>Clear</span>
         </button>
       </div>
+      <div className="dev-console-actions" style={{ borderTop: "1px solid #374151", paddingTop: "8px", marginTop: "8px", gap: "8px" }}>
+        <button type="button" onClick={handleValidateMne}>
+          <Clipboard size={14} />
+          <span>Validate .mne</span>
+        </button>
+        <button type="button" onClick={handlePreviewMne}>
+          <FileDown size={14} />
+          <span>Preview .mne</span>
+        </button>
+        <button type="button" onClick={handleImportMneAsNew}>
+          <FileUp size={14} />
+          <span>Import as new copy</span>
+        </button>
+      </div>
       {import.meta.env.DEV ? (
         <section className="dev-command-console" aria-label="Dev Command Console">
           <div className="dev-command-header">
@@ -3550,6 +3811,11 @@ export function App() {
   }
 
   if (view === "chat") {
+    const currentConversation = conversations.find((c) => c.conversation_id === currentConversationId);
+    const isCurrentSessionArchived = currentConversation
+      ? (Boolean(currentConversation.archived_at) || currentConversation.title.startsWith("[Archived] "))
+      : currentSessionTitle.startsWith("[Archived] ");
+
     return (
       <main className="chat-only-shell">
         <header className="chat-only-header">
@@ -3578,16 +3844,29 @@ export function App() {
             <p className="session-state-label">{sessionContinuityLabel}</p>
           </div>
           <div className="chat-top-actions">
-            <button
-              className="ghost-action danger"
-              type="button"
-              title="Archive session"
-              onClick={() => handleDeleteChat()}
-              disabled={busy}
-            >
-              <Trash2 size={16} />
-              <span>Archive Session</span>
-            </button>
+            {isCurrentSessionArchived ? (
+              <button
+                className="ghost-action"
+                type="button"
+                title="Restore session"
+                onClick={() => handleRestoreSession()}
+                disabled={busy}
+              >
+                <RefreshCcw size={16} />
+                <span>Restore Session</span>
+              </button>
+            ) : (
+              <button
+                className="ghost-action danger"
+                type="button"
+                title="Archive session"
+                onClick={() => handleDeleteChat()}
+                disabled={busy}
+              >
+                <Trash2 size={16} />
+                <span>Archive Session</span>
+              </button>
+            )}
             <button
               className="ghost-action"
               type="button"
@@ -3664,7 +3943,7 @@ export function App() {
                           </button>
                         </div>
                         <button
-                          title="Delete this response"
+                          title="Hide/Rewind response"
                           onClick={() => handleDeleteChatMessage(message)}
                           disabled={turnInProgress}
                         >
@@ -3698,7 +3977,7 @@ export function App() {
                           <Pencil size={14} />
                         </button>
                         <button
-                          title="Delete this message"
+                          title="Hide/Rewind message"
                           onClick={() => handleDeleteChatMessage(message)}
                           disabled={turnInProgress}
                         >
@@ -3743,8 +4022,17 @@ export function App() {
           </div>
         </section>
 
-        {activeEvaluatorJob ? (
+        {showEvaluatorJobBanner && activeEvaluatorJob ? (
           <section className={`evaluator-job-banner ${activeEvaluatorJob.status}`}>
+            <button
+              type="button"
+              className="evaluator-job-banner-close"
+              aria-label="Close state updater status"
+              title="Close"
+              onClick={handleDismissEvaluatorJobBanner}
+            >
+              <X size={14} />
+            </button>
             <div>
               <strong>{evaluatorJobBannerTitle(activeEvaluatorJob)}</strong>
               <span>
@@ -3787,7 +4075,7 @@ export function App() {
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={handleComposerKeyDown}
-            placeholder="Type message... Enter for newline, Shift+Enter to send."
+            placeholder="Type message... Enter to send, Shift+Enter for a new line."
             disabled={busy}
             rows={2}
           />
@@ -3888,12 +4176,12 @@ export function App() {
             </button>
             <button
               className="danger-button"
-              title="Delete selected Setting"
-              onClick={handleDeleteSetting}
+              title="Archive selected Setting"
+              onClick={handleArchiveSetting}
               disabled={!setting || busy}
             >
-              <Trash2 size={18} />
-              <span>Delete</span>
+              <Archive size={18} />
+              <span>Archive</span>
             </button>
           </div>
 
@@ -4052,12 +4340,12 @@ export function App() {
             </button>
             <button
               className="danger-button"
-              title="Delete selected Soul"
+              title="Archive selected Soul"
               onClick={handleDeleteSoul}
               disabled={!soul || busy}
             >
               <Trash2 size={18} />
-              <span>Delete</span>
+              <span>Archive</span>
             </button>
           </div>
 
@@ -4394,21 +4682,6 @@ export function App() {
 
         <div className="session-strip launcher-provider-strip">
           <label className="field">
-            <span>Provider</span>
-            <select
-              value={provider}
-              onChange={(event) => {
-                const nextProvider = event.target.value as ProviderKind;
-                setProvider(nextProvider);
-                logDev("info", "app", "Provider mode changed", { provider: nextProvider });
-              }}
-              disabled={busy}
-            >
-              <option>Mock</option>
-              <option>API</option>
-            </select>
-          </label>
-          <label className="field">
             <span>Mode</span>
             <select
               value={mode}
@@ -4430,7 +4703,7 @@ export function App() {
                 setContextMode(nextMode);
                 logDev("info", "context", "Context mode changed", { context_mode: nextMode });
               }}
-              disabled={busy || provider !== "API"}
+              disabled={busy}
             >
               <option value="brief">Mnemosyne Brief</option>
               <option value="full_chat">Full Chat</option>
@@ -4554,8 +4827,8 @@ export function App() {
                     onClick={handleDeleteNarratorProviderProfile}
                     disabled={busy || !selectedProviderProfileId}
                   >
-                    <Trash2 size={16} />
-                    <span>Delete</span>
+                    <Archive size={16} />
+                    <span>Archive Profile</span>
                   </button>
                 </div>
               </div>
@@ -4742,8 +5015,8 @@ export function App() {
                         onClick={handleDeleteStateUpdaterProviderProfile}
                         disabled={busy || !selectedStateUpdaterProfileId}
                       >
-                        <Trash2 size={16} />
-                        <span>Delete</span>
+                        <Archive size={16} />
+                        <span>Archive Profile</span>
                       </button>
                     </div>
                   </>
@@ -4794,16 +5067,30 @@ export function App() {
           </p>
           <section className="session-list" aria-label="Saved chats">
             <div className="session-list-heading">
-              <span className="eyebrow">{showArchivedSessions ? "Archived chats" : "Active chats"}</span>
-              <strong>{visibleConversations.length}</strong>
-              <label className="archive-toggle">
-                <input
-                  type="checkbox"
-                  checked={showArchivedSessions}
-                  onChange={(event) => setShowArchivedSessions(event.target.checked)}
-                />
-                <span>Show archived</span>
-              </label>
+              <div className="session-list-title">
+                <span className="eyebrow">{showArchivedSessions ? "Archived chats" : "Active chats"}</span>
+                <strong>{visibleConversations.length}</strong>
+              </div>
+              <div className="session-list-actions">
+                <button
+                  type="button"
+                  className="session-data-folder-button"
+                  title="Open the local session database folder in Explorer"
+                  onClick={() => void handleOpenSessionDataLocation()}
+                  disabled={busy}
+                >
+                  <FolderOpen size={14} />
+                  <span>Open in Explorer</span>
+                </button>
+                <label className="archive-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showArchivedSessions}
+                    onChange={(event) => setShowArchivedSessions(event.target.checked)}
+                  />
+                  <span>Show archived</span>
+                </label>
+              </div>
             </div>
             {visibleConversations.length === 0 ? (
               <p className="muted">
@@ -4812,29 +5099,66 @@ export function App() {
                   : "No active named chats for this Soul yet."}
               </p>
             ) : (
-              visibleConversations.slice(0, 8).map((conversation) => (
-                <div
-                  key={conversation.conversation_id}
-                  className="session-row"
-                >
-                  <button type="button" onClick={() => handleSelectConversation(conversation)} disabled={busy}>
-                    <span>{conversation.title}</span>
-                    <small>
-                      {conversation.message_count} messages
-                      {conversation.last_message_preview ? ` / ${conversation.last_message_preview}` : ""}
-                    </small>
-                  </button>
-                  <button
-                    type="button"
-                    className="session-delete-button"
-                    title="Archive session"
-                    onClick={() => handleDeleteChat(conversation.conversation_id)}
-                    disabled={busy}
+              <>
+                {paginatedConversations.map((conversation) => (
+                  <div
+                    key={conversation.conversation_id}
+                    className="session-row"
                   >
-                    <Trash2 size={14} />
-                  </button>
-                </div>
-              ))
+                    <button type="button" onClick={() => handleSelectConversation(conversation)} disabled={busy}>
+                      <span>{conversation.title}</span>
+                      <small>
+                        {conversation.message_count} messages
+                        {conversation.last_message_preview ? ` / ${conversation.last_message_preview}` : ""}
+                      </small>
+                    </button>
+                    {showArchivedSessions ? (
+                      <button
+                        type="button"
+                        className="session-delete-button"
+                        title="Restore session"
+                        onClick={() => handleRestoreSession(conversation.conversation_id)}
+                        disabled={busy}
+                      >
+                        <RefreshCcw size={14} />
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="session-delete-button"
+                        title="Archive session"
+                        onClick={() => handleDeleteChat(conversation.conversation_id)}
+                        disabled={busy}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    )}
+                  </div>
+                ))}
+                {sessionListTotalPages > 1 ? (
+                  <nav className="session-list-pagination" aria-label="Chat list pages">
+                    <button
+                      type="button"
+                      onClick={() => setSessionListPage((page) => Math.max(1, page - 1))}
+                      disabled={sessionListPage <= 1 || busy}
+                    >
+                      Previous
+                    </button>
+                    <span>
+                      {sessionListPage} / {sessionListTotalPages}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSessionListPage((page) => Math.min(sessionListTotalPages, page + 1))
+                      }
+                      disabled={sessionListPage >= sessionListTotalPages || busy}
+                    >
+                      Next
+                    </button>
+                  </nav>
+                ) : null}
+              </>
             )}
           </section>
         </div>

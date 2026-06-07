@@ -9,15 +9,16 @@ use crate::{
     },
     evaluator_form::{
         clean, slugify,
-        validate_event_row, validate_memory_row, validate_object_row, validate_relationship_row,
-        validate_review_row,
-        ConfidenceTier, EvalFormCompileResult,
-        EvalFormResponse, EvalFormRowRejection, EvalFormSpec, EventRow,
-        EventType, ExistingStateRow, FormDedupeDecisionTrace, FormEntityOption, ImportanceTier,
-        MagnitudeTier, MemoryRow, RelationshipDimension, RelationshipDirection,
-        RelationshipRow, ReviewDecision, ReviewRow, ExistingStateKind,
-        normalize_eval_form_response, EvalFormTrace, EvalRowTrace,
-        normalize_player_id,
+        relationship_evaluation_has_delta, relationship_event_row_id,
+        relationship_from_numeric_event_row,
+        validate_event_row, validate_memory_row, validate_object_row,
+        validate_relationship_event_row, validate_relationship_row, validate_review_row,
+        ConfidenceTier, EvalFormCompileResult, EvalFormResponse, EvalFormRowRejection,
+        EvalFormSpec, EvalFormTrace, EvalRowTrace, EventRow, EventType, ExistingStateKind,
+        ExistingStateRow, FormDedupeDecisionTrace, FormEntityOption, FormRelationshipState,
+        ImportanceTier, MagnitudeTier, MemoryRow, RelationshipDimension, RelationshipDirection,
+        RelationshipEventValidation, RelationshipRow, ReviewDecision, ReviewRow,
+        RELATIONSHIP_EVENT_TEMPLATE_VERSION, normalize_eval_form_response, normalize_player_id,
     },
     evaluator_ingest::NormalizedEvaluationDraft,
     patch::{MemoryPatch, SceneStatePatch, PATCH_PROTOCOL_VERSION},
@@ -59,6 +60,7 @@ pub fn build_eval_form_spec(
             },
         ],
         active_soul_ids: vec![soul.character_id.clone()],
+        active_relationship_states: relationship_states_for_spec(soul),
         known_object_ids,
         allowed_memory_slots: vec![
             MemorySlot::RelationshipMemory,
@@ -131,6 +133,42 @@ pub fn build_eval_form_spec(
     }
 }
 
+fn relationship_states_for_spec(soul: &Soul) -> Vec<FormRelationshipState> {
+    soul.relationships
+        .iter()
+        .map(|(target, relationship)| FormRelationshipState {
+            source_soul_id: soul.character_id.clone(),
+            target_entity_id: normalize_player_id(target),
+            trust: relationship.trust,
+            affection: relationship.affection,
+            intimacy: relationship.intimacy,
+            passion: relationship.passion,
+            commitment: relationship.commitment,
+            fear: relationship.fear,
+            desire: relationship.desire,
+            respect: relationship.respect,
+            conflict: relationship.conflict,
+            dependency: relationship.dependency,
+            curiosity: relationship.curiosity,
+            comfort: relationship.comfort,
+            boundary_pressure: relationship.boundary_pressure,
+            trustable_bias: relationship.trustable_bias,
+            untrustworthy_bias: relationship.untrustworthy_bias,
+            asshole_bias: relationship.asshole_bias,
+            care_bias: relationship.care_bias,
+            danger_bias: relationship.danger_bias,
+            competence_bias: relationship.competence_bias,
+            autonomy_respect_bias: relationship.autonomy_respect_bias,
+            attachment_pull: relationship.attachment_pull,
+            schema_threat: relationship.schema_threat,
+            first_impression_strength: relationship.first_impression_strength,
+            first_impression_confidence: relationship.first_impression_confidence,
+            reappraisal_debt: relationship.reappraisal_debt,
+            reappraisal_state_code: relationship.reappraisal_state_code,
+        })
+        .collect()
+}
+
 pub fn compile_eval_form_response(
     spec: &EvalFormSpec,
     raw_response_struct: &EvalFormResponse,
@@ -154,8 +192,10 @@ pub fn compile_eval_form_response(
         form_rows_submitted: response.event_rows.len()
             + response.object_rows.len()
             + response.relationship_rows.len()
+            + response.relationship_event_rows.len()
             + response.memory_rows.len()
             + response.review_rows.len(),
+        relationship_event_template_version: RELATIONSHIP_EVENT_TEMPLATE_VERSION.to_string(),
         ..EvalFormTrace::default()
     };
     trace.relationship_dimension_inferred_from = response
@@ -164,12 +204,26 @@ pub fn compile_eval_form_response(
         .filter(|row| row.dimension.is_some() && !row.selected_tags.is_empty())
         .map(|row| format!("tags:{}", row.selected_tags.join(",")))
         .collect();
-    trace.relationship_direction_inferred_from = response
-        .relationship_rows
-        .iter()
-        .filter(|row| row.direction.is_some() && row.summary.as_deref().and_then(clean).is_some())
-        .map(|_| "summary".to_string())
-        .collect();
+    let mut direction_inferred = Vec::new();
+    for (idx, row) in response.relationship_rows.iter().enumerate() {
+        if row.direction.is_some() {
+            let raw_has_dir = raw_response_struct
+                .relationship_rows
+                .get(idx)
+                .and_then(|r| r.direction)
+                .is_some();
+            if !raw_has_dir {
+                if row.summary.as_deref().and_then(clean).is_some() {
+                    direction_inferred.push("summary".to_string());
+                } else if row.shift.as_deref().and_then(clean).is_some() {
+                    direction_inferred.push("shift".to_string());
+                } else {
+                    direction_inferred.push("evidence".to_string());
+                }
+            }
+        }
+    }
+    trace.relationship_direction_inferred_from = direction_inferred;
 
     let allowed_entities = spec
         .active_entities
@@ -305,6 +359,90 @@ pub fn compile_eval_form_response(
 
     let mut relationship_non_delta_count = 0;
     let mut relationship_row_results = std::collections::HashMap::new();
+    let mut relationship_event_row_results = std::collections::HashMap::new();
+    let mut relationship_delta_source = std::collections::HashMap::new();
+    let mut numeric_relationship_pairs = HashSet::new();
+
+    for (idx, row) in response.relationship_event_rows.iter().enumerate() {
+        let row_id = relationship_event_row_id(row);
+        let rejected_before = rejected_rows.len();
+        let validated = validate_relationship_event_row(
+            row,
+            spec,
+            &allowed_entities,
+            &event_ids,
+            &mut rejected_rows,
+        );
+        let rejection_reason = if validated.is_some() {
+            None
+        } else {
+            rejected_rows.get(rejected_before).map(|row| row.reason.clone())
+        };
+
+        let (validation_status, compiler_result, normalized_row) = match validated.as_ref() {
+            Some(RelationshipEventValidation::Enabled(parsed_row)) => {
+                let relation = relationship_from_numeric_event_row(parsed_row, spec);
+                let has_delta = relationship_evaluation_has_delta(&relation);
+                if has_delta {
+                    numeric_relationship_pairs.insert((
+                        relation.source_soul_id.clone(),
+                        relation.target_entity_id.clone(),
+                    ));
+                    output.relationship_evaluations.push(relation);
+                    output.turn_flags_u64 |= turn_flags::RELATIONSHIP_SHIFT;
+                    relationship_event_row_results
+                        .insert(row_id.clone(), "delta_created".to_string());
+                    relationship_delta_source
+                        .insert(row_id.clone(), "numeric_event_v2".to_string());
+                    (
+                        "accepted".to_string(),
+                        "relationship_delta_created".to_string(),
+                        serde_json::to_value(parsed_row).unwrap_or_else(|_| row.clone()),
+                    )
+                } else {
+                    relationship_non_delta_count += 1;
+                    relationship_event_row_results
+                        .insert(row_id.clone(), "non_delta_no_change".to_string());
+                    (
+                        "accepted".to_string(),
+                        "non_delta_no_change".to_string(),
+                        serde_json::to_value(parsed_row).unwrap_or_else(|_| row.clone()),
+                    )
+                }
+            }
+            Some(RelationshipEventValidation::Disabled) => {
+                relationship_event_row_results
+                    .insert(row_id.clone(), "disabled_row_ignored".to_string());
+                (
+                    "accepted".to_string(),
+                    "disabled_row_ignored".to_string(),
+                    row.clone(),
+                )
+            }
+            None => {
+                relationship_event_row_results.insert(row_id.clone(), "rejected".to_string());
+                ("rejected".to_string(), "rejected".to_string(), row.clone())
+            }
+        };
+
+        evaluator_row_traces.push(EvalRowTrace {
+            row_kind: "relationship_event".to_string(),
+            row_index: idx,
+            raw_row: raw_response_struct
+                .relationship_event_rows
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| row.clone()),
+            normalized_row,
+            validation_status,
+            rejection_reason,
+            compiler_result,
+        });
+
+        if matches!(validated, Some(RelationshipEventValidation::Enabled(_))) {
+            trace.form_rows_accepted += 1;
+        }
+    }
 
     for (idx, row) in response.relationship_rows.iter().enumerate() {
         let raw_row = raw_response_struct.relationship_rows.get(idx).cloned().unwrap_or_else(|| row.clone());
@@ -315,6 +453,24 @@ pub fn compile_eval_form_response(
             row.target_entity_id,
             row.dimension.map(|d| d.as_label()).unwrap_or("unknown")
         );
+
+        if numeric_relationship_pairs.contains(&(row.source_soul_id.clone(), row.target_entity_id.clone())) {
+            evaluator_row_traces.push(EvalRowTrace {
+                row_kind: "relationship".to_string(),
+                row_index: idx,
+                raw_row: serde_json::to_value(&raw_row).unwrap_or_default(),
+                normalized_row: serde_json::to_value(row).unwrap_or_default(),
+                validation_status: "accepted".to_string(),
+                rejection_reason: None,
+                compiler_result: "deduped_numeric_event_v2_priority".to_string(),
+            });
+            trace.form_rows_accepted += 1;
+            relationship_row_results.insert(
+                row_id,
+                "deduped_numeric_event_v2_priority".to_string(),
+            );
+            continue;
+        }
 
         let valid = validate_relationship_row(row, spec, &allowed_entities, &event_ids, &mut rejected_rows);
         
@@ -347,7 +503,9 @@ pub fn compile_eval_form_response(
                     .relationship_evaluations
                     .push(relationship_from_row(row));
                 output.turn_flags_u64 |= turn_flags::RELATIONSHIP_SHIFT;
-                relationship_row_results.insert(row_id, "delta_created".to_string());
+                relationship_row_results.insert(row_id.clone(), "delta_created".to_string());
+                relationship_delta_source
+                    .insert(row_id, "legacy_relationship_row".to_string());
             } else {
                 relationship_non_delta_count += 1;
                 relationship_row_results.insert(row_id, "non_delta_no_change".to_string());
@@ -359,10 +517,25 @@ pub fn compile_eval_form_response(
 
     trace.relationship_non_delta_count = relationship_non_delta_count;
     trace.relationship_row_results = relationship_row_results;
+    trace.relationship_event_row_results = relationship_event_row_results;
+    trace.relationship_delta_source = relationship_delta_source;
 
     for (idx, row) in response.memory_rows.iter().enumerate() {
         let raw_row = raw_response_struct.memory_rows.get(idx).cloned().unwrap_or_else(|| row.clone());
         let candidate_id = memory_candidate_id(row);
+        if memory_row_disabled(row) {
+            memory_row_results.insert(candidate_id, "disabled_row_ignored".to_string());
+            evaluator_row_traces.push(EvalRowTrace {
+                row_kind: "memory".to_string(),
+                row_index: idx,
+                raw_row: serde_json::to_value(&raw_row).unwrap_or_default(),
+                normalized_row: serde_json::to_value(row).unwrap_or_default(),
+                validation_status: "accepted".to_string(),
+                rejection_reason: None,
+                compiler_result: "disabled_row_ignored".to_string(),
+            });
+            continue;
+        }
         let review = review_map.get(&candidate_id).copied();
         
         let valid = validate_memory_row(row, spec, &event_ids, &mut rejected_rows);
@@ -488,6 +661,7 @@ pub fn compile_eval_form_response(
     trace.code_assigned_decay_profile = response
         .memory_rows
         .iter()
+        .filter(|row| !memory_row_disabled(row))
         .map(|row| {
             (
                 memory_candidate_id(row),
@@ -573,6 +747,10 @@ fn memory_candidate_from_row(row: &MemoryRow, candidate_id: &str) -> MemoryCandi
     }
 }
 
+fn memory_row_disabled(row: &MemoryRow) -> bool {
+    row.row_enabled == Some(0)
+}
+
 fn apply_review_memory_operations(
     conversion: &mut EvaluatorConversionReport,
     response: &EvalFormResponse,
@@ -580,6 +758,9 @@ fn apply_review_memory_operations(
 ) {
     let mut operations = Vec::new();
     for row in &response.memory_rows {
+        if memory_row_disabled(row) {
+            continue;
+        }
         let candidate_id = memory_candidate_id(row);
         let Some((decision, review)) = review_map.get(&candidate_id).copied() else {
             continue;

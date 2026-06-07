@@ -147,6 +147,9 @@ pub fn validate_memory_row(
     rejected: &mut Vec<EvalFormRowRejection>,
 ) -> bool {
     let row_id = memory_candidate_id(row);
+    if matches!(row.row_enabled, Some(value) if value > 1) {
+        return reject_row(rejected, "memory", &row_id, "row_enabled must be 0 or 1");
+    }
     if !event_ids.contains(row.linked_event_id.as_str()) {
         return reject_row(rejected, "memory", &row_id, "linked_event_id is unknown");
     }

@@ -1403,6 +1403,7 @@ fn map_relationship_evaluation(
         confidence,
         relevance_tags,
         evidence_validated_by_form: false,
+        ..RelationshipEvaluation::default()
     }
 }
 

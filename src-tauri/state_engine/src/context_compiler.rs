@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::patch::is_premature_user_turn_event;
+use crate::relationship_surface::relationship_surface_summary;
 use crate::setting::SessionWorld;
 use crate::soul::{MemoryEntry, MemorySourceType, PlotStatus, Soul, TruthStatus};
 
@@ -1075,30 +1076,11 @@ fn build_relationship_section(soul: &Soul, budget: &ContextBudget) -> BuiltSecti
     let lines = relationships
         .into_iter()
         .map(|(target, relationship)| {
-            let mut metrics = vec![
-                format!("trust {:.0}", relationship.trust),
-                format!("affection {:.0}", relationship.affection),
-                format!("intimacy {:.0}", relationship.intimacy),
-                format!("passion {:.0}", relationship.passion),
-                format!("commitment {:.0}", relationship.commitment),
-                format!("fear {:.0}", relationship.fear),
-                format!("desire {:.0}", relationship.desire),
-            ];
-            push_metric_if_nonzero(&mut metrics, "respect", relationship.respect);
-            push_metric_if_nonzero(&mut metrics, "conflict", relationship.conflict);
-            push_metric_if_nonzero(&mut metrics, "dependency", relationship.dependency);
-            push_metric_if_nonzero(&mut metrics, "curiosity", relationship.curiosity);
-            push_metric_if_nonzero(&mut metrics, "comfort", relationship.comfort);
-            push_metric_if_nonzero(
-                &mut metrics,
-                "boundary_pressure",
-                relationship.boundary_pressure,
-            );
             format!(
-                "{} -> {}: {}. Label/style: {}.",
+                "{} -> {}: {} Label/style: {}.",
                 fallback(&soul.character_name, "Character"),
                 display_entity_id(target),
-                metrics.join(", "),
+                relationship_surface_summary(relationship),
                 fallback(&relationship.love_type, "not yet named"),
             )
         })
@@ -1654,12 +1636,6 @@ fn display_entity_id(entity_id: &str) -> String {
     trimmed.to_string()
 }
 
-fn push_metric_if_nonzero(metrics: &mut Vec<String>, label: &str, value: f32) {
-    if value.abs() >= 0.5 {
-        metrics.push(format!("{label} {:.0}", value));
-    }
-}
-
 fn excerpt(text: &str, max_chars: usize) -> String {
     let text = text.trim();
     if text.chars().count() <= max_chars {
@@ -1798,13 +1774,71 @@ mod tests {
         assert!(preview.text.contains("[RELATIONSHIPS]"));
         assert!(preview
             .text
-            .contains("Aurora -> junhwa: trust 8, affection 18"));
-        assert!(preview.text.contains("fear 35"));
-        assert!(preview.text.contains("dependency 70"));
+            .contains("Aurora -> junhwa: Conflict is strong"));
+        assert!(!preview.text.contains("trust 8"));
+        assert!(!preview.text.contains("dependency 70"));
         assert!(preview
             .text
-            .contains("Aurora -> rhy: trust 16, affection 22"));
-        assert!(preview.text.contains("curiosity 35"));
+            .contains("Aurora -> rhy: Trust feels faint and comfort feels faint"));
+        assert!(!preview.text.contains("curiosity 35"));
+    }
+
+    #[test]
+    fn narrator_surface_hides_raw_scores() {
+        let mut soul = new_default_soul("Aurora");
+        let relationship = soul.relationships.get_mut("user").unwrap();
+        relationship.trust = 77.0;
+        relationship.comfort = 55.0;
+        relationship.boundary_pressure = 12.0;
+        relationship.autonomy_respect_bias = 45.0;
+
+        let preview = compile_context_for_messages(&soul, &[]);
+
+        assert!(preview.text.contains("[RELATIONSHIPS]"));
+        assert!(!preview.text.contains("trust 77"));
+        assert!(!preview.text.contains("comfort 55"));
+        assert!(!preview.text.contains("boundary_pressure"));
+    }
+
+    #[test]
+    fn narrator_surface_describes_high_asshole_and_high_trustable() {
+        let mut soul = new_default_soul("Aurora");
+        let relationship = soul.relationships.get_mut("user").unwrap();
+        relationship.asshole_bias = 70.0;
+        relationship.trustable_bias = 65.0;
+
+        let preview = compile_context_for_messages(&soul, &[]);
+
+        assert!(preview
+            .text
+            .contains("abrasive and difficult, but increasingly reliable"));
+    }
+
+    #[test]
+    fn narrator_surface_describes_boundary_pressure_drop() {
+        let mut soul = new_default_soul("Aurora");
+        let relationship = soul.relationships.get_mut("user").unwrap();
+        relationship.boundary_pressure = 5.0;
+        relationship.autonomy_respect_bias = 50.0;
+
+        let preview = compile_context_for_messages(&soul, &[]);
+
+        assert!(preview.text.contains("sense of being cornered has eased"));
+    }
+
+    #[test]
+    fn narrator_surface_describes_reappraisal_under_review() {
+        let mut soul = new_default_soul("Aurora");
+        soul.relationships
+            .get_mut("user")
+            .unwrap()
+            .reappraisal_state_code = 2;
+
+        let preview = compile_context_for_messages(&soul, &[]);
+
+        assert!(preview
+            .text
+            .contains("earlier impression is under pressure"));
     }
 
     #[test]

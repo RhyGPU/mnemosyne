@@ -7,6 +7,7 @@ pub mod evaluator_ingest;
 pub mod hidden_state;
 pub mod memory;
 pub mod patch;
+pub mod relationship_surface;
 pub mod schema;
 pub mod setting;
 pub mod soul;

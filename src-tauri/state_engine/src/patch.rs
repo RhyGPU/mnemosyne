@@ -61,6 +61,20 @@ pub struct RelationshipDelta {
     pub curiosity: Option<f32>,
     pub comfort: Option<f32>,
     pub boundary_pressure: Option<f32>,
+    pub trustable_bias: Option<f32>,
+    pub untrustworthy_bias: Option<f32>,
+    pub asshole_bias: Option<f32>,
+    pub care_bias: Option<f32>,
+    pub danger_bias: Option<f32>,
+    pub competence_bias: Option<f32>,
+    pub autonomy_respect_bias: Option<f32>,
+    pub attachment_pull: Option<f32>,
+    pub schema_threat: Option<f32>,
+    pub first_impression_strength: Option<f32>,
+    pub first_impression_confidence: Option<f32>,
+    pub reappraisal_debt: Option<f32>,
+    pub reappraisal_state_code: Option<u8>,
+    pub max_abs_delta: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -709,6 +723,19 @@ impl RelationshipDelta {
             && self.curiosity.is_none()
             && self.comfort.is_none()
             && self.boundary_pressure.is_none()
+            && self.trustable_bias.is_none()
+            && self.untrustworthy_bias.is_none()
+            && self.asshole_bias.is_none()
+            && self.care_bias.is_none()
+            && self.danger_bias.is_none()
+            && self.competence_bias.is_none()
+            && self.autonomy_respect_bias.is_none()
+            && self.attachment_pull.is_none()
+            && self.schema_threat.is_none()
+            && self.first_impression_strength.is_none()
+            && self.first_impression_confidence.is_none()
+            && self.reappraisal_debt.is_none()
+            && self.reappraisal_state_code.is_none()
     }
 
     fn target_name(&self) -> String {
@@ -1213,12 +1240,13 @@ impl SensoryPatch {
     }
 }
 
-fn apply_delta(value: &mut f32, delta: Option<f32>) {
+fn apply_delta_with_cap(value: &mut f32, delta: Option<f32>, max_abs_delta: f32) {
+    let max_abs_delta = finite_delta(max_abs_delta, 0.0, 30.0);
     *value = (*value
         + finite_delta(
             delta.unwrap_or(0.0),
-            -MAX_RELATIONSHIP_DELTA,
-            MAX_RELATIONSHIP_DELTA,
+            -max_abs_delta,
+            max_abs_delta,
         ))
     .clamp(RELATIONSHIP_SCALAR_MIN, RELATIONSHIP_SCALAR_MAX);
 }
@@ -1241,19 +1269,78 @@ fn apply_relationship_delta(soul: &mut Soul, delta: &RelationshipDelta) -> bool 
         .relationships
         .entry(target)
         .or_insert_with(default_relationship);
-    apply_delta(&mut relationship.trust, delta.trust);
-    apply_delta(&mut relationship.affection, delta.affection);
-    apply_delta(&mut relationship.intimacy, delta.intimacy);
-    apply_delta(&mut relationship.passion, delta.passion);
-    apply_delta(&mut relationship.commitment, delta.commitment);
-    apply_delta(&mut relationship.fear, delta.fear);
-    apply_delta(&mut relationship.desire, delta.desire);
-    apply_delta(&mut relationship.respect, delta.respect);
-    apply_delta(&mut relationship.conflict, delta.conflict);
-    apply_delta(&mut relationship.dependency, delta.dependency);
-    apply_delta(&mut relationship.curiosity, delta.curiosity);
-    apply_delta(&mut relationship.comfort, delta.comfort);
-    apply_delta(&mut relationship.boundary_pressure, delta.boundary_pressure);
+    let max_abs_delta = delta
+        .max_abs_delta
+        .unwrap_or(MAX_RELATIONSHIP_DELTA)
+        .clamp(0.0, 30.0);
+    apply_delta_with_cap(&mut relationship.trust, delta.trust, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.affection, delta.affection, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.intimacy, delta.intimacy, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.passion, delta.passion, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.commitment, delta.commitment, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.fear, delta.fear, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.desire, delta.desire, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.respect, delta.respect, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.conflict, delta.conflict, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.dependency, delta.dependency, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.curiosity, delta.curiosity, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.comfort, delta.comfort, max_abs_delta);
+    apply_delta_with_cap(
+        &mut relationship.boundary_pressure,
+        delta.boundary_pressure,
+        max_abs_delta,
+    );
+    apply_delta_with_cap(
+        &mut relationship.trustable_bias,
+        delta.trustable_bias,
+        max_abs_delta,
+    );
+    apply_delta_with_cap(
+        &mut relationship.untrustworthy_bias,
+        delta.untrustworthy_bias,
+        max_abs_delta,
+    );
+    apply_delta_with_cap(&mut relationship.asshole_bias, delta.asshole_bias, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.care_bias, delta.care_bias, max_abs_delta);
+    apply_delta_with_cap(&mut relationship.danger_bias, delta.danger_bias, max_abs_delta);
+    apply_delta_with_cap(
+        &mut relationship.competence_bias,
+        delta.competence_bias,
+        max_abs_delta,
+    );
+    apply_delta_with_cap(
+        &mut relationship.autonomy_respect_bias,
+        delta.autonomy_respect_bias,
+        max_abs_delta,
+    );
+    apply_delta_with_cap(
+        &mut relationship.attachment_pull,
+        delta.attachment_pull,
+        max_abs_delta,
+    );
+    apply_delta_with_cap(
+        &mut relationship.schema_threat,
+        delta.schema_threat,
+        max_abs_delta,
+    );
+    apply_delta_with_cap(
+        &mut relationship.first_impression_strength,
+        delta.first_impression_strength,
+        max_abs_delta,
+    );
+    apply_delta_with_cap(
+        &mut relationship.first_impression_confidence,
+        delta.first_impression_confidence,
+        max_abs_delta,
+    );
+    apply_delta_with_cap(
+        &mut relationship.reappraisal_debt,
+        delta.reappraisal_debt,
+        max_abs_delta,
+    );
+    if let Some(code) = delta.reappraisal_state_code {
+        relationship.reappraisal_state_code = code.min(4);
+    }
     true
 }
 
@@ -1288,6 +1375,7 @@ fn default_relationship() -> Relationship {
         comfort: 0.0,
         boundary_pressure: 0.0,
         love_type: String::new(),
+        ..Relationship::default()
     }
 }
 

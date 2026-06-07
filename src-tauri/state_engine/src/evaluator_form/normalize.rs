@@ -1011,6 +1011,23 @@ pub fn normalize_eval_form_response(
     normalized
 }
 
+pub fn normalize_relationship_event_entities(row: &mut Value, spec: &EvalFormSpec) {
+    let Some(object) = row.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "source_entity_id",
+        "target_entity_id",
+        "perceived_by_entity_id",
+    ] {
+        let Some(raw) = object.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let resolved = normalize_player_id(&resolve_active_entity_id(raw, spec));
+        object.insert(key.into(), Value::String(resolved));
+    }
+}
+
 pub fn default_participants(spec: &EvalFormSpec) -> Vec<String> {
     let mut participants = spec.active_soul_ids.clone();
     if !participants.iter().any(|id| id == "default_player") {
@@ -1156,6 +1173,19 @@ pub fn normalize_relationship_defaults(row: &mut RelationshipRow) {
                 row.direction = Some(RelationshipDirection::Decrease);
             } else {
                 row.direction = Some(RelationshipDirection::NoChange);
+            }
+        }
+    }
+
+    if row.direction.is_none() {
+        if let Some(dim) = row.dimension {
+            if let Some(inferred) = infer_relationship_direction_from_evidence(
+                dim,
+                &row.evidence_quote,
+                row.shift.as_deref(),
+                row.summary.as_deref(),
+            ) {
+                row.direction = Some(inferred);
             }
         }
     }
@@ -1528,5 +1558,120 @@ pub(crate) fn infer_physical_object_from_evidence(evidence: &str) -> Option<&'st
             return Some(noun);
         }
     }
+    None
+}
+
+pub fn infer_relationship_direction_from_evidence(
+    dimension: RelationshipDimension,
+    evidence_quote: &str,
+    _shift: Option<&str>,
+    _summary: Option<&str>,
+) -> Option<RelationshipDirection> {
+    let evidence_lower = evidence_quote.to_ascii_lowercase();
+
+    match dimension {
+        RelationshipDimension::BoundaryPressure => {
+            let strong_boundary = [
+                "chain is still on the door",
+                "expecting someone or preparing for a stranger",
+                "preparing for a stranger",
+                "chain still holds the door",
+                "keeps the door chained",
+                "keeps the chain on",
+                "hesitates before opening",
+                "holds the door an inch",
+                "holds the door partly closed",
+                "keeps distance",
+                "backs away",
+                "sets a boundary",
+                "refuses entry",
+                "door chain",
+                "chain on the door",
+                "guarded door chain",
+                "guarded",
+                "uncertain entry",
+            ];
+            if strong_boundary.iter().any(|&p| evidence_lower.contains(p)) {
+                return Some(RelationshipDirection::Increase);
+            }
+        }
+        RelationshipDimension::Trust => {
+            let strong_distrust = [
+                "doesn't trust",
+                "does not trust",
+                "distrust",
+                "backs away suspiciously",
+                "keeps the chain on",
+                "chain is still on the door",
+                "asks who sent you",
+                "refuses to open",
+            ];
+            if strong_distrust.iter().any(|&p| evidence_lower.contains(p)) {
+                return Some(RelationshipDirection::Decrease);
+            }
+        }
+        RelationshipDimension::Comfort => {
+            let strong_discomfort = [
+                "chain is still on the door",
+                "keeps the chain on",
+                "doesn't trust",
+                "does not trust",
+                "distrust",
+                "backs away suspiciously",
+                "asks who sent you",
+                "refuses to open",
+                "hesitates before opening",
+                "holds the door partly closed",
+                "keeps distance",
+                "backs away",
+                "sets a boundary",
+                "refuses entry",
+                "expecting someone or preparing for a stranger",
+                "preparing for a stranger",
+                "tension",
+                "discomfort",
+                "unease",
+                "uneasy",
+                "guarded",
+                "stiffens",
+            ];
+            let strong_comfort = [
+                "relax",
+                "soften",
+                "invites closer",
+                "inviting closer",
+                "opens the door fully",
+                "opening the door fully",
+                "comfortable familiarity",
+                "comfortable",
+                "familiar",
+                "welcom",
+            ];
+            if strong_comfort.iter().any(|&p| evidence_lower.contains(p)) {
+                return Some(RelationshipDirection::Increase);
+            } else if strong_discomfort.iter().any(|&p| evidence_lower.contains(p)) {
+                return Some(RelationshipDirection::Decrease);
+            }
+        }
+        RelationshipDimension::Fear => {
+            let strong_fear = [
+                "stiffens",
+                "pulse thrumming",
+                "taste copper",
+                "startled",
+                "flinches",
+                "fear spikes",
+                "panic",
+                "scared",
+                "frightened",
+                "terror",
+            ];
+            if strong_fear.iter().any(|&p| evidence_lower.contains(p)) {
+                return Some(RelationshipDirection::Increase);
+            }
+        }
+        _ => {}
+    }
+
     None
 }

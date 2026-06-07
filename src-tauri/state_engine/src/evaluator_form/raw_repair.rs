@@ -23,6 +23,7 @@ pub fn parse_eval_form_response_with_trace(
 
     match serde_json::from_str::<Value>(&extracted) {
         Ok(mut value) => {
+            unwrap_top_level_form_envelope(&mut value, &mut trace);
             normalize_eval_form_value(&mut value, &mut trace);
             let response = serde_json::from_value(value).map_err(|err| {
                 format!("invalid EvalFormResponse JSON after normalization: {err}")
@@ -36,6 +37,7 @@ pub fn parse_eval_form_response_with_trace(
             let mut value = serde_json::from_str::<Value>(&repaired).map_err(|err| {
                 format!("invalid EvalFormResponse JSON: {first_err}; repair failed: {err}")
             })?;
+            unwrap_top_level_form_envelope(&mut value, &mut trace);
             normalize_eval_form_value(&mut value, &mut trace);
             let response = serde_json::from_value(value)
                 .map_err(|err| format!("invalid EvalFormResponse JSON after repair: {err}"))?;
@@ -43,6 +45,48 @@ pub fn parse_eval_form_response_with_trace(
             Ok((response, trace))
         }
     }
+}
+
+pub fn unwrap_top_level_form_envelope(value: &mut Value, trace: &mut EvalFormRepairTrace) {
+    const ENVELOPE_KEYS: [&str; 4] = ["evaluator_form_v1", "form", "eval_form", "response"];
+
+    let Some(object) = value.as_object() else {
+        return;
+    };
+
+    let nested = ENVELOPE_KEYS.iter().find_map(|key| {
+        object
+            .get(*key)
+            .filter(|nested| has_form_row_array(nested))
+            .cloned()
+    });
+
+    if let Some(nested) = nested {
+        *value = nested;
+        trace
+            .raw_form_repair_warnings
+            .push("top_level_evaluator_form_v1_envelope_unwrapped".into());
+        trace.raw_form_repair_applied = true;
+    }
+}
+
+fn has_form_row_array(value: &Value) -> bool {
+    const ROW_KEYS: [&str; 6] = [
+        "event_rows",
+        "object_rows",
+        "relationship_rows",
+        "relationship_event_rows",
+        "memory_rows",
+        "review_rows",
+    ];
+
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    ROW_KEYS
+        .iter()
+        .any(|key| object.get(*key).is_some_and(Value::is_array))
 }
 
 pub fn strip_json_fences(raw: &str) -> String {

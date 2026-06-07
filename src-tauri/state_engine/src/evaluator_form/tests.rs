@@ -2524,6 +2524,7 @@ fn live_exact_relationship_row_reaches_exported_relationship_delta() {
             comfort: 10.0,
             boundary_pressure: 0.0,
             love_type: String::new(),
+            ..crate::soul::Relationship::default()
         },
     );
 
@@ -2924,4 +2925,1152 @@ fn live_wet_jacket_chair_rows_create_object_patch() {
         object_patch_count, 2,
         "both object rows should show compiler_result = object_patch_created"
     );
+}
+
+#[test]
+fn boundary_pressure_infers_increase_from_door_chain() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Knock", "Door chains");
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "source_entity_id": "aurora_soul",
+            "target_entity_id": "default_player",
+            "dimension": "boundary_pressure",
+            "evidence_quote": "keeps the door chained"
+          }]
+        }"#
+    ).expect("parse response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.output.relationship_evaluations.len(), 1);
+    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+}
+
+#[test]
+fn boundary_pressure_infers_increase_from_preparing_for_stranger() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Knock", "Door opens");
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "source_entity_id": "aurora_soul",
+            "target_entity_id": "default_player",
+            "dimension": "boundary_pressure",
+            "evidence_quote": "preparing for a stranger"
+          }]
+        }"#
+    ).expect("parse response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.output.relationship_evaluations.len(), 1);
+    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+}
+
+#[test]
+fn trust_infers_decrease_from_guarded_door_chain() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Knock", "Suspicious look");
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "source_entity_id": "aurora_soul",
+            "target_entity_id": "default_player",
+            "dimension": "trust",
+            "evidence_quote": "backs away suspiciously and keeps the chain on"
+          }]
+        }"#
+    ).expect("parse response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.output.relationship_evaluations.len(), 1);
+    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Decrease));
+    assert!(result.output.relationship_evaluations[0].trust.unwrap() < 0.0);
+}
+
+#[test]
+fn comfort_infers_decrease_from_guarded_uncertain_entry() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Knock", "Hesitates");
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "source_entity_id": "aurora_soul",
+            "target_entity_id": "default_player",
+            "dimension": "comfort",
+            "evidence_quote": "hesitates before opening and keeps distance"
+          }]
+        }"#
+    ).expect("parse response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.output.relationship_evaluations.len(), 1);
+    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Decrease));
+    assert!(result.output.relationship_evaluations[0].comfort.unwrap() < 0.0);
+}
+
+#[test]
+fn fear_infers_increase_from_stiffens_and_pulse() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Knock", "Startled");
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "source_entity_id": "aurora_soul",
+            "target_entity_id": "default_player",
+            "dimension": "fear",
+            "evidence_quote": "stiffens with her pulse thrumming"
+          }]
+        }"#
+    ).expect("parse response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.output.relationship_evaluations.len(), 1);
+    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+    assert!(result.output.relationship_evaluations[0].fear.unwrap() > 0.0);
+}
+
+#[test]
+fn generic_watching_does_not_infer_direction() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Knock", "Watching");
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "source_entity_id": "aurora_soul",
+            "target_entity_id": "default_player",
+            "dimension": "trust",
+            "evidence_quote": "she watches him look at the wall"
+          }]
+        }"#
+    ).expect("parse response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "direction_missing_uncertain");
+}
+
+#[test]
+fn ambiguous_relationship_row_still_rejects_direction_missing_uncertain() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Knock", "Smiles");
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "source_entity_id": "aurora_soul",
+            "target_entity_id": "default_player",
+            "dimension": "comfort",
+            "evidence_quote": "she smiles and she pauses and breathes"
+          }]
+        }"#
+    ).expect("parse response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "direction_missing_uncertain");
+}
+
+#[test]
+fn live_knock_boundary_pressure_row_compiles() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Knock", "Chain is on the door");
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "source_entity_id": "aurora_soul",
+            "target_entity_id": "default_player",
+            "dimension": "boundary_pressure",
+            "evidence_quote": "The chain is still on the door—she hasn't decided if she's expecting someone or preparing for a stranger—but she's already reaching for the key."
+          }]
+        }"#
+    ).expect("parse response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.output.relationship_evaluations.len(), 1);
+    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+    assert!(result.output.relationship_evaluations[0].boundary_pressure.unwrap() > 0.0);
+}
+
+#[test]
+fn row_trace_records_relationship_direction_inference() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Knock", "Chain lock");
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "source_entity_id": "aurora_soul",
+            "target_entity_id": "default_player",
+            "dimension": "boundary_pressure",
+            "evidence_quote": "keeps the door chained"
+          }]
+        }"#
+    ).expect("parse response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.trace.relationship_direction_inferred_from.len(), 1);
+    assert_eq!(result.trace.relationship_direction_inferred_from[0], "evidence");
+    let rel_trace = result.trace.evaluator_row_traces.iter().find(|t| t.row_kind == "relationship").unwrap();
+    assert_eq!(rel_trace.compiler_result, "relationship_delta_created");
+}
+
+#[test]
+fn unwraps_evaluator_form_v1_top_level_envelope() {
+    let (parsed, trace) = parse_eval_form_response_with_trace(
+        r#"{
+          "evaluator_form_v1": {
+            "relationship_rows": [{
+              "relationship_dimension": "trust",
+              "evidence_quote": "Her shoulders ease as recognition settles in.",
+              "tags": ["relationship"]
+            }]
+          }
+        }"#,
+    )
+    .expect("wrapped evaluator_form_v1 should parse");
+
+    assert_eq!(parsed.relationship_rows.len(), 1);
+    assert_eq!(parsed.relationship_rows[0].dimension, Some(RelationshipDimension::Trust));
+    assert!(trace
+        .raw_form_repair_warnings
+        .iter()
+        .any(|warning| warning == "top_level_evaluator_form_v1_envelope_unwrapped"));
+}
+
+#[test]
+fn unwraps_form_top_level_envelope() {
+    let parsed = parse_eval_form_response(
+        r#"{
+          "form": {
+            "event_rows": [{
+              "event_id": "knock",
+              "event_type": "scene_event",
+              "summary": "The visitor knocked.",
+              "participants": ["aurora_soul", "default_player"],
+              "evidence_quote": "A knock sounds."
+            }]
+          }
+        }"#,
+    )
+    .expect("wrapped form should parse");
+
+    assert_eq!(parsed.event_rows.len(), 1);
+    assert_eq!(parsed.event_rows[0].event_id, "knock");
+}
+
+#[test]
+fn unwraps_response_top_level_envelope_only_when_nested_object_has_rows() {
+    let (parsed, trace) = parse_eval_form_response_with_trace(
+        r#"{
+          "response": {
+            "memory_rows": [{
+              "owner_soul_id": "aurora_soul",
+              "slot_id": "current_plot_memory",
+              "content": "Aurora noticed the familiar voice at the door.",
+              "evidence_quote": "The voice is familiar.",
+              "tags": ["current_plot"]
+            }]
+          }
+        }"#,
+    )
+    .expect("response envelope with rows should parse");
+
+    assert_eq!(parsed.memory_rows.len(), 1);
+    assert!(trace
+        .raw_form_repair_warnings
+        .iter()
+        .any(|warning| warning == "top_level_evaluator_form_v1_envelope_unwrapped"));
+
+    let (unrelated, unrelated_trace) = parse_eval_form_response_with_trace(
+        r#"{
+          "response": {
+            "message": "not a form"
+          }
+        }"#,
+    )
+    .expect("non-form response should remain an empty default form");
+
+    assert_eq!(unrelated.memory_rows.len(), 0);
+    assert!(!unrelated_trace
+        .raw_form_repair_warnings
+        .iter()
+        .any(|warning| warning == "top_level_evaluator_form_v1_envelope_unwrapped"));
+}
+
+#[test]
+fn does_not_unwrap_unrelated_nested_json() {
+    let (parsed, trace) = parse_eval_form_response_with_trace(
+        r#"{
+          "metadata": {
+            "relationship_rows": [{
+              "relationship_dimension": "trust",
+              "evidence_quote": "This is diagnostic metadata, not a submitted form."
+            }]
+          }
+        }"#,
+    )
+    .expect("unrelated nested json should parse as default form");
+
+    assert_eq!(parsed.relationship_rows.len(), 0);
+    assert!(!trace
+        .raw_form_repair_warnings
+        .iter()
+        .any(|warning| warning == "top_level_evaluator_form_v1_envelope_unwrapped"));
+}
+
+#[test]
+fn live_wrapped_boundary_pressure_missing_direction_compiles() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "Knock",
+        "The chain still holds the door an inch from fully open, but her grip on the deadbolt has unconsciously relaxed.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "evaluator_form_v1": {
+            "event_rows": [],
+            "object_rows": [],
+            "relationship_rows": [
+              {
+                "relationship_dimension": "boundary_pressure",
+                "evidence_quote": "The chain still holds the door an inch from fully open, but her grip on the deadbolt has unconsciously relaxed.",
+                "tags": ["boundary"]
+              },
+              {
+                "relationship_dimension": "trust",
+                "evidence_quote": "It's not the confident drawl of a stranger, nor the clipped wariness of someone demanding entry--it's... softer. Familiar in a way that makes her chest tighten just a fraction.",
+                "tags": ["relationship"]
+              }
+            ],
+            "memory_rows": [],
+            "review_rows": []
+          }
+        }"#,
+    )
+    .expect("live wrapped form should parse");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert!(result.trace.form_rows_submitted > 0);
+    assert!(result.trace.form_rows_accepted > 0);
+    assert!(!result.trace.relationship_direction_inferred_from.is_empty());
+    assert!(!result.output.relationship_evaluations.is_empty());
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
+    let boundary_key = "event_latest_turn:aurora_soul:default_player:boundary_pressure";
+    assert_eq!(
+        result.trace.relationship_row_results.get(boundary_key),
+        Some(&"delta_created".to_string())
+    );
+    assert!(result.trace.evaluator_row_traces.iter().any(|row| {
+        row.row_kind == "relationship"
+            && row.compiler_result == "relationship_delta_created"
+            && row
+                .normalized_row
+                .get("dimension")
+                .and_then(serde_json::Value::as_str)
+                == Some("boundary_pressure")
+    }));
+}
+
+#[test]
+fn wrapped_form_rows_are_counted_as_submitted() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "I knock.", "A knock sounds.");
+    let response = parse_eval_form_response(
+        r#"{
+          "eval_form": {
+            "event_rows": [{
+              "event_id": "knock",
+              "event_type": "scene_event",
+              "summary": "The visitor knocked.",
+              "participants": ["aurora_soul", "default_player"],
+              "evidence_quote": "I knock."
+            }],
+            "memory_rows": [{
+              "event_id": "knock",
+              "owner_soul_id": "aurora_soul",
+              "slot_id": "current_plot_memory",
+              "content": "Aurora heard the visitor knock.",
+              "evidence_quote": "I knock.",
+              "tags": ["current_plot"]
+            }]
+          }
+        }"#,
+    )
+    .expect("wrapped eval_form should parse");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_submitted, 2);
+    assert_eq!(result.trace.form_rows_accepted, 2);
+    assert_eq!(result.trace.form_rows_rejected, 0);
+}
+
+#[test]
+fn wrapped_form_trace_records_unwrap_warning() {
+    let (_, trace) = parse_eval_form_response_with_trace(
+        r#"{
+          "form": {
+            "object_rows": [{
+              "object_id": "apartment_door",
+              "property_changed": "open_state",
+              "new_value": "ajar",
+              "evidence_quote": "The door is ajar."
+            }]
+          }
+        }"#,
+    )
+    .expect("wrapped form should parse with trace");
+
+    assert!(trace.raw_form_repair_applied);
+    assert!(trace
+        .raw_form_repair_warnings
+        .iter()
+        .any(|warning| warning == "top_level_evaluator_form_v1_envelope_unwrapped"));
+}
+
+#[test]
+fn wrapped_form_memory_rows_still_compile() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "I knock.",
+        "Aurora recognizes the visitor's familiar knock.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "evaluator_form_v1": {
+            "memory_rows": [{
+              "owner_soul_id": "aurora_soul",
+              "slot_id": "current_plot_memory",
+              "content": "Aurora recognizes the visitor's familiar knock.",
+              "evidence_quote": "Aurora recognizes the visitor's familiar knock.",
+              "tags": ["current_plot"]
+            }]
+          }
+        }"#,
+    )
+    .expect("wrapped memory rows should parse");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.draft.memory_candidate_count, 1);
+    assert_eq!(result.output.memory_candidates.len(), 1);
+}
+
+fn relationship_event_base_row() -> serde_json::Value {
+    serde_json::json!({
+        "row_enabled": 1,
+        "event_id": "event_latest_turn",
+        "actor_entity_id": "default_player",
+        "relationship_source_soul_id": "aurora_soul",
+        "relationship_target_entity_id": "default_player",
+        "perceived_by_entity_id": "aurora_soul",
+        "evidence_quote": "I stay outside the threshold with my hands visible. You don't have to open the door.",
+        "intent": 3,
+        "honesty": 1,
+        "reliability": 1,
+        "boundary_treatment": 5,
+        "responsiveness": 3,
+        "power_use": 1,
+        "evaluation_tone": 1,
+        "competence": 0,
+        "disclosure": 0,
+        "reciprocity": 1,
+        "repair": 0,
+        "predictability": 2,
+        "salience": 65,
+        "certainty": 95,
+        "directness": 90,
+        "costliness": 25,
+        "stakes": 50,
+        "repetition": 20,
+        "event_flags_u64": 35
+    })
+}
+
+fn relationship_event_disabled_template_row() -> serde_json::Value {
+    serde_json::json!({
+        "row_enabled": 0,
+        "event_id": "event_latest_turn",
+        "actor_entity_id": "default_player",
+        "relationship_source_soul_id": "aurora_soul",
+        "relationship_target_entity_id": "default_player",
+        "perceived_by_entity_id": "aurora_soul",
+        "evidence_quote": "",
+        "intent": 0,
+        "honesty": 0,
+        "reliability": 0,
+        "boundary_treatment": 0,
+        "responsiveness": 0,
+        "power_use": 0,
+        "evaluation_tone": 0,
+        "competence": 0,
+        "disclosure": 0,
+        "reciprocity": 0,
+        "repair": 0,
+        "predictability": 0,
+        "salience": 0,
+        "certainty": 0,
+        "directness": 0,
+        "costliness": 0,
+        "stakes": 0,
+        "repetition": 0,
+        "event_flags_u64": 0
+    })
+}
+
+fn compile_relationship_event_row(
+    row: serde_json::Value,
+    configure: impl FnOnce(&mut Soul),
+) -> EvalFormCompileResult {
+    let (mut soul, world) = soul_and_world();
+    configure(&mut soul);
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "I stay outside the threshold.",
+        "Aurora watches from behind the door chain.",
+    );
+    compile_eval_form_response(
+        &spec,
+        &EvalFormResponse {
+            relationship_event_rows: vec![row],
+            ..EvalFormResponse::default()
+        },
+        &context,
+    )
+}
+
+fn first_relationship_delta(result: &EvalFormCompileResult) -> &RelationshipEvaluation {
+    result
+        .output
+        .relationship_evaluations
+        .first()
+        .expect("relationship delta")
+}
+
+fn set_row_i64(row: &mut serde_json::Value, key: &str, value: i64) {
+    row.as_object_mut()
+        .expect("row object")
+        .insert(key.into(), serde_json::Value::from(value));
+}
+
+#[test]
+fn hard_relationship_event_template_accepts_exact_keys() {
+    let result = compile_relationship_event_row(relationship_event_base_row(), |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert!(result.trace.evaluator_row_traces.iter().any(|row| {
+        row.row_kind == "relationship_event"
+            && row.validation_status == "accepted"
+            && row.compiler_result == "relationship_delta_created"
+    }));
+    assert_eq!(
+        result.trace.relationship_event_template_version,
+        RELATIONSHIP_EVENT_TEMPLATE_VERSION
+    );
+}
+
+#[test]
+fn hard_relationship_event_template_rejects_unknown_axis_trust() {
+    let mut row = relationship_event_base_row();
+    row.as_object_mut()
+        .unwrap()
+        .insert("axis_trust".into(), serde_json::Value::from(5));
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "relationship_event_unknown_key:axis_trust"
+    );
+}
+
+#[test]
+fn hard_relationship_event_template_rejects_unknown_modifier_trust() {
+    let mut row = relationship_event_base_row();
+    row.as_object_mut()
+        .unwrap()
+        .insert("modifier_trust".into(), serde_json::Value::from(80));
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "relationship_event_unknown_key:modifier_trust"
+    );
+}
+
+#[test]
+fn hard_relationship_event_template_rejects_missing_intent() {
+    let mut row = relationship_event_base_row();
+    row.as_object_mut().unwrap().remove("intent");
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "relationship_event_missing_key:intent"
+    );
+}
+
+#[test]
+fn hard_relationship_event_template_rejects_string_number() {
+    let mut row = relationship_event_base_row();
+    row.as_object_mut()
+        .unwrap()
+        .insert("intent".into(), serde_json::Value::String("5".into()));
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "numeric_field_non_numeric:intent");
+}
+
+#[test]
+fn hard_relationship_event_template_ignores_disabled_row() {
+    let result = compile_relationship_event_row(relationship_event_disabled_template_row(), |_| {});
+
+    assert_eq!(result.trace.form_rows_submitted, 2);
+    assert_eq!(result.trace.form_rows_accepted, 1);
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert!(result.output.relationship_evaluations.is_empty());
+    assert!(result.trace.evaluator_row_traces.iter().any(|row| {
+        row.row_kind == "relationship_event"
+            && row.validation_status == "accepted"
+            && row.compiler_result == "disabled_row_ignored"
+    }));
+}
+
+#[test]
+fn hard_relationship_event_template_compiles_enabled_row() {
+    let result = compile_relationship_event_row(relationship_event_base_row(), |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.output.relationship_evaluations.len(), 1);
+    assert!(result
+        .trace
+        .relationship_delta_source
+        .values()
+        .any(|source| source == "numeric_event_v2"));
+}
+
+#[test]
+fn hard_relationship_event_template_requires_row_enabled_zero_or_one() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "row_enabled", 2);
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "relationship_event_row_enabled_invalid"
+    );
+}
+
+#[test]
+fn live_axis_trust_payload_rejected_with_unknown_key_reason() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "I wait outside.",
+        "Aurora watches from behind the chain.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "evaluator_form_v1": {
+            "relationship_event_rows": [{
+              "row_enabled": 1,
+              "event_id": "event_latest_turn",
+              "actor_entity_id": "default_player",
+              "relationship_source_soul_id": "aurora_soul",
+              "relationship_target_entity_id": "default_player",
+              "perceived_by_entity_id": "aurora_soul",
+              "evidence_quote": "I wait outside.",
+              "axis_trust": 5,
+              "intent": 3,
+              "honesty": 1,
+              "reliability": 1,
+              "boundary_treatment": 5,
+              "responsiveness": 3,
+              "power_use": 1,
+              "evaluation_tone": 1,
+              "competence": 0,
+              "disclosure": 0,
+              "reciprocity": 1,
+              "repair": 0,
+              "predictability": 2,
+              "salience": 65,
+              "certainty": 95,
+              "directness": 90,
+              "costliness": 25,
+              "stakes": 50,
+              "repetition": 20,
+              "event_flags_u64": 35
+            }]
+          }
+        }"#,
+    )
+    .expect("axis_trust payload should parse as raw row");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "relationship_event_unknown_key:axis_trust"
+    );
+    assert!(result.output.relationship_evaluations.is_empty());
+}
+
+#[test]
+fn live_canonical_template_payload_compiles_numeric_event_v2() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "I wait outside.",
+        "Aurora watches from behind the chain.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "evaluator_form_v1": {
+            "relationship_event_rows": [{
+              "row_enabled": 1,
+              "event_id": "event_latest_turn",
+              "actor_entity_id": "default_player",
+              "relationship_source_soul_id": "aurora_soul",
+              "relationship_target_entity_id": "default_player",
+              "perceived_by_entity_id": "aurora_soul",
+              "evidence_quote": "I wait outside the threshold with my hands visible.",
+              "intent": 3,
+              "honesty": 1,
+              "reliability": 1,
+              "boundary_treatment": 5,
+              "responsiveness": 3,
+              "power_use": 1,
+              "evaluation_tone": 1,
+              "competence": 0,
+              "disclosure": 0,
+              "reciprocity": 1,
+              "repair": 0,
+              "predictability": 2,
+              "salience": 65,
+              "certainty": 95,
+              "directness": 90,
+              "costliness": 25,
+              "stakes": 50,
+              "repetition": 20,
+              "event_flags_u64": 35
+            }]
+          }
+        }"#,
+    )
+    .expect("canonical payload should parse");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.output.relationship_evaluations.len(), 1);
+    assert!(result
+        .trace
+        .relationship_delta_source
+        .values()
+        .any(|source| source == "numeric_event_v2"));
+}
+
+#[test]
+fn relationship_event_row_accepts_all_required_numbers() {
+    let result = compile_relationship_event_row(relationship_event_base_row(), |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert!(result.trace.form_rows_accepted >= 1);
+    assert!(result.trace.evaluator_row_traces.iter().any(|row| {
+        row.row_kind == "relationship_event" && row.validation_status == "accepted"
+    }));
+}
+
+#[test]
+fn relationship_event_row_rejects_missing_numeric_field() {
+    let mut row = relationship_event_base_row();
+    row.as_object_mut().unwrap().remove("intent");
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "relationship_event_missing_key:intent"
+    );
+}
+
+#[test]
+fn relationship_event_row_rejects_string_numeric_field() {
+    let mut row = relationship_event_base_row();
+    row.as_object_mut()
+        .unwrap()
+        .insert("intent".into(), serde_json::Value::String("5".into()));
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "numeric_field_non_numeric:intent");
+}
+
+#[test]
+fn relationship_event_row_rejects_axis_out_of_range() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "intent", 6);
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "axis_out_of_range:intent");
+}
+
+#[test]
+fn relationship_event_row_rejects_modifier_out_of_range() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "salience", 101);
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "modifier_out_of_range:salience");
+}
+
+#[test]
+fn relationship_event_row_rejects_missing_evidence() {
+    let mut row = relationship_event_base_row();
+    row.as_object_mut()
+        .unwrap()
+        .insert("evidence_quote".into(), serde_json::Value::String("".into()));
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "evidence_quote_missing");
+}
+
+#[test]
+fn relationship_event_row_rejects_bad_entity() {
+    let mut row = relationship_event_base_row();
+    row.as_object_mut()
+        .unwrap()
+        .insert("actor_entity_id".into(), serde_json::Value::String("stranger".into()));
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "entity_resolution_failed");
+}
+
+#[test]
+fn boundary_respect_decreases_boundary_pressure() {
+    let result = compile_relationship_event_row(relationship_event_base_row(), |soul| {
+        soul.relationships.get_mut("user").unwrap().boundary_pressure = 40.0;
+    });
+
+    assert!(first_relationship_delta(&result).boundary_pressure.unwrap() < 0.0);
+}
+
+#[test]
+fn pressure_after_refusal_increases_boundary_pressure() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "intent", -3);
+    set_row_i64(&mut row, "boundary_treatment", -5);
+    set_row_i64(&mut row, "responsiveness", -3);
+    set_row_i64(&mut row, "power_use", -2);
+    set_row_i64(&mut row, "evaluation_tone", -2);
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert!(first_relationship_delta(&result).boundary_pressure.unwrap() > 0.0);
+}
+
+#[test]
+fn honest_costly_support_increases_trustable_bias() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "honesty", 5);
+    set_row_i64(&mut row, "reliability", 5);
+    set_row_i64(&mut row, "costliness", 90);
+    row.as_object_mut()
+        .unwrap()
+        .insert("event_flags_u64".into(), serde_json::Value::from(128_u64));
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert!(first_relationship_delta(&result).trustable_bias.unwrap() > 0.0);
+}
+
+#[test]
+fn betrayal_increases_untrustworthy_bias_more_than_minor_kindness_reduces_it() {
+    let mut betrayal = relationship_event_base_row();
+    set_row_i64(&mut betrayal, "honesty", -5);
+    set_row_i64(&mut betrayal, "reliability", -5);
+    set_row_i64(&mut betrayal, "intent", -4);
+    let betrayal_result = compile_relationship_event_row(betrayal, |soul| {
+        soul.relationships.get_mut("user").unwrap().untrustworthy_bias = 40.0;
+    });
+
+    let mut kindness = relationship_event_base_row();
+    set_row_i64(&mut kindness, "honesty", 1);
+    set_row_i64(&mut kindness, "reliability", 1);
+    set_row_i64(&mut kindness, "salience", 20);
+    set_row_i64(&mut kindness, "stakes", 10);
+    let kindness_result = compile_relationship_event_row(kindness, |soul| {
+        soul.relationships.get_mut("user").unwrap().untrustworthy_bias = 40.0;
+    });
+
+    let betrayal_delta = first_relationship_delta(&betrayal_result)
+        .untrustworthy_bias
+        .unwrap();
+    let kindness_delta = first_relationship_delta(&kindness_result)
+        .untrustworthy_bias
+        .unwrap_or(0.0);
+    assert!(betrayal_delta > kindness_delta.abs());
+}
+
+#[test]
+fn asshole_and_trustable_bias_can_both_be_high() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "honesty", 5);
+    set_row_i64(&mut row, "reliability", 5);
+    let result = compile_relationship_event_row(row, |soul| {
+        let relationship = soul.relationships.get_mut("user").unwrap();
+        relationship.asshole_bias = 70.0;
+        relationship.trustable_bias = 60.0;
+    });
+
+    let delta = first_relationship_delta(&result);
+    assert!(70.0 + delta.asshole_bias.unwrap_or(0.0) >= 65.0);
+    assert!(60.0 + delta.trustable_bias.unwrap_or(0.0) >= 60.0);
+}
+
+#[test]
+fn minor_nice_event_does_not_erase_asshole_bias() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "salience", 10);
+    set_row_i64(&mut row, "certainty", 50);
+    set_row_i64(&mut row, "stakes", 10);
+    let result = compile_relationship_event_row(row, |soul| {
+        soul.relationships.get_mut("user").unwrap().asshole_bias = 80.0;
+    });
+
+    let next = 80.0 + first_relationship_delta(&result).asshole_bias.unwrap_or(0.0);
+    assert!(next > 75.0);
+}
+
+#[test]
+fn high_score_requires_cost_or_repetition() {
+    let mut weak = relationship_event_base_row();
+    set_row_i64(&mut weak, "honesty", 5);
+    set_row_i64(&mut weak, "reliability", 5);
+    set_row_i64(&mut weak, "costliness", 0);
+    set_row_i64(&mut weak, "stakes", 10);
+    set_row_i64(&mut weak, "repetition", 0);
+    let weak_result = compile_relationship_event_row(weak, |_| {});
+
+    let mut strong = relationship_event_base_row();
+    set_row_i64(&mut strong, "honesty", 5);
+    set_row_i64(&mut strong, "reliability", 5);
+    set_row_i64(&mut strong, "costliness", 90);
+    set_row_i64(&mut strong, "stakes", 90);
+    set_row_i64(&mut strong, "repetition", 90);
+    let strong_result = compile_relationship_event_row(strong, |_| {});
+
+    let weak_delta = first_relationship_delta(&weak_result)
+        .trustable_bias
+        .unwrap_or(0.0);
+    let strong_delta = first_relationship_delta(&strong_result)
+        .trustable_bias
+        .unwrap_or(0.0);
+    assert!(strong_delta > weak_delta * 2.0);
+}
+
+#[test]
+fn comfort_rises_from_responsiveness_and_boundary_respect() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "responsiveness", 5);
+    set_row_i64(&mut row, "boundary_treatment", 5);
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert!(first_relationship_delta(&result).comfort.unwrap() > 0.0);
+}
+
+#[test]
+fn conflict_rises_from_negative_tone_and_boundary_violation() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "evaluation_tone", -5);
+    set_row_i64(&mut row, "boundary_treatment", -5);
+    set_row_i64(&mut row, "intent", -4);
+    set_row_i64(&mut row, "reciprocity", -4);
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert!(first_relationship_delta(&result).conflict.unwrap() > 0.0);
+}
+
+#[test]
+fn contradictory_event_adds_reappraisal_debt() {
+    let mut row = relationship_event_base_row();
+    row.as_object_mut()
+        .unwrap()
+        .insert("event_flags_u64".into(), serde_json::Value::from(32_u64));
+    let result = compile_relationship_event_row(row, |soul| {
+        soul.relationships.get_mut("user").unwrap().asshole_bias = 90.0;
+    });
+
+    assert!(first_relationship_delta(&result).reappraisal_debt.unwrap() > 0.0);
+}
+
+#[test]
+fn reappraisal_enters_under_review_at_threshold() {
+    let mut row = relationship_event_base_row();
+    row.as_object_mut()
+        .unwrap()
+        .insert("event_flags_u64".into(), serde_json::Value::from(32_u64));
+    let result = compile_relationship_event_row(row, |soul| {
+        let relationship = soul.relationships.get_mut("user").unwrap();
+        relationship.asshole_bias = 100.0;
+        relationship.reappraisal_debt = 35.0;
+    });
+
+    assert_eq!(first_relationship_delta(&result).reappraisal_state_code, Some(2));
+}
+
+#[test]
+fn reappraisal_revises_after_strong_contradiction() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "salience", 100);
+    set_row_i64(&mut row, "certainty", 100);
+    set_row_i64(&mut row, "directness", 100);
+    set_row_i64(&mut row, "costliness", 100);
+    set_row_i64(&mut row, "stakes", 100);
+    set_row_i64(&mut row, "repetition", 100);
+    row.as_object_mut()
+        .unwrap()
+        .insert("event_flags_u64".into(), serde_json::Value::from(32_u64 | 64_u64));
+    let result = compile_relationship_event_row(row, |soul| {
+        let relationship = soul.relationships.get_mut("user").unwrap();
+        relationship.asshole_bias = 100.0;
+        relationship.reappraisal_debt = 65.0;
+    });
+
+    assert_eq!(first_relationship_delta(&result).reappraisal_state_code, Some(3));
+}
+
+#[test]
+fn first_impression_does_not_flip_from_one_minor_event() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "salience", 10);
+    set_row_i64(&mut row, "certainty", 20);
+    row.as_object_mut()
+        .unwrap()
+        .insert("event_flags_u64".into(), serde_json::Value::from(2048_u64));
+    let result = compile_relationship_event_row(row, |_| {});
+
+    let delta = first_relationship_delta(&result);
+    assert_eq!(delta.reappraisal_state_code, Some(1));
+    assert!(delta.reappraisal_debt.is_none());
+}
+
+#[test]
+fn legacy_relationship_rows_still_compile_when_no_numeric_rows() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Hi", "Aurora relaxes.");
+    let response = EvalFormResponse {
+        relationship_rows: vec![RelationshipRow {
+            source_soul_id: "aurora_soul".into(),
+            target_entity_id: "default_player".into(),
+            dimension: Some(RelationshipDimension::Comfort),
+            direction: Some(RelationshipDirection::Increase),
+            evidence_quote: "Aurora relaxes.".into(),
+            ..RelationshipRow::default()
+        }],
+        ..EvalFormResponse::default()
+    };
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert!(result.output.relationship_evaluations[0].comfort.unwrap() > 0.0);
+}
+
+#[test]
+fn numeric_relationship_event_rows_take_priority_when_present() {
+    let (mut soul, world) = soul_and_world();
+    soul.relationships.get_mut("user").unwrap().boundary_pressure = 40.0;
+    let (spec, context) = spec_and_context(&soul, &world, "Door", "Aurora waits.");
+    let response = EvalFormResponse {
+        relationship_event_rows: vec![relationship_event_base_row()],
+        relationship_rows: vec![RelationshipRow {
+            source_soul_id: "aurora_soul".into(),
+            target_entity_id: "default_player".into(),
+            dimension: Some(RelationshipDimension::BoundaryPressure),
+            direction: Some(RelationshipDirection::Increase),
+            evidence_quote: "Aurora waits.".into(),
+            ..RelationshipRow::default()
+        }],
+        ..EvalFormResponse::default()
+    };
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.output.relationship_evaluations.len(), 1);
+    assert_eq!(
+        result
+            .trace
+            .relationship_delta_source
+            .values()
+            .next()
+            .map(String::as_str),
+        Some("numeric_event_v2")
+    );
+    assert!(result.trace.evaluator_row_traces.iter().any(|row| {
+        row.compiler_result == "deduped_numeric_event_v2_priority"
+    }));
+}
+
+#[test]
+fn bad_numeric_event_row_does_not_kill_legacy_relationship_rows() {
+    let mut bad = relationship_event_base_row();
+    bad.as_object_mut().unwrap().remove("intent");
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Hi", "Aurora relaxes.");
+    let response = EvalFormResponse {
+        relationship_event_rows: vec![bad],
+        relationship_rows: vec![RelationshipRow {
+            source_soul_id: "aurora_soul".into(),
+            target_entity_id: "default_player".into(),
+            dimension: Some(RelationshipDimension::Comfort),
+            direction: Some(RelationshipDirection::Increase),
+            evidence_quote: "Aurora relaxes.".into(),
+            ..RelationshipRow::default()
+        }],
+        ..EvalFormResponse::default()
+    };
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "relationship_event_missing_key:intent"
+    );
+    assert_eq!(result.output.relationship_evaluations.len(), 1);
+    assert!(result.output.relationship_evaluations[0].comfort.unwrap() > 0.0);
+}
+
+#[test]
+fn door_chain_numeric_event_compiles_without_direction() {
+    let result = compile_relationship_event_row(relationship_event_base_row(), |soul| {
+        let relationship = soul.relationships.get_mut("user").unwrap();
+        relationship.trust = 0.0;
+        relationship.boundary_pressure = 30.0;
+    });
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert!(!result
+        .rejected_rows
+        .iter()
+        .any(|row| row.reason == "direction_missing_uncertain"));
+    let delta = first_relationship_delta(&result);
+    assert!(delta.boundary_pressure.unwrap() < 0.0);
+    assert!(delta.comfort.unwrap() > 0.0);
+    assert!(delta.trust.unwrap() > 0.0);
+    assert!(delta.autonomy_respect_bias.unwrap() > 0.0);
+    assert!(result
+        .trace
+        .relationship_delta_source
+        .values()
+        .any(|source| source == "numeric_event_v2"));
 }

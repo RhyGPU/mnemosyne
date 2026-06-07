@@ -77,7 +77,7 @@ pub struct TraumaSymptoms {
     pub avoidance: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Relationship {
     pub trust: f32,
     pub affection: f32,
@@ -98,6 +98,33 @@ pub struct Relationship {
     pub comfort: f32,
     #[serde(default)]
     pub boundary_pressure: f32,
+    #[serde(default)]
+    pub trustable_bias: f32,
+    #[serde(default)]
+    pub untrustworthy_bias: f32,
+    #[serde(default)]
+    pub asshole_bias: f32,
+    #[serde(default)]
+    pub care_bias: f32,
+    #[serde(default)]
+    pub danger_bias: f32,
+    #[serde(default)]
+    pub competence_bias: f32,
+    #[serde(default)]
+    pub autonomy_respect_bias: f32,
+    #[serde(default)]
+    pub attachment_pull: f32,
+    #[serde(default)]
+    pub schema_threat: f32,
+    #[serde(default)]
+    pub first_impression_strength: f32,
+    #[serde(default)]
+    pub first_impression_confidence: f32,
+    #[serde(default)]
+    pub reappraisal_debt: f32,
+    #[serde(default)]
+    pub reappraisal_state_code: u8,
+    #[serde(default)]
     pub love_type: String,
 }
 
@@ -523,6 +550,7 @@ impl Soul {
                 comfort: 10.0,
                 boundary_pressure: 0.0,
                 love_type: String::new(),
+                ..Relationship::default()
             },
         );
 
@@ -633,6 +661,7 @@ pub fn neutral_user_relationship() -> Relationship {
         comfort: 10.0,
         boundary_pressure: 0.0,
         love_type: String::new(),
+        ..Relationship::default()
     }
 }
 

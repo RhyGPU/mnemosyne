@@ -161,6 +161,7 @@ export type SoulSummary = {
   last_updated: number;
   recent_count: number;
   core_count: number;
+  archived_at?: number | null;
 };
 
 export type ConversationSummary = {
@@ -174,6 +175,7 @@ export type ConversationSummary = {
   updated_at: number;
   last_message_preview: string | null;
   message_count: number;
+  archived_at?: number | null;
 };
 
 export type RestoreTurnsPreview = {
@@ -232,6 +234,28 @@ export type MneImportResult = {
   summary: string;
 };
 
+export type MneValidationSummary = {
+  soul_name?: string | null;
+  soul_id?: string | null;
+  world_name?: string | null;
+  world_id?: string | null;
+  conversation_title?: string | null;
+  conversation_id?: string | null;
+  message_count: number;
+  memory_count: number;
+  recent_event_count: number;
+  object_state_count: number;
+  relationship_count: number;
+  payload_log_count: number;
+};
+
+export type MneValidationReport = {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+  summary: MneValidationSummary;
+};
+
 export type SessionStartResult = {
   soul: Soul;
   conversation: ConversationSummary;
@@ -244,6 +268,7 @@ export type SettingSummary = {
   last_updated: number;
   turn_counter: number;
   location: string;
+  archived_at?: number | null;
 };
 
 export type ChatMessage = {
@@ -485,6 +510,7 @@ export type ProviderProfile = ApiProviderSettings & {
   name: string;
   created_at: number;
   updated_at: number;
+  archived_at?: number | null;
 };
 
 export type EvaluatorJobStatus =
@@ -741,17 +767,25 @@ export function createDefaultSetting(settingName: string): Promise<SettingSoul> 
 
 export function listSouls(): Promise<SoulSummary[]> {
   return invokeOrPreview("list_souls", {}, () =>
-    browserSouls.filter((soul) => soul.soul_kind !== "session_clone").map(summarizeSoul),
+    browserSouls.filter((soul) => soul.soul_kind !== "session_clone" && !(soul as any).archived_at).map(summarizeSoul),
   );
 }
 
 export function listSoulsDebug(): Promise<SoulSummary[]> {
-  return invokeOrPreview("list_souls_debug", {}, () => browserSouls.map(summarizeSoul));
+  return invokeOrPreview("list_souls_debug", {}, () =>
+    browserSouls.filter((soul) => !(soul as any).archived_at).map(summarizeSoul),
+  );
 }
 
 export function listConversations(): Promise<ConversationSummary[]> {
   return invokeOrPreview("list_conversations", {}, () =>
     browserConversations.map(summarizePreviewConversation),
+  );
+}
+
+export function listArchivedSessions(): Promise<ConversationSummary[]> {
+  return invokeOrPreview("list_archived_sessions", {}, () =>
+    browserConversations.filter(c => c.title.startsWith("[Archived] ") || (c as any).archived_at).map(summarizePreviewConversation),
   );
 }
 
@@ -769,7 +803,9 @@ export function renameConversation(
 }
 
 export function listSettings(): Promise<SettingSummary[]> {
-  return invokeOrPreview("list_settings", {}, () => browserSettings.map(summarizeSetting));
+  return invokeOrPreview("list_settings", {}, () =>
+    browserSettings.filter((item) => !(item as any).archived_at).map(summarizeSetting),
+  );
 }
 
 export function upsertSoul(soul: Soul): Promise<SoulSummary> {
@@ -911,32 +947,125 @@ export function importMneBundle(filePath: string): Promise<MneImportResult> {
   }));
 }
 
-export function deleteSoul(soulId: string): Promise<boolean> {
-  return invokeOrPreview("delete_soul", { soulId }, () => {
-    const beforeCount = browserSouls.length;
-    browserSouls = browserSouls.filter((item) => item.character_id !== soulId);
-    browserMessages = browserMessages.filter(
-      (message) => message.conversation_id !== previewConversationIdForSoul(soulId),
-    );
-    browserAssistantVariants = browserAssistantVariants.filter(
-      (variant) => variant.conversation_id !== previewConversationIdForSoul(soulId),
-    );
-    browserPayloadLogs = browserPayloadLogs.filter(
-      (log) => log.conversation_id !== previewConversationIdForSoul(soulId),
-    );
-    browserConversations = browserConversations.filter((conversation) => conversation.soul_id !== soulId);
-    return browserSouls.length !== beforeCount;
+export function validateMneBundle(filePath: string): Promise<MneValidationReport> {
+  return invokeOrPreview("validate_mne_bundle", { filePath }, () => ({
+    valid: true,
+    errors: [],
+    warnings: [],
+    summary: {
+      message_count: 0,
+      memory_count: 0,
+      recent_event_count: 0,
+      object_state_count: 0,
+      relationship_count: 0,
+      payload_log_count: 0,
+    },
+  }));
+}
+
+export function previewMneImport(filePath: string): Promise<MneValidationReport> {
+  return invokeOrPreview("preview_mne_import", { filePath }, () => ({
+    valid: true,
+    errors: [],
+    warnings: [],
+    summary: {
+      message_count: 0,
+      memory_count: 0,
+      recent_event_count: 0,
+      object_state_count: 0,
+      relationship_count: 0,
+      payload_log_count: 0,
+    },
+  }));
+}
+
+export function importMneAsNew(filePath: string): Promise<MneImportResult> {
+  return invokeOrPreview("import_mne_as_new", { filePath }, () => ({
+    bundle_id: crypto.randomUUID(),
+    bundle_type: "preview",
+    imported_soul_ids: [],
+    imported_setting_ids: [],
+    remapped_ids: {},
+    summary: "Mock import as new copy",
+  }));
+}
+
+export function archiveSoul(soulId: string): Promise<boolean> {
+  return invokeOrPreview("archive_soul", { soulId }, () => {
+    const soul = browserSouls.find((item) => item.character_id === soulId);
+    if (!soul) return false;
+    (soul as any).archived_at = Math.floor(Date.now() / 1000);
+    return true;
   });
+}
+
+export function restoreSoul(soulId: string): Promise<boolean> {
+  return invokeOrPreview("restore_soul", { soulId }, () => {
+    const soul = browserSouls.find((item) => item.character_id === soulId);
+    if (!soul) return false;
+    (soul as any).archived_at = null;
+    return true;
+  });
+}
+
+export function listArchivedSouls(): Promise<SoulSummary[]> {
+  return invokeOrPreview("list_archived_souls", {}, () =>
+    browserSouls.filter((soul) => soul.soul_kind !== "session_clone" && (soul as any).archived_at).map(summarizeSoul),
+  );
+}
+
+export function archiveSavepoint(soulId: string): Promise<boolean> {
+  return archiveSoul(soulId);
+}
+
+export function restoreSavepoint(soulId: string): Promise<boolean> {
+  return restoreSoul(soulId);
+}
+
+export function listArchivedSavepoints(): Promise<SoulSummary[]> {
+  return invokeOrPreview("list_archived_savepoints", {}, () =>
+    browserSouls.filter((soul) => soul.soul_kind !== "session_clone" && (soul as any).archived_at).map(summarizeSoul),
+  );
+}
+
+export function deleteSoul(soulId: string): Promise<boolean> {
+  return archiveSoul(soulId);
 }
 
 export function deleteSetting(settingId: string): Promise<boolean> {
   return invokeOrPreview("delete_setting", { settingId }, () => {
-    const beforeCount = browserSettings.length;
-    browserSettings = browserSettings.filter((item) => item.setting_id !== settingId);
-    browserMessages = browserMessages.filter(
-      (message) => !message.conversation_id.startsWith(`local-mock-${settingId}-`),
-    );
-    return browserSettings.length !== beforeCount;
+    return Promise.reject(new Error("delete_setting is deprecated; use archive_setting with active/default setting guard."));
+  });
+}
+
+export function archiveSetting(settingId: string, activeOrDefaultIds: string[]): Promise<boolean> {
+  return invokeOrPreview("archive_setting", { settingId, activeOrDefaultIds }, () => {
+    if (activeOrDefaultIds.includes(settingId)) {
+      return Promise.reject(new Error("Cannot archive the active/default setting. Switch settings first."));
+    }
+    const index = browserSettings.findIndex((item) => item.setting_id === settingId);
+    if (index >= 0) {
+      (browserSettings[index] as any).archived_at = Math.floor(Date.now() / 1000);
+      return Promise.resolve(true);
+    }
+    return Promise.resolve(false);
+  });
+}
+
+export function restoreSetting(settingId: string): Promise<boolean> {
+  return invokeOrPreview("restore_setting", { settingId }, () => {
+    const index = browserSettings.findIndex((item) => item.setting_id === settingId);
+    if (index >= 0) {
+      (browserSettings[index] as any).archived_at = null;
+      return Promise.resolve(true);
+    }
+    return Promise.resolve(false);
+  });
+}
+
+export function listArchivedSettings(): Promise<SettingSummary[]> {
+  return invokeOrPreview("list_archived_settings", {}, () => {
+    return browserSettings.filter((item) => !!(item as any).archived_at).map(summarizeSetting);
   });
 }
 
@@ -1068,6 +1197,37 @@ export function deleteProviderProfile(profileId: string): Promise<boolean> {
     const before = browserProviderProfiles.length;
     browserProviderProfiles = browserProviderProfiles.filter((item) => item.id !== profileId);
     return browserProviderProfiles.length !== before;
+  });
+}
+
+export function archiveProviderProfile(profileId: string, activeIds: string[]): Promise<boolean> {
+  return invokeOrPreview("archive_provider_profile", { profileId, activeIds }, () => {
+    if (activeIds.includes(profileId)) {
+      return Promise.reject(new Error("Cannot archive the active provider profile. Switch profiles first."));
+    }
+    const index = browserProviderProfiles.findIndex((item) => item.id === profileId);
+    if (index >= 0) {
+      browserProviderProfiles[index] = { ...browserProviderProfiles[index], archived_at: Math.floor(Date.now() / 1000) };
+      return true;
+    }
+    return false;
+  });
+}
+
+export function restoreProviderProfile(profileId: string): Promise<boolean> {
+  return invokeOrPreview("restore_provider_profile", { profileId }, () => {
+    const index = browserProviderProfiles.findIndex((item) => item.id === profileId);
+    if (index >= 0) {
+      browserProviderProfiles[index] = { ...browserProviderProfiles[index], archived_at: null };
+      return true;
+    }
+    return false;
+  });
+}
+
+export function listArchivedProviderProfiles(): Promise<ProviderProfile[]> {
+  return invokeOrPreview("list_archived_provider_profiles", {}, () => {
+    return browserProviderProfiles.filter((item) => !!item.archived_at);
   });
 }
 
@@ -1240,9 +1400,35 @@ export function deleteConversation(conversationId: string): Promise<boolean> {
     if (!conversation.title.startsWith("[Archived] ")) {
       conversation.title = `[Archived] ${conversation.title}`;
     }
+    (conversation as any).archived_at = Math.floor(Date.now() / 1000);
     conversation.updated_at = Math.floor(Date.now() / 1000);
     return true;
   });
+}
+
+export function restoreConversation(conversationId: string): Promise<boolean> {
+  return invokeOrPreview("restore_session", { conversationId }, () => {
+    const conversation = browserConversations.find(
+      (item) => item.conversation_id === conversationId,
+    );
+    if (!conversation) return false;
+    if (conversation.title.startsWith("[Archived] ")) {
+      conversation.title = conversation.title.replace("[Archived] ", "");
+    }
+    (conversation as any).archived_at = null;
+    conversation.updated_at = Math.floor(Date.now() / 1000);
+    return true;
+  });
+}
+
+export function openSessionDataLocation(): Promise<string> {
+  return invokeOrPreview(
+    "open_session_data_location",
+    {},
+    () => {
+      throw new Error("Opening the session data folder requires the Mnemosyne desktop app.");
+    },
+  );
 }
 
 export function deleteMessage(conversationId: string, messageId: number): Promise<boolean> {
@@ -1643,6 +1829,7 @@ function summarizeSoul(soul: Soul): SoulSummary {
     last_updated: soul.last_updated,
     recent_count: soul.memory.recent.length,
     core_count: soul.memory.core.length,
+    archived_at: (soul as any).archived_at ?? null,
   };
 }
 
@@ -1697,6 +1884,7 @@ function summarizePreviewConversation(conversation: {
     updated_at: conversation.updated_at,
     last_message_preview: lastMessage?.content.split(/\s+/).join(" ").slice(0, 140) ?? null,
     message_count: messages.length,
+    archived_at: (conversation as any).archived_at ?? null,
   };
 }
 
@@ -1707,6 +1895,7 @@ function summarizeSetting(setting: SettingSoul): SettingSummary {
     last_updated: setting.last_updated,
     turn_counter: setting.turn_counter,
     location: setting.world.location,
+    archived_at: (setting as any).archived_at ?? null,
   };
 }
 

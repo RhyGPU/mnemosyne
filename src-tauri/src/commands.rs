@@ -670,13 +670,20 @@ pub fn export_current_session_checkpoint_mne(
     manifest.world_id = Some(session_world.world_id.clone());
     manifest.source_savepoint_id = soul.source_savepoint_id.clone();
     manifest.source_setting_id = session_world.source_setting_id.clone();
-    let files = vec![
+    let payload_logs = db::list_llm_payload_logs(&conn, &conversation_id).unwrap_or_default();
+    let mut files = vec![
         json_bundle_file("manifest.json", &manifest)?,
         json_bundle_file(&soul_path, &soul)?,
         json_bundle_file(&world_path, &session_world)?,
         json_bundle_file(&conversation_path, &conversation)?,
         json_bundle_file("conversation/messages.json", &messages)?,
     ];
+    if !payload_logs.is_empty() {
+        files.push(json_bundle_file(
+            "conversation/payload_logs.json",
+            &payload_logs,
+        )?);
+    }
     let result = write_mne_bundle(&app, &output_path, &manifest, files)?;
     let export_trace = mne_export_state_trace_json(
         &manifest,
@@ -716,6 +723,672 @@ pub fn export_current_session_checkpoint_mne(
         },
     );
     Ok(result)
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MneValidationSummary {
+    #[serde(default)]
+    pub soul_name: Option<String>,
+    #[serde(default)]
+    pub soul_id: Option<String>,
+    #[serde(default)]
+    pub world_name: Option<String>,
+    #[serde(default)]
+    pub world_id: Option<String>,
+    #[serde(default)]
+    pub conversation_title: Option<String>,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub message_count: usize,
+    #[serde(default)]
+    pub memory_count: usize,
+    #[serde(default)]
+    pub recent_event_count: usize,
+    #[serde(default)]
+    pub object_state_count: usize,
+    #[serde(default)]
+    pub relationship_count: usize,
+    #[serde(default)]
+    pub payload_log_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MneValidationReport {
+    pub valid: bool,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub summary: MneValidationSummary,
+}
+
+pub fn validate_mne_bundle_bytes(bytes: &[u8]) -> MneValidationReport {
+    let mut report = MneValidationReport::default();
+
+    let entries = match read_stored_zip(bytes) {
+        Ok(e) => e,
+        Err(err) => {
+            report.valid = false;
+            report
+                .errors
+                .push(format!("Invalid zip structure: {}", err));
+            return report;
+        }
+    };
+
+    let manifest_bytes = match entries.get("manifest.json") {
+        Some(b) => b,
+        None => {
+            report.valid = false;
+            report.errors.push("Missing manifest.json".to_string());
+            return report;
+        }
+    };
+
+    if manifest_bytes.is_empty() {
+        report.valid = false;
+        report.errors.push("manifest.json is empty".to_string());
+        return report;
+    }
+
+    let manifest: MneBundleManifest = match serde_json::from_slice(manifest_bytes) {
+        Ok(m) => m,
+        Err(err) => {
+            report.valid = false;
+            report
+                .errors
+                .push(format!("Invalid manifest JSON: {}", err));
+            return report;
+        }
+    };
+
+    if manifest.mne_version != 1 {
+        report
+            .errors
+            .push(format!("Unsupported .mne version {}", manifest.mne_version));
+    }
+    if !matches!(
+        manifest.bundle_type.as_str(),
+        "character_soul" | "world_setting" | "scenario_bundle" | "session_checkpoint"
+    ) {
+        report.errors.push(format!(
+            "Unsupported .mne bundle_type: {}",
+            manifest.bundle_type
+        ));
+    }
+
+    let mut expected_files = HashSet::new();
+    expected_files.insert("manifest.json".to_string());
+
+    let mut parsed_souls = Vec::new();
+    for soul_path in &manifest.contents.souls {
+        expected_files.insert(soul_path.clone());
+        match entries.get(soul_path) {
+            Some(soul_bytes) => {
+                if soul_bytes.is_empty() {
+                    report
+                        .errors
+                        .push(format!("Required file {} is empty", soul_path));
+                } else {
+                    match serde_json::from_slice::<Soul>(soul_bytes) {
+                        Ok(soul) => {
+                            parsed_souls.push(soul);
+                        }
+                        Err(err) => {
+                            report.errors.push(format!(
+                                "Failed to parse Soul JSON at {}: {}",
+                                soul_path, err
+                            ));
+                        }
+                    }
+                }
+            }
+            None => {
+                report
+                    .errors
+                    .push(format!("Missing required file: {}", soul_path));
+            }
+        }
+    }
+
+    let mut parsed_worlds = Vec::new();
+    let mut parsed_settings = Vec::new();
+    for world_path in &manifest.contents.worlds {
+        expected_files.insert(world_path.clone());
+        match entries.get(world_path) {
+            Some(world_bytes) => {
+                if world_bytes.is_empty() {
+                    report
+                        .errors
+                        .push(format!("Required file {} is empty", world_path));
+                } else {
+                    if manifest.bundle_type == "session_checkpoint" {
+                        match serde_json::from_slice::<SessionWorld>(world_bytes) {
+                            Ok(w) => parsed_worlds.push(w),
+                            Err(_) => match setting_from_mne_world_bytes(world_bytes) {
+                                Ok(s) => parsed_settings.push(s),
+                                Err(err) => {
+                                    report.errors.push(format!("Failed to parse SessionWorld JSON or Setting JSON at {}: {}", world_path, err));
+                                }
+                            },
+                        }
+                    } else {
+                        match setting_from_mne_world_bytes(world_bytes) {
+                            Ok(s) => parsed_settings.push(s),
+                            Err(err) => {
+                                report.errors.push(format!(
+                                    "Failed to parse Setting JSON at {}: {}",
+                                    world_path, err
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                report
+                    .errors
+                    .push(format!("Missing required file: {}", world_path));
+            }
+        }
+    }
+
+    for img_path in &manifest.contents.images {
+        expected_files.insert(img_path.clone());
+        if !entries.contains_key(img_path) {
+            report
+                .errors
+                .push(format!("Missing image asset: {}", img_path));
+        }
+    }
+
+    let mut parsed_conversation = None;
+    if let Some(conv_path) = &manifest.contents.conversation {
+        expected_files.insert(conv_path.clone());
+        match entries.get(conv_path) {
+            Some(conv_bytes) => {
+                if conv_bytes.is_empty() {
+                    report
+                        .errors
+                        .push(format!("Required file {} is empty", conv_path));
+                } else {
+                    match serde_json::from_slice::<ConversationSummary>(conv_bytes) {
+                        Ok(conv) => {
+                            parsed_conversation = Some(conv);
+                        }
+                        Err(err) => {
+                            report.errors.push(format!(
+                                "Failed to parse Conversation JSON at {}: {}",
+                                conv_path, err
+                            ));
+                        }
+                    }
+                }
+            }
+            None => {
+                report
+                    .errors
+                    .push(format!("Missing required file: {}", conv_path));
+            }
+        }
+    } else if manifest.bundle_type == "session_checkpoint" {
+        report.errors.push(
+            "Missing conversation path in manifest contents for session_checkpoint".to_string(),
+        );
+    }
+
+    let mut parsed_messages = Vec::new();
+    if manifest.bundle_type == "session_checkpoint" {
+        let msg_path = "conversation/messages.json";
+        expected_files.insert(msg_path.to_string());
+        match entries.get(msg_path) {
+            Some(msg_bytes) => {
+                if msg_bytes.is_empty() {
+                    report
+                        .errors
+                        .push(format!("Required file {} is empty", msg_path));
+                } else {
+                    match serde_json::from_slice::<Vec<ChatMessage>>(msg_bytes) {
+                        Ok(msgs) => {
+                            parsed_messages = msgs;
+                        }
+                        Err(err) => {
+                            report.errors.push(format!(
+                                "Failed to parse messages JSON at {}: {}",
+                                msg_path, err
+                            ));
+                        }
+                    }
+                }
+            }
+            None => {
+                report
+                    .errors
+                    .push(format!("Missing required file: {}", msg_path));
+            }
+        }
+    }
+
+    let mut parsed_payloads = Vec::new();
+    let payload_path = "conversation/payload_logs.json";
+    if entries.contains_key(payload_path) {
+        expected_files.insert(payload_path.to_string());
+        if let Some(payload_bytes) = entries.get(payload_path) {
+            if !payload_bytes.is_empty() {
+                match serde_json::from_slice::<Vec<LlmPayloadLog>>(payload_bytes) {
+                    Ok(logs) => {
+                        parsed_payloads = logs;
+                    }
+                    Err(err) => {
+                        report.warnings.push(format!(
+                            "Failed to parse payload logs JSON at {}: {}",
+                            payload_path, err
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for key in entries.keys() {
+        if !expected_files.contains(key) {
+            report
+                .warnings
+                .push(format!("Unknown extra file in bundle: {}", key));
+        }
+    }
+
+    if let (Some(soul), Some(manifest_soul_id)) = (parsed_souls.first(), &manifest.soul_id) {
+        if soul.character_id != *manifest_soul_id {
+            report.errors.push(format!(
+                "Soul ID mismatch: manifest soul_id '{}' does not match Soul character_id '{}'",
+                manifest_soul_id, soul.character_id
+            ));
+        }
+    }
+
+    if manifest.bundle_type == "session_checkpoint" {
+        if let (Some(world), Some(manifest_world_id)) = (parsed_worlds.first(), &manifest.world_id)
+        {
+            if world.world_id != *manifest_world_id {
+                report.errors.push(format!("World ID mismatch: manifest world_id '{}' does not match SessionWorld world_id '{}'", manifest_world_id, world.world_id));
+            }
+        }
+
+        if let (Some(conv), Some(manifest_conv_id)) =
+            (&parsed_conversation, &manifest.conversation_id)
+        {
+            if conv.conversation_id != *manifest_conv_id {
+                report.errors.push(format!("Conversation ID mismatch: manifest conversation_id '{}' does not match Conversation conversation_id '{}'", manifest_conv_id, conv.conversation_id));
+            }
+
+            for (idx, msg) in parsed_messages.iter().enumerate() {
+                if msg.conversation_id != *manifest_conv_id {
+                    report.errors.push(format!("Message conversation_id mismatch at index {}: message conversation_id '{}' does not match expected '{}'", idx, msg.conversation_id, manifest_conv_id));
+                }
+            }
+
+            for (idx, log) in parsed_payloads.iter().enumerate() {
+                if log.conversation_id != *manifest_conv_id {
+                    report.errors.push(format!("Payload log conversation_id mismatch at index {}: log conversation_id '{}' does not match expected '{}'", idx, log.conversation_id, manifest_conv_id));
+                }
+            }
+        }
+    } else {
+        if let (Some(setting), Some(manifest_world_id)) =
+            (parsed_settings.first(), &manifest.world_id)
+        {
+            if setting.setting_id != *manifest_world_id {
+                report.errors.push(format!("Setting ID mismatch: manifest world_id '{}' does not match Setting setting_id '{}'", manifest_world_id, setting.setting_id));
+            }
+        }
+    }
+
+    report.valid = report.errors.is_empty();
+
+    if let Some(soul) = parsed_souls.first() {
+        report.summary.soul_name = Some(soul.character_name.clone());
+        report.summary.soul_id = Some(soul.character_id.clone());
+        report.summary.memory_count =
+            soul.memory.core.len() + soul.memory.recent.len() + soul.memory.schemas.len();
+        report.summary.relationship_count = soul.relationships.len();
+        report.summary.recent_event_count = soul.world.recent_events.len();
+        report.summary.object_state_count = soul.world.object_states.len();
+    }
+
+    if manifest.bundle_type == "session_checkpoint" {
+        if let Some(world) = parsed_worlds.first() {
+            report.summary.world_name = Some(world.setting_name.clone());
+            report.summary.world_id = Some(world.world_id.clone());
+            report.summary.recent_event_count = world.recent_events.len();
+            report.summary.object_state_count = world.object_states.len();
+        }
+        if let Some(conv) = &parsed_conversation {
+            report.summary.conversation_title = Some(conv.title.clone());
+            report.summary.conversation_id = Some(conv.conversation_id.clone());
+        }
+        report.summary.message_count = parsed_messages.len();
+    } else {
+        if let Some(setting) = parsed_settings.first() {
+            report.summary.world_name = Some(setting.setting_name.clone());
+            report.summary.world_id = Some(setting.setting_id.clone());
+            report.summary.recent_event_count = setting.world.recent_events.len();
+            report.summary.object_state_count = setting.world.object_states.len();
+        }
+    }
+
+    report.summary.payload_log_count = parsed_payloads.len();
+
+    report
+}
+
+#[tauri::command]
+pub fn validate_mne_bundle(file_path: String) -> Result<MneValidationReport, String> {
+    let path = PathBuf::from(&file_path);
+    if path.extension().and_then(|ext| ext.to_str()) != Some("mne") {
+        let mut report = MneValidationReport::default();
+        report.valid = false;
+        report
+            .errors
+            .push("Mnemosyne bundle import requires a .mne file".into());
+        return Ok(report);
+    }
+    let bytes = fs::read(&path).map_err(|err| err.to_string())?;
+    Ok(validate_mne_bundle_bytes(&bytes))
+}
+
+#[tauri::command]
+pub fn preview_mne_import(file_path: String) -> Result<MneValidationReport, String> {
+    let path = PathBuf::from(&file_path);
+    if path.extension().and_then(|ext| ext.to_str()) != Some("mne") {
+        let mut report = MneValidationReport::default();
+        report.valid = false;
+        report
+            .errors
+            .push("Mnemosyne bundle import requires a .mne file".into());
+        return Ok(report);
+    }
+    let bytes = fs::read(&path).map_err(|err| err.to_string())?;
+    Ok(validate_mne_bundle_bytes(&bytes))
+}
+
+pub fn import_mne_as_new_inner(conn: &Connection, bytes: &[u8]) -> Result<MneImportResult, String> {
+    let report = validate_mne_bundle_bytes(&bytes);
+    if !report.valid {
+        return Err(format!(
+            "Validation failed:\n- {}",
+            report.errors.join("\n- ")
+        ));
+    }
+
+    let entries = read_stored_zip(&bytes)?;
+    let manifest_bytes = entries.get("manifest.json").unwrap();
+    let manifest: MneBundleManifest = serde_json::from_slice(manifest_bytes).unwrap();
+
+    let mut result = MneImportResult {
+        bundle_id: manifest.bundle_id.clone(),
+        bundle_type: manifest.bundle_type.clone(),
+        ..MneImportResult::default()
+    };
+
+    let mut id_map: HashMap<String, String> = HashMap::new();
+    let mut msg_map: HashMap<i64, i64> = HashMap::new();
+
+    // A. Souls import
+    for soul_path in &manifest.contents.souls {
+        let soul_bytes = entries.get(soul_path).unwrap();
+        let mut soul: Soul = serde_json::from_slice(soul_bytes).unwrap();
+        let old_soul_id = soul.character_id.clone();
+
+        let must_remap = db::get_soul(conn, &old_soul_id).is_ok();
+        let target_soul_id = if must_remap {
+            let remapped = uuid_like_id();
+            id_map.insert(old_soul_id.clone(), remapped.clone());
+            result
+                .remapped_ids
+                .insert(old_soul_id.clone(), remapped.clone());
+            remapped
+        } else {
+            old_soul_id.clone()
+        };
+
+        soul.character_id = target_soul_id.clone();
+        if must_remap {
+            soul.source_soul_id = Some(old_soul_id.clone());
+        }
+
+        for mem in &mut soul.memory.recent {
+            if let Some(owner) = &mem.owner_soul_id {
+                if let Some(new_owner) = id_map.get(owner) {
+                    mem.owner_soul_id = Some(new_owner.clone());
+                }
+            }
+        }
+        for schema in &mut soul.memory.schemas {
+            if let Some(owner) = &schema.owner_soul_id {
+                if let Some(new_owner) = id_map.get(owner) {
+                    schema.owner_soul_id = Some(new_owner.clone());
+                }
+            }
+        }
+
+        if manifest.bundle_type != "session_checkpoint" {
+            soul.soul_kind = "savepoint".into();
+            soul.source_savepoint_id = None;
+        }
+        soul.last_updated = db::now_ts();
+
+        db::upsert_soul(conn, &soul).map_err(|err| err.to_string())?;
+        result.imported_soul_ids.push(soul.character_id);
+    }
+
+    // B. Worlds import
+    let mut imported_session_world_id: Option<String> = None;
+    if manifest.bundle_type == "session_checkpoint" {
+        for world_path in &manifest.contents.worlds {
+            let world_bytes = entries.get(world_path).unwrap();
+            let mut session_world: SessionWorld =
+                serde_json::from_slice(world_bytes).or_else(|_| {
+                    let setting = setting_from_mne_world_bytes(world_bytes)?;
+                    Ok::<SessionWorld, String>(state_engine::setting::session_world_from_setting(
+                        &setting,
+                    ))
+                })?;
+
+            let old_world_id = session_world.world_id.clone();
+            let must_remap = db::get_session_world(conn, &old_world_id).is_ok();
+            let target_world_id = if must_remap {
+                let remapped = uuid_like_id();
+                id_map.insert(old_world_id.clone(), remapped.clone());
+                result
+                    .remapped_ids
+                    .insert(old_world_id.clone(), remapped.clone());
+                remapped
+            } else {
+                old_world_id.clone()
+            };
+
+            session_world.world_id = target_world_id.clone();
+            session_world.last_updated = db::now_ts();
+
+            if let Some(ref setting_id) = session_world.source_setting_id {
+                if db::get_setting(conn, setting_id).is_err() {
+                    session_world.source_setting_id = None;
+                }
+            }
+
+            db::upsert_session_world(conn, &session_world).map_err(|err| err.to_string())?;
+            imported_session_world_id = Some(session_world.world_id);
+        }
+    } else {
+        for world_path in &manifest.contents.worlds {
+            let world_bytes = entries.get(world_path).unwrap();
+            let mut setting = setting_from_mne_world_bytes(world_bytes)?;
+
+            let old_setting_id = setting.setting_id.clone();
+            let must_remap = db::get_setting(conn, &old_setting_id).is_ok();
+            let target_setting_id = if must_remap {
+                let remapped = uuid_like_id();
+                id_map.insert(old_setting_id.clone(), remapped.clone());
+                result
+                    .remapped_ids
+                    .insert(old_setting_id.clone(), remapped.clone());
+                remapped
+            } else {
+                old_setting_id.clone()
+            };
+
+            setting.setting_id = target_setting_id.clone();
+            setting.last_updated = db::now_ts();
+
+            db::upsert_setting(conn, &setting).map_err(|err| err.to_string())?;
+            result.imported_setting_ids.push(setting.setting_id);
+        }
+    }
+
+    // C. Conversation/Messages import
+    if manifest.bundle_type == "session_checkpoint" {
+        let conversation_path = manifest.contents.conversation.as_ref().unwrap();
+        let conversation_bytes = entries.get(conversation_path).unwrap();
+        let conversation: ConversationSummary = serde_json::from_slice(conversation_bytes).unwrap();
+
+        let old_conv_id = manifest
+            .conversation_id
+            .clone()
+            .unwrap_or_else(|| conversation.conversation_id.clone());
+        let must_remap = db::get_conversation_summary(conn, &old_conv_id).is_ok();
+        let target_conv_id = if must_remap {
+            let remapped = uuid_like_id();
+            id_map.insert(old_conv_id.clone(), remapped.clone());
+            result
+                .remapped_ids
+                .insert(old_conv_id.clone(), remapped.clone());
+            remapped
+        } else {
+            old_conv_id.clone()
+        };
+
+        let soul_id = result
+            .imported_soul_ids
+            .first()
+            .cloned()
+            .or_else(|| manifest.soul_id.clone())
+            .unwrap();
+
+        let title = unique_imported_session_title(conn, &conversation.title)
+            .map_err(|err| err.to_string())?;
+
+        let safe_source_setting_id = manifest.source_setting_id.as_deref().and_then(|sid| {
+            if db::get_setting(conn, sid).is_ok() {
+                Some(sid)
+            } else {
+                None
+            }
+        });
+
+        db::ensure_conversation_with_title_and_world(
+            conn,
+            &target_conv_id,
+            &soul_id,
+            imported_session_world_id.as_deref(),
+            safe_source_setting_id,
+            Some(&title),
+        )
+        .map_err(|err| err.to_string())?;
+
+        let messages_path = "conversation/messages.json";
+        if let Some(message_bytes) = entries.get(messages_path) {
+            let messages: Vec<ChatMessage> = serde_json::from_slice(message_bytes).unwrap();
+            for message in messages {
+                if message.role == "user" || message.role == "assistant" {
+                    let new_msg_id = db::insert_message_and_get_id(
+                        conn,
+                        &target_conv_id,
+                        &message.role,
+                        &message.content,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    msg_map.insert(message.id, new_msg_id);
+                }
+            }
+        }
+
+        if let Some(imported_soul_id) = result.imported_soul_ids.first() {
+            let mut soul = db::get_soul(conn, imported_soul_id).map_err(|err| err.to_string())?;
+            let mut modified = false;
+            for mem in &mut soul.memory.recent {
+                if let Some(c_id) = &mem.source_conversation_id {
+                    if c_id == &old_conv_id {
+                        mem.source_conversation_id = Some(target_conv_id.clone());
+                        modified = true;
+                    }
+                }
+                if let Some(m_id) = mem.source_message_id {
+                    if let Some(new_m_id) = msg_map.get(&m_id) {
+                        mem.source_message_id = Some(*new_m_id);
+                        modified = true;
+                    }
+                }
+            }
+            if modified {
+                db::upsert_soul(conn, &soul).map_err(|err| err.to_string())?;
+            }
+        }
+
+        let payload_path = "conversation/payload_logs.json";
+        if let Some(payload_bytes) = entries.get(payload_path) {
+            if let Ok(payload_logs) = serde_json::from_slice::<Vec<LlmPayloadLog>>(payload_bytes) {
+                for mut log in payload_logs {
+                    log.conversation_id = target_conv_id.clone();
+                    if let Some(old_msg_id) = log.message_id {
+                        if let Some(new_msg_id) = msg_map.get(&old_msg_id) {
+                            log.message_id = Some(*new_msg_id);
+                        }
+                    }
+                    db::insert_llm_payload_log(conn, &log).map_err(|err| err.to_string())?;
+                }
+            }
+        }
+
+        if let (Ok(soul), Some(world_id)) = (
+            db::get_soul(conn, &soul_id),
+            imported_session_world_id.as_deref(),
+        ) {
+            let world = db::get_session_world(conn, world_id).map_err(|err| err.to_string())?;
+            let _ = db::create_session_branch(conn, &target_conv_id, &soul, &world);
+        }
+    }
+
+    let warning_part = if entries.contains_key("conversation/branches.json")
+        || entries.contains_key("conversation/turns.json")
+    {
+        " (branch/variant structure import was skipped to protect data)"
+    } else {
+        ""
+    };
+
+    result.summary = format!(
+        "Imported {} Soul(s), {} World/Setting savepoint(s) from {}{}",
+        result.imported_soul_ids.len(),
+        result.imported_setting_ids.len(),
+        manifest.title,
+        warning_part
+    );
+
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn import_mne_as_new(
+    state: State<'_, AppState>,
+    file_path: String,
+) -> Result<MneImportResult, String> {
+    let path = PathBuf::from(&file_path);
+    if path.extension().and_then(|ext| ext.to_str()) != Some("mne") {
+        return Err("Mnemosyne bundle import requires a .mne file".into());
+    }
+    let bytes = fs::read(&path).map_err(|err| err.to_string())?;
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    import_mne_as_new_inner(&conn, &bytes)
 }
 
 #[tauri::command]
@@ -1198,7 +1871,7 @@ pub fn create_user_image_message(
         }
         Err(err) => {
             let conn = state.conn.lock().map_err(|lock_err| lock_err.to_string())?;
-            let _ = db::delete_message(&conn, &conversation_id, message_id);
+            let _ = db::hard_delete_message_internal(&conn, &conversation_id, message_id);
             emit_dev_log(
                 &window,
                 "error",
@@ -1273,7 +1946,7 @@ pub fn create_user_image_message_bytes(
         }
         Err(err) => {
             let conn = state.conn.lock().map_err(|lock_err| lock_err.to_string())?;
-            let _ = db::delete_message(&conn, &conversation_id, message_id);
+            let _ = db::hard_delete_message_internal(&conn, &conversation_id, message_id);
             emit_dev_log(
                 &window,
                 "error",
@@ -1429,9 +2102,74 @@ pub fn delete_soul(state: State<'_, AppState>, soul_id: String) -> Result<bool, 
 }
 
 #[tauri::command]
-pub fn delete_setting(state: State<'_, AppState>, setting_id: String) -> Result<bool, String> {
+pub fn archive_soul(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    db::delete_setting(&conn, &setting_id).map_err(|err| err.to_string())
+    db::archive_soul(&conn, &soul_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn restore_soul(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::restore_soul(&conn, &soul_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_archived_souls(state: State<'_, AppState>) -> Result<Vec<db::SoulSummary>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_archived_souls(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn archive_savepoint(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::archive_savepoint(&conn, &soul_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn restore_savepoint(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::restore_savepoint(&conn, &soul_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_archived_savepoints(
+    state: State<'_, AppState>,
+) -> Result<Vec<db::SoulSummary>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_archived_savepoints(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn delete_setting(_state: State<'_, AppState>, _setting_id: String) -> Result<bool, String> {
+    Err(
+        "delete_setting is deprecated; use archive_setting with active/default setting guard."
+            .into(),
+    )
+}
+
+#[tauri::command]
+pub fn archive_setting(
+    state: State<'_, AppState>,
+    setting_id: String,
+    active_or_default_ids: Vec<String>,
+) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let active_refs: Vec<&str> = active_or_default_ids.iter().map(|s| s.as_str()).collect();
+    db::archive_setting(&conn, &setting_id, &active_refs)
+}
+
+#[tauri::command]
+pub fn restore_setting(state: State<'_, AppState>, setting_id: String) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::restore_setting(&conn, &setting_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_archived_settings(
+    state: State<'_, AppState>,
+) -> Result<Vec<db::SettingSummary>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_archived_settings(&conn).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -1494,6 +2232,130 @@ pub fn restore_inactive_messages(
     let messages =
         db::list_messages(&conn, &conversation_id, 500).map_err(|err| err.to_string())?;
     Ok(RestoreTurnsResult { messages, preview })
+}
+
+fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map_err(|err| format!("Failed to open Explorer: {}", err))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map_err(|err| format!("Failed to open Finder: {}", err))?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let open_path = path
+            .parent()
+            .filter(|parent| parent.exists())
+            .unwrap_or(path);
+        std::process::Command::new("xdg-open")
+            .arg(open_path)
+            .spawn()
+            .map_err(|err| format!("Failed to open file manager: {}", err))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn open_session_data_location(app: AppHandle) -> Result<String, String> {
+    let db_path = db::connection_path(&app).map_err(|err| err.to_string())?;
+    reveal_path_in_file_manager(&db_path)?;
+    Ok(db_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn create_backup(app: AppHandle, _state: State<'_, AppState>) -> Result<String, String> {
+    let db_path = db::connection_path(&app).map_err(|err| err.to_string())?;
+    let mut backup_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
+    backup_dir.push("backups");
+    let backup_path = db::create_backup_file(&db_path, &backup_dir)?;
+    Ok(backup_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn archive_session(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::archive_session(&conn, &conversation_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn restore_session(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::restore_session(&conn, &conversation_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_archived_sessions(
+    state: State<'_, AppState>,
+) -> Result<Vec<ConversationSummary>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_archived_sessions(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn hide_turn_range(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    start_message_id: i64,
+    end_message_id: i64,
+) -> Result<usize, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let count = db::hide_turn_range(&conn, &conversation_id, start_message_id, end_message_id)
+        .map_err(|err| err.to_string())?;
+    if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
+        db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+pub fn restore_turn_range(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    start_message_id: i64,
+    end_message_id: i64,
+) -> Result<usize, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let count = db::restore_turn_range(&conn, &conversation_id, start_message_id, end_message_id)
+        .map_err(|err| err.to_string())?;
+    if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
+        db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+pub fn list_hidden_turns(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Vec<ChatMessage>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_hidden_turns(&conn, &conversation_id).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -2073,11 +2935,41 @@ pub fn upsert_provider_profile(
 
 #[tauri::command]
 pub fn delete_provider_profile(
+    _state: State<'_, AppState>,
+    _profile_id: String,
+) -> Result<bool, String> {
+    Err("delete_provider_profile is deprecated; use archive_provider_profile with active profile guard.".into())
+}
+
+#[tauri::command]
+pub fn archive_provider_profile(
+    state: State<'_, AppState>,
+    profile_id: String,
+    active_ids: Vec<String>,
+) -> Result<bool, String> {
+    if active_ids.is_empty() {
+        return Err("active_ids is required and cannot be empty.".into());
+    }
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let active_refs: Vec<&str> = active_ids.iter().map(|s| s.as_str()).collect();
+    db::archive_provider_profile(&conn, &profile_id, &active_refs)
+}
+
+#[tauri::command]
+pub fn restore_provider_profile(
     state: State<'_, AppState>,
     profile_id: String,
 ) -> Result<bool, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    db::delete_provider_profile(&conn, &profile_id).map_err(|err| err.to_string())
+    db::restore_provider_profile(&conn, &profile_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_archived_provider_profiles(
+    state: State<'_, AppState>,
+) -> Result<Vec<ProviderProfile>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_archived_provider_profiles(&conn).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -8030,6 +8922,9 @@ fn runtime_form_trace_json(outcome: &RuntimeEvaluatorOutcome) -> serde_json::Val
             "relationship_dimension_inferred_from": &trace.relationship_dimension_inferred_from,
             "relationship_direction_inferred_from": &trace.relationship_direction_inferred_from,
             "relationship_rows_split_count": trace.relationship_rows_split_count,
+            "relationship_row_results": &trace.relationship_row_results,
+            "relationship_event_row_results": &trace.relationship_event_row_results,
+            "relationship_delta_source": &trace.relationship_delta_source,
             "partial_success": outcome.partial_success,
             "partial_success_reason": outcome.partial_success_reason.as_deref(),
         })
@@ -12095,6 +12990,7 @@ mod tests {
         evaluator_ingest::parse_evaluator_output,
         hidden_state::HiddenState,
         patch::{EnginePatch, WorldPatch},
+        soul::{MemoryEntry, MemorySourceType, ObjectState, Relationship, TruthStatus},
     };
 
     fn variant_test_setup(conversation_id: &str) -> (Connection, Soul, db::SessionBranch, i64) {
@@ -13379,6 +14275,7 @@ mod tests {
             updated_at: 1,
             last_message_preview: None,
             message_count: 1,
+            archived_at: None,
         };
         let messages = vec![ChatMessage {
             id: 1,
@@ -13389,6 +14286,7 @@ mod tests {
             status: "active".into(),
             origin: "active".into(),
             attachments: Vec::new(),
+            hidden_at: None,
         }];
         let mut manifest = mne_manifest(
             "session_checkpoint",
@@ -14178,6 +15076,7 @@ mod tests {
                 status: "active".into(),
                 origin: "active".into(),
                 attachments: Vec::new(),
+                hidden_at: None,
             },
             ChatMessage {
                 id: 2,
@@ -14190,6 +15089,7 @@ mod tests {
                 status: "active".into(),
                 origin: "active".into(),
                 attachments: Vec::new(),
+                hidden_at: None,
             },
         ];
 
@@ -14961,7 +15861,8 @@ mod tests {
             "evaluator_form_v1_background"
         );
         assert!(prompt.contains("[FORM SPEC]"));
-        assert!(prompt.contains("EvalFormResponse"));
+        assert!(prompt.contains("[HARD FILLABLE FORM TEMPLATE]"));
+        assert!(prompt.contains("provided JSON evaluation sheet"));
     }
 
     #[test]
@@ -16619,5 +17520,672 @@ mod tests {
         assert!(!out.text.contains("</assistant>"));
         let expected = "Aurora nods.\n\n```status\nScene | Focus: Aurora | Physical state: Damp | Atmosphere: Rainy\n```";
         assert_eq!(out.text.trim(), expected);
+    }
+    // --- P0.3A Hardening Tests ---
+
+    #[test]
+    fn validate_good_mne_bundle_passes() {
+        let soul = new_default_soul("Aurora");
+        let manifest = mne_manifest(
+            "character_soul",
+            "Aurora",
+            "test",
+            vec!["souls/aurora.json".into()],
+            Vec::new(),
+            None,
+        );
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/aurora.json".into(),
+            serde_json::to_vec(&soul).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+        let report = validate_mne_bundle_bytes(&bytes);
+
+        assert!(report.valid, "Report should be valid: {:?}", report.errors);
+        assert_eq!(report.summary.soul_name.as_deref(), Some("Aurora"));
+        assert_eq!(
+            report.summary.soul_id.as_deref(),
+            Some(soul.character_id.as_str())
+        );
+    }
+
+    #[test]
+    fn validate_missing_manifest_fails() {
+        let mut entries = HashMap::new();
+        entries.insert("souls/aurora.json".into(), b"{}".to_vec());
+
+        let bytes = write_test_mne_bytes(entries);
+        let report = validate_mne_bundle_bytes(&bytes);
+
+        assert!(!report.valid);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("Missing manifest.json")));
+    }
+
+    #[test]
+    fn validate_missing_soul_json_fails() {
+        let manifest = mne_manifest(
+            "character_soul",
+            "Aurora",
+            "test",
+            vec!["souls/aurora.json".into()],
+            Vec::new(),
+            None,
+        );
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+        let report = validate_mne_bundle_bytes(&bytes);
+
+        assert!(!report.valid);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("Missing required file: souls/aurora.json")));
+    }
+
+    #[test]
+    fn validate_bad_json_fails() {
+        let manifest = mne_manifest(
+            "character_soul",
+            "Aurora",
+            "test",
+            vec!["souls/aurora.json".into()],
+            Vec::new(),
+            None,
+        );
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert("souls/aurora.json".into(), b"{invalid json}".to_vec());
+
+        let bytes = write_test_mne_bytes(entries);
+        let report = validate_mne_bundle_bytes(&bytes);
+
+        assert!(!report.valid);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.contains("Failed to parse Soul JSON")));
+    }
+
+    #[test]
+    fn validate_id_mismatch_fails() {
+        let mut soul = new_default_soul("Aurora");
+        soul.character_id = "soul-actual".into();
+        let mut manifest = mne_manifest(
+            "character_soul",
+            "Aurora",
+            "test",
+            vec!["souls/aurora.json".into()],
+            Vec::new(),
+            None,
+        );
+        manifest.soul_id = Some("soul-expected-mismatch".into());
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/aurora.json".into(),
+            serde_json::to_vec(&soul).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+        let report = validate_mne_bundle_bytes(&bytes);
+
+        assert!(!report.valid);
+        assert!(report.errors.iter().any(|e| e.contains("Soul ID mismatch")));
+    }
+
+    #[test]
+    fn validate_unknown_extra_files_warns_not_fails() {
+        let soul = new_default_soul("Aurora");
+        let manifest = mne_manifest(
+            "character_soul",
+            "Aurora",
+            "test",
+            vec!["souls/aurora.json".into()],
+            Vec::new(),
+            None,
+        );
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/aurora.json".into(),
+            serde_json::to_vec(&soul).unwrap(),
+        );
+        entries.insert("mystery_extra.txt".into(), b"extra info".to_vec());
+
+        let bytes = write_test_mne_bytes(entries);
+        let report = validate_mne_bundle_bytes(&bytes);
+
+        assert!(report.valid);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("mystery_extra.txt"));
+    }
+
+    #[test]
+    fn preview_import_does_not_mutate_database() {
+        let conn = db::init_memory_connection().unwrap();
+        let soul = new_default_soul("PreviewOnly");
+        let manifest = mne_manifest(
+            "character_soul",
+            "PreviewOnly",
+            "test",
+            vec!["souls/preview.json".into()],
+            Vec::new(),
+            None,
+        );
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/preview.json".into(),
+            serde_json::to_vec(&soul).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+
+        let report = validate_mne_bundle_bytes(&bytes);
+        assert!(report.valid);
+
+        assert!(db::get_soul(&conn, &soul.character_id).is_err());
+    }
+
+    #[test]
+    fn preview_import_returns_counts() {
+        let mut soul = new_default_soul("PreviewOnly");
+        soul.relationships.insert(
+            "user".into(),
+            Relationship {
+                trust: 5.0,
+                affection: 10.0,
+                intimacy: 0.0,
+                passion: 0.0,
+                commitment: 0.0,
+                fear: 0.0,
+                desire: 0.0,
+                respect: 0.0,
+                conflict: 0.0,
+                dependency: 0.0,
+                curiosity: 0.0,
+                comfort: 0.0,
+                boundary_pressure: 0.0,
+                love_type: String::new(),
+                ..Relationship::default()
+            },
+        );
+        soul.world.object_states.push(ObjectState::default());
+        soul.world.recent_events.push("An event occurred".into());
+        soul.memory.recent.push(MemoryEntry {
+            id: "mem1".into(),
+            timestamp: 100,
+            content: "recent observation".into(),
+            salience: 50.0,
+            tag: "observation".into(),
+            retrieval_strength: 50.0,
+            source_type: MemorySourceType::CurrentSession,
+            source_session_id: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            source_entity_id: None,
+            is_lived_experience: true,
+            is_imported_context: false,
+            perceived_by_entity_id: None,
+            target_entity_ids: Vec::new(),
+            interpretation: None,
+            confidence: None,
+            objective_event_id: None,
+            truth_status: TruthStatus::Unknown,
+            architecture_verified: false,
+            memory_slot: None,
+            owner_soul_id: None,
+            relevance_tags: HashMap::new(),
+            knowledge_scope: None,
+            is_active: true,
+            invalidated_by_patch_id: None,
+            superseded_by_memory_id: None,
+            is_retconned: false,
+        });
+
+        let manifest = mne_manifest(
+            "character_soul",
+            "PreviewOnly",
+            "test",
+            vec!["souls/preview.json".into()],
+            Vec::new(),
+            None,
+        );
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/preview.json".into(),
+            serde_json::to_vec(&soul).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+        let report = validate_mne_bundle_bytes(&bytes);
+
+        assert!(report.valid);
+        assert_eq!(report.summary.soul_name.as_deref(), Some("PreviewOnly"));
+        assert_eq!(report.summary.memory_count, 2);
+        assert_eq!(report.summary.object_state_count, 1);
+        assert_eq!(report.summary.recent_event_count, 1);
+        assert_eq!(report.summary.relationship_count, 1);
+    }
+
+    #[test]
+    fn preview_import_reports_errors_without_panicking() {
+        let bytes = b"garbage zip file".to_vec();
+        let report = validate_mne_bundle_bytes(&bytes);
+        assert!(!report.valid);
+        assert!(!report.errors.is_empty());
+    }
+
+    #[test]
+    fn import_as_new_creates_new_soul_and_conversation() {
+        let conn = db::init_memory_connection().unwrap();
+        let mut soul = new_default_soul("ImportNew");
+        soul.character_id = "soul-1".into();
+
+        let conversation = ConversationSummary {
+            conversation_id: "conv-1".into(),
+            soul_id: "soul-1".into(),
+            world_id: Some("world-1".into()),
+            source_savepoint_id: None,
+            source_setting_id: None,
+            title: "Original Title".into(),
+            created_at: db::now_ts(),
+            updated_at: db::now_ts(),
+            last_message_preview: None,
+            message_count: 0,
+            archived_at: None,
+        };
+
+        let messages = vec![ChatMessage {
+            id: 10,
+            conversation_id: "conv-1".into(),
+            role: "user".into(),
+            content: "Hello!".into(),
+            created_at: 100,
+            status: "active".into(),
+            origin: "active".into(),
+            attachments: Vec::new(),
+            hidden_at: None,
+        }];
+
+        let mut manifest = mne_manifest(
+            "session_checkpoint",
+            "Original Title",
+            "test",
+            vec!["souls/soul-1.json".into()],
+            vec!["worlds/world-1.json".into()],
+            Some("conversation/conversation.json".into()),
+        );
+        manifest.soul_id = Some("soul-1".into());
+        manifest.world_id = Some("world-1".into());
+        manifest.conversation_id = Some("conv-1".into());
+
+        let mut session_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Setting-1"));
+        session_world.world_id = "world-1".into();
+        session_world.source_setting_id = None;
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/soul-1.json".into(),
+            serde_json::to_vec(&soul).unwrap(),
+        );
+        entries.insert(
+            "worlds/world-1.json".into(),
+            serde_json::to_vec(&session_world).unwrap(),
+        );
+        entries.insert(
+            "conversation/conversation.json".into(),
+            serde_json::to_vec(&conversation).unwrap(),
+        );
+        entries.insert(
+            "conversation/messages.json".into(),
+            serde_json::to_vec(&messages).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+        let result = import_mne_as_new_inner(&conn, &bytes).unwrap();
+
+        assert_eq!(result.imported_soul_ids.len(), 1);
+        assert_eq!(result.imported_soul_ids[0], "soul-1"); // No collision
+
+        let imported_conv = db::get_conversation_summary(&conn, "conv-1").unwrap();
+        assert_eq!(imported_conv.title, "Original Title");
+    }
+
+    #[test]
+    fn import_as_new_remaps_colliding_ids() {
+        let conn = db::init_memory_connection().unwrap();
+
+        let mut existing_soul = new_default_soul("Aurora");
+        existing_soul.character_id = "soul-1".into();
+        db::upsert_soul(&conn, &existing_soul).unwrap();
+
+        db::ensure_conversation(&conn, "conv-1", "soul-1").unwrap();
+
+        let mut existing_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Lab"));
+        existing_world.world_id = "world-1".into();
+        existing_world.source_setting_id = None;
+        db::upsert_session_world(&conn, &existing_world).unwrap();
+
+        let mut soul = new_default_soul("Aurora");
+        soul.character_id = "soul-1".into();
+
+        let conversation = ConversationSummary {
+            conversation_id: "conv-1".into(),
+            soul_id: "soul-1".into(),
+            world_id: Some("world-1".into()),
+            source_savepoint_id: None,
+            source_setting_id: None,
+            title: "Aurora Session".into(),
+            created_at: db::now_ts(),
+            updated_at: db::now_ts(),
+            last_message_preview: None,
+            message_count: 0,
+            archived_at: None,
+        };
+
+        let messages = vec![ChatMessage {
+            id: 10,
+            conversation_id: "conv-1".into(),
+            role: "user".into(),
+            content: "Hello!".into(),
+            created_at: 100,
+            status: "active".into(),
+            origin: "active".into(),
+            attachments: Vec::new(),
+            hidden_at: None,
+        }];
+
+        let mut manifest = mne_manifest(
+            "session_checkpoint",
+            "Aurora Session",
+            "test",
+            vec!["souls/soul-1.json".into()],
+            vec!["worlds/world-1.json".into()],
+            Some("conversation/conversation.json".into()),
+        );
+        manifest.soul_id = Some("soul-1".into());
+        manifest.world_id = Some("world-1".into());
+        manifest.conversation_id = Some("conv-1".into());
+
+        let mut session_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Lab"));
+        session_world.world_id = "world-1".into();
+        session_world.source_setting_id = None;
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/soul-1.json".into(),
+            serde_json::to_vec(&soul).unwrap(),
+        );
+        entries.insert(
+            "worlds/world-1.json".into(),
+            serde_json::to_vec(&session_world).unwrap(),
+        );
+        entries.insert(
+            "conversation/conversation.json".into(),
+            serde_json::to_vec(&conversation).unwrap(),
+        );
+        entries.insert(
+            "conversation/messages.json".into(),
+            serde_json::to_vec(&messages).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+        let result = import_mne_as_new_inner(&conn, &bytes).unwrap();
+
+        assert_eq!(result.imported_soul_ids.len(), 1);
+        let new_soul_id = &result.imported_soul_ids[0];
+        assert_ne!(new_soul_id, "soul-1");
+
+        let new_conv_id = result.remapped_ids.get("conv-1").unwrap();
+        assert_ne!(new_conv_id, "conv-1");
+
+        let new_world_id = result.remapped_ids.get("world-1").unwrap();
+        assert_ne!(new_world_id, "world-1");
+
+        let original_soul = db::get_soul(&conn, "soul-1").unwrap();
+        assert_eq!(original_soul.character_name, "Aurora");
+
+        let new_conv = db::get_conversation_summary(&conn, new_conv_id).unwrap();
+        assert_eq!(new_conv.soul_id, *new_soul_id);
+    }
+
+    #[test]
+    fn import_as_new_does_not_overwrite_existing_soul() {
+        let conn = db::init_memory_connection().unwrap();
+
+        let mut existing_soul = new_default_soul("Untouched");
+        existing_soul.character_id = "soul-1".into();
+        db::upsert_soul(&conn, &existing_soul).unwrap();
+
+        let mut soul = new_default_soul("IncomingNewData");
+        soul.character_id = "soul-1".into();
+
+        let mut manifest = mne_manifest(
+            "character_soul",
+            "IncomingNewData",
+            "test",
+            vec!["souls/soul-1.json".into()],
+            Vec::new(),
+            None,
+        );
+        manifest.soul_id = Some("soul-1".into());
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/soul-1.json".into(),
+            serde_json::to_vec(&soul).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+        let result = import_mne_as_new_inner(&conn, &bytes).unwrap();
+
+        let untouched = db::get_soul(&conn, "soul-1").unwrap();
+        assert_eq!(untouched.character_name, "Untouched");
+
+        let target_soul_id = &result.imported_soul_ids[0];
+        let imported = db::get_soul(&conn, target_soul_id).unwrap();
+        assert_eq!(imported.character_name, "IncomingNewData");
+    }
+
+    #[test]
+    fn import_as_new_preserves_payload_logs_if_present() {
+        let conn = db::init_memory_connection().unwrap();
+        let mut soul = new_default_soul("Aurora");
+        soul.character_id = "soul-1".into();
+
+        let conversation = ConversationSummary {
+            conversation_id: "conv-1".into(),
+            soul_id: "soul-1".into(),
+            world_id: Some("world-1".into()),
+            source_savepoint_id: None,
+            source_setting_id: None,
+            title: "Aurora Session".into(),
+            created_at: db::now_ts(),
+            updated_at: db::now_ts(),
+            last_message_preview: None,
+            message_count: 0,
+            archived_at: None,
+        };
+
+        let messages = vec![ChatMessage {
+            id: 10,
+            conversation_id: "conv-1".into(),
+            role: "user".into(),
+            content: "Hello!".into(),
+            created_at: 100,
+            status: "active".into(),
+            origin: "active".into(),
+            attachments: Vec::new(),
+            hidden_at: None,
+        }];
+
+        let log = LlmPayloadLog {
+            id: 0,
+            conversation_id: "conv-1".into(),
+            message_id: Some(10),
+            provider: "openai".into(),
+            mode: "chat".into(),
+            context_mode: "complete".into(),
+            model: "gpt-4".into(),
+            base_url: "url".into(),
+            system_message: "sys".into(),
+            user_message: "Hello!".into(),
+            context_text: "context".into(),
+            estimated_system_tokens: 0,
+            estimated_user_tokens: 0,
+            estimated_total_tokens: 0,
+            truncated: false,
+            created_at: 1234,
+            ..Default::default()
+        };
+
+        let mut manifest = mne_manifest(
+            "session_checkpoint",
+            "Aurora Session",
+            "test",
+            vec!["souls/soul-1.json".into()],
+            vec!["worlds/world-1.json".into()],
+            Some("conversation/conversation.json".into()),
+        );
+        manifest.soul_id = Some("soul-1".into());
+        manifest.world_id = Some("world-1".into());
+        manifest.conversation_id = Some("conv-1".into());
+
+        let mut session_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Lab"));
+        session_world.world_id = "world-1".into();
+        session_world.source_setting_id = None;
+
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/soul-1.json".into(),
+            serde_json::to_vec(&soul).unwrap(),
+        );
+        entries.insert(
+            "worlds/world-1.json".into(),
+            serde_json::to_vec(&session_world).unwrap(),
+        );
+        entries.insert(
+            "conversation/conversation.json".into(),
+            serde_json::to_vec(&conversation).unwrap(),
+        );
+        entries.insert(
+            "conversation/messages.json".into(),
+            serde_json::to_vec(&messages).unwrap(),
+        );
+        entries.insert(
+            "conversation/payload_logs.json".into(),
+            serde_json::to_vec(&vec![log]).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+        let _result = import_mne_as_new_inner(&conn, &bytes).unwrap();
+
+        let imported_logs = db::list_llm_payload_logs(&conn, "conv-1").unwrap();
+        assert_eq!(imported_logs.len(), 1);
+        assert_eq!(imported_logs[0].provider, "openai");
+    }
+
+    #[test]
+    fn export_then_validate_bundle_passes() {
+        let conn = db::init_memory_connection().unwrap();
+
+        // 1. Create deterministically
+        let mut soul = new_default_soul("Aurora");
+        soul.character_id = "soul-1".into();
+        db::upsert_soul(&conn, &soul).unwrap();
+
+        db::ensure_conversation(&conn, "conv-1", "soul-1").unwrap();
+
+        let mut world = new_default_setting("Kitchen");
+        world.setting_id = "world-1".into();
+        db::upsert_setting(&conn, &world).unwrap();
+
+        let manifest = mne_manifest(
+            "scenario_bundle",
+            "Aurora + Kitchen",
+            "test",
+            vec!["souls/soul-1.json".into()],
+            vec!["worlds/world-1.json".into()],
+            None,
+        );
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/soul-1.json".into(),
+            serde_json::to_vec(&soul).unwrap(),
+        );
+        entries.insert(
+            "worlds/world-1.json".into(),
+            serde_json::to_vec(&world).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+        let report = validate_mne_bundle_bytes(&bytes);
+
+        assert!(report.valid);
+        assert_eq!(report.summary.soul_name.as_deref(), Some("Aurora"));
+        assert_eq!(report.summary.world_name.as_deref(), Some("Kitchen"));
+    }
+
+    fn write_test_mne_bytes(entries: HashMap<String, Vec<u8>>) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mne");
+        let files: Vec<(String, Vec<u8>)> = entries.into_iter().collect();
+        write_stored_zip(&path, &files).unwrap();
+        fs::read(&path).unwrap()
     }
 }

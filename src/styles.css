@@ -300,22 +300,45 @@ button {
 
 .evaluator-job-banner {
   position: fixed;
+  top: 78px;
   right: 18px;
-  bottom: 84px;
-  left: 18px;
-  z-index: 20;
+  left: auto;
+  bottom: auto;
+  z-index: 25;
   display: flex;
-  max-width: 920px;
-  margin-inline: auto;
-  align-items: center;
-  justify-content: space-between;
-  gap: 14px;
+  flex-direction: column;
+  width: min(340px, calc(100vw - 36px));
+  max-width: 340px;
+  align-items: stretch;
+  gap: 10px;
   border: 1px solid #cfc6b6;
   border-radius: 8px;
-  background: #fffdf8;
+  background: rgba(255, 253, 248, 0.98);
   box-shadow: 0 10px 30px rgba(22, 32, 28, 0.12);
-  padding: 10px 12px;
+  padding: 10px 12px 12px;
   color: #16201c;
+}
+
+.evaluator-job-banner-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid #d9d3c3;
+  border-radius: 999px;
+  background: #fffdf8;
+  color: #5b665f;
+  padding: 0;
+  cursor: pointer;
+}
+
+.evaluator-job-banner-close:hover {
+  color: #16201c;
+  border-color: #b8b0a0;
 }
 
 .evaluator-job-banner.running,
@@ -332,6 +355,7 @@ button {
   display: grid;
   gap: 2px;
   min-width: 0;
+  padding-right: 24px;
 }
 
 .evaluator-job-banner span,
@@ -344,6 +368,7 @@ button {
   display: inline-flex;
   flex-wrap: wrap;
   gap: 8px;
+  justify-content: flex-end;
 }
 
 .evaluator-job-actions button {
@@ -945,6 +970,20 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  flex-wrap: wrap;
+}
+
+.session-list-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.session-list-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
 }
 
 .session-list-heading strong {
@@ -957,10 +996,62 @@ button:disabled {
   min-height: 30px;
   align-items: center;
   gap: 6px;
-  margin-left: auto;
   color: #5b665f;
   font-size: 0.74rem;
   font-weight: 800;
+}
+
+.session-data-folder-button {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #d9d3c3;
+  border-radius: 6px;
+  background: #fffdf8;
+  color: #1d5e52;
+  padding: 4px 8px;
+  font-size: 0.72rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.session-data-folder-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.session-list-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.session-list-pagination span {
+  min-width: 4.5rem;
+  color: #5b665f;
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+.session-list-pagination button {
+  min-height: 30px;
+  border: 1px solid #d9d3c3;
+  border-radius: 6px;
+  background: #fffdf8;
+  color: #1d5e52;
+  padding: 4px 10px;
+  font-size: 0.74rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.session-list-pagination button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .session-row {

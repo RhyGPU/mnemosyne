@@ -28,6 +28,7 @@ pub struct SoulSummary {
     pub last_updated: i64,
     pub recent_count: usize,
     pub core_count: usize,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +38,7 @@ pub struct SettingSummary {
     pub last_updated: i64,
     pub turn_counter: u64,
     pub location: String,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +54,7 @@ pub struct ChatMessage {
     pub origin: String,
     #[serde(default)]
     pub attachments: Vec<MessageAttachment>,
+    pub hidden_at: Option<i64>,
 }
 
 fn default_message_status() -> String {
@@ -101,6 +104,7 @@ pub struct ConversationSummary {
     pub updated_at: i64,
     pub last_message_preview: Option<String>,
     pub message_count: i64,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,6 +265,7 @@ pub struct ProviderProfile {
     pub allow_send_with_stale_state: Option<bool>,
     pub evaluator_background_enabled: Option<bool>,
     pub anti_replay_forced_retry_enabled: Option<bool>,
+    pub archived_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +368,24 @@ pub fn connection_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::E
     Ok(dir)
 }
 
+pub fn create_backup_file(
+    db_path: &std::path::Path,
+    backup_dir: &std::path::Path,
+) -> Result<PathBuf, String> {
+    if !db_path.exists() {
+        return Err(format!("Database file does not exist at {:?}", db_path));
+    }
+    std::fs::create_dir_all(backup_dir).map_err(|err| err.to_string())?;
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
+    let backup_filename = format!("backup_{}.sqlite3", timestamp);
+    let mut backup_path = backup_dir.to_path_buf();
+    backup_path.push(backup_filename);
+
+    std::fs::copy(db_path, &backup_path)
+        .map_err(|err| format!("Failed to copy DB file: {}", err))?;
+    Ok(backup_path)
+}
+
 pub fn init_connection(path: &PathBuf) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     run_migrations(&conn)?;
@@ -399,7 +422,8 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             turn_counter INTEGER NOT NULL DEFAULT 0,
             location TEXT NOT NULL DEFAULT '',
             last_updated INTEGER NOT NULL,
-            setting_json TEXT NOT NULL
+            setting_json TEXT NOT NULL,
+            archived_at INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS session_worlds (
@@ -683,6 +707,7 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     add_column_if_missing(conn, "conversations", "world_id", "TEXT")?;
     add_column_if_missing(conn, "conversations", "source_setting_id", "TEXT")?;
+    add_column_if_missing(conn, "conversations", "archived_at", "INTEGER")?;
     add_column_if_missing(conn, "messages", "branch_id", "TEXT")?;
     add_column_if_missing(conn, "messages", "is_active", "INTEGER NOT NULL DEFAULT 1")?;
     add_column_if_missing(
@@ -697,6 +722,9 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "message_origin",
         "TEXT NOT NULL DEFAULT 'active'",
     )?;
+    add_column_if_missing(conn, "messages", "hidden_at", "INTEGER")?;
+    add_column_if_missing(conn, "souls", "archived_at", "INTEGER")?;
+    add_column_if_missing(conn, "settings", "archived_at", "INTEGER")?;
     add_column_if_missing(conn, "assistant_message_variants", "turn_id", "TEXT")?;
     add_column_if_missing(conn, "assistant_message_variants", "state_patch_id", "TEXT")?;
     add_column_if_missing(
@@ -807,6 +835,9 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     if added_setting_summary_columns {
         backfill_setting_summary_columns(conn)?;
     }
+
+    add_column_if_missing(conn, "provider_profiles", "archived_at", "INTEGER")?;
+
     Ok(())
 }
 
@@ -916,6 +947,7 @@ fn summarize_soul(soul: &Soul) -> SoulSummary {
         last_updated: soul.last_updated,
         recent_count: soul.memory.recent.len(),
         core_count: soul.memory.core.len(),
+        archived_at: None,
     }
 }
 
@@ -932,6 +964,7 @@ fn soul_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SoulSummar
         last_updated: row.get(6)?,
         recent_count: recent_count.max(0) as usize,
         core_count: core_count.max(0) as usize,
+        archived_at: row.get(9)?,
     })
 }
 
@@ -968,7 +1001,18 @@ pub fn upsert_soul(conn: &Connection, soul: &Soul) -> rusqlite::Result<SoulSumma
         ],
     )?;
 
-    Ok(summarize_soul(soul))
+    let archived_at: Option<i64> = conn
+        .query_row(
+            "SELECT archived_at FROM souls WHERE character_id = ?1",
+            [&soul.character_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+
+    let mut summary = summarize_soul(soul);
+    summary.archived_at = archived_at;
+    Ok(summary)
 }
 
 pub fn upsert_setting(
@@ -1125,8 +1169,9 @@ pub fn ensure_conversation_session_world(
 pub fn list_settings(conn: &Connection) -> rusqlite::Result<Vec<SettingSummary>> {
     let mut stmt = conn.prepare(
         "
-        SELECT setting_id, setting_name, last_updated, turn_counter, location
+        SELECT setting_id, setting_name, last_updated, turn_counter, location, archived_at
         FROM settings
+        WHERE archived_at IS NULL
         ORDER BY last_updated DESC, setting_name ASC
         ",
     )?;
@@ -1138,6 +1183,7 @@ pub fn list_settings(conn: &Connection) -> rusqlite::Result<Vec<SettingSummary>>
             last_updated: row.get(2)?,
             turn_counter: turn_counter.max(0) as u64,
             location: row.get(4)?,
+            archived_at: row.get(5)?,
         })
     })?;
 
@@ -1153,9 +1199,98 @@ pub fn get_setting(conn: &Connection, setting_id: &str) -> rusqlite::Result<Sett
     decode_setting(&setting_json)
 }
 
-pub fn delete_setting(conn: &Connection, setting_id: &str) -> rusqlite::Result<bool> {
+pub fn delete_setting(_conn: &Connection, _setting_id: &str) -> rusqlite::Result<bool> {
+    Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "delete_setting is deprecated; use archive_setting with active/default setting guard.",
+        ),
+    )))
+}
+
+#[allow(dead_code)]
+pub(crate) fn delete_setting_internal(
+    conn: &Connection,
+    setting_id: &str,
+) -> rusqlite::Result<bool> {
     let affected = conn.execute("DELETE FROM settings WHERE setting_id = ?1", [setting_id])?;
     Ok(affected > 0)
+}
+
+pub fn archive_setting(
+    conn: &Connection,
+    setting_id: &str,
+    active_or_default_ids: &[&str],
+) -> Result<bool, String> {
+    if active_or_default_ids.contains(&setting_id) {
+        return Err(
+            "Cannot archive the active/default setting. Switch settings first.".to_string(),
+        );
+    }
+
+    let non_archived_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM settings WHERE archived_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| err.to_string())?;
+
+    if non_archived_count <= 1 {
+        let is_archived: Option<i64> = conn
+            .query_row(
+                "SELECT archived_at FROM settings WHERE setting_id = ?1",
+                [setting_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| err.to_string())?;
+        if is_archived.is_none() {
+            return Err(
+                "Cannot archive the active/default setting. Switch settings first.".to_string(),
+            );
+        }
+    }
+
+    let now = now_ts();
+    let affected = conn
+        .execute(
+            "UPDATE settings SET archived_at = ?1 WHERE setting_id = ?2",
+            params![Some(now), setting_id],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(affected > 0)
+}
+
+pub fn restore_setting(conn: &Connection, setting_id: &str) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE settings SET archived_at = NULL WHERE setting_id = ?1",
+        [setting_id],
+    )?;
+    Ok(affected > 0)
+}
+
+pub fn list_archived_settings(conn: &Connection) -> rusqlite::Result<Vec<SettingSummary>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT setting_id, setting_name, last_updated, turn_counter, location, archived_at
+        FROM settings
+        WHERE archived_at IS NOT NULL
+        ORDER BY archived_at DESC, setting_name ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let turn_counter: i64 = row.get(3)?;
+        Ok(SettingSummary {
+            setting_id: row.get(0)?,
+            setting_name: row.get(1)?,
+            last_updated: row.get(2)?,
+            turn_counter: turn_counter.max(0) as u64,
+            location: row.get(4)?,
+            archived_at: row.get(5)?,
+        })
+    })?;
+
+    rows.collect()
 }
 
 pub fn list_souls(conn: &Connection) -> rusqlite::Result<Vec<SoulSummary>> {
@@ -1175,16 +1310,17 @@ fn list_souls_with_filter(
     let sql = if include_session_clones {
         "
         SELECT character_id, character_name, soul_kind, source_soul_id, source_savepoint_id,
-               avatar_image_id, last_updated, recent_count, core_count
+               avatar_image_id, last_updated, recent_count, core_count, archived_at
         FROM souls
+        WHERE archived_at IS NULL
         ORDER BY last_updated DESC, character_name ASC
         "
     } else {
         "
         SELECT character_id, character_name, soul_kind, source_soul_id, source_savepoint_id,
-               avatar_image_id, last_updated, recent_count, core_count
+               avatar_image_id, last_updated, recent_count, core_count, archived_at
         FROM souls
-        WHERE soul_kind != 'session_clone'
+        WHERE soul_kind != 'session_clone' AND archived_at IS NULL
         ORDER BY last_updated DESC, character_name ASC
         "
     };
@@ -1203,7 +1339,63 @@ pub fn get_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<Soul> {
     decode_soul(&soul_json)
 }
 
+pub fn archive_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE souls SET archived_at = ?1 WHERE character_id = ?2",
+        params![now_ts(), soul_id],
+    )?;
+    Ok(affected > 0)
+}
+
+pub fn restore_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE souls SET archived_at = NULL WHERE character_id = ?1",
+        params![soul_id],
+    )?;
+    Ok(affected > 0)
+}
+
+pub fn list_archived_souls(conn: &Connection) -> rusqlite::Result<Vec<SoulSummary>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT character_id, character_name, soul_kind, source_soul_id, source_savepoint_id,
+               avatar_image_id, last_updated, recent_count, core_count, archived_at
+        FROM souls
+        WHERE soul_kind != 'session_clone' AND archived_at IS NOT NULL
+        ORDER BY archived_at DESC, character_name ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], soul_summary_from_row)?;
+    rows.collect()
+}
+
+pub fn archive_savepoint(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
+    archive_soul(conn, soul_id)
+}
+
+pub fn restore_savepoint(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
+    restore_soul(conn, soul_id)
+}
+
+pub fn list_archived_savepoints(conn: &Connection) -> rusqlite::Result<Vec<SoulSummary>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT character_id, character_name, soul_kind, source_soul_id, source_savepoint_id,
+               avatar_image_id, last_updated, recent_count, core_count, archived_at
+        FROM souls
+        WHERE soul_kind != 'session_clone' AND archived_at IS NOT NULL
+        ORDER BY archived_at DESC, character_name ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], soul_summary_from_row)?;
+    rows.collect()
+}
+
 pub fn delete_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
+    archive_soul(conn, soul_id)
+}
+
+pub fn hard_delete_soul_internal(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
     let affected = conn.execute("DELETE FROM souls WHERE character_id = ?1", [soul_id])?;
     Ok(affected > 0)
 }
@@ -1299,9 +1491,11 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
                 SELECT COUNT(*)
                 FROM messages
                 WHERE conversation_id = c.id AND is_active != 0 AND message_status = 'active'
-            ) AS message_count
+            ) AS message_count,
+            c.archived_at
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
+        WHERE c.archived_at IS NULL
         ORDER BY c.updated_at DESC, c.created_at DESC
         ",
     )?;
@@ -1318,6 +1512,7 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             updated_at: row.get(7)?,
             last_message_preview: preview.map(compact_preview),
             message_count: row.get(9)?,
+            archived_at: row.get(10)?,
         })
     })?;
     rows.collect()
@@ -1329,7 +1524,7 @@ pub fn get_conversation_summary(
 ) -> rusqlite::Result<ConversationSummary> {
     conn.query_row(
         "
-        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL), c.world_id, c.source_setting_id
+        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL), c.world_id, c.source_setting_id, c.archived_at
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
         WHERE c.id = ?1
@@ -1350,6 +1545,7 @@ pub fn get_conversation_summary(
                 source_setting_id: row.get(7)?,
                 last_message_preview,
                 message_count,
+                archived_at: row.get(8)?,
             })
         },
     )
@@ -2160,9 +2356,9 @@ pub fn list_messages_before_id(
 ) -> rusqlite::Result<Vec<ChatMessage>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, role, content, created_at, message_status, message_origin
+        SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
         FROM (
-            SELECT id, conversation_id, role, content, created_at, message_status, message_origin
+            SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
             FROM messages
             WHERE conversation_id = ?1 AND id < ?2 AND is_active != 0 AND message_status = 'active'
             ORDER BY id DESC
@@ -2185,6 +2381,7 @@ pub fn list_messages_before_id(
                 status: row.get(5)?,
                 origin: row.get(6)?,
                 attachments: list_message_attachments(conn, message_id)?,
+                hidden_at: row.get(7)?,
             })
         },
     )?;
@@ -2192,7 +2389,7 @@ pub fn list_messages_before_id(
     rows.collect()
 }
 
-pub fn delete_conversation(conn: &Connection, conversation_id: &str) -> rusqlite::Result<bool> {
+pub fn archive_session(conn: &Connection, conversation_id: &str) -> rusqlite::Result<bool> {
     let title: Option<String> = conn
         .query_row(
             "SELECT title FROM conversations WHERE id = ?1",
@@ -2209,23 +2406,315 @@ pub fn delete_conversation(conn: &Connection, conversation_id: &str) -> rusqlite
         format!("[Archived] {title}")
     };
     let affected = conn.execute(
-        "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
-        params![archived_title, now_ts(), conversation_id],
+        "UPDATE conversations SET title = ?1, archived_at = ?2, updated_at = ?3 WHERE id = ?4",
+        params![archived_title, now_ts(), now_ts(), conversation_id],
     )?;
     Ok(affected > 0)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RestoreInactiveMessagesResult {
-    pub restored_message_ids: Vec<i64>,
-    pub skipped_duplicate_ids: Vec<i64>,
-    pub skipped_pending_ids: Vec<i64>,
-    pub skipped_failed_ids: Vec<i64>,
-    pub skipped_retry_attempt_ids: Vec<i64>,
-    pub skipped_regenerated_discarded_ids: Vec<i64>,
+pub fn restore_session(conn: &Connection, conversation_id: &str) -> rusqlite::Result<bool> {
+    let title: Option<String> = conn
+        .query_row(
+            "SELECT title FROM conversations WHERE id = ?1",
+            [conversation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(title) = title else {
+        return Ok(false);
+    };
+    let restored_title = if title.starts_with("[Archived] ") {
+        title.replacen("[Archived] ", "", 1)
+    } else {
+        title
+    };
+    let affected = conn.execute(
+        "UPDATE conversations SET title = ?1, archived_at = NULL, updated_at = ?2 WHERE id = ?3",
+        params![restored_title, now_ts(), conversation_id],
+    )?;
+    Ok(affected > 0)
+}
+
+pub fn list_archived_sessions(conn: &Connection) -> rusqlite::Result<Vec<ConversationSummary>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT
+            c.id,
+            c.title,
+            c.soul_id,
+            COALESCE(s.source_savepoint_id, NULL),
+            c.world_id,
+            c.source_setting_id,
+            c.created_at,
+            c.updated_at,
+            (
+                SELECT content
+                FROM messages
+                WHERE conversation_id = c.id AND is_active != 0 AND message_status = 'active'
+                ORDER BY id DESC
+                LIMIT 1
+            ) AS last_message_preview,
+            (
+                SELECT COUNT(*)
+                FROM messages
+                WHERE conversation_id = c.id AND is_active != 0 AND message_status = 'active'
+            ) AS message_count,
+            c.archived_at
+        FROM conversations c
+        LEFT JOIN souls s ON s.character_id = c.soul_id
+        WHERE c.archived_at IS NOT NULL
+        ORDER BY c.archived_at DESC, c.updated_at DESC
+        ",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let preview: Option<String> = row.get(8)?;
+        Ok(ConversationSummary {
+            conversation_id: row.get(0)?,
+            title: row.get(1)?,
+            soul_id: row.get(2)?,
+            source_savepoint_id: row.get(3)?,
+            world_id: row.get(4)?,
+            source_setting_id: row.get(5)?,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+            last_message_preview: preview.map(compact_preview),
+            message_count: row.get(9)?,
+            archived_at: row.get(10)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn delete_conversation(conn: &Connection, conversation_id: &str) -> rusqlite::Result<bool> {
+    archive_session(conn, conversation_id)
+}
+
+pub fn hide_turn_range(
+    conn: &Connection,
+    conversation_id: &str,
+    start_message_id: i64,
+    end_message_id: i64,
+) -> rusqlite::Result<usize> {
+    let affected = conn.execute(
+        "UPDATE messages
+         SET hidden_at = ?1, is_active = 0, message_status = 'hidden'
+         WHERE conversation_id = ?2 AND id >= ?3 AND id <= ?4",
+        params![now_ts(), conversation_id, start_message_id, end_message_id],
+    )?;
+
+    conn.execute(
+        "UPDATE turn_commits SET is_active = 0, is_discarded = 1, active_variant = 0
+         WHERE conversation_id = ?1
+           AND (
+             (user_message_id >= ?2 AND user_message_id <= ?3)
+             OR (assistant_message_id >= ?2 AND assistant_message_id <= ?3)
+           )",
+        params![conversation_id, start_message_id, end_message_id],
+    )?;
+
+    conn.execute(
+        "UPDATE state_patches SET is_active = 0
+         WHERE turn_id IN (
+             SELECT turn_id FROM turn_commits
+             WHERE conversation_id = ?1
+               AND (
+                 (user_message_id >= ?2 AND user_message_id <= ?3)
+                 OR (assistant_message_id >= ?2 AND assistant_message_id <= ?3)
+               )
+         )",
+        params![conversation_id, start_message_id, end_message_id],
+    )?;
+
+    if affected > 0 {
+        conn.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now_ts(), conversation_id],
+        )?;
+    }
+
+    Ok(affected)
+}
+
+pub fn restore_turn_range(
+    conn: &Connection,
+    conversation_id: &str,
+    start_message_id: i64,
+    end_message_id: i64,
+) -> rusqlite::Result<usize> {
+    let Some(branch) = get_active_session_branch(conn, conversation_id).optional()? else {
+        return Ok(0);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant FROM turn_commits WHERE branch_id = ?1 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([&branch.branch_id], turn_commit_from_row)?;
+    let mut commits_by_id = HashMap::new();
+    let mut latest_turn_id = None;
+    for row in rows {
+        let commit = row?;
+        latest_turn_id = Some(commit.turn_id.clone());
+        commits_by_id.insert(commit.turn_id.clone(), commit);
+    }
+
+    let Some(mut cursor) = branch.active_turn_id.clone().or(latest_turn_id) else {
+        return Ok(0);
+    };
+    let mut path = Vec::new();
+    let mut seen = HashSet::new();
+    while seen.insert(cursor.clone()) {
+        let Some(commit) = commits_by_id.get(&cursor).cloned() else {
+            break;
+        };
+        cursor = commit.parent_turn_id.clone().unwrap_or_default();
+        path.push(commit);
+        if cursor.is_empty() {
+            break;
+        }
+    }
+    path.reverse();
+
+    let canonical_message_ids = path
+        .iter()
+        .flat_map(|commit| [commit.user_message_id, commit.assistant_message_id])
+        .flatten()
+        .collect::<HashSet<_>>();
+
+    let mut stmt = conn.prepare(
+        "
+        SELECT id, role, content, message_status
+        FROM messages
+        WHERE conversation_id = ?1 AND is_active = 0 AND id >= ?2 AND id <= ?3
+        ORDER BY id ASC
+        ",
+    )?;
+    let rows = stmt.query_map(
+        params![conversation_id, start_message_id, end_message_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        },
+    )?;
+
+    let mut restored_message_ids = Vec::new();
+    let mut canonical_user_by_group = HashMap::<String, i64>::new();
+    for commit in &path {
+        if let Some(message_id) = commit.user_message_id {
+            canonical_user_by_group
+                .entry(turn_request_group_key(commit))
+                .or_insert(message_id);
+        }
+    }
+
+    for row in rows {
+        let (message_id, role, _content, status) = row?;
+        match status.as_str() {
+            "pending"
+            | "failed"
+            | "retry_attempt"
+            | "regenerated_discarded"
+            | "duplicate_hidden" => {
+                // skip
+            }
+            _ if !canonical_message_ids.contains(&message_id) => {
+                // skip if not in our branch's canonical path
+            }
+            _ => {
+                let is_duplicate_user = role == "user"
+                    && path.iter().any(|commit| {
+                        commit.user_message_id == Some(message_id)
+                            && canonical_user_by_group
+                                .get(&turn_request_group_key(commit))
+                                .is_some_and(|canonical_id| *canonical_id != message_id)
+                    });
+                if !is_duplicate_user {
+                    restored_message_ids.push(message_id);
+                }
+            }
+        }
+    }
+
+    for message_id in &restored_message_ids {
+        conn.execute(
+            "UPDATE messages SET is_active = 1, message_status = 'active', hidden_at = NULL WHERE conversation_id = ?1 AND id = ?2",
+            params![conversation_id, message_id],
+        )?;
+    }
+
+    for commit in &path {
+        let has_restored_msg = commit
+            .user_message_id
+            .map(|id| restored_message_ids.contains(&id))
+            .unwrap_or(false)
+            || commit
+                .assistant_message_id
+                .map(|id| restored_message_ids.contains(&id))
+                .unwrap_or(false);
+        if has_restored_msg {
+            conn.execute(
+                "UPDATE turn_commits SET is_active = 1, is_discarded = 0, active_variant = 1 WHERE turn_id = ?1 AND conversation_id = ?2",
+                params![commit.turn_id, conversation_id],
+            )?;
+            conn.execute(
+                "UPDATE state_patches SET is_active = 1 WHERE turn_id = ?1",
+                [&commit.turn_id],
+            )?;
+        }
+    }
+
+    if !restored_message_ids.is_empty() {
+        conn.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now_ts(), conversation_id],
+        )?;
+    }
+
+    Ok(restored_message_ids.len())
+}
+
+pub fn list_hidden_turns(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<ChatMessage>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
+        FROM messages
+        WHERE conversation_id = ?1 AND (hidden_at IS NOT NULL OR message_status = 'hidden')
+        ORDER BY id ASC
+        ",
+    )?;
+    let rows = stmt.query_map([conversation_id], |row| {
+        let message_id: i64 = row.get(0)?;
+        Ok(ChatMessage {
+            id: message_id,
+            conversation_id: row.get(1)?,
+            role: row.get(2)?,
+            content: row.get(3)?,
+            created_at: row.get(4)?,
+            status: row.get(5)?,
+            origin: row.get(6)?,
+            attachments: list_message_attachments(conn, message_id)?,
+            hidden_at: row.get(7)?,
+        })
+    })?;
+    rows.collect()
 }
 
 pub fn delete_message(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: i64,
+) -> rusqlite::Result<bool> {
+    let count = hide_turn_range(conn, conversation_id, message_id, message_id)?;
+    Ok(count > 0)
+}
+
+pub fn hard_delete_message_internal(
     conn: &Connection,
     conversation_id: &str,
     message_id: i64,
@@ -2243,49 +2732,156 @@ pub fn delete_message(
     Ok(affected > 0)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RestoreInactiveMessagesResult {
+    pub restored_message_ids: Vec<i64>,
+    pub skipped_duplicate_ids: Vec<i64>,
+    pub skipped_pending_ids: Vec<i64>,
+    pub skipped_failed_ids: Vec<i64>,
+    pub skipped_retry_attempt_ids: Vec<i64>,
+    pub skipped_regenerated_discarded_ids: Vec<i64>,
+}
+
 pub fn restore_inactive_messages(
     conn: &Connection,
     conversation_id: &str,
 ) -> rusqlite::Result<RestoreInactiveMessagesResult> {
+    let mut result = RestoreInactiveMessagesResult::default();
     let Some(branch) = get_active_session_branch(conn, conversation_id).optional()? else {
         let mut preview = restore_preview_for_inactive_messages(conn, conversation_id, &[])?;
         let restored = restore_inactive_messages_legacy_all(conn, conversation_id)?;
         preview.restored_message_ids = restored;
         return Ok(preview);
     };
-    let canonical_commits =
-        active_commit_path_until(conn, &branch.branch_id, branch.active_turn_id.as_deref())?;
-    let canonical_message_ids = canonical_commits
+
+    let mut stmt = conn.prepare(
+        "SELECT turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant FROM turn_commits WHERE branch_id = ?1 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([&branch.branch_id], turn_commit_from_row)?;
+    let mut commits_by_id = HashMap::new();
+    let mut latest_turn_id = None;
+    for row in rows {
+        let commit = row?;
+        latest_turn_id = Some(commit.turn_id.clone());
+        commits_by_id.insert(commit.turn_id.clone(), commit);
+    }
+
+    let Some(mut cursor) = branch.active_turn_id.clone().or(latest_turn_id) else {
+        return Ok(result);
+    };
+    let mut path = Vec::new();
+    let mut seen = HashSet::new();
+    while seen.insert(cursor.clone()) {
+        let Some(commit) = commits_by_id.get(&cursor).cloned() else {
+            break;
+        };
+        cursor = commit.parent_turn_id.clone().unwrap_or_default();
+        path.push(commit);
+        if cursor.is_empty() {
+            break;
+        }
+    }
+    path.reverse();
+
+    let canonical_message_ids = path
         .iter()
         .flat_map(|commit| [commit.user_message_id, commit.assistant_message_id])
         .flatten()
         .collect::<HashSet<_>>();
-    let result = restore_preview_for_inactive_messages(conn, conversation_id, &canonical_commits)?;
-    if canonical_message_ids.is_empty() {
-        return Ok(result);
+
+    let mut stmt = conn.prepare(
+        "
+        SELECT id, role, content, message_status
+        FROM messages
+        WHERE conversation_id = ?1 AND is_active = 0
+        ORDER BY id ASC
+        ",
+    )?;
+    let rows = stmt.query_map([conversation_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    let mut restored_message_ids = Vec::new();
+    let mut canonical_user_by_group = HashMap::<String, i64>::new();
+    for commit in &path {
+        if let Some(message_id) = commit.user_message_id {
+            canonical_user_by_group
+                .entry(turn_request_group_key(commit))
+                .or_insert(message_id);
+        }
     }
-    for commit in &canonical_commits {
-        conn.execute(
-            "UPDATE turn_commits SET is_active = 1, is_discarded = 0, active_variant = 1 WHERE turn_id = ?1 AND conversation_id = ?2",
-            params![commit.turn_id, conversation_id],
-        )?;
-        conn.execute(
-            "UPDATE state_patches SET is_active = 1 WHERE turn_id = ?1",
-            [&commit.turn_id],
-        )?;
+
+    for row in rows {
+        let (message_id, role, _content, status) = row?;
+        match status.as_str() {
+            "pending" => result.skipped_pending_ids.push(message_id),
+            "failed" => result.skipped_failed_ids.push(message_id),
+            "retry_attempt" => result.skipped_retry_attempt_ids.push(message_id),
+            "regenerated_discarded" => result.skipped_regenerated_discarded_ids.push(message_id),
+            "duplicate_hidden" => result.skipped_duplicate_ids.push(message_id),
+            _ if !canonical_message_ids.contains(&message_id) => {
+                if role == "user" {
+                    result.skipped_duplicate_ids.push(message_id);
+                }
+            }
+            _ => {
+                let is_duplicate_user = role == "user"
+                    && path.iter().any(|commit| {
+                        commit.user_message_id == Some(message_id)
+                            && canonical_user_by_group
+                                .get(&turn_request_group_key(commit))
+                                .is_some_and(|canonical_id| *canonical_id != message_id)
+                    });
+                if is_duplicate_user {
+                    result.skipped_duplicate_ids.push(message_id);
+                } else {
+                    restored_message_ids.push(message_id);
+                }
+            }
+        }
     }
-    for message_id in &result.restored_message_ids {
+
+    for message_id in &restored_message_ids {
         conn.execute(
-            "UPDATE messages SET is_active = 1, message_status = 'active', message_origin = 'restored' WHERE conversation_id = ?1 AND id = ?2",
+            "UPDATE messages SET is_active = 1, message_status = 'active', hidden_at = NULL WHERE conversation_id = ?1 AND id = ?2",
             params![conversation_id, message_id],
         )?;
+        result.restored_message_ids.push(*message_id);
     }
-    if !result.restored_message_ids.is_empty() {
+
+    for commit in &path {
+        let has_restored_msg = commit
+            .user_message_id
+            .map(|id| restored_message_ids.contains(&id))
+            .unwrap_or(false)
+            || commit
+                .assistant_message_id
+                .map(|id| restored_message_ids.contains(&id))
+                .unwrap_or(false);
+        if has_restored_msg {
+            conn.execute(
+                "UPDATE turn_commits SET is_active = 1, is_discarded = 0, active_variant = 1 WHERE turn_id = ?1 AND conversation_id = ?2",
+                params![commit.turn_id, conversation_id],
+            )?;
+            conn.execute(
+                "UPDATE state_patches SET is_active = 1 WHERE turn_id = ?1",
+                [&commit.turn_id],
+            )?;
+        }
+    }
+
+    if !restored_message_ids.is_empty() {
         conn.execute(
             "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
             params![now_ts(), conversation_id],
         )?;
     }
+
     Ok(result)
 }
 
@@ -2426,9 +3022,9 @@ pub fn list_messages(
 ) -> rusqlite::Result<Vec<ChatMessage>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, role, content, created_at, message_status, message_origin
+        SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
         FROM (
-            SELECT id, conversation_id, role, content, created_at, message_status, message_origin
+            SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
             FROM messages
             WHERE conversation_id = ?1 AND is_active != 0 AND message_status = 'active'
             ORDER BY id DESC
@@ -2449,6 +3045,7 @@ pub fn list_messages(
             status: row.get(5)?,
             origin: row.get(6)?,
             attachments: list_message_attachments(conn, message_id)?,
+            hidden_at: row.get(7)?,
         })
     })?;
 
@@ -2462,7 +3059,7 @@ pub fn get_message(
 ) -> rusqlite::Result<ChatMessage> {
     conn.query_row(
         "
-        SELECT id, conversation_id, role, content, created_at, message_status, message_origin
+        SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
         FROM messages
         WHERE conversation_id = ?1 AND id = ?2
         ",
@@ -2478,6 +3075,7 @@ pub fn get_message(
                 status: row.get(5)?,
                 origin: row.get(6)?,
                 attachments: list_message_attachments(conn, message_id)?,
+                hidden_at: row.get(7)?,
             })
         },
     )
@@ -2892,8 +3490,8 @@ pub fn deactivate_downstream_from_message(
     message_id: i64,
 ) -> rusqlite::Result<usize> {
     conn.execute(
-        "UPDATE messages SET is_active = 0, message_status = 'hidden' WHERE conversation_id = ?1 AND id >= ?2",
-        params![conversation_id, message_id],
+        "UPDATE messages SET is_active = 0, message_status = 'hidden', hidden_at = ?3 WHERE conversation_id = ?1 AND id >= ?2",
+        params![conversation_id, message_id, now_ts()],
     )?;
     let commits = list_commits_at_or_after_message(conn, conversation_id, message_id)?;
     let mut count = 0;
@@ -3265,9 +3863,9 @@ pub fn upsert_provider_profile(
             id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
             narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
             wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
-            anti_replay_forced_retry_enabled
+            anti_replay_forced_retry_enabled, archived_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             base_url = excluded.base_url,
@@ -3282,7 +3880,8 @@ pub fn upsert_provider_profile(
             wait_for_evaluator_before_next_turn = excluded.wait_for_evaluator_before_next_turn,
             allow_send_with_stale_state = excluded.allow_send_with_stale_state,
             evaluator_background_enabled = excluded.evaluator_background_enabled,
-            anti_replay_forced_retry_enabled = excluded.anti_replay_forced_retry_enabled
+            anti_replay_forced_retry_enabled = excluded.anti_replay_forced_retry_enabled,
+            archived_at = excluded.archived_at
         ",
         params![
             updated.id,
@@ -3300,7 +3899,8 @@ pub fn upsert_provider_profile(
             updated.wait_for_evaluator_before_next_turn,
             updated.allow_send_with_stale_state,
             updated.evaluator_background_enabled,
-            updated.anti_replay_forced_retry_enabled
+            updated.anti_replay_forced_retry_enabled,
+            updated.archived_at
         ],
     )?;
     Ok(updated)
@@ -3312,8 +3912,9 @@ pub fn list_provider_profiles(conn: &Connection) -> rusqlite::Result<Vec<Provide
         SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
                narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
-               anti_replay_forced_retry_enabled
+               anti_replay_forced_retry_enabled, archived_at
         FROM provider_profiles
+        WHERE archived_at IS NULL
         ORDER BY updated_at DESC, name ASC
         ",
     )?;
@@ -3327,7 +3928,7 @@ pub fn get_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<Pro
         SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
                narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
-               anti_replay_forced_retry_enabled
+               anti_replay_forced_retry_enabled, archived_at
         FROM provider_profiles
         WHERE id = ?1
         ",
@@ -3336,9 +3937,69 @@ pub fn get_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<Pro
     )
 }
 
-pub fn delete_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+pub fn delete_provider_profile(_conn: &Connection, _id: &str) -> rusqlite::Result<bool> {
+    Err(rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "delete_provider_profile is deprecated; use archive_provider_profile with active profile guard.",
+    ))))
+}
+
+#[allow(dead_code)]
+pub(crate) fn delete_provider_profile_internal(
+    conn: &Connection,
+    id: &str,
+) -> rusqlite::Result<bool> {
     let affected = conn.execute("DELETE FROM provider_profiles WHERE id = ?1", [id])?;
     Ok(affected > 0)
+}
+
+pub fn archive_provider_profile(
+    conn: &Connection,
+    id: &str,
+    active_ids: &[&str],
+) -> Result<bool, String> {
+    if active_ids.is_empty() {
+        return Err("active_ids is required and cannot be empty.".to_string());
+    }
+    if active_ids.contains(&id) {
+        return Err(
+            "Cannot archive the active provider profile. Switch profiles first.".to_string(),
+        );
+    }
+    let now = now_ts();
+    let affected = conn
+        .execute(
+            "UPDATE provider_profiles SET archived_at = ?1 WHERE id = ?2",
+            params![Some(now), id],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(affected > 0)
+}
+
+pub fn restore_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE provider_profiles SET archived_at = NULL WHERE id = ?1",
+        [id],
+    )?;
+    Ok(affected > 0)
+}
+
+pub fn list_archived_provider_profiles(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<ProviderProfile>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
+               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
+               wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
+               anti_replay_forced_retry_enabled, archived_at
+        FROM provider_profiles
+        WHERE archived_at IS NOT NULL
+        ORDER BY archived_at DESC, name ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], provider_profile_from_row)?;
+    rows.collect()
 }
 
 fn provider_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderProfile> {
@@ -3359,6 +4020,7 @@ fn provider_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provid
         allow_send_with_stale_state: row.get(13)?,
         evaluator_background_enabled: row.get(14)?,
         anti_replay_forced_retry_enabled: row.get(15)?,
+        archived_at: row.get(16)?,
     })
 }
 
@@ -3563,6 +4225,7 @@ fn summarize_setting(setting: &SettingSoul) -> SettingSummary {
         last_updated: setting.last_updated,
         turn_counter: setting.turn_counter,
         location: setting.world.location.clone(),
+        archived_at: None,
     }
 }
 
@@ -4648,7 +5311,9 @@ mod tests {
             "Response A"
         );
 
-        assert!(delete_message(&conn, "variants", message_id).expect("delete message"));
+        assert!(
+            hard_delete_message_internal(&conn, "variants", message_id).expect("delete message")
+        );
         let variant_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM assistant_message_variants WHERE message_id = ?1",
@@ -4672,7 +5337,7 @@ mod tests {
         assert!(archived.title.starts_with("[Archived] "));
         assert_eq!(list_messages(&conn, "mock", 5).expect("messages").len(), 1);
 
-        assert!(delete_soul(&conn, &soul.character_id).expect("delete soul"));
+        assert!(hard_delete_soul_internal(&conn, &soul.character_id).expect("delete soul"));
         assert!(list_souls(&conn).expect("souls").is_empty());
 
         let message_count: i64 = conn
@@ -4976,8 +5641,133 @@ mod tests {
 
         let loaded = get_setting(&conn, &setting.setting_id).expect("get setting");
         assert_eq!(loaded.world.location, "Underground cell");
-        assert!(delete_setting(&conn, &setting.setting_id).expect("delete"));
+        assert!(delete_setting(&conn, &setting.setting_id).is_err());
+        assert!(delete_setting_internal(&conn, &setting.setting_id).expect("delete"));
         assert!(list_settings(&conn).expect("list settings").is_empty());
+    }
+
+    #[test]
+    fn archive_setting_hides_from_active_list() {
+        let conn = init_memory_connection().expect("db");
+        let setting1 = new_default_setting("ActiveSetting1");
+        let setting2 = new_default_setting("ActiveSetting2");
+        upsert_setting(&conn, &setting1).expect("upsert");
+        upsert_setting(&conn, &setting2).expect("upsert");
+
+        assert_eq!(list_settings(&conn).expect("list").len(), 2);
+
+        archive_setting(&conn, &setting1.setting_id, &[]).expect("archive");
+        let active = list_settings(&conn).expect("list");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].setting_id, setting2.setting_id);
+    }
+
+    #[test]
+    fn restore_setting_reappears_in_active_list() {
+        let conn = init_memory_connection().expect("db");
+        let setting1 = new_default_setting("RestoreSetting1");
+        let setting2 = new_default_setting("RestoreSetting2");
+        upsert_setting(&conn, &setting1).expect("upsert");
+        upsert_setting(&conn, &setting2).expect("upsert");
+
+        archive_setting(&conn, &setting1.setting_id, &[]).expect("archive");
+        assert_eq!(list_settings(&conn).expect("list").len(), 1);
+
+        restore_setting(&conn, &setting1.setting_id).expect("restore");
+        assert_eq!(list_settings(&conn).expect("list").len(), 2);
+    }
+
+    #[test]
+    fn archive_setting_does_not_delete_config() {
+        let conn = init_memory_connection().expect("db");
+        let setting1 = new_default_setting("ConfigSetting1");
+        let setting2 = new_default_setting("ConfigSetting2");
+        upsert_setting(&conn, &setting1).expect("upsert");
+        upsert_setting(&conn, &setting2).expect("upsert");
+
+        archive_setting(&conn, &setting1.setting_id, &[]).expect("archive");
+
+        let retrieved = get_setting(&conn, &setting1.setting_id).expect("get");
+        assert_eq!(retrieved.setting_name, "ConfigSetting1");
+    }
+
+    #[test]
+    fn archive_one_setting_does_not_affect_sibling_settings() {
+        let conn = init_memory_connection().expect("db");
+        let setting1 = new_default_setting("Setting1");
+        let setting2 = new_default_setting("Setting2");
+        upsert_setting(&conn, &setting1).expect("upsert");
+        upsert_setting(&conn, &setting2).expect("upsert");
+
+        archive_setting(&conn, &setting1.setting_id, &[]).expect("archive");
+
+        let active = list_settings(&conn).expect("list");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].setting_id, setting2.setting_id);
+    }
+
+    #[test]
+    fn archive_active_or_default_setting_is_blocked() {
+        let conn = init_memory_connection().expect("db");
+        let setting1 = new_default_setting("ActiveSetting1");
+        let setting2 = new_default_setting("ActiveSetting2");
+        upsert_setting(&conn, &setting1).expect("upsert");
+        upsert_setting(&conn, &setting2).expect("upsert");
+
+        // 1. Blocked because it is in active_ids list
+        let active_ids = vec![setting1.setting_id.as_str()];
+        let res = archive_setting(&conn, &setting1.setting_id, &active_ids);
+        assert!(res.is_err());
+        assert_eq!(
+            res.err().unwrap(),
+            "Cannot archive the active/default setting. Switch settings first."
+        );
+
+        // 2. Blocked because it is the last remaining setting
+        archive_setting(&conn, &setting1.setting_id, &[]).expect("archive first");
+        let res2 = archive_setting(&conn, &setting2.setting_id, &[]);
+        assert!(res2.is_err());
+        assert_eq!(
+            res2.err().unwrap(),
+            "Cannot archive the active/default setting. Switch settings first."
+        );
+    }
+
+    #[test]
+    fn list_archived_settings_returns_only_archived() {
+        let conn = init_memory_connection().expect("db");
+        let setting1 = new_default_setting("Setting1");
+        let setting2 = new_default_setting("Setting2");
+        upsert_setting(&conn, &setting1).expect("upsert");
+        upsert_setting(&conn, &setting2).expect("upsert");
+
+        archive_setting(&conn, &setting1.setting_id, &[]).expect("archive");
+
+        let archived = list_archived_settings(&conn).expect("list");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].setting_id, setting1.setting_id);
+    }
+
+    #[test]
+    fn delete_setting_returns_deprecated_error_or_noops() {
+        let conn = init_memory_connection().expect("db");
+        let setting = new_default_setting("DeleteSetting");
+        upsert_setting(&conn, &setting).expect("upsert");
+
+        let res = delete_setting(&conn, &setting.setting_id);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn setting_row_survives_legacy_delete_attempt() {
+        let conn = init_memory_connection().expect("db");
+        let setting = new_default_setting("SurvivingSetting");
+        upsert_setting(&conn, &setting).expect("upsert");
+
+        let _ = delete_setting(&conn, &setting.setting_id);
+
+        let retrieved = get_setting(&conn, &setting.setting_id).expect("survives");
+        assert_eq!(retrieved.setting_name, "SurvivingSetting");
     }
 
     #[test]
@@ -5000,6 +5790,7 @@ mod tests {
             allow_send_with_stale_state: Some(false),
             evaluator_background_enabled: Some(false),
             anti_replay_forced_retry_enabled: Some(false),
+            archived_at: None,
         };
 
         let saved = upsert_provider_profile(&conn, &profile).expect("upsert");
@@ -5016,8 +5807,238 @@ mod tests {
                 .as_deref(),
             Some("evaluator_form_v1")
         );
-        assert!(delete_provider_profile(&conn, "openai").expect("delete"));
+        assert!(delete_provider_profile(&conn, "openai").is_err());
+        assert!(delete_provider_profile_internal(&conn, "openai").expect("delete"));
         assert!(list_provider_profiles(&conn).expect("list").is_empty());
+    }
+
+    #[test]
+    fn provider_profiles_archive_restore_safety() {
+        let conn = init_memory_connection().expect("db");
+        let profile1 = ProviderProfile {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key-openai".into(),
+            model: "gpt-4".into(),
+            system_prompt: "Sys1".into(),
+            created_at: 0,
+            updated_at: 0,
+            narrator_timeout_ms: Some(30_000),
+            evaluator_timeout_ms: Some(25_000),
+            evaluator_timeout_mode: Some("finite".into()),
+            evaluator_mode: Some("evaluator_form_v1".into()),
+            wait_for_evaluator_before_next_turn: Some(true),
+            allow_send_with_stale_state: Some(false),
+            evaluator_background_enabled: Some(false),
+            anti_replay_forced_retry_enabled: Some(false),
+            archived_at: None,
+        };
+        let profile2 = ProviderProfile {
+            id: "anthropic".into(),
+            name: "Anthropic".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_key: "key-anthropic".into(),
+            model: "claude-3".into(),
+            system_prompt: "Sys2".into(),
+            created_at: 0,
+            updated_at: 0,
+            narrator_timeout_ms: Some(40_000),
+            evaluator_timeout_ms: Some(35_000),
+            evaluator_timeout_mode: Some("finite".into()),
+            evaluator_mode: Some("evaluator_form_v1".into()),
+            wait_for_evaluator_before_next_turn: Some(false),
+            allow_send_with_stale_state: Some(true),
+            evaluator_background_enabled: Some(true),
+            anti_replay_forced_retry_enabled: Some(true),
+            archived_at: None,
+        };
+
+        upsert_provider_profile(&conn, &profile1).expect("upsert1");
+        upsert_provider_profile(&conn, &profile2).expect("upsert2");
+
+        // Verify initially both are in list_provider_profiles and list_archived is empty
+        assert_eq!(list_provider_profiles(&conn).expect("list").len(), 2);
+        assert_eq!(
+            list_archived_provider_profiles(&conn)
+                .expect("list archived")
+                .len(),
+            0
+        );
+
+        // 1. archive_active_provider_profile_is_blocked
+        let active_ids = vec!["openai"];
+        let block_res = archive_provider_profile(&conn, "openai", &active_ids);
+        assert!(block_res.is_err());
+        assert_eq!(
+            block_res.err().unwrap(),
+            "Cannot archive the active provider profile. Switch profiles first."
+        );
+
+        // 2. archive_provider_profile_hides_from_active_list
+        let archive_res =
+            archive_provider_profile(&conn, "openai", &["anthropic"]).expect("archive");
+        assert!(archive_res);
+
+        let active_list = list_provider_profiles(&conn).expect("list");
+        assert_eq!(active_list.len(), 1);
+        assert_eq!(active_list[0].id, "anthropic");
+
+        let archived_list = list_archived_provider_profiles(&conn).expect("list archived");
+        assert_eq!(archived_list.len(), 1);
+        assert_eq!(archived_list[0].id, "openai");
+
+        // 3. archive_one_profile_does_not_affect_sibling_profiles
+        let anthropic_active = get_provider_profile(&conn, "anthropic").expect("get active");
+        assert_eq!(anthropic_active.archived_at, None);
+
+        // 4. archive_provider_profile_does_not_delete_config and does_not_delete_api_key_field
+        let openai_archived = get_provider_profile(&conn, "openai").expect("get archived");
+        assert!(openai_archived.archived_at.is_some());
+        assert_eq!(openai_archived.base_url, "https://api.openai.com/v1");
+        assert_eq!(openai_archived.api_key, "key-openai");
+        assert_eq!(openai_archived.model, "gpt-4");
+        assert_eq!(openai_archived.system_prompt, "Sys1");
+
+        // 5. restore_provider_profile_reappears_in_active_list
+        assert!(restore_provider_profile(&conn, "openai").expect("restore"));
+        assert_eq!(list_provider_profiles(&conn).expect("list").len(), 2);
+        assert_eq!(
+            list_archived_provider_profiles(&conn)
+                .expect("list archived")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn delete_provider_profile_no_longer_hard_deletes() {
+        let conn = init_memory_connection().expect("db");
+        let profile = ProviderProfile {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "gpt-4".into(),
+            system_prompt: "Sys".into(),
+            created_at: 0,
+            updated_at: 0,
+            narrator_timeout_ms: Some(30_000),
+            evaluator_timeout_ms: Some(25_000),
+            evaluator_timeout_mode: Some("finite".into()),
+            evaluator_mode: Some("evaluator_form_v1".into()),
+            wait_for_evaluator_before_next_turn: Some(true),
+            allow_send_with_stale_state: Some(false),
+            evaluator_background_enabled: Some(false),
+            anti_replay_forced_retry_enabled: Some(false),
+            archived_at: None,
+        };
+        upsert_provider_profile(&conn, &profile).expect("upsert");
+
+        let delete_res = delete_provider_profile(&conn, "openai");
+        assert!(delete_res.is_err());
+
+        let record = get_provider_profile(&conn, "openai").expect("still exists");
+        assert_eq!(record.id, "openai");
+        assert_eq!(record.archived_at, None);
+    }
+
+    #[test]
+    fn delete_provider_profile_cannot_archive_active_profile_or_returns_deprecated_error() {
+        let conn = init_memory_connection().expect("db");
+        let profile = ProviderProfile {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "gpt-4".into(),
+            system_prompt: "Sys".into(),
+            created_at: 0,
+            updated_at: 0,
+            narrator_timeout_ms: Some(30_000),
+            evaluator_timeout_ms: Some(25_000),
+            evaluator_timeout_mode: Some("finite".into()),
+            evaluator_mode: Some("evaluator_form_v1".into()),
+            wait_for_evaluator_before_next_turn: Some(true),
+            allow_send_with_stale_state: Some(false),
+            evaluator_background_enabled: Some(false),
+            anti_replay_forced_retry_enabled: Some(false),
+            archived_at: None,
+        };
+        upsert_provider_profile(&conn, &profile).expect("upsert");
+
+        let delete_res = delete_provider_profile(&conn, "openai");
+        assert!(delete_res.is_err());
+        let err_msg = format!("{:?}", delete_res.err().unwrap());
+        assert!(
+            err_msg.contains("deprecated")
+                || err_msg.contains("delete_provider_profile is deprecated")
+        );
+    }
+
+    #[test]
+    fn archive_provider_profile_still_blocks_active_profile() {
+        let conn = init_memory_connection().expect("db");
+        let profile = ProviderProfile {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "gpt-4".into(),
+            system_prompt: "Sys".into(),
+            created_at: 0,
+            updated_at: 0,
+            narrator_timeout_ms: Some(30_000),
+            evaluator_timeout_ms: Some(25_000),
+            evaluator_timeout_mode: Some("finite".into()),
+            evaluator_mode: Some("evaluator_form_v1".into()),
+            wait_for_evaluator_before_next_turn: Some(true),
+            allow_send_with_stale_state: Some(false),
+            evaluator_background_enabled: Some(false),
+            anti_replay_forced_retry_enabled: Some(false),
+            archived_at: None,
+        };
+        upsert_provider_profile(&conn, &profile).expect("upsert");
+
+        let active_ids = vec!["openai"];
+        let archive_res = archive_provider_profile(&conn, "openai", &active_ids);
+        assert!(archive_res.is_err());
+        assert_eq!(
+            archive_res.err().unwrap(),
+            "Cannot archive the active provider profile. Switch profiles first."
+        );
+    }
+
+    #[test]
+    fn archive_provider_profile_still_archives_inactive_profile() {
+        let conn = init_memory_connection().expect("db");
+        let profile = ProviderProfile {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "gpt-4".into(),
+            system_prompt: "Sys".into(),
+            created_at: 0,
+            updated_at: 0,
+            narrator_timeout_ms: Some(30_000),
+            evaluator_timeout_ms: Some(25_000),
+            evaluator_timeout_mode: Some("finite".into()),
+            evaluator_mode: Some("evaluator_form_v1".into()),
+            wait_for_evaluator_before_next_turn: Some(true),
+            allow_send_with_stale_state: Some(false),
+            evaluator_background_enabled: Some(false),
+            anti_replay_forced_retry_enabled: Some(false),
+            archived_at: None,
+        };
+        upsert_provider_profile(&conn, &profile).expect("upsert");
+
+        let active_ids = vec!["some_other_active_profile"];
+        let archive_res = archive_provider_profile(&conn, "openai", &active_ids).expect("archive");
+        assert!(archive_res);
+
+        let record = get_provider_profile(&conn, "openai").expect("exists");
+        assert!(record.archived_at.is_some());
     }
 
     #[test]
@@ -5420,5 +6441,455 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(latest.evaluator_job_id, "job1");
+    }
+
+    #[test]
+    fn test_backups() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("mnemosyne.sqlite3");
+        let conn = Connection::open(&db_path).expect("open");
+        run_migrations(&conn).expect("migrations");
+
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+
+        let backup_dir = temp_dir.path().join("backups");
+        let backup_path = create_backup_file(&db_path, &backup_dir).expect("backup");
+
+        assert!(backup_path.exists(), "Backup file should exist");
+        let metadata = std::fs::metadata(&backup_path).expect("metadata");
+        assert!(metadata.len() > 0, "Backup file should have nonzero size");
+    }
+
+    #[test]
+    fn test_session_archive_and_restore() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+
+        // Create sibling sessions
+        let sess_a = "session-a";
+        let sess_b = "session-b";
+        ensure_conversation(&conn, sess_a, &soul.character_id).expect("create session a");
+        ensure_conversation(&conn, sess_b, &soul.character_id).expect("create session b");
+
+        // Add a message and a payload log to session A
+        let msg_id =
+            insert_message_and_get_id(&conn, sess_a, "user", "Message in A").expect("insert msg");
+
+        // Add an LLM payload log to session A
+        conn.execute(
+            "INSERT INTO llm_payload_logs (conversation_id, message_id, provider, mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 10, 10, 20, 1000)",
+            params![sess_a, msg_id, "openai", "chat", "gpt-4", "http://api", "sys", "usr", "ctx"]
+        ).expect("insert log");
+
+        // Verify both sessions are active
+        let active = list_conversations(&conn).expect("list");
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|c| c.conversation_id == sess_a));
+        assert!(active.iter().any(|c| c.conversation_id == sess_b));
+
+        // Archive session A
+        let ok = archive_session(&conn, sess_a).expect("archive");
+        assert!(ok);
+
+        // Verify session A is hidden from active list but sibling B is unaffected
+        let active_after = list_conversations(&conn).expect("list");
+        assert_eq!(active_after.len(), 1);
+        assert!(!active_after.iter().any(|c| c.conversation_id == sess_a));
+        assert!(active_after.iter().any(|c| c.conversation_id == sess_b));
+
+        // Verify session A appears in archived list
+        let archived = list_archived_sessions(&conn).expect("archived");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].conversation_id, sess_a);
+        assert!(archived[0].title.starts_with("[Archived] "));
+
+        // Verify archive did not delete the message
+        let messages = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                [sess_a],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query count");
+        assert_eq!(messages, 1);
+
+        // Verify archive did not delete the payload logs
+        let logs = conn
+            .query_row(
+                "SELECT COUNT(*) FROM llm_payload_logs WHERE conversation_id = ?1",
+                [sess_a],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query count");
+        assert_eq!(logs, 1);
+
+        // Restore session A
+        let ok = restore_session(&conn, sess_a).expect("restore");
+        assert!(ok);
+
+        // Verify A is back in active sessions and its title is stripped of prefix
+        let active_restored = list_conversations(&conn).expect("list");
+        assert_eq!(active_restored.len(), 2);
+        let restored_a = active_restored
+            .iter()
+            .find(|c| c.conversation_id == sess_a)
+            .unwrap();
+        assert!(!restored_a.title.starts_with("[Archived] "));
+        assert_eq!(restored_a.archived_at, None);
+    }
+
+    #[test]
+    fn test_turn_hide_and_restore() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+
+        let conversation_id = "hide-restore-conv";
+        ensure_conversation(&conn, conversation_id, &soul.character_id).expect("create conv");
+
+        // Insert messages
+        let msg_u1 = insert_message_and_get_id(&conn, conversation_id, "user", "U1").unwrap();
+        let msg_a1 = insert_message_and_get_id(&conn, conversation_id, "assistant", "A1").unwrap();
+        let msg_u2 = insert_message_and_get_id(&conn, conversation_id, "user", "U2").unwrap();
+        let msg_a2 = insert_message_and_get_id(&conn, conversation_id, "assistant", "A2").unwrap();
+
+        // Setup session branch
+        let branch_id = "branch-1";
+        conn.execute(
+            "INSERT INTO session_branches (branch_id, conversation_id, base_soul_json, base_session_world_json, rebuild_generation, is_active, created_at, updated_at)
+             VALUES (?1, ?2, '{}', '{}', 1, 1, 1000, 1000)",
+            params![branch_id, conversation_id]
+        ).unwrap();
+
+        // Setup commits
+        conn.execute(
+            "INSERT INTO turn_commits (turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, created_at, active_variant, is_active, is_discarded)
+             VALUES ('turn-1', ?1, ?2, NULL, ?3, ?4, 1001, 1, 1, 0)",
+            params![conversation_id, branch_id, msg_u1, msg_a1]
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO turn_commits (turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, created_at, active_variant, is_active, is_discarded)
+             VALUES ('turn-2', ?1, ?2, 'turn-1', ?3, ?4, 1002, 1, 1, 0)",
+            params![conversation_id, branch_id, msg_u2, msg_a2]
+        ).unwrap();
+
+        // Setup state patch for turn-2
+        conn.execute(
+            "INSERT INTO state_patches (patch_id, turn_id, patch_json, applied_at, applies_to, is_active)
+             VALUES ('patch-2', 'turn-2', '{}', 1002, 'session', 1)",
+            []
+        ).unwrap();
+
+        // Set active turn on branch
+        conn.execute(
+            "UPDATE session_branches SET active_turn_id = 'turn-2' WHERE branch_id = ?1",
+            [branch_id],
+        )
+        .unwrap();
+
+        // Insert some extra messages with various statuses to test skipping
+        let msg_pending =
+            insert_message_and_get_id(&conn, conversation_id, "assistant", "Pending response")
+                .unwrap();
+        conn.execute(
+            "UPDATE messages SET message_status = 'pending', is_active = 0 WHERE id = ?1",
+            [msg_pending],
+        )
+        .unwrap();
+
+        let msg_failed =
+            insert_message_and_get_id(&conn, conversation_id, "assistant", "Failed response")
+                .unwrap();
+        conn.execute(
+            "UPDATE messages SET message_status = 'failed', is_active = 0 WHERE id = ?1",
+            [msg_failed],
+        )
+        .unwrap();
+
+        // Add an LLM payload log linked to turn 2
+        conn.execute(
+            "INSERT INTO llm_payload_logs (conversation_id, message_id, provider, mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, created_at)
+             VALUES (?1, ?2, 'openai', 'chat', 'gpt-4', 'http://api', 'sys', 'usr', 'ctx', 10, 10, 20, 1000)",
+            params![conversation_id, msg_a2]
+        ).unwrap();
+
+        // List messages, all 4 canonical messages are active/visible
+        let active_msgs = list_messages(&conn, conversation_id, 10).unwrap();
+        assert_eq!(active_msgs.len(), 4);
+
+        // Hide turn 2 range (msg_u2 to msg_a2)
+        let hidden_count = hide_turn_range(&conn, conversation_id, msg_u2, msg_a2).unwrap();
+        assert_eq!(hidden_count, 2);
+
+        // Verify only active turns (msg_u1 and msg_a1) remain in visible list
+        let active_msgs_after = list_messages(&conn, conversation_id, 10).unwrap();
+        assert_eq!(active_msgs_after.len(), 2);
+        assert!(!active_msgs_after
+            .iter()
+            .any(|m| m.id == msg_u2 || m.id == msg_a2));
+
+        // Verify payload logs remain unchanged
+        let log_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM llm_payload_logs WHERE conversation_id = ?1",
+                [conversation_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(log_count, 1);
+
+        // Verify commits and patches are deactivated
+        let commit_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM turn_commits WHERE turn_id = 'turn-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(commit_active, 0);
+
+        let patch_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM state_patches WHERE patch_id = 'patch-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(patch_active, 0);
+
+        // Verify they are listed in hidden turns (along with other hidden ones)
+        let hidden = list_hidden_turns(&conn, conversation_id).unwrap();
+        assert!(hidden
+            .iter()
+            .any(|m| m.id == msg_u2 && m.hidden_at.is_some()));
+        assert!(hidden
+            .iter()
+            .any(|m| m.id == msg_a2 && m.hidden_at.is_some()));
+
+        // Restore turn 2 range
+        let restored_count =
+            restore_turn_range(&conn, conversation_id, msg_u2, msg_failed).unwrap();
+        // Should restore exactly msg_u2 and msg_a2 (2 messages), skipping msg_pending and msg_failed!
+        assert_eq!(restored_count, 2);
+
+        // Verify restored turns are active and visible
+        let active_msgs_restored = list_messages(&conn, conversation_id, 10).unwrap();
+        assert_eq!(active_msgs_restored.len(), 4);
+        assert!(active_msgs_restored.iter().any(|m| m.id == msg_u2));
+        assert!(active_msgs_restored.iter().any(|m| m.id == msg_a2));
+
+        // Verify pending and failed messages remain inactive
+        let pending_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM messages WHERE id = ?1",
+                [msg_pending],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_active, 0);
+
+        // Verify turn commits and patches are reactivated
+        let restored_commit_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM turn_commits WHERE turn_id = 'turn-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_commit_active, 1);
+
+        let restored_patch_active: i64 = conn
+            .query_row(
+                "SELECT is_active FROM state_patches WHERE patch_id = 'patch-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_patch_active, 1);
+    }
+
+    #[test]
+    fn test_soul_archive_and_restore() {
+        let conn = init_memory_connection().expect("db");
+        let soul_a = new_default_soul("Aurora");
+        let soul_b = new_default_soul("Luna");
+        upsert_soul(&conn, &soul_a).expect("upsert a");
+        upsert_soul(&conn, &soul_b).expect("upsert b");
+
+        // Verify sibling savepoints/checkpoints exist
+        let mut savepoint_c = new_default_soul("Aurora Snapshot");
+        savepoint_c.soul_kind = "checkpoint".into();
+        savepoint_c.source_soul_id = Some(soul_a.character_id.clone());
+        upsert_soul(&conn, &savepoint_c).expect("upsert c");
+
+        // Create a conversation for Soul A
+        let conv_id = "soul-a-conv";
+        ensure_conversation(&conn, conv_id, &soul_a.character_id).expect("create conversation");
+
+        // Insert message for Soul A
+        let msg_id =
+            insert_message_and_get_id(&conn, conv_id, "user", "Hello").expect("insert message");
+
+        // Insert LLM payload log for Soul A
+        conn.execute(
+            "INSERT INTO llm_payload_logs (conversation_id, message_id, provider, mode, model, base_url, system_message, user_message, context_text, estimated_system_tokens, estimated_user_tokens, estimated_total_tokens, created_at)
+             VALUES (?1, ?2, 'openai', 'chat', 'gpt-4', 'http://api', 'sys', 'usr', 'ctx', 10, 10, 20, 1000)",
+            params![conv_id, msg_id]
+        ).expect("insert log");
+
+        // Verify active list
+        let active = list_souls(&conn).expect("list");
+        assert_eq!(active.len(), 3);
+        assert!(active.iter().any(|s| s.character_id == soul_a.character_id));
+        assert!(active.iter().any(|s| s.character_id == soul_b.character_id));
+        assert!(active
+            .iter()
+            .any(|s| s.character_id == savepoint_c.character_id));
+
+        // 1. Archive Soul A
+        let ok = archive_soul(&conn, &soul_a.character_id).expect("archive soul");
+        assert!(ok);
+
+        // 2. Verify archive_soul hides from active list
+        let active_after = list_souls(&conn).expect("list");
+        assert_eq!(active_after.len(), 2);
+        assert!(!active_after
+            .iter()
+            .any(|s| s.character_id == soul_a.character_id));
+        // Verify sibling Soul B and Savepoint C are unaffected
+        assert!(active_after
+            .iter()
+            .any(|s| s.character_id == soul_b.character_id));
+        assert!(active_after
+            .iter()
+            .any(|s| s.character_id == savepoint_c.character_id));
+
+        // 3. Verify archived Soul appears in archived list
+        let archived = list_archived_souls(&conn).expect("archived");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].character_id, soul_a.character_id);
+
+        // 4. Verify archive does NOT delete conversations
+        let conv_exists = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE id = ?1",
+                [conv_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query count")
+            > 0;
+        assert!(conv_exists);
+
+        // 5. Verify archive does NOT delete messages
+        let msg_exists = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE id = ?1",
+                [msg_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query count")
+            > 0;
+        assert!(msg_exists);
+
+        // 6. Verify archive does NOT delete savepoints
+        let savepoint_exists = conn
+            .query_row(
+                "SELECT COUNT(*) FROM souls WHERE character_id = ?1",
+                [&savepoint_c.character_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query count")
+            > 0;
+        assert!(savepoint_exists);
+
+        // 7. Verify archive does NOT delete payload logs
+        let logs_exist = conn
+            .query_row(
+                "SELECT COUNT(*) FROM llm_payload_logs WHERE conversation_id = ?1",
+                [conv_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query count")
+            > 0;
+        assert!(logs_exist);
+
+        // 8. Restore Soul A
+        let ok = restore_soul(&conn, &soul_a.character_id).expect("restore");
+        assert!(ok);
+
+        // 9. Verify reappeared in active list
+        let active_restored = list_souls(&conn).expect("list");
+        assert_eq!(active_restored.len(), 3);
+        assert!(active_restored
+            .iter()
+            .any(|s| s.character_id == soul_a.character_id));
+    }
+
+    #[test]
+    fn test_savepoint_archive_and_restore() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+
+        let mut savepoint_a = new_default_soul("Aurora Snapshot A");
+        savepoint_a.soul_kind = "checkpoint".into();
+        savepoint_a.source_soul_id = Some(soul.character_id.clone());
+        upsert_soul(&conn, &savepoint_a).expect("upsert savepoint a");
+
+        let mut savepoint_b = new_default_soul("Aurora Snapshot B");
+        savepoint_b.soul_kind = "checkpoint".into();
+        savepoint_b.source_soul_id = Some(soul.character_id.clone());
+        upsert_soul(&conn, &savepoint_b).expect("upsert savepoint b");
+
+        // Verify they are both active
+        let active = list_souls(&conn).expect("list");
+        assert_eq!(active.len(), 3);
+
+        // 1. Archive Savepoint A
+        let ok = archive_savepoint(&conn, &savepoint_a.character_id).expect("archive savepoint");
+        assert!(ok);
+
+        // 2. Verify archive hides from active list and does NOT affect sibling B
+        let active_after = list_souls(&conn).expect("list");
+        assert_eq!(active_after.len(), 2);
+        assert!(!active_after
+            .iter()
+            .any(|s| s.character_id == savepoint_a.character_id));
+        assert!(active_after
+            .iter()
+            .any(|s| s.character_id == savepoint_b.character_id));
+
+        // 3. Verify archived savepoint appears in list_archived_savepoints
+        let archived = list_archived_savepoints(&conn).expect("archived");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].character_id, savepoint_a.character_id);
+
+        // 4. Verify archive did NOT delete savepoint data (row still exists in souls table)
+        let row_exists = conn
+            .query_row(
+                "SELECT COUNT(*) FROM souls WHERE character_id = ?1",
+                [&savepoint_a.character_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query count")
+            > 0;
+        assert!(row_exists);
+
+        // 5. Restore Savepoint A
+        let ok = restore_savepoint(&conn, &savepoint_a.character_id).expect("restore savepoint");
+        assert!(ok);
+
+        // 6. Verify reappeared in active list and preserved linked soul info
+        let active_restored = list_souls(&conn).expect("list");
+        assert_eq!(active_restored.len(), 3);
+        let restored_a = active_restored
+            .iter()
+            .find(|s| s.character_id == savepoint_a.character_id)
+            .unwrap();
+        assert_eq!(restored_a.source_soul_id, Some(soul.character_id.clone()));
     }
 }
