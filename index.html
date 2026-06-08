@@ -1,107 +1,12 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RhyGPU</title>
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #0b0d12;
-      --text: #e8e8e8;
-      --muted: #9aa3b8;
-      --soft: #c7cad3;
-      --line: #252a36;
-      --accent: #8ab4ff;
-    }
-
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: radial-gradient(circle at top left, #151b2a 0, var(--bg) 34rem);
-      color: var(--text);
-      font-family: Arial, Helvetica, sans-serif;
-    }
-
-    main {
-      max-width: 760px;
-      padding: 48px 24px;
-      line-height: 1.65;
-    }
-
-    h1 {
-      font-size: clamp(3rem, 12vw, 6rem);
-      line-height: 0.95;
-      margin: 0 0 1rem;
-      letter-spacing: -0.07em;
-    }
-
-    .subtitle {
-      color: var(--soft);
-      font-size: clamp(1.1rem, 3vw, 1.35rem);
-      max-width: 660px;
-      margin-bottom: 2.5rem;
-    }
-
-    .links {
-      display: grid;
-      gap: 14px;
-      margin-top: 2rem;
-    }
-
-    a.card {
-      display: block;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 18px 20px;
-      color: var(--text);
-      text-decoration: none;
-      background: rgba(255, 255, 255, 0.025);
-    }
-
-    a.card:hover {
-      border-color: var(--accent);
-      background: rgba(138, 180, 255, 0.06);
-    }
-
-    .card strong {
-      display: block;
-      font-size: 1.05rem;
-      margin-bottom: 0.25rem;
-    }
-
-    .card span {
-      color: var(--muted);
-      font-size: 0.95rem;
-    }
-
-    .tag {
-      color: var(--muted);
-      font-size: 0.95rem;
-      margin-top: 2.5rem;
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>RhyGPU</h1>
-    <p class="subtitle">
-      Building Mnemosyne, a local-first AI roleplay memory engine, and documenting the dev adventure behind it.
-    </p>
-
-    <section class="links" aria-label="Site links">
-      <a class="card" href="/devlog-000.html">
-        <strong>Devlog 000, Before the Repository</strong>
-        <span>The origin of Mnemosyne: crude tracking blocks, memory frustration, and the first shape of the Soul idea.</span>
-      </a>
-    </section>
-
-    <p class="tag">
-      rhygpu.dev · project notes, devlogs, and AI memory systems
-    </p>
-  </main>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mnemosyne</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>

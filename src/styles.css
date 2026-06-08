@@ -292,10 +292,77 @@ button {
   box-shadow: 0 0 0 3px rgba(29, 94, 82, 0.16);
 }
 
+.composer-input-shell {
+  position: relative;
+  min-width: 0;
+}
+
+.slash-command-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 35;
+  display: grid;
+  max-height: min(340px, 52vh);
+  overflow: auto;
+  border: 1px solid #cfc6b6;
+  border-radius: 8px;
+  background: #fffdf8;
+  box-shadow: 0 18px 44px rgba(22, 32, 28, 0.18);
+}
+
+.slash-command-menu button {
+  display: grid;
+  width: 100%;
+  height: auto;
+  min-height: 68px;
+  justify-items: start;
+  gap: 2px;
+  border-radius: 0;
+  border-bottom: 1px solid #e5dfd1;
+  background: transparent;
+  color: #16201c;
+  padding: 10px 12px;
+  text-align: left;
+}
+
+.slash-command-menu button:last-child {
+  border-bottom: 0;
+}
+
+.slash-command-menu button.selected,
+.slash-command-menu button:hover {
+  background: #e8f0ed;
+}
+
+.slash-command-menu strong {
+  color: #1d5e52;
+  font-size: 0.9rem;
+}
+
+.slash-command-menu span {
+  color: #33413a;
+  font-size: 0.8rem;
+  font-weight: 800;
+}
+
+.slash-command-menu small {
+  color: #66746b;
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
 .chat-only-composer button {
   width: 46px;
   height: 46px;
   border-radius: 999px;
+}
+
+.chat-only-composer .slash-command-menu button {
+  width: 100%;
+  height: auto;
+  border-radius: 0;
 }
 
 .evaluator-job-banner {
@@ -505,6 +572,114 @@ h2 {
   gap: 8px;
   padding: 0 14px;
   font-weight: 800;
+}
+
+.chat-only-composer .slash-command-menu button {
+  display: grid;
+  justify-content: stretch;
+  justify-items: start;
+  background: transparent;
+  color: #16201c;
+}
+
+.chat-only-composer .slash-command-menu button.selected,
+.chat-only-composer .slash-command-menu button:hover {
+  background: #e8f0ed;
+}
+
+.persona-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  background: rgba(12, 18, 16, 0.42);
+  padding: 24px;
+}
+
+.persona-modal {
+  width: min(720px, 100%);
+  max-height: min(760px, 88vh);
+  overflow: auto;
+  border: 1px solid #cfc6b6;
+  border-radius: 8px;
+  background: #fffdf8;
+  box-shadow: 0 24px 80px rgba(22, 32, 28, 0.28);
+  color: #16201c;
+}
+
+.persona-modal header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px;
+  border-bottom: 1px solid #e5dfd1;
+}
+
+.persona-modal header h2 {
+  margin: 2px 0 0;
+  font-size: 1.1rem;
+}
+
+.persona-list,
+.persona-form {
+  display: grid;
+  gap: 12px;
+  padding: 18px 20px 20px;
+}
+
+.persona-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+  border: 1px solid #e5dfd1;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fffaf0;
+}
+
+.persona-row.selected {
+  border-color: #1d5e52;
+  background: #e8f0ed;
+}
+
+.persona-row strong,
+.persona-row span,
+.persona-row p {
+  display: block;
+}
+
+.persona-row span {
+  color: #66746b;
+  font-size: 0.78rem;
+}
+
+.persona-row p {
+  margin: 6px 0 0;
+  color: #33413a;
+}
+
+.persona-row-actions,
+.persona-form-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.persona-form label {
+  display: grid;
+  gap: 6px;
+}
+
+.persona-form input,
+.persona-form textarea {
+  width: 100%;
+}
+
+.persona-add-button {
+  justify-self: start;
 }
 
 button:disabled {

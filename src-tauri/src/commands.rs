@@ -18,8 +18,10 @@ use tauri::{AppHandle, Emitter, Manager, State, Window};
 use state_engine::{
     consolidation::consolidate_soul,
     context_compiler::{
-        compile_context_for_session, compile_context_for_session_separate_user_message,
-        estimate_tokens, ContextMessage, ContextPreview, MemorySlotTrace,
+        compile_context_for_session,
+        compile_context_for_session_separate_user_message_with_player_persona_pending,
+        compile_context_for_session_with_player_persona, estimate_tokens, ContextMessage,
+        ContextPreview, MemorySlotTrace, PlayerPersonaContext,
     },
     evaluator::{
         active_souls_for_v1, evaluator_output_to_engine_patch, EvaluatorConversionContext,
@@ -27,14 +29,15 @@ use state_engine::{
         WorldChangeEvaluation, EVALUATOR_SCHEMA_VERSION,
     },
     evaluator_form::{
-        build_eval_form_spec, compile_eval_form_response, parse_eval_form_response_with_trace,
-        EvalFormRowRejection, EvalFormSpec, EvalFormTrace,
+        build_eval_form_spec_with_player_persona, compile_eval_form_response,
+        parse_eval_form_response_with_trace, EvalFormRowRejection, EvalFormSpec, EvalFormTrace,
     },
     evaluator_ingest::{parse_evaluator_output_with_context, EvaluatorDraftContext},
     hidden_state::{parse_hidden_state, HiddenState},
     patch::{
         is_premature_user_turn_event, is_retcon_or_correction_text,
         purge_premature_recent_events_from_world, EnginePatch, MemoryApplyAction, SceneStatePatch,
+        WorldPatch,
     },
     setting::{new_default_setting, SessionWorld, SettingSoul},
     soul::{
@@ -44,20 +47,33 @@ use state_engine::{
 };
 
 use crate::{
+    chat_commands::{
+        parse_chat_command, AskMode, ChatCommandKind, ParsedChatCommand, PersonaSubcommandKind,
+        StateSubcommandKind,
+    },
     db::{
         self, AssistantMessageVariant, ChatMessage, ConversationSummary, EntityRecord, ImageAsset,
-        LlmPayloadLog, ProviderProfile, RestoreInactiveMessagesResult, SettingSummary, SoulSummary,
+        LlmPayloadLog, PlayerPersona, ProviderProfile, RestoreInactiveMessagesResult,
+        SettingSummary, SoulSummary,
     },
     pipeline_trace::{PipelineErrorCode, TurnPipelineTrace},
     providers::{
         api::{
-            build_evaluator_form_prompt, build_evaluator_prompt, build_narrator_system_prompt,
-            ApiMessage, ApiProvider, ApiProviderSettings, PreparedApiPayload,
+            build_command_help_prompt, build_command_ooc_prompt, build_command_setup_prompt,
+            build_command_soul_edit_agent_prompt, build_command_state_edit_prompt,
+            build_command_state_summary_prompt, build_evaluator_form_prompt_with_player_persona,
+            build_evaluator_prompt, build_narrator_system_prompt, ApiMessage, ApiProvider,
+            ApiProviderSettings, PreparedApiPayload,
         },
         mock::MockProvider,
     },
     AppState,
 };
+
+#[cfg(test)]
+use crate::providers::api::build_evaluator_form_prompt;
+#[cfg(test)]
+use state_engine::evaluator_form::build_eval_form_spec;
 
 const CONSOLIDATION_INTERVAL_TURNS: u64 = 10;
 const NO_LLM_PAYLOAD_LOGS_MESSAGE: &str = "No LLM payload logs found for this conversation.";
@@ -76,6 +92,8 @@ const OP_REGENERATE: &str = "regenerate";
 const OP_FIX_RESPONSE: &str = "fix_response";
 const OP_BASELINE_PATCH: &str = "baseline_patch";
 const OP_ENRICHMENT_PATCH: &str = "enrichment_patch";
+const MANUAL_USER_STATE_COMMAND_SOURCE: &str = "manual_user_state_command";
+const AI_AGENT_SOUL_EDIT_COMMAND_SOURCE: &str = "ai_agent_soul_edit_command";
 const NARRATOR_PROVIDER_ERROR_VISIBLE: &str =
     "[Provider error: narrator response could not be generated.]";
 const MOCK_OBSERVATION_READER_LINE: &str =
@@ -1609,6 +1627,148 @@ pub fn list_souls_debug(state: State<'_, AppState>) -> Result<Vec<SoulSummary>, 
 pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<ConversationSummary>, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::list_conversations(&conn).map_err(|err| err.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlayerPersonaInput {
+    pub persona_id: Option<String>,
+    pub display_name: String,
+    pub description: String,
+    pub gender_code: String,
+    pub pronouns: String,
+    pub appearance: Option<String>,
+    pub voice_style: Option<String>,
+    pub boundaries: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[tauri::command]
+pub fn list_player_personas(state: State<'_, AppState>) -> Result<Vec<PlayerPersona>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_player_personas(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn get_active_player_persona(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<PlayerPersona, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::get_active_player_persona(&conn, &conversation_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn set_active_player_persona(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    persona_id: String,
+) -> Result<PlayerPersona, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::set_active_player_persona(&conn, &conversation_id, &persona_id)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn upsert_player_persona(
+    state: State<'_, AppState>,
+    input: PlayerPersonaInput,
+) -> Result<PlayerPersona, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let display_name = required_persona_field("display_name", &input.display_name)?;
+    let description = required_persona_field("description", &input.description)?;
+    let gender_code = required_persona_field("gender_code", &input.gender_code)?;
+    let pronouns = required_persona_field("pronouns", &input.pronouns)?;
+    let persona_id = input
+        .persona_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("persona_{}", slugify_for_id(&display_name)));
+    if db::built_in_player_personas()
+        .iter()
+        .any(|persona| persona.persona_id == persona_id)
+    {
+        return Err("Built-in personas cannot be edited.".into());
+    }
+    let now = db::now_ts();
+    db::upsert_player_persona(
+        &conn,
+        &PlayerPersona {
+            persona_id,
+            display_name,
+            description,
+            gender_code,
+            pronouns,
+            is_builtin: false,
+            is_archived: false,
+            created_at: now,
+            updated_at: now,
+            appearance: clean_optional(input.appearance),
+            voice_style: clean_optional(input.voice_style),
+            boundaries: clean_optional(input.boundaries),
+            notes: clean_optional(input.notes),
+        },
+    )
+    .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn archive_player_persona(
+    state: State<'_, AppState>,
+    persona_id: String,
+) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::archive_player_persona(&conn, &persona_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn restore_player_persona(
+    state: State<'_, AppState>,
+    persona_id: String,
+) -> Result<bool, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::restore_player_persona(&conn, &persona_id).map_err(|err| err.to_string())
+}
+
+fn required_persona_field(name: &str, value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(format!("Persona {name} is required."))
+    } else {
+        Ok(trimmed.chars().take(500).collect())
+    }
+}
+
+fn clean_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().chars().take(1_000).collect::<String>())
+        .filter(|value| !value.is_empty())
+}
+
+fn slugify_for_id(value: &str) -> String {
+    let slug = value
+        .trim()
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if slug.is_empty() {
+        format!("custom_{}", uuid_like_id())
+    } else {
+        slug
+    }
+}
+
+fn player_persona_context(persona: &PlayerPersona) -> PlayerPersonaContext {
+    PlayerPersonaContext {
+        persona_id: persona.persona_id.clone(),
+        display_name: persona.display_name.clone(),
+        gender_code: persona.gender_code.clone(),
+        pronouns: persona.pronouns.clone(),
+        description: persona.description.clone(),
+    }
 }
 
 #[tauri::command]
@@ -3153,8 +3313,15 @@ pub fn compile_context(
     };
     emit_possible_world_character_mismatch(&window, &conversation_id, &soul, Some(&session_world));
     let messages = db::list_messages(&conn, &conversation_id, 5).map_err(|err| err.to_string())?;
-    let preview =
-        compile_context_for_session(&soul, Some(&session_world), &messages_to_context(messages));
+    let persona =
+        db::get_active_player_persona(&conn, &conversation_id).map_err(|err| err.to_string())?;
+    let persona_context = player_persona_context(&persona);
+    let preview = compile_context_for_session_with_player_persona(
+        &soul,
+        Some(&session_world),
+        &messages_to_context(messages),
+        &persona_context,
+    );
     emit_memory_slot_debug_logs(&window, &conversation_id, &soul.character_id, &preview);
     Ok(preview)
 }
@@ -3268,6 +3435,9 @@ pub fn preview_api_payload(
     let soul = db::get_soul(&conn, &soul_id).map_err(|err| err.to_string())?;
     let session_world = db::ensure_conversation_session_world(&conn, &conversation_id, &soul, None)
         .map_err(|err| err.to_string())?;
+    let persona =
+        db::get_active_player_persona(&conn, &conversation_id).map_err(|err| err.to_string())?;
+    let persona_context = player_persona_context(&persona);
     let messages = messages_to_context(
         db::list_messages(&conn, &conversation_id, 5).map_err(|err| err.to_string())?,
     );
@@ -3281,6 +3451,7 @@ pub fn preview_api_payload(
         &settings,
         &provider,
         ContextMode::from_label(context_mode.as_deref()),
+        Some(&persona_context),
     ))
 }
 
@@ -3324,7 +3495,21 @@ fn send_mock_turn_with_conn(
     replacement_assistant_id: Option<i64>,
     correction_instruction: Option<String>,
 ) -> Result<TurnResult, String> {
-    let canonical_turn_id = format!("turn_{}", uuid_like_id());
+    let request_id = uuid_like_id();
+    let canonical_turn_id = format!("turn_{request_id}");
+    if let Some(command_result) = maybe_handle_chat_command_with_conn(
+        None,
+        conn,
+        conversation_id.clone(),
+        soul_id.clone(),
+        user_text.clone(),
+        &request_id,
+        &canonical_turn_id,
+        ContextMode::Brief,
+        None,
+    )? {
+        return Ok(command_result);
+    }
     let (mut soul, snapshot_user_text, pre_turn_soul_json) =
         if let Some(message_id) = replacement_assistant_id {
             let snapshot = db::get_turn_snapshot(&conn, &conversation_id, message_id)
@@ -3388,15 +3573,35 @@ fn send_mock_turn_with_conn(
         None => db::list_messages(&conn, &conversation_id, 5),
     }
     .map_err(|err| err.to_string())?;
+    let pending_setup_text = take_pending_setup_for_normal_turn(
+        conn,
+        &conversation_id,
+        &snapshot_user_text,
+        replacement_assistant_id,
+    )?;
+    let active_persona =
+        db::get_active_player_persona(conn, &conversation_id).map_err(|err| err.to_string())?;
+    let active_persona_context = player_persona_context(&active_persona);
     let context_preview = compile_context_with_correction(
         &soul,
         Some(&session_world),
         &messages_to_context(before_messages),
         correction_instruction.as_deref(),
         Some(snapshot_user_text.as_str()),
+        Some(&active_persona_context),
+    );
+    let (context_preview, effective_mock_user_text) = apply_pending_setup_to_turn(
+        context_preview,
+        snapshot_user_text.clone(),
+        pending_setup_text.as_deref(),
     );
     let provider = MockProvider::default();
-    let raw_response = provider.complete(&soul, &context_preview.text, &snapshot_user_text, &mode);
+    let raw_response = provider.complete(
+        &soul,
+        &context_preview.text,
+        &effective_mock_user_text,
+        &mode,
+    );
     let parsed = parse_hidden_state(&raw_response).map_err(|err| err.to_string())?;
     let (visible_response, replay_guard, output_contract_warning, _) =
         guard_narrator_visible_response(
@@ -3484,10 +3689,11 @@ fn send_mock_turn_with_conn(
     db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
     let messages =
         db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?;
-    let context_preview = compile_context_for_session(
+    let context_preview = compile_context_for_session_with_player_persona(
         &soul,
         Some(&session_world),
         &messages_to_context(messages.clone()),
+        &active_persona_context,
     );
 
     Ok(TurnResult {
@@ -3499,6 +3705,1698 @@ fn send_mock_turn_with_conn(
         consolidation_ran,
         debug,
     })
+}
+
+#[derive(Debug, Clone)]
+struct CommandPatchOutcome {
+    patch_id: String,
+    turn_id: String,
+    branch_id: String,
+    applied_patch_count: usize,
+    before_summary: serde_json::Value,
+    after_summary: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct CommandTurnState {
+    soul: Soul,
+    session_world: SessionWorld,
+    branch: Option<db::SessionBranch>,
+    parent_turn_id: Option<String>,
+    pre_turn_soul_json: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CommandLlmResult {
+    called: bool,
+    mode: Option<&'static str>,
+    system_prompt: String,
+    user_message: String,
+    response: Option<String>,
+    raw_response: Option<String>,
+    provider_error: Option<String>,
+    model: String,
+    base_url: String,
+    elapsed_ms: u64,
+    simulated: bool,
+    output_guard_action: &'static str,
+}
+
+impl CommandLlmResult {
+    fn not_called() -> Self {
+        Self {
+            output_guard_action: "none",
+            ..Self::default()
+        }
+    }
+}
+
+fn command_message_channel(parsed: &ParsedChatCommand) -> &'static str {
+    match parsed.kind {
+        ChatCommandKind::Ooc => db::MESSAGE_CHANNEL_COMMAND_OOC,
+        ChatCommandKind::Setup => db::MESSAGE_CHANNEL_COMMAND_SETUP,
+        ChatCommandKind::State | ChatCommandKind::Status => db::MESSAGE_CHANNEL_COMMAND_STATE,
+        ChatCommandKind::Persona => db::MESSAGE_CHANNEL_COMMAND_PERSONA,
+        ChatCommandKind::Ask => db::MESSAGE_CHANNEL_COMMAND_ASK,
+        ChatCommandKind::Help | ChatCommandKind::Unknown(_) => db::MESSAGE_CHANNEL_COMMAND_HELP,
+        ChatCommandKind::None => db::MESSAGE_CHANNEL_RP_SCENE,
+    }
+}
+
+fn maybe_handle_chat_command_with_conn(
+    window: Option<&Window>,
+    conn: &Connection,
+    conversation_id: String,
+    soul_id: String,
+    user_text: String,
+    request_id: &str,
+    canonical_turn_id: &str,
+    context_mode: ContextMode,
+    command_llm_result: Option<CommandLlmResult>,
+) -> Result<Option<TurnResult>, String> {
+    let parsed = parse_chat_command(&user_text);
+    if !parsed.detected() {
+        return Ok(None);
+    }
+
+    let mut state = load_command_turn_state(conn, &conversation_id, &soul_id)?;
+    let mut command_llm_result =
+        command_llm_result.unwrap_or_else(|| mock_command_llm_result(&parsed, &state));
+    let command_channel = command_message_channel(&parsed);
+    let user_message_id = Some(
+        db::insert_message_with_channel_and_get_id(
+            conn,
+            &conversation_id,
+            "user",
+            &user_text,
+            command_channel,
+        )
+        .map_err(|err| err.to_string())?,
+    );
+    let started = Instant::now();
+    let mut pipeline_trace = TurnPipelineTrace::new(
+        request_id.to_string(),
+        Some(canonical_turn_id.to_string()),
+        conversation_id.clone(),
+        db::now_ts(),
+    );
+    pipeline_trace.record_stage(
+        "chat_command_routed",
+        "success",
+        0,
+        Some(parsed.kind_label()),
+        Some("Narrator generation blocked by command router".into()),
+    );
+
+    let (
+        mut response,
+        route,
+        evaluator_skip,
+        state_mutation_allowed,
+        pending_setup_updated,
+        mut mutation_applied,
+    ) = build_non_mutating_command_response(
+        conn,
+        &conversation_id,
+        &parsed,
+        &state,
+        &command_llm_result,
+    )?;
+    let mut patch_outcome = None;
+    let mut patch_source = None;
+    let mut proposed_patch = serde_json::Value::Null;
+
+    let (guarded_response, guard_action) = guard_command_output(&parsed, &response, &state);
+    response = guarded_response;
+    command_llm_result.output_guard_action = guard_action;
+
+    if let Some((patch, source, pending_response)) =
+        build_mutating_command_patch(conn, &parsed, &state, &command_llm_result)?
+    {
+        response = pending_response;
+        patch_source = Some(source);
+        proposed_patch = command_patch_summary_json(&patch);
+        if !patch.is_empty() {
+            let placeholder = "Applying state update...";
+            let assistant_message_id = db::insert_message_with_channel_and_get_id(
+                conn,
+                &conversation_id,
+                "assistant",
+                placeholder,
+                command_channel,
+            )
+            .map_err(|err| err.to_string())?;
+            patch_outcome = Some(apply_command_patch_to_ledger(
+                conn,
+                &conversation_id,
+                canonical_turn_id,
+                user_message_id,
+                assistant_message_id,
+                &mut state,
+                &patch,
+            )?);
+            mutation_applied = true;
+            response = render_mutating_command_response(
+                &parsed,
+                patch_source.unwrap_or(MANUAL_USER_STATE_COMMAND_SOURCE),
+                patch_outcome.as_ref(),
+                command_llm_result.response.as_deref(),
+            );
+            let (guarded_response, guard_action) = guard_command_output(&parsed, &response, &state);
+            response = guarded_response;
+            command_llm_result.output_guard_action = guard_action;
+            db::update_message_content(conn, &conversation_id, assistant_message_id, &response)
+                .map_err(|err| err.to_string())?;
+            db::upsert_turn_snapshot(
+                conn,
+                &db::TurnSnapshot {
+                    conversation_id: conversation_id.clone(),
+                    assistant_message_id,
+                    user_text: user_text.clone(),
+                    soul_json: state.pre_turn_soul_json.clone(),
+                },
+            )
+            .map_err(|err| err.to_string())?;
+            finalize_chat_command_turn(
+                window,
+                conn,
+                conversation_id,
+                user_text,
+                state,
+                response,
+                parsed,
+                route,
+                evaluator_skip,
+                state_mutation_allowed,
+                pending_setup_updated,
+                mutation_applied,
+                patch_source,
+                patch_outcome,
+                proposed_patch,
+                user_message_id,
+                Some(assistant_message_id),
+                request_id,
+                canonical_turn_id,
+                context_mode,
+                pipeline_trace,
+                started,
+                command_llm_result,
+            )
+            .map(Some)
+        } else {
+            finalize_non_mutating_chat_command(
+                window,
+                conn,
+                conversation_id,
+                user_text,
+                state,
+                response,
+                parsed,
+                route,
+                evaluator_skip,
+                state_mutation_allowed,
+                pending_setup_updated,
+                mutation_applied,
+                patch_source,
+                patch_outcome,
+                proposed_patch,
+                user_message_id,
+                request_id,
+                canonical_turn_id,
+                context_mode,
+                pipeline_trace,
+                started,
+                command_llm_result,
+            )
+            .map(Some)
+        }
+    } else {
+        finalize_non_mutating_chat_command(
+            window,
+            conn,
+            conversation_id,
+            user_text,
+            state,
+            response,
+            parsed,
+            route,
+            evaluator_skip,
+            state_mutation_allowed,
+            pending_setup_updated,
+            mutation_applied,
+            patch_source,
+            patch_outcome,
+            proposed_patch,
+            user_message_id,
+            request_id,
+            canonical_turn_id,
+            context_mode,
+            pipeline_trace,
+            started,
+            command_llm_result,
+        )
+        .map(Some)
+    }
+}
+
+fn load_command_turn_state(
+    conn: &Connection,
+    conversation_id: &str,
+    soul_id: &str,
+) -> Result<CommandTurnState, String> {
+    let fallback_soul = db::get_soul(conn, soul_id).map_err(|err| err.to_string())?;
+    db::ensure_conversation(conn, conversation_id, &fallback_soul.character_id)
+        .map_err(|err| err.to_string())?;
+    let fallback_world =
+        db::ensure_conversation_session_world(conn, conversation_id, &fallback_soul, None)
+            .map_err(|err| err.to_string())?;
+    let branch = db::get_active_session_branch(conn, conversation_id).ok();
+    let (soul, session_world, parent_turn_id) = if let Some(branch) = branch.as_ref() {
+        let parent_turn_id = branch.active_turn_id.clone();
+        let rebuilt = db::rebuild_session_state_until(
+            conn,
+            conversation_id,
+            &branch.branch_id,
+            parent_turn_id.as_deref(),
+        )
+        .map_err(|err| err.to_string())?;
+        (rebuilt.soul, rebuilt.session_world, parent_turn_id)
+    } else {
+        (fallback_soul, fallback_world, None)
+    };
+    let pre_turn_soul_json = serde_json::to_string(&soul).map_err(|err| err.to_string())?;
+    Ok(CommandTurnState {
+        soul,
+        session_world,
+        branch,
+        parent_turn_id,
+        pre_turn_soul_json,
+    })
+}
+
+fn command_llm_mode(parsed: &ParsedChatCommand) -> Option<&'static str> {
+    match parsed.kind {
+        ChatCommandKind::Ooc => Some("ooc"),
+        ChatCommandKind::Setup => Some("setup"),
+        ChatCommandKind::State => match parsed.state_subcommand {
+            Some(StateSubcommandKind::Show) => Some("state_summary"),
+            Some(StateSubcommandKind::Update) => Some("state_edit"),
+            _ => None,
+        },
+        ChatCommandKind::Status => Some("state_summary"),
+        ChatCommandKind::Persona => None,
+        ChatCommandKind::Ask => Some("soul_edit_agent"),
+        ChatCommandKind::Help => Some("help"),
+        _ => None,
+    }
+}
+
+fn command_system_prompt_for_mode(mode: &str) -> &'static str {
+    match mode {
+        "ooc" => build_command_ooc_prompt(),
+        "setup" => build_command_setup_prompt(),
+        "state_summary" => build_command_state_summary_prompt(),
+        "state_edit" => build_command_state_edit_prompt(),
+        "soul_edit_agent" => build_command_soul_edit_agent_prompt(),
+        "help" => build_command_help_prompt(),
+        _ => build_command_ooc_prompt(),
+    }
+}
+
+fn command_llm_response_or_fallback(
+    command_llm_result: &CommandLlmResult,
+    fallback: impl FnOnce() -> String,
+) -> String {
+    command_llm_result
+        .response
+        .as_deref()
+        .map(str::trim)
+        .filter(|response| !response.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(fallback)
+}
+
+fn mock_command_llm_result(
+    parsed: &ParsedChatCommand,
+    state: &CommandTurnState,
+) -> CommandLlmResult {
+    let Some(mode) = command_llm_mode(parsed) else {
+        return CommandLlmResult::not_called();
+    };
+    let user_message = build_command_llm_user_message(parsed, state, &[]);
+    let response = match mode {
+        "ooc" => {
+            if parsed.body.trim().is_empty() {
+                "Out-of-roleplay assistant ready. No RP narrator or scene evaluator was run.".into()
+            } else {
+                "Out-of-roleplay request noted. No RP narrator or scene evaluator was run.".into()
+            }
+        }
+        "setup" => {
+            "Setup staged.\nPending setup:\n- Setup saved for the next normal RP turn.\nNo scene narration or state update was run.".into()
+        }
+        "state_summary" => {
+            render_state_show_response(&parsed.body, state)
+        }
+        "state_edit" => {
+            "Risk level: low\nTarget: tracked session state\nReason: Direct operator state update command.\nValidated edit intent: queued\nApply behavior: applied".into()
+        }
+        "soul_edit_agent" => render_mock_soul_edit_agent_response(parsed, state),
+        "help" => {
+            render_help_response()
+        }
+        _ => String::new(),
+    };
+    CommandLlmResult {
+        called: true,
+        mode: Some(mode),
+        system_prompt: command_system_prompt_for_mode(mode).to_string(),
+        user_message,
+        response: Some(sanitize_command_llm_response(&response)),
+        raw_response: Some(response),
+        provider_error: None,
+        model: "local-command-sim".into(),
+        base_url: "local".into(),
+        elapsed_ms: 0,
+        simulated: true,
+        output_guard_action: "none",
+    }
+}
+
+fn render_mock_soul_edit_agent_response(
+    parsed: &ParsedChatCommand,
+    state: &CommandTurnState,
+) -> String {
+    let instruction = parsed.body.trim();
+    if instruction.is_empty() {
+        return "Risk level: low\nTarget: none\nReason: No edit instruction was provided.\nProposed edit: none\nApply behavior: plan only"
+            .into();
+    }
+    let risk = if is_high_risk_soul_edit(instruction) {
+        "high"
+    } else {
+        "low"
+    };
+    let mutation_note =
+        if parsed.ask_mode == AskMode::Plan || parsed.ask_mode == AskMode::Diff || risk == "high" {
+            " No state was changed."
+        } else {
+            ""
+        };
+    format!(
+        "Risk level: {risk}\nTarget: scene/session state\nReason: Current focus is '{}'.\nProposed edit: {}{mutation_note}\nApply behavior: {}",
+        state.session_world.scene_state.focus.trim(),
+        instruction,
+        if mutation_note.is_empty() { "applied" } else { "plan only" }
+    )
+}
+
+fn sanitize_command_llm_response(response: &str) -> String {
+    let without_hidden = strip_hidden_state_blocks(response);
+    let without_status = strip_status_blocks_for_export(&without_hidden);
+    let trimmed = without_status.trim();
+    if trimmed.is_empty() {
+        "Command completed without scene narration.".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn guard_command_output(
+    parsed: &ParsedChatCommand,
+    response: &str,
+    state: &CommandTurnState,
+) -> (String, &'static str) {
+    if !looks_like_live_scene_prose(response) {
+        return (response.to_string(), "none");
+    }
+    let fallback = match parsed.kind {
+        ChatCommandKind::Setup => render_setup_fallback(&parsed.body),
+        ChatCommandKind::State | ChatCommandKind::Status => {
+            render_state_show_response(&parsed.body, state)
+        }
+        ChatCommandKind::Ask => render_ask_guard_fallback(&parsed.body),
+        ChatCommandKind::Ooc => {
+            "OOC reply blocked because it looked like live scene continuation. No RP narrator or scene evaluator was run.".into()
+        }
+        ChatCommandKind::Persona => render_persona_help_response(),
+        ChatCommandKind::Help | ChatCommandKind::Unknown(_) | ChatCommandKind::None => {
+            render_help_response()
+        }
+    };
+    (fallback, "deterministic_fallback_used")
+}
+
+fn looks_like_live_scene_prose(response: &str) -> bool {
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("```status") || lower.contains("scene | focus:") {
+        return true;
+    }
+    let first_line = trimmed
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let lower_first = first_line.trim().to_ascii_lowercase();
+    let scene_opening = [
+        "aurora ",
+        "she ",
+        "he ",
+        "they ",
+        "the door ",
+        "the room ",
+        "the chain ",
+    ]
+    .iter()
+    .any(|prefix| lower_first.starts_with(prefix));
+    let actionish = [
+        " says",
+        " whispers",
+        " steps",
+        " looks",
+        " reaches",
+        " turns",
+        " breathes",
+        " holds",
+        " opens",
+        " closes",
+        "\"",
+    ]
+    .iter()
+    .any(|needle| lower_first.contains(needle) || lower.contains(needle));
+    scene_opening && actionish
+}
+
+fn render_setup_fallback(body: &str) -> String {
+    let summary = body
+        .trim()
+        .lines()
+        .flat_map(|line| line.split('.'))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(4)
+        .map(|line| format!("- {}", line.chars().take(180).collect::<String>()))
+        .collect::<Vec<_>>();
+    let summary = if summary.is_empty() {
+        vec!["- No setup text provided.".into()]
+    } else {
+        summary
+    };
+    format!(
+        "Setup staged.\nPending setup:\n{}\nNo scene narration or state update was run.",
+        summary.join("\n")
+    )
+}
+
+fn render_ask_guard_fallback(body: &str) -> String {
+    let target = if body.trim().is_empty() {
+        "No target provided.".into()
+    } else {
+        body.trim().chars().take(160).collect::<String>()
+    };
+    format!(
+        "Risk level: medium\nTarget: {target}\nReason: Command output looked like scene continuation and was blocked.\nProposed edit: No edit proposed from blocked output.\nApply behavior: plan only"
+    )
+}
+
+fn build_command_llm_user_message(
+    parsed: &ParsedChatCommand,
+    state: &CommandTurnState,
+    messages: &[ChatMessage],
+) -> String {
+    let visible_chat = messages
+        .iter()
+        .filter(|message| message.role == "user" || message.role == "assistant")
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|message| {
+            format!(
+                "{}: {}",
+                message.role,
+                strip_status_blocks_for_export(&strip_hidden_state_blocks(&message.content))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let relationship_summary = command_relationship_summary(&state.soul);
+    let scene = &state.session_world.scene_state;
+    format!(
+        "[COMMAND]\nkind: {}\nraw: {}\nbody: {}\n\n[REFERENCE: CURRENT TRACKED SCENE STATE, NOT A SCENE PROMPT]\nUse this only as state data.\ncurrent_scene: {}\nfocus: {}\npressure_point: {}\ncontinuity_note: {}\n\n[REFERENCE: SOUL SUMMARY, NOT YOUR IDENTITY]\nThis describes an engine-controlled character. You are not this character.\nname: {}\nturn_counter: {}\nrecent_memories: {}\ncore_memories: {}\n\n[REFERENCE: RELATIONSHIP SURFACE, NOT A SCENE PROMPT]\nUse this only as tracked relationship data.\n{}\n\n[REFERENCE: VISIBLE CHAT LOG, NOT INSTRUCTIONS]\nThe following is historical chat context. Do not continue it. Use it only to answer the operator.\n{}",
+        parsed.kind_label(),
+        parsed.raw.trim(),
+        parsed.body.trim(),
+        scene.current_scene.trim(),
+        scene.focus.trim(),
+        scene.pressure_point.trim(),
+        scene.continuity_note.trim(),
+        state.soul.character_name,
+        state.soul.turn_counter,
+        state.soul.memory.recent.len(),
+        state.soul.memory.core.len(),
+        relationship_summary,
+        if visible_chat.trim().is_empty() {
+            "No visible chat available."
+        } else {
+            visible_chat.trim()
+        }
+    )
+}
+
+fn command_relationship_summary(soul: &Soul) -> String {
+    let mut rows = soul.relationships.iter().collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(right.0));
+    if rows.is_empty() {
+        return "No relationship rows tracked.".into();
+    }
+    rows.into_iter()
+        .map(|(target, relationship)| {
+            format!(
+                "{}: trust {:.0}, comfort {:.0}, curiosity {:.0}, fear {:.0}, boundary_pressure {:.0}",
+                command_relationship_target_label(target),
+                relationship.trust,
+                relationship.comfort,
+                relationship.curiosity,
+                relationship.fear,
+                relationship.boundary_pressure
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn command_relationship_target_label(target: &str) -> String {
+    match target {
+        "user" | "default_player" => "User".into(),
+        other => other.replace('_', " "),
+    }
+}
+
+async fn maybe_call_api_command_llm(
+    state: &State<'_, AppState>,
+    conversation_id: &str,
+    soul_id: &str,
+    user_text: &str,
+    settings: &ApiProviderSettings,
+) -> Result<Option<CommandLlmResult>, String> {
+    let parsed = parse_chat_command(user_text);
+    let Some(mode) = command_llm_mode(&parsed) else {
+        return Ok(None);
+    };
+    let system_prompt = command_system_prompt_for_mode(mode).to_string();
+    let user_message = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let command_state = load_command_turn_state(&conn, conversation_id, soul_id)?;
+        let messages =
+            db::list_messages(&conn, conversation_id, 12).map_err(|err| err.to_string())?;
+        build_command_llm_user_message(&parsed, &command_state, &messages)
+    };
+    let started = Instant::now();
+    let provider = ApiProvider::default();
+    let raw_response = provider
+        .complete_prompt(settings, &system_prompt, &user_message, 0.35)
+        .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let (response, raw_response, provider_error) = match raw_response {
+        Ok(raw) => (Some(sanitize_command_llm_response(&raw)), Some(raw), None),
+        Err(err) => (
+            Some(format!(
+                "Command LLM unavailable: {err}\nNo RP narrator or scene evaluator was run."
+            )),
+            None,
+            Some(err),
+        ),
+    };
+    Ok(Some(CommandLlmResult {
+        called: true,
+        mode: Some(mode),
+        system_prompt,
+        user_message,
+        response,
+        raw_response,
+        provider_error,
+        model: settings.model.trim().to_string(),
+        base_url: settings.base_url.trim().to_string(),
+        elapsed_ms,
+        simulated: false,
+        output_guard_action: "none",
+    }))
+}
+
+fn build_non_mutating_command_response(
+    conn: &Connection,
+    conversation_id: &str,
+    parsed: &ParsedChatCommand,
+    state: &CommandTurnState,
+    command_llm_result: &CommandLlmResult,
+) -> Result<(String, &'static str, &'static str, bool, bool, bool), String> {
+    match &parsed.kind {
+        ChatCommandKind::Ooc => Ok((
+            command_llm_response_or_fallback(command_llm_result, || {
+                render_ooc_response(&parsed.body)
+            }),
+            "command_ooc_llm",
+            "command_ooc_llm",
+            false,
+            false,
+            false,
+        )),
+        ChatCommandKind::Setup => {
+            db::set_pending_setup(conn, conversation_id, &parsed.body)
+                .map_err(|err| err.to_string())?;
+            Ok((
+                command_llm_response_or_fallback(command_llm_result, || {
+                    render_setup_fallback(&parsed.body)
+                }),
+                "setup_staged",
+                "setup_only",
+                false,
+                true,
+                false,
+            ))
+        }
+        ChatCommandKind::State => match parsed
+            .state_subcommand
+            .clone()
+            .unwrap_or(StateSubcommandKind::Show)
+        {
+            StateSubcommandKind::Show => Ok((
+                command_llm_response_or_fallback(command_llm_result, || {
+                    render_state_show_response(&parsed.body, state)
+                }),
+                "command_state_summary",
+                "command_state_summary",
+                false,
+                false,
+                false,
+            )),
+            StateSubcommandKind::Review => Ok((
+                render_state_review_response(conn, conversation_id)?,
+                "state_review",
+                "slash_state_review",
+                false,
+                false,
+                false,
+            )),
+            StateSubcommandKind::Update => Ok((
+                "State update could not be applied.".into(),
+                "manual_state_patch",
+                "manual_state_patch",
+                true,
+                false,
+                false,
+            )),
+            StateSubcommandKind::Unknown(command) => Ok((
+                format!("Unknown /state command {command}. Use /help for commands."),
+                "state_unknown",
+                "unknown_state_subcommand",
+                false,
+                false,
+                false,
+            )),
+        },
+        ChatCommandKind::Status => Ok((
+            command_llm_response_or_fallback(command_llm_result, || {
+                render_state_show_response(&parsed.body, state)
+            }),
+            "command_state_summary",
+            "command_state_summary",
+            false,
+            false,
+            false,
+        )),
+        ChatCommandKind::Persona => {
+            let (response, route, mutation_allowed, mutation_applied) =
+                handle_persona_command(conn, conversation_id, parsed)?;
+            Ok((
+                response,
+                route,
+                "slash_persona_command",
+                mutation_allowed,
+                false,
+                mutation_applied,
+            ))
+        }
+        ChatCommandKind::Ask => Ok((
+            command_llm_response_or_fallback(command_llm_result, || {
+                "Ask command did not produce a safe edit.".into()
+            }),
+            "agent_soul_edit_llm",
+            "agent_soul_edit_llm",
+            matches!(parsed.ask_mode, AskMode::Auto | AskMode::Apply),
+            false,
+            false,
+        )),
+        ChatCommandKind::Help => Ok((
+            command_llm_response_or_fallback(command_llm_result, || render_help_response()),
+            "help",
+            "slash_help",
+            false,
+            false,
+            false,
+        )),
+        ChatCommandKind::Unknown(command) => Ok((
+            format!("Unknown command /{command}. Use /help for commands."),
+            "unknown",
+            "unknown_slash_command",
+            false,
+            false,
+            false,
+        )),
+        ChatCommandKind::None => Ok(("".into(), "none", "none", false, false, false)),
+    }
+}
+
+fn build_mutating_command_patch(
+    conn: &Connection,
+    parsed: &ParsedChatCommand,
+    state: &CommandTurnState,
+    command_llm_result: &CommandLlmResult,
+) -> Result<Option<(EnginePatch, &'static str, String)>, String> {
+    match &parsed.kind {
+        ChatCommandKind::State => {
+            if parsed.state_subcommand != Some(StateSubcommandKind::Update) {
+                return Ok(None);
+            }
+            let Some((target, instruction)) = parse_state_update_body(&parsed.body) else {
+                return Ok(Some((
+                    EnginePatch::default(),
+                    MANUAL_USER_STATE_COMMAND_SOURCE,
+                    "Please use `/state update <target> <instruction>`.".into(),
+                )));
+            };
+            if let Some(reason) = hard_delete_or_external_write_reason(&instruction) {
+                return Ok(Some((
+                    EnginePatch::default(),
+                    MANUAL_USER_STATE_COMMAND_SOURCE,
+                    format!("State update blocked: {reason}"),
+                )));
+            }
+            let patch = scene_state_command_patch(&target, &instruction, "user_state_command");
+            Ok(Some((
+                patch,
+                MANUAL_USER_STATE_COMMAND_SOURCE,
+                command_llm_response_or_fallback(command_llm_result, || {
+                    "State update queued.".into()
+                }),
+            )))
+        }
+        ChatCommandKind::Ask => {
+            let instruction = parsed.body.trim().to_string();
+            if instruction.is_empty() {
+                return Ok(Some((
+                    EnginePatch::default(),
+                    AI_AGENT_SOUL_EDIT_COMMAND_SOURCE,
+                    "Please include what you want the agent to inspect or edit.".into(),
+                )));
+            }
+            if let Some(reason) = hard_delete_or_external_write_reason(&instruction) {
+                return Ok(Some((
+                    EnginePatch::default(),
+                    AI_AGENT_SOUL_EDIT_COMMAND_SOURCE,
+                    format!("Ask edit blocked: {reason}"),
+                )));
+            }
+            let patch = scene_state_command_patch("state", &instruction, "ai_agent_soul_edit");
+            if parsed.ask_mode == AskMode::Plan
+                || parsed.ask_mode == AskMode::Diff
+                || is_high_risk_soul_edit(&instruction)
+            {
+                let response = command_llm_response_or_fallback(command_llm_result, || {
+                    render_ask_proposal_response(parsed.ask_mode, &instruction, &patch)
+                });
+                return Ok(Some((
+                    EnginePatch::default(),
+                    AI_AGENT_SOUL_EDIT_COMMAND_SOURCE,
+                    response,
+                )));
+            }
+            let _ = conn;
+            let _ = state;
+            Ok(Some((
+                patch,
+                AI_AGENT_SOUL_EDIT_COMMAND_SOURCE,
+                command_llm_response_or_fallback(command_llm_result, || "Ask edit queued.".into()),
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn apply_command_patch_to_ledger(
+    conn: &Connection,
+    conversation_id: &str,
+    canonical_turn_id: &str,
+    user_message_id: Option<i64>,
+    assistant_message_id: i64,
+    state: &mut CommandTurnState,
+    patch: &EnginePatch,
+) -> Result<CommandPatchOutcome, String> {
+    patch.validate().map_err(|err| format!("{err:?}"))?;
+    let branch = if let Some(branch) = state.branch.clone() {
+        branch
+    } else {
+        db::create_session_branch(conn, conversation_id, &state.soul, &state.session_world)
+            .map_err(|err| err.to_string())?
+    };
+    let before_summary = compact_state_summary_json(&state.soul, &state.session_world);
+    db::record_turn_commit_with_patch_for_turn_id(
+        conn,
+        canonical_turn_id,
+        conversation_id,
+        &branch.branch_id,
+        state.parent_turn_id.as_deref(),
+        user_message_id,
+        assistant_message_id,
+        None,
+        patch,
+        false,
+    )
+    .map_err(|err| err.to_string())?;
+    let rebuilt = db::rebuild_session_state(conn, conversation_id, &branch.branch_id)
+        .map_err(|err| err.to_string())?;
+    let patch_id = rebuilt
+        .debug
+        .applied_patches
+        .last()
+        .cloned()
+        .unwrap_or_default();
+    let applied_patch_count = rebuilt.debug.applied_patches.len();
+    state.soul = rebuilt.soul;
+    state.session_world = rebuilt.session_world;
+    state.branch = Some(branch.clone());
+    state.parent_turn_id = Some(canonical_turn_id.to_string());
+    let after_summary = compact_state_summary_json(&state.soul, &state.session_world);
+    Ok(CommandPatchOutcome {
+        patch_id,
+        turn_id: canonical_turn_id.to_string(),
+        branch_id: branch.branch_id,
+        applied_patch_count,
+        before_summary,
+        after_summary,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_non_mutating_chat_command(
+    window: Option<&Window>,
+    conn: &Connection,
+    conversation_id: String,
+    user_text: String,
+    state: CommandTurnState,
+    response: String,
+    parsed: ParsedChatCommand,
+    route: &'static str,
+    evaluator_skip: &'static str,
+    state_mutation_allowed: bool,
+    pending_setup_updated: bool,
+    mutation_applied: bool,
+    patch_source: Option<&'static str>,
+    patch_outcome: Option<CommandPatchOutcome>,
+    proposed_patch: serde_json::Value,
+    user_message_id: Option<i64>,
+    request_id: &str,
+    canonical_turn_id: &str,
+    context_mode: ContextMode,
+    pipeline_trace: TurnPipelineTrace,
+    started: Instant,
+    command_llm_result: CommandLlmResult,
+) -> Result<TurnResult, String> {
+    let assistant_message_id = db::insert_message_with_channel_and_get_id(
+        conn,
+        &conversation_id,
+        "assistant",
+        &response,
+        command_message_channel(&parsed),
+    )
+    .map_err(|err| err.to_string())?;
+    finalize_chat_command_turn(
+        window,
+        conn,
+        conversation_id,
+        user_text,
+        state,
+        response,
+        parsed,
+        route,
+        evaluator_skip,
+        state_mutation_allowed,
+        pending_setup_updated,
+        mutation_applied,
+        patch_source,
+        patch_outcome,
+        proposed_patch,
+        user_message_id,
+        Some(assistant_message_id),
+        request_id,
+        canonical_turn_id,
+        context_mode,
+        pipeline_trace,
+        started,
+        command_llm_result,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_chat_command_turn(
+    window: Option<&Window>,
+    conn: &Connection,
+    conversation_id: String,
+    user_text: String,
+    state: CommandTurnState,
+    response: String,
+    parsed: ParsedChatCommand,
+    route: &'static str,
+    evaluator_skip: &'static str,
+    state_mutation_allowed: bool,
+    pending_setup_updated: bool,
+    mutation_applied: bool,
+    patch_source: Option<&'static str>,
+    patch_outcome: Option<CommandPatchOutcome>,
+    proposed_patch: serde_json::Value,
+    user_message_id: Option<i64>,
+    assistant_message_id: Option<i64>,
+    request_id: &str,
+    canonical_turn_id: &str,
+    context_mode: ContextMode,
+    mut pipeline_trace: TurnPipelineTrace,
+    started: Instant,
+    command_llm_result: CommandLlmResult,
+) -> Result<TurnResult, String> {
+    if command_llm_result.called {
+        pipeline_trace.record_stage(
+            "command_llm_called",
+            if command_llm_result.provider_error.is_some() {
+                "warning"
+            } else {
+                "success"
+            },
+            command_llm_result.elapsed_ms,
+            command_llm_result.mode.map(str::to_string),
+            command_llm_result
+                .provider_error
+                .as_ref()
+                .map(|err| format!("provider_error={err}")),
+        );
+    }
+    pipeline_trace.record_stage(
+        "rp_narrator_called",
+        "skipped",
+        0,
+        None,
+        Some("rp_narrator_called=false".into()),
+    );
+    pipeline_trace.record_stage(
+        "narrator_called",
+        "skipped",
+        0,
+        None,
+        Some("legacy narrator stage skipped; rp_narrator_called=false".into()),
+    );
+    pipeline_trace.record_stage(
+        "evaluator_job_started",
+        "skipped",
+        0,
+        None,
+        Some(format!("evaluator_skipped_reason={evaluator_skip}")),
+    );
+    pipeline_trace.final_status = "success".into();
+    pipeline_trace.finalize_timing(started.elapsed().as_millis() as u64);
+
+    let chat_trace = chat_command_trace_json(
+        &parsed,
+        route,
+        evaluator_skip,
+        state_mutation_allowed,
+        pending_setup_updated,
+        mutation_applied,
+        patch_source,
+        patch_outcome.as_ref(),
+        proposed_patch,
+        user_message_id,
+        &pipeline_trace,
+        &command_llm_result,
+    );
+    insert_chat_command_payload_log(
+        conn,
+        &conversation_id,
+        assistant_message_id,
+        &user_text,
+        &response,
+        request_id,
+        canonical_turn_id,
+        context_mode,
+        &chat_trace,
+        state.branch.as_ref().map(|branch| branch.branch_id.clone()),
+        state.parent_turn_id.clone(),
+        patch_outcome
+            .as_ref()
+            .map(|outcome| vec![outcome.patch_id.clone()])
+            .unwrap_or_default(),
+        &command_llm_result,
+    )?;
+
+    if let (Some(window), Some(message_id)) = (window, assistant_message_id) {
+        if let Ok(message) = db::get_message(conn, &conversation_id, message_id) {
+            let _ = window.emit(
+                "chat-message-saved",
+                SavedChatMessageEvent {
+                    conversation_id: conversation_id.clone(),
+                    message,
+                },
+            );
+        }
+        let _ = window.emit("pipeline-trace-updated", &pipeline_trace);
+    }
+
+    let messages = db::list_messages(conn, &conversation_id, 100).map_err(|err| err.to_string())?;
+    let persona =
+        db::get_active_player_persona(conn, &conversation_id).map_err(|err| err.to_string())?;
+    let persona_context = player_persona_context(&persona);
+    let context_preview = compile_context_for_session_with_player_persona(
+        &state.soul,
+        Some(&state.session_world),
+        &messages_to_context(messages.clone()),
+        &persona_context,
+    );
+    let mut debug = TurnDebug {
+        provider: "CommandRouter".into(),
+        hidden_state_found: false,
+        fallback_hidden_state_generated: false,
+        narrator_response_saved: true,
+        assistant_message_id,
+        selected_variant_id: None,
+        state_updater_status: route.into(),
+        replay_detected: false,
+        replay_score: 0.0,
+        replay_reason: None,
+        replay_compared_against_message_id: None,
+        output_contract_warning: None,
+        tag: None,
+        trust_delta: None,
+        affection_delta: None,
+        new_location: None,
+        present_characters: Vec::new(),
+        request_id: Some(request_id.to_string()),
+        turn_id: Some(canonical_turn_id.to_string()),
+        state_patch_id: patch_outcome
+            .as_ref()
+            .map(|outcome| outcome.patch_id.clone()),
+        baseline_patch_id: None,
+        enrichment_patch_id: None,
+        simulated_response: false,
+        fallback_used: false,
+        fallback_reason: None,
+    };
+    if !mutation_applied && state_mutation_allowed {
+        debug.state_updater_status = format!("{route}_no_patch_applied");
+    }
+
+    Ok(TurnResult {
+        conversation_id,
+        soul: state.soul,
+        visible_response: response,
+        context_preview,
+        messages,
+        consolidation_ran: false,
+        debug,
+    })
+}
+
+fn insert_chat_command_payload_log(
+    conn: &Connection,
+    conversation_id: &str,
+    assistant_message_id: Option<i64>,
+    user_text: &str,
+    response: &str,
+    request_id: &str,
+    turn_id: &str,
+    context_mode: ContextMode,
+    trace: &serde_json::Value,
+    branch_id: Option<String>,
+    parent_turn_id: Option<String>,
+    applied_patch_ids: Vec<String>,
+    command_llm_result: &CommandLlmResult,
+) -> Result<(), String> {
+    let provider = if command_llm_result.called {
+        "chat_command_llm"
+    } else {
+        "chat_command_router"
+    };
+    let mode = command_llm_result
+        .mode
+        .map(|mode| format!("slash_command:{mode}"))
+        .unwrap_or_else(|| "slash_command".into());
+    let system_message = command_llm_result.system_prompt.clone();
+    let command_user_message = if command_llm_result.user_message.trim().is_empty() {
+        user_text.to_string()
+    } else {
+        command_llm_result.user_message.clone()
+    };
+    let context_text = if command_llm_result.called {
+        "Command LLM response; RP narrator/evaluator not invoked.".into()
+    } else {
+        "Command router response; RP narrator/evaluator not invoked.".into()
+    };
+    db::insert_llm_payload_log(
+        conn,
+        &LlmPayloadLog {
+            id: 0,
+            conversation_id: conversation_id.to_string(),
+            message_id: assistant_message_id,
+            provider: provider.into(),
+            mode,
+            context_mode: context_mode.label().into(),
+            model: command_llm_result.model.clone(),
+            base_url: command_llm_result.base_url.clone(),
+            system_message,
+            user_message: command_user_message.clone(),
+            context_text,
+            estimated_system_tokens: estimate_tokens(&command_llm_result.system_prompt),
+            estimated_user_tokens: estimate_tokens(&command_user_message),
+            estimated_total_tokens: estimate_tokens(&command_llm_result.system_prompt)
+                + estimate_tokens(&command_user_message)
+                + estimate_tokens(response),
+            truncated: false,
+            created_at: db::now_ts(),
+            branch_id,
+            active_turn_id: Some(turn_id.to_string()),
+            parent_turn_id,
+            state_patch_ids_applied: applied_patch_ids,
+            discarded_patch_ids_skipped: Vec::new(),
+            state_rebuild_generation: None,
+            latest_assistant_variant_id: None,
+            request_id: Some(request_id.to_string()),
+            turn_id: Some(turn_id.to_string()),
+            raw_provider_response: command_llm_result.raw_response.clone(),
+            normalized_response: Some(response.to_string()),
+            finish_reason: Some("command_router".into()),
+            provider_error: command_llm_result.provider_error.clone(),
+            fallback_used: false,
+            fallback_reason: None,
+            provider_request_id: None,
+            provider_response_id: None,
+            pipeline_trace_json: Some(
+                serde_json::to_string_pretty(trace).unwrap_or_else(|_| trace.to_string()),
+            ),
+        },
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chat_command_trace_json(
+    parsed: &ParsedChatCommand,
+    route: &str,
+    evaluator_skip: &str,
+    state_mutation_allowed: bool,
+    pending_setup_updated: bool,
+    mutation_applied: bool,
+    patch_source: Option<&str>,
+    patch_outcome: Option<&CommandPatchOutcome>,
+    proposed_patch: serde_json::Value,
+    user_message_id: Option<i64>,
+    pipeline_trace: &TurnPipelineTrace,
+    command_llm_result: &CommandLlmResult,
+) -> serde_json::Value {
+    let patch_id = patch_outcome.map(|outcome| outcome.patch_id.clone());
+    let trace = serde_json::json!({
+        "chat_command_detected": true,
+        "chat_command_kind": parsed.kind_label(),
+        "chat_command_route": route,
+        "rp_narrator_called": false,
+        "scene_narration_blocked": true,
+        "command_llm_called": command_llm_result.called,
+        "command_llm_mode": command_llm_result.mode,
+        "command_llm_simulated": command_llm_result.simulated,
+        "command_llm_provider_error": command_llm_result.provider_error.as_deref(),
+        "command_output_guard_action": command_llm_result.output_guard_action,
+        "scene_evaluator_skipped": true,
+        "scene_evaluator_skipped_reason": evaluator_skip,
+        "evaluator_skipped_reason": evaluator_skip,
+        "state_mutation_allowed": state_mutation_allowed,
+        "pending_setup_updated": pending_setup_updated,
+        "user_message_id": user_message_id,
+        "mutation_applied": mutation_applied,
+        "manual_patch_source": (patch_source == Some(MANUAL_USER_STATE_COMMAND_SOURCE)).then_some("user_state_command"),
+        "patch_source": patch_source,
+        "patch_id": patch_id,
+        "turn_id": patch_outcome.map(|outcome| outcome.turn_id.clone()),
+        "branch_id": patch_outcome.map(|outcome| outcome.branch_id.clone()),
+        "applied_patch_count": patch_outcome.map(|outcome| outcome.applied_patch_count).unwrap_or(0),
+        "before_after_state_summary": patch_outcome.map(|outcome| serde_json::json!({
+            "before": outcome.before_summary.clone(),
+            "after": outcome.after_summary.clone()
+        })),
+        "proposed_patch_summary": proposed_patch,
+        "pipeline_trace": pipeline_trace,
+    });
+    trace
+}
+
+fn render_ooc_response(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        "Out-of-roleplay assistant ready.".into()
+    } else {
+        "Noted. No scene narration or state update was run.".into()
+    }
+}
+
+fn render_help_response() -> String {
+    [
+        "Commands:",
+        "/ooc <message> - Out-of-roleplay assistant reply only.",
+        "/setup <text> - Stage setup for the next scene turn.",
+        "/state show [target] - Show compact state.",
+        "/state update <target> <instruction> - Apply a validated manual state patch.",
+        "/state review - Show pending setup and recent command state activity.",
+        "/persona list|lookup|change|add|edit - Manage the user-controlled RP persona.",
+        "/ask [plan|apply|diff] <request> - Ask the state agent for a safe Soul/state edit.",
+        "/help - Show this list.",
+        "/status [target] - Deprecated alias for /state show [target].",
+    ]
+    .join("\n")
+}
+
+fn render_persona_help_response() -> String {
+    [
+        "Persona commands:",
+        "/persona list - Show personas and allow selection.",
+        "/persona lookup [persona_id or name] - Show current or selected persona details.",
+        "/persona change <persona_id or name> - Change the active player persona.",
+        "/persona add - Open the Add Persona dialog.",
+        "/persona edit <persona_id or name> - Open the Edit Persona dialog.",
+    ]
+    .join("\n")
+}
+
+fn handle_persona_command(
+    conn: &Connection,
+    conversation_id: &str,
+    parsed: &ParsedChatCommand,
+) -> Result<(String, &'static str, bool, bool), String> {
+    match parsed
+        .persona_subcommand
+        .clone()
+        .unwrap_or(PersonaSubcommandKind::Help)
+    {
+        PersonaSubcommandKind::List => {
+            let personas = db::list_player_personas(conn).map_err(|err| err.to_string())?;
+            let active = db::get_active_player_persona_id(conn, conversation_id)
+                .map_err(|err| err.to_string())?;
+            Ok((
+                render_persona_list_response(&personas, &active),
+                "persona_list",
+                false,
+                false,
+            ))
+        }
+        PersonaSubcommandKind::Lookup => {
+            let lookup = persona_command_arg(&parsed.body);
+            let persona = if lookup.trim().is_empty() {
+                db::get_active_player_persona(conn, conversation_id)
+                    .map_err(|err| err.to_string())?
+            } else {
+                db::find_player_persona(conn, &lookup)
+                    .map_err(|err| err.to_string())?
+                    .ok_or_else(|| format!("Persona not found: {lookup}"))?
+            };
+            Ok((
+                render_persona_details(&persona),
+                "persona_lookup",
+                false,
+                false,
+            ))
+        }
+        PersonaSubcommandKind::Change => {
+            let lookup = persona_command_arg(&parsed.body);
+            if lookup.trim().is_empty() {
+                return Ok((
+                    "Persona change needs a persona_id or display name.".into(),
+                    "persona_change",
+                    true,
+                    false,
+                ));
+            }
+            let persona = db::find_player_persona(conn, &lookup)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| format!("Persona not found: {lookup}"))?;
+            let persona = db::set_active_player_persona(conn, conversation_id, &persona.persona_id)
+                .map_err(|err| err.to_string())?;
+            Ok((
+                format!(
+                    "Active player persona changed.\n{}",
+                    render_persona_details(&persona)
+                ),
+                "persona_change",
+                true,
+                true,
+            ))
+        }
+        PersonaSubcommandKind::Add => Ok((
+            "Open Add Persona UI. No LLM was called.".into(),
+            "persona_add",
+            true,
+            false,
+        )),
+        PersonaSubcommandKind::Edit => Ok((
+            "Open Edit Persona UI. No LLM was called.".into(),
+            "persona_edit",
+            true,
+            false,
+        )),
+        PersonaSubcommandKind::Help => {
+            Ok((render_persona_help_response(), "persona_help", false, false))
+        }
+        PersonaSubcommandKind::Unknown(command) => Ok((
+            format!("Unknown /persona command {command}. Use /persona for help."),
+            "persona_unknown",
+            false,
+            false,
+        )),
+    }
+}
+
+fn persona_command_arg(body: &str) -> String {
+    let mut parts = body.split_whitespace();
+    let _subcommand = parts.next();
+    parts.collect::<Vec<_>>().join(" ")
+}
+
+fn render_persona_list_response(personas: &[PlayerPersona], active_persona_id: &str) -> String {
+    let mut lines = vec!["Player personas:".to_string()];
+    for persona in personas {
+        let selected = if persona.persona_id == active_persona_id {
+            "selected"
+        } else {
+            "available"
+        };
+        lines.push(format!(
+            "- {} ({}) [{}] - {}",
+            persona.display_name, persona.persona_id, selected, persona.description
+        ));
+    }
+    lines.push("Use /persona change <persona_id or name> to switch.".into());
+    lines.join("\n")
+}
+
+fn render_persona_details(persona: &PlayerPersona) -> String {
+    let mut lines = vec![
+        format!("Persona: {}", persona.display_name),
+        format!("persona_id: {}", persona.persona_id),
+        format!("gender_code: {}", persona.gender_code),
+        format!("pronouns: {}", persona.pronouns),
+        format!("description: {}", persona.description),
+        format!("is_builtin: {}", persona.is_builtin),
+    ];
+    if let Some(appearance) = persona.appearance.as_deref().and_then(nonempty_str) {
+        lines.push(format!("appearance: {appearance}"));
+    }
+    if let Some(notes) = persona.notes.as_deref().and_then(nonempty_str) {
+        lines.push(format!("notes: {notes}"));
+    }
+    lines.join("\n")
+}
+
+fn nonempty_str(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+fn render_state_show_response(body: &str, state: &CommandTurnState) -> String {
+    let target = state_show_target(body);
+    let scene = &state.session_world.scene_state;
+    let mut lines = vec![format!("State show{}.", target)];
+    lines.push(format!("Turn: {}", state.soul.turn_counter));
+    if !scene.current_scene.trim().is_empty() {
+        lines.push(format!("Scene: {}", scene.current_scene.trim()));
+    }
+    if !scene.focus.trim().is_empty() {
+        lines.push(format!("Focus: {}", scene.focus.trim()));
+    }
+    if !scene.pressure_point.trim().is_empty() {
+        lines.push(format!("Pressure: {}", scene.pressure_point.trim()));
+    }
+    lines.push(format!(
+        "Recent events: {}. Memories: {}. Objects: {}.",
+        state.session_world.recent_events.len(),
+        state.soul.memory.recent.len(),
+        state.session_world.object_states.len()
+    ));
+    if let Some(relationship) = state
+        .soul
+        .relationships
+        .get("user")
+        .or_else(|| state.soul.relationships.get("default_player"))
+    {
+        lines.push(format!(
+            "User relationship: trust {:.0}, comfort {:.0}, curiosity {:.0}, fear {:.0}, boundary pressure {:.0}.",
+            relationship.trust,
+            relationship.comfort,
+            relationship.curiosity,
+            relationship.fear,
+            relationship.boundary_pressure
+        ));
+    }
+    lines.join("\n")
+}
+
+fn state_show_target(body: &str) -> String {
+    let mut parts = body.split_whitespace();
+    let first = parts.next();
+    let rest = if first.is_some_and(|part| part.eq_ignore_ascii_case("show")) {
+        parts.collect::<Vec<_>>().join(" ")
+    } else {
+        body.trim().to_string()
+    };
+    if rest.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" for {}", rest.trim())
+    }
+}
+
+fn render_state_review_response(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<String, String> {
+    let pending = db::get_pending_setup(conn, conversation_id).map_err(|err| err.to_string())?;
+    let pending_line = pending
+        .as_deref()
+        .map(|text| format!("Pending setup: {text}"))
+        .unwrap_or_else(|| "Pending setup: none".into());
+    Ok(format!(
+        "State review.\n{pending_line}\nRecent command changes are recorded in the payload trace ledger."
+    ))
+}
+
+fn render_mutating_command_response(
+    parsed: &ParsedChatCommand,
+    source: &str,
+    outcome: Option<&CommandPatchOutcome>,
+    llm_response: Option<&str>,
+) -> String {
+    let Some(outcome) = outcome else {
+        return "No state patch was applied.".into();
+    };
+    let base = match parsed.kind {
+        ChatCommandKind::Ask => format!(
+            "Ask edit applied. Source: {source}. Patch ID: {}. Ledger turn: {}.",
+            outcome.patch_id, outcome.turn_id
+        ),
+        _ => format!(
+            "State update applied. Source: user_state_command. Patch ID: {}. Ledger turn: {}.",
+            outcome.patch_id, outcome.turn_id
+        ),
+    };
+    if let Some(llm_res) = llm_response {
+        format!("{llm_res}\n\n{base}")
+    } else {
+        base
+    }
+}
+
+fn render_ask_proposal_response(mode: AskMode, instruction: &str, patch: &EnginePatch) -> String {
+    let mode_label = match mode {
+        AskMode::Plan => "plan",
+        AskMode::Diff => "diff",
+        AskMode::Apply | AskMode::Auto => "proposal",
+    };
+    format!(
+        "Ask {mode_label} only. No state was changed.\nRequest: {}\nProposed safe edit: {}",
+        instruction.trim(),
+        command_patch_summary_json(patch)
+    )
+}
+
+fn parse_state_update_body(body: &str) -> Option<(String, String)> {
+    let mut parts = body.split_whitespace();
+    let first = parts.next()?;
+    if !first.eq_ignore_ascii_case("update") {
+        return None;
+    }
+    let target = parts.next()?.trim().to_string();
+    let instruction = parts.collect::<Vec<_>>().join(" ");
+    (!target.is_empty() && !instruction.trim().is_empty())
+        .then_some((target, instruction.trim().to_string()))
+}
+
+fn scene_state_command_patch(target: &str, instruction: &str, source_label: &str) -> EnginePatch {
+    let focus = infer_command_focus(instruction);
+    let pressure_point = infer_command_pressure_point(instruction);
+    EnginePatch {
+        schema_version: Some(state_engine::patch::PATCH_PROTOCOL_VERSION),
+        world_patch: Some(WorldPatch {
+            scene_state: Some(SceneStatePatch {
+                scene_state_id: Some(format!("scene_cmd_{}", uuid_like_id())),
+                focus: Some(focus.unwrap_or_else(|| target.trim().to_string())),
+                pressure_point,
+                continuity_note: Some(format!("{source_label}: {}", instruction.trim())),
+                ..SceneStatePatch::default()
+            }),
+            ..WorldPatch::default()
+        }),
+        ..EnginePatch::default()
+    }
+}
+
+fn infer_command_focus(instruction: &str) -> Option<String> {
+    let lower = instruction.to_ascii_lowercase();
+    let mut parts = Vec::new();
+    if lower.contains("cautious") && lower.contains("curious") {
+        parts.push("Aurora is cautious but curious".to_string());
+    } else if lower.contains("cautious") {
+        parts.push("Aurora is cautious".to_string());
+    } else if lower.contains("curious") {
+        parts.push("Aurora is curious".to_string());
+    }
+    if lower.contains("not scared") || lower.contains("not afraid") {
+        parts.push("not scared".into());
+    }
+    if parts.is_empty() {
+        let compact = instruction.trim();
+        (!compact.is_empty()).then(|| compact.chars().take(160).collect())
+    } else {
+        Some(format!("{}.", parts.join(", ")))
+    }
+}
+
+fn infer_command_pressure_point(instruction: &str) -> Option<String> {
+    let lower = instruction.to_ascii_lowercase();
+    if lower.contains("door chain") && (lower.contains("engaged") || lower.contains("on")) {
+        Some("The door chain remains engaged.".into())
+    } else if lower.contains("deadbolt") || lower.contains("lock") || lower.contains("chain") {
+        Some(instruction.trim().chars().take(160).collect())
+    } else {
+        None
+    }
+}
+
+fn hard_delete_or_external_write_reason(instruction: &str) -> Option<&'static str> {
+    let lower = instruction.to_ascii_lowercase();
+    if [
+        "hard delete",
+        "delete all",
+        "wipe",
+        "erase all",
+        "drop table",
+        "remove all memories",
+        "forget everything",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return Some("hard deletes are not allowed from slash commands");
+    }
+    if [
+        "../",
+        "..\\",
+        "c:\\",
+        "/users/",
+        "filesystem",
+        "outside sandbox",
+        "write file",
+        "run code",
+        "shell command",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return Some("external writes or code execution are outside the Soul/state sandbox");
+    }
+    None
+}
+
+fn is_high_risk_soul_edit(instruction: &str) -> bool {
+    let lower = instruction.to_ascii_lowercase();
+    [
+        "core identity",
+        "identity",
+        "personality",
+        "backstory",
+        "permanent",
+        "always",
+        "never",
+        "replace aurora",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn command_patch_summary_json(patch: &EnginePatch) -> serde_json::Value {
+    serde_json::json!({
+        "patch_empty": patch.is_empty(),
+        "summary": engine_patch_summary(patch),
+        "scene_state": patch
+            .world_patch
+            .as_ref()
+            .and_then(|world| world.scene_state.as_ref())
+    })
+}
+
+fn apply_pending_setup_to_turn(
+    mut context_preview: ContextPreview,
+    user_text: String,
+    pending_setup: Option<&str>,
+) -> (ContextPreview, String) {
+    let Some(setup) = pending_setup
+        .map(str::trim)
+        .filter(|setup| !setup.is_empty())
+    else {
+        return (context_preview, user_text);
+    };
+    let setup_block = format!("[PENDING SETUP, HIGH PRIORITY]\n{setup}");
+    context_preview.text = format!("{setup_block}\n\n{}", context_preview.text);
+    context_preview.estimated_tokens = estimate_tokens(&context_preview.text);
+    context_preview.truncated = true;
+    let user_text = format!(
+        "{setup_block}\n\n[LATEST USER MESSAGE]\n{}",
+        user_text.trim()
+    );
+    (context_preview, user_text)
+}
+
+fn take_pending_setup_for_normal_turn(
+    conn: &Connection,
+    conversation_id: &str,
+    user_text: &str,
+    replacement_assistant_id: Option<i64>,
+) -> Result<Option<String>, String> {
+    if replacement_assistant_id.is_some() || is_ooc_or_gm_prefix(user_text) {
+        return Ok(None);
+    }
+    let pending = db::get_pending_setup(conn, conversation_id).map_err(|err| err.to_string())?;
+    if pending.is_some() {
+        db::clear_pending_setup(conn, conversation_id).map_err(|err| err.to_string())?;
+    }
+    Ok(pending)
 }
 
 fn reuse_or_insert_user_message(
@@ -3542,6 +5440,30 @@ pub async fn send_api_turn(
         conversation_id.clone(),
         db::now_ts(),
     );
+    let command_llm_result = maybe_call_api_command_llm(
+        &state,
+        &conversation_id,
+        &soul_id,
+        &user_text,
+        &narrator_settings,
+    )
+    .await?;
+    if let Some(command_result) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        maybe_handle_chat_command_with_conn(
+            Some(&window),
+            &conn,
+            conversation_id.clone(),
+            soul_id.clone(),
+            user_text.clone(),
+            &request_id,
+            &canonical_turn_id,
+            context_mode,
+            command_llm_result,
+        )?
+    } {
+        return Ok(command_result);
+    }
     let gate_outcome =
         gate_pending_evaluator_jobs(&window, &state, &conversation_id, &state_updater_settings)?;
     let mut turn_trace = NarratorTurnTrace {
@@ -3576,8 +5498,9 @@ pub async fn send_api_turn(
         mut soul,
         mut session_world,
         context_messages,
-        context_preview,
+        mut context_preview,
         snapshot_user_text,
+        pending_setup_text,
         pre_turn_soul_json,
         entity_context,
         replay_sources,
@@ -3721,7 +5644,7 @@ pub async fn send_api_turn(
         let mut replay_sources = recent_assistant_replay_sources(&before_messages, 3);
         if let Some(message_id) = replacement_assistant_id {
             if let Ok(message) = db::get_message(&conn, &conversation_id, message_id) {
-                if message.role == "assistant" {
+                if message.role == "assistant" && message.channel == db::MESSAGE_CHANNEL_RP_SCENE {
                     replay_sources.insert(
                         0,
                         ReplaySource {
@@ -3734,12 +5657,22 @@ pub async fn send_api_turn(
             }
         }
         let context_messages = messages_to_context(before_messages);
+        let pending_setup_text = take_pending_setup_for_normal_turn(
+            &conn,
+            &conversation_id,
+            &snapshot_user_text,
+            replacement_assistant_id,
+        )?;
+        let active_persona = db::get_active_player_persona(&conn, &conversation_id)
+            .map_err(|err| err.to_string())?;
+        let active_persona_context = player_persona_context(&active_persona);
         let context_preview = compile_context_with_correction(
             &soul,
             Some(&session_world),
             &context_messages,
             correction_instruction.as_deref(),
             Some(snapshot_user_text.as_str()),
+            Some(&active_persona_context),
         );
         turn_trace.user_message_id = ledger_user_message_id;
         turn_trace.branch_id = ledger_branch
@@ -3783,6 +5716,7 @@ pub async fn send_api_turn(
             context_messages,
             context_preview,
             snapshot_user_text,
+            pending_setup_text,
             pre_turn_soul_json,
             entity_context,
             replay_sources,
@@ -3793,6 +5727,15 @@ pub async fn send_api_turn(
     };
     emit_entity_resolution_log(&window, &conversation_id, &entity_context.speaker);
     emit_possible_world_character_mismatch(&window, &conversation_id, &soul, Some(&session_world));
+    let mut effective_user_text =
+        build_user_text_with_correction(&snapshot_user_text, correction_instruction.as_deref());
+    let (updated_context_preview, updated_effective_user_text) = apply_pending_setup_to_turn(
+        context_preview,
+        effective_user_text,
+        pending_setup_text.as_deref(),
+    );
+    context_preview = updated_context_preview;
+    effective_user_text = updated_effective_user_text;
     emit_dev_log(
         &window,
         "info",
@@ -3809,8 +5752,6 @@ pub async fn send_api_turn(
         })),
     );
 
-    let effective_user_text =
-        build_user_text_with_correction(&snapshot_user_text, correction_instruction.as_deref());
     let narrator_payload = prepare_narrator_payload(
         &narrator_settings,
         &soul,
@@ -5363,21 +7304,29 @@ pub async fn send_api_turn(
     let updater_payload_started = Instant::now();
     let evaluator_mode = evaluator_mode(&state_updater_settings);
     let selected_evaluator_source = selected_evaluator_source(&evaluator_mode);
+    let active_player_persona = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::get_active_player_persona(&conn, &conversation_id).map_err(|err| err.to_string())?
+    };
     let form_spec = (selected_evaluator_source == EVALUATOR_MODE_FORM_V1).then(|| {
-        build_eval_form_spec(
+        build_eval_form_spec_with_player_persona(
             &pre_baseline_soul,
             Some(&pre_baseline_session_world),
             &snapshot_user_text,
             &visible_response_for_updater,
             8,
+            &active_player_persona.persona_id,
+            &active_player_persona.display_name,
         )
     });
     let updater_system_prompt = if selected_evaluator_source == EVALUATOR_MODE_FORM_V1 {
-        build_evaluator_form_prompt(
+        build_evaluator_form_prompt_with_player_persona(
             &pre_baseline_soul,
             Some(&pre_baseline_session_world),
             &snapshot_user_text,
             &visible_response_for_updater,
+            &active_player_persona.persona_id,
+            &active_player_persona.display_name,
         )
     } else {
         build_evaluator_prompt(&pre_baseline_soul, Some(&pre_baseline_session_world))
@@ -6937,6 +8886,7 @@ fn redact_dev_log_details(value: serde_json::Value) -> serde_json::Value {
 fn messages_to_context(messages: Vec<ChatMessage>) -> Vec<ContextMessage> {
     messages
         .into_iter()
+        .filter(|message| message.channel == db::MESSAGE_CHANNEL_RP_SCENE)
         .map(|message| ContextMessage {
             role: message.role,
             content: message.content,
@@ -6948,7 +8898,9 @@ fn recent_assistant_replay_sources(messages: &[ChatMessage], limit: usize) -> Ve
     messages
         .iter()
         .rev()
-        .filter(|message| message.role == "assistant")
+        .filter(|message| {
+            message.role == "assistant" && message.channel == db::MESSAGE_CHANNEL_RP_SCENE
+        })
         .take(limit)
         .map(|message| ReplaySource {
             message_id: message.id,
@@ -8208,6 +10160,7 @@ fn ensure_default_entities(
     conversation_id: &str,
     soul: &Soul,
 ) -> rusqlite::Result<()> {
+    let active_persona = db::get_active_player_persona(conn, conversation_id)?;
     let default_player = EntityRecord {
         entity_id: "default_player".into(),
         conversation_id: conversation_id.into(),
@@ -8221,6 +10174,25 @@ fn ensure_default_entities(
         updated_at: 0,
     };
     db::upsert_entity(conn, &default_player)?;
+
+    let player_persona = EntityRecord {
+        entity_id: active_persona.persona_id.clone(),
+        conversation_id: conversation_id.into(),
+        display_name: active_persona.display_name,
+        aliases: vec![
+            active_persona.persona_id.clone(),
+            "user".into(),
+            "player".into(),
+            "active player persona".into(),
+        ],
+        kind: "player_persona".into(),
+        controlled_by: "user".into(),
+        linked_soul_id: None,
+        active_in_scene: true,
+        created_at: 0,
+        updated_at: 0,
+    };
+    db::upsert_entity(conn, &player_persona)?;
 
     let soul_entity = EntityRecord {
         entity_id: normalize_entity_id(&soul.character_name),
@@ -8582,10 +10554,11 @@ fn build_entity_updater_context(soul: &Soul, context: &EntityTurnContext) -> Str
         .iter()
         .filter(|entity| entity.kind != "soul")
         .filter_map(|entity| {
-            relationship_for_entity(soul, &entity.entity_id).map(|relationship| {
+            relationship_for_entity(soul, entity).map(|relationship| {
                 format!(
-                    "{} -> {}: trust {:.0}, affection {:.0}, fear {:.0}, desire {:.0}, conflict {:.0}, curiosity {:.0}, comfort {:.0}, dependency {:.0}",
+                    "{} -> {} ({}): trust {:.0}, affection {:.0}, fear {:.0}, desire {:.0}, conflict {:.0}, curiosity {:.0}, comfort {:.0}, dependency {:.0}",
                     soul.character_name,
+                    entity.display_name,
                     entity.entity_id,
                     relationship.trust,
                     relationship.affection,
@@ -8618,11 +10591,15 @@ fn build_entity_updater_context(soul: &Soul, context: &EntityTurnContext) -> Str
 
 fn relationship_for_entity<'a>(
     soul: &'a Soul,
-    entity_id: &str,
+    entity: &EntityRecord,
 ) -> Option<&'a state_engine::soul::Relationship> {
-    soul.relationships.get(entity_id).or_else(|| {
-        if entity_id.eq_ignore_ascii_case("default_player") {
-            soul.relationships.get("user")
+    soul.relationships.get(&entity.entity_id).or_else(|| {
+        if entity.entity_id.eq_ignore_ascii_case("default_player")
+            || entity.kind.eq_ignore_ascii_case("player_persona")
+        {
+            soul.relationships
+                .get("default_player")
+                .or_else(|| soul.relationships.get("user"))
         } else {
             None
         }
@@ -8673,12 +10650,14 @@ fn compile_context_with_correction(
     messages: &[ContextMessage],
     correction_instruction: Option<&str>,
     pending_user_text: Option<&str>,
+    player_persona: Option<&PlayerPersonaContext>,
 ) -> ContextPreview {
-    let mut preview = state_engine::context_compiler::compile_context_for_session_separate_user_message_with_pending(
+    let mut preview = compile_context_for_session_separate_user_message_with_player_persona_pending(
         soul,
         session_world,
         messages,
         pending_user_text,
+        player_persona,
     );
     let instruction = correction_instruction
         .map(str::trim)
@@ -9806,21 +11785,39 @@ async fn run_background_evaluator_job(
 
     let evaluator_mode = evaluator_mode(&state_updater_settings);
     let selected_evaluator_source = selected_evaluator_source(&evaluator_mode);
+    let active_player_persona = {
+        let state = app.state::<AppState>();
+        state
+            .conn
+            .lock()
+            .ok()
+            .and_then(|conn| db::get_active_player_persona(&conn, &job.conversation_id).ok())
+            .unwrap_or_else(|| {
+                db::built_in_player_personas()
+                    .into_iter()
+                    .next()
+                    .expect("built-in player persona exists")
+            })
+    };
     let form_spec = (selected_evaluator_source == EVALUATOR_MODE_FORM_V1).then(|| {
-        build_eval_form_spec(
+        build_eval_form_spec_with_player_persona(
             &soul,
             Some(&session_world),
             &snapshot_user_text,
             &visible_response_for_updater,
             8,
+            &active_player_persona.persona_id,
+            &active_player_persona.display_name,
         )
     });
     let updater_system_prompt = if selected_evaluator_source == EVALUATOR_MODE_FORM_V1 {
-        build_evaluator_form_prompt(
+        build_evaluator_form_prompt_with_player_persona(
             &soul,
             Some(&session_world),
             &snapshot_user_text,
             &visible_response_for_updater,
+            &active_player_persona.persona_id,
+            &active_player_persona.display_name,
         )
     } else {
         build_evaluator_prompt(&soul, Some(&session_world))
@@ -11816,11 +13813,27 @@ fn build_llm_payload_preview(
     settings: &ApiProviderSettings,
     provider: &str,
     context_mode: ContextMode,
+    player_persona: Option<&PlayerPersonaContext>,
 ) -> LlmPayloadPreview {
     let context_preview = if user_text.trim().is_empty() {
-        compile_context_for_session(soul, session_world, messages)
+        if let Some(player_persona) = player_persona {
+            compile_context_for_session_with_player_persona(
+                soul,
+                session_world,
+                messages,
+                player_persona,
+            )
+        } else {
+            compile_context_for_session(soul, session_world, messages)
+        }
     } else {
-        compile_context_for_session_separate_user_message(soul, session_world, messages)
+        compile_context_for_session_separate_user_message_with_player_persona_pending(
+            soul,
+            session_world,
+            messages,
+            None,
+            player_persona,
+        )
     };
     let prepared = prepare_narrator_payload(
         settings,
@@ -13007,6 +15020,723 @@ mod tests {
         (conn, soul, branch, assistant_id)
     }
 
+    fn command_test_setup(conversation_id: &str) -> (Connection, Soul) {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("soul");
+        db::ensure_conversation(&conn, conversation_id, &soul.character_id).expect("conversation");
+        let world = db::create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+        db::create_session_branch(&conn, conversation_id, &soul, &world).expect("branch");
+        (conn, soul)
+    }
+
+    fn run_command_turn(
+        conn: &Connection,
+        conversation_id: &str,
+        soul: &Soul,
+        text: &str,
+    ) -> TurnResult {
+        let request_id = uuid_like_id();
+        let turn_id = format!("turn_{request_id}");
+        maybe_handle_chat_command_with_conn(
+            None,
+            conn,
+            conversation_id.to_string(),
+            soul.character_id.clone(),
+            text.to_string(),
+            &request_id,
+            &turn_id,
+            ContextMode::Brief,
+            None,
+        )
+        .expect("command result")
+        .expect("recognized command")
+    }
+
+    fn run_command_turn_with_llm(
+        conn: &Connection,
+        conversation_id: &str,
+        soul: &Soul,
+        text: &str,
+        command_llm_result: CommandLlmResult,
+    ) -> TurnResult {
+        let request_id = uuid_like_id();
+        let turn_id = format!("turn_{request_id}");
+        maybe_handle_chat_command_with_conn(
+            None,
+            conn,
+            conversation_id.to_string(),
+            soul.character_id.clone(),
+            text.to_string(),
+            &request_id,
+            &turn_id,
+            ContextMode::Brief,
+            Some(command_llm_result),
+        )
+        .expect("command result")
+        .expect("recognized command")
+    }
+
+    fn simulated_command_llm(mode: &'static str, response: &str) -> CommandLlmResult {
+        CommandLlmResult {
+            called: true,
+            mode: Some(mode),
+            system_prompt: command_system_prompt_for_mode(mode).to_string(),
+            user_message: "[COMMAND TEST]".into(),
+            response: Some(sanitize_command_llm_response(response)),
+            raw_response: Some(response.into()),
+            provider_error: None,
+            model: "test-command-model".into(),
+            base_url: "test".into(),
+            elapsed_ms: 0,
+            simulated: true,
+            output_guard_action: "none",
+        }
+    }
+
+    fn latest_command_trace(conn: &Connection, conversation_id: &str) -> serde_json::Value {
+        let logs = db::list_llm_payload_logs(conn, conversation_id).expect("logs");
+        let log = logs.last().expect("latest log");
+        serde_json::from_str(log.pipeline_trace_json.as_deref().expect("trace")).expect("json")
+    }
+
+    fn assert_command_trace_skips_rp(trace: &serde_json::Value) {
+        assert_eq!(trace["rp_narrator_called"], false);
+        assert_eq!(trace["scene_narration_blocked"], true);
+        assert_eq!(trace["scene_evaluator_skipped"], true);
+    }
+
+    #[test]
+    fn ooc_diagnostic_setup_does_not_generate_scene() {
+        let (conn, soul) = command_test_setup("slash-ooc-scene");
+        let result = run_command_turn(
+            &conn,
+            "slash-ooc-scene",
+            &soul,
+            "/ooc Diagnostic test. Aurora is cautious at the door.",
+        );
+        assert!(result
+            .visible_response
+            .contains("Out-of-roleplay request noted"));
+        assert!(!result.visible_response.contains("```status"));
+        assert!(!result.visible_response.contains("Aurora is cautious"));
+        assert_eq!(result.debug.state_updater_status, "command_ooc_llm");
+
+        let logs = db::list_llm_payload_logs(&conn, "slash-ooc-scene").expect("logs");
+        let log = logs.last().expect("command router log");
+        assert_eq!(log.provider, "chat_command_llm");
+        assert!(log
+            .system_message
+            .contains("Mnemosyne Out-of-Roleplay Session Assistant"));
+        assert_eq!(
+            log.context_text,
+            "Command LLM response; RP narrator/evaluator not invoked."
+        );
+
+        let trace = latest_command_trace(&conn, "slash-ooc-scene");
+        assert_eq!(trace["chat_command_route"], "command_ooc_llm");
+        assert_eq!(trace["command_llm_called"], true);
+        assert_eq!(trace["command_llm_mode"], "ooc");
+        assert_eq!(trace["scene_evaluator_skipped_reason"], "command_ooc_llm");
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn ooc_skips_evaluator() {
+        let (conn, soul) = command_test_setup("slash-ooc-skip");
+        run_command_turn(&conn, "slash-ooc-skip", &soul, "/ooc pause");
+        let trace = latest_command_trace(&conn, "slash-ooc-skip");
+        assert_eq!(trace["scene_evaluator_skipped_reason"], "command_ooc_llm");
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn setup_stages_setup_and_does_not_narrate() {
+        let (conn, soul) = command_test_setup("slash-setup");
+        let result = run_command_turn(
+            &conn,
+            "slash-setup",
+            &soul,
+            "/setup Door chain stays engaged.",
+        );
+        assert!(result.visible_response.starts_with("Setup staged."));
+        assert!(!result.visible_response.contains("```status"));
+        assert_eq!(
+            db::get_pending_setup(&conn, "slash-setup")
+                .unwrap()
+                .as_deref(),
+            Some("Door chain stays engaged.")
+        );
+        let trace = latest_command_trace(&conn, "slash-setup");
+        assert_eq!(trace["pending_setup_updated"], true);
+    }
+
+    #[test]
+    fn state_show_does_not_mutate_state() {
+        let (conn, soul) = command_test_setup("slash-state-show");
+        let before = db::rebuild_session_state(
+            &conn,
+            "slash-state-show",
+            &db::get_active_session_branch(&conn, "slash-state-show")
+                .unwrap()
+                .branch_id,
+        )
+        .unwrap()
+        .soul
+        .turn_counter;
+        let result = run_command_turn(&conn, "slash-state-show", &soul, "/state show aurora");
+        assert!(result.visible_response.contains("State show for aurora"));
+        assert_eq!(result.soul.turn_counter, before);
+        let trace = latest_command_trace(&conn, "slash-state-show");
+        assert_eq!(trace["chat_command_route"], "command_state_summary");
+        assert_eq!(trace["state_mutation_allowed"], false);
+        assert_eq!(trace["command_llm_called"], true);
+        assert_eq!(trace["command_llm_mode"], "state_summary");
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn status_alias_routes_to_state_summary() {
+        let (conn, soul) = command_test_setup("slash-status");
+        let result = run_command_turn(&conn, "slash-status", &soul, "/status aurora");
+        assert!(result.visible_response.contains("State show for aurora"));
+        assert!(!result.visible_response.contains("```status"));
+        let trace = latest_command_trace(&conn, "slash-status");
+        assert_eq!(trace["chat_command_kind"], "status");
+        assert_eq!(trace["chat_command_route"], "command_state_summary");
+        assert_eq!(trace["command_llm_called"], true);
+        assert_eq!(trace["command_llm_mode"], "state_summary");
+        assert_eq!(trace["state_mutation_allowed"], false);
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn ooc_routes_to_command_llm_not_rp_narrator() {
+        let (conn, soul) = command_test_setup("slash-ooc-command-llm");
+        run_command_turn(&conn, "slash-ooc-command-llm", &soul, "/ooc explain state");
+        let trace = latest_command_trace(&conn, "slash-ooc-command-llm");
+        assert_eq!(trace["chat_command_route"], "command_ooc_llm");
+        assert_eq!(trace["command_llm_called"], true);
+        assert_eq!(trace["command_llm_mode"], "ooc");
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn ask_routes_to_soul_edit_agent_llm_not_rp_narrator() {
+        let (conn, soul) = command_test_setup("slash-ask-command-llm");
+        run_command_turn(
+            &conn,
+            "slash-ask-command-llm",
+            &soul,
+            "/ask plan make Aurora curious",
+        );
+        let trace = latest_command_trace(&conn, "slash-ask-command-llm");
+        assert_eq!(trace["chat_command_route"], "agent_soul_edit_llm");
+        assert_eq!(trace["command_llm_called"], true);
+        assert_eq!(trace["command_llm_mode"], "soul_edit_agent");
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn state_show_routes_to_state_summary_not_rp_narrator() {
+        let (conn, soul) = command_test_setup("slash-state-summary-route");
+        run_command_turn(
+            &conn,
+            "slash-state-summary-route",
+            &soul,
+            "/state show aurora",
+        );
+        let trace = latest_command_trace(&conn, "slash-state-summary-route");
+        assert_eq!(trace["chat_command_route"], "command_state_summary");
+        assert_eq!(trace["command_llm_called"], true);
+        assert_eq!(trace["command_llm_mode"], "state_summary");
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn state_update_creates_validated_manual_patch() {
+        let (conn, soul) = command_test_setup("slash-state-update");
+        let result = run_command_turn(
+            &conn,
+            "slash-state-update",
+            &soul,
+            "/state update status Aurora is cautious but curious, not scared, and the door chain remains engaged.",
+        );
+        let patch_id = result.debug.state_patch_id.as_deref().expect("patch id");
+        let patch_record = db::get_state_patch(&conn, patch_id).expect("patch");
+        let patch: EnginePatch =
+            serde_json::from_str(&patch_record.patch_json).expect("patch json");
+        patch.validate().expect("valid patch");
+        assert!(patch.world_patch.unwrap().scene_state.is_some());
+        let trace = latest_command_trace(&conn, "slash-state-update");
+        assert_eq!(trace["chat_command_route"], "manual_state_patch");
+        assert_eq!(trace["manual_patch_source"], "user_state_command");
+        assert_eq!(trace["mutation_applied"], true);
+        assert_eq!(
+            trace["scene_evaluator_skipped_reason"],
+            "manual_state_patch"
+        );
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn state_update_routes_to_manual_patch_not_scene_evaluator() {
+        let (conn, soul) = command_test_setup("slash-state-manual-route");
+        run_command_turn(
+            &conn,
+            "slash-state-manual-route",
+            &soul,
+            "/state update status Aurora is curious and the door chain remains engaged.",
+        );
+        let trace = latest_command_trace(&conn, "slash-state-manual-route");
+        assert_eq!(trace["chat_command_route"], "manual_state_patch");
+        assert_eq!(trace["patch_source"], MANUAL_USER_STATE_COMMAND_SOURCE);
+        assert_eq!(trace["scene_evaluator_skipped"], true);
+        assert_eq!(
+            trace["scene_evaluator_skipped_reason"],
+            "manual_state_patch"
+        );
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn ask_does_not_generate_scene() {
+        let (conn, soul) = command_test_setup("slash-ask-scene");
+        let result = run_command_turn(
+            &conn,
+            "slash-ask-scene",
+            &soul,
+            "/ask Update Aurora's current status so she is cautious but curious, not scared, and the door chain remains engaged.",
+        );
+        assert!(result.visible_response.starts_with("Risk level:"));
+        assert!(!result.visible_response.contains("```status"));
+        let trace = latest_command_trace(&conn, "slash-ask-scene");
+        assert_eq!(trace["chat_command_route"], "agent_soul_edit_llm");
+        assert_eq!(trace["command_llm_called"], true);
+        assert_eq!(trace["command_llm_mode"], "soul_edit_agent");
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn ask_skips_normal_scene_evaluator() {
+        let (conn, soul) = command_test_setup("slash-ask-skip");
+        run_command_turn(
+            &conn,
+            "slash-ask-skip",
+            &soul,
+            "/ask apply Make Aurora curious.",
+        );
+        let trace = latest_command_trace(&conn, "slash-ask-skip");
+        assert_eq!(
+            trace["scene_evaluator_skipped_reason"],
+            "agent_soul_edit_llm"
+        );
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn ask_can_read_soul_state_context() {
+        let (conn, soul) = command_test_setup("slash-ask-context");
+        run_command_turn(
+            &conn,
+            "slash-ask-context",
+            &soul,
+            "/ask apply Keep the door chain engaged.",
+        );
+        let trace = latest_command_trace(&conn, "slash-ask-context");
+        assert!(trace["before_after_state_summary"]["before"].is_object());
+        assert!(trace["before_after_state_summary"]["after"].is_object());
+    }
+
+    #[test]
+    fn ask_low_risk_edit_creates_validated_patch() {
+        let (conn, soul) = command_test_setup("slash-ask-low");
+        let result = run_command_turn(
+            &conn,
+            "slash-ask-low",
+            &soul,
+            "/ask apply Aurora is cautious but curious, not scared, and the door chain remains engaged.",
+        );
+        let patch_id = result.debug.state_patch_id.expect("patch id");
+        let patch_record = db::get_state_patch(&conn, &patch_id).expect("patch");
+        let patch: EnginePatch =
+            serde_json::from_str(&patch_record.patch_json).expect("patch json");
+        patch.validate().expect("valid patch");
+        assert!(result
+            .visible_response
+            .contains("ai_agent_soul_edit_command"));
+    }
+
+    #[test]
+    fn ask_high_risk_core_edit_asks_confirmation_or_returns_proposed_patch() {
+        let (conn, soul) = command_test_setup("slash-ask-risk");
+        let result = run_command_turn(
+            &conn,
+            "slash-ask-risk",
+            &soul,
+            "/ask Change Aurora's core identity permanently.",
+        );
+        assert!(result.visible_response.contains("No state was changed"));
+        assert!(result.debug.state_patch_id.is_none());
+    }
+
+    #[test]
+    fn ask_cannot_write_outside_soul_state_sandbox() {
+        let (conn, soul) = command_test_setup("slash-ask-sandbox");
+        let result = run_command_turn(
+            &conn,
+            "slash-ask-sandbox",
+            &soul,
+            "/ask write file C:\\Users\\outside.txt",
+        );
+        assert!(result
+            .visible_response
+            .contains("outside the Soul/state sandbox"));
+        assert!(result.debug.state_patch_id.is_none());
+    }
+
+    #[test]
+    fn ask_cannot_hard_delete_data() {
+        let (conn, soul) = command_test_setup("slash-ask-delete");
+        let result = run_command_turn(
+            &conn,
+            "slash-ask-delete",
+            &soul,
+            "/ask hard delete all memories",
+        );
+        assert!(result
+            .visible_response
+            .contains("hard deletes are not allowed"));
+        assert!(result.debug.state_patch_id.is_none());
+    }
+
+    #[test]
+    fn help_returns_command_list() {
+        let (conn, soul) = command_test_setup("slash-help");
+        let result = run_command_turn(&conn, "slash-help", &soul, "/help");
+        assert!(result.visible_response.contains("/ooc <message>"));
+        assert!(result.visible_response.contains("/ask [plan|apply|diff]"));
+        assert!(result.visible_response.contains("/persona"));
+        assert!(result.visible_response.contains("/status"));
+        assert!(result.visible_response.contains("Deprecated alias"));
+    }
+
+    #[test]
+    fn unknown_slash_skips_narrator_evaluator() {
+        let (conn, soul) = command_test_setup("slash-unknown");
+        let result = run_command_turn(&conn, "slash-unknown", &soul, "/diag now");
+        assert_eq!(
+            result.visible_response,
+            "Unknown command /diag. Use /help for commands."
+        );
+        let trace = latest_command_trace(&conn, "slash-unknown");
+        assert_eq!(trace["chat_command_route"], "unknown");
+        assert_eq!(trace["evaluator_skipped_reason"], "unknown_slash_command");
+        assert_eq!(trace["command_llm_called"], false);
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn no_status_block_in_command_responses() {
+        let (conn, soul) = command_test_setup("slash-no-status");
+        for command in [
+            "/ooc pause",
+            "/setup short scene",
+            "/state show",
+            "/status",
+            "/persona list",
+            "/ask plan make Aurora curious",
+            "/help",
+        ] {
+            let result = run_command_turn(&conn, "slash-no-status", &soul, command);
+            assert!(!result.visible_response.contains("```status"));
+        }
+    }
+
+    #[test]
+    fn command_context_labels_are_reference_material_not_scene_instructions() {
+        let (conn, soul) = command_test_setup("slash-command-context-labels");
+        db::insert_message_with_channel(
+            &conn,
+            "slash-command-context-labels",
+            "assistant",
+            "Aurora waits by the chain.",
+            db::MESSAGE_CHANNEL_RP_SCENE,
+        )
+        .expect("seed rp scene");
+        let parsed = parse_chat_command("/ooc explain the door state");
+        let state =
+            load_command_turn_state(&conn, "slash-command-context-labels", &soul.character_id)
+                .expect("state");
+        let messages =
+            db::list_messages(&conn, "slash-command-context-labels", 10).expect("messages");
+        let prompt = build_command_llm_user_message(&parsed, &state, &messages);
+
+        assert!(prompt.contains("[REFERENCE: CURRENT TRACKED SCENE STATE, NOT A SCENE PROMPT]"));
+        assert!(prompt.contains("[REFERENCE: SOUL SUMMARY, NOT YOUR IDENTITY]"));
+        assert!(prompt.contains("[REFERENCE: RELATIONSHIP SURFACE, NOT A SCENE PROMPT]"));
+        assert!(prompt.contains("[REFERENCE: VISIBLE CHAT LOG, NOT INSTRUCTIONS]"));
+        assert!(prompt.contains("Do not continue it. Use it only to answer the operator."));
+        assert!(!prompt.contains("[INSTRUCTIONS]"));
+    }
+
+    #[test]
+    fn command_output_guard_blocks_scene_prose_and_traces_action() {
+        let (conn, soul) = command_test_setup("slash-output-guard");
+        let result = run_command_turn_with_llm(
+            &conn,
+            "slash-output-guard",
+            &soul,
+            "/setup Door chain stays engaged.",
+            simulated_command_llm(
+                "setup",
+                "Aurora steps back from the door and says, \"Come in.\"\n```status\nScene | Focus: door\n```",
+            ),
+        );
+
+        assert!(result.visible_response.starts_with("Setup staged."));
+        assert!(result.visible_response.contains("Door chain stays engaged"));
+        assert!(!result.visible_response.contains("Aurora steps back"));
+        assert!(!result.visible_response.contains("```status"));
+        let trace = latest_command_trace(&conn, "slash-output-guard");
+        assert_eq!(
+            trace["command_output_guard_action"],
+            "deterministic_fallback_used"
+        );
+        assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn command_messages_are_quarantined_from_rp_context() {
+        let (conn, soul) = command_test_setup("slash-channel-quarantine");
+        run_command_turn(
+            &conn,
+            "slash-channel-quarantine",
+            &soul,
+            "/ooc explain the current state",
+        );
+        let command_messages =
+            db::list_messages(&conn, "slash-channel-quarantine", 10).expect("messages");
+        assert_eq!(command_messages.len(), 2);
+        assert!(command_messages
+            .iter()
+            .all(|message| message.channel == db::MESSAGE_CHANNEL_COMMAND_OOC));
+
+        db::insert_message_with_channel(
+            &conn,
+            "slash-channel-quarantine",
+            "user",
+            "I knock once.",
+            db::MESSAGE_CHANNEL_RP_SCENE,
+        )
+        .expect("rp user");
+        db::insert_message_with_channel(
+            &conn,
+            "slash-channel-quarantine",
+            "assistant",
+            "Aurora hears the knock.",
+            db::MESSAGE_CHANNEL_RP_SCENE,
+        )
+        .expect("rp assistant");
+        let context = messages_to_context(
+            db::list_messages(&conn, "slash-channel-quarantine", 10).expect("messages"),
+        );
+        let context_text = context
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(context_text.contains("I knock once."));
+        assert!(context_text.contains("Aurora hears the knock."));
+        assert!(!context_text.contains("Out-of-roleplay"));
+        assert!(!context_text.contains("/ooc"));
+    }
+
+    #[test]
+    fn persona_list_is_deterministic_and_skips_llm() {
+        let (conn, soul) = command_test_setup("slash-persona-list");
+        let result = run_command_turn(&conn, "slash-persona-list", &soul, "/persona list");
+
+        assert!(result.visible_response.contains("Player personas:"));
+        assert!(result
+            .visible_response
+            .contains("Male Persona (preset_male) [selected]"));
+        assert!(result
+            .visible_response
+            .contains("Female Persona (preset_female) [available]"));
+        let trace = latest_command_trace(&conn, "slash-persona-list");
+        assert_eq!(trace["chat_command_route"], "persona_list");
+        assert_eq!(trace["command_llm_called"], false);
+        assert_eq!(
+            trace["scene_evaluator_skipped_reason"],
+            "slash_persona_command"
+        );
+        assert_command_trace_skips_rp(&trace);
+
+        let messages = db::list_messages(&conn, "slash-persona-list", 10).expect("messages");
+        assert!(messages
+            .iter()
+            .all(|message| message.channel == db::MESSAGE_CHANNEL_COMMAND_PERSONA));
+    }
+
+    #[test]
+    fn persona_change_updates_active_session_without_llm() {
+        let (conn, soul) = command_test_setup("slash-persona-change");
+        let result = run_command_turn(
+            &conn,
+            "slash-persona-change",
+            &soul,
+            "/persona change preset_female",
+        );
+
+        assert!(result
+            .visible_response
+            .contains("Active player persona changed."));
+        assert_eq!(
+            db::get_active_player_persona_id(&conn, "slash-persona-change").unwrap(),
+            "preset_female"
+        );
+        let trace = latest_command_trace(&conn, "slash-persona-change");
+        assert_eq!(trace["chat_command_route"], "persona_change");
+        assert_eq!(trace["command_llm_called"], false);
+        assert_eq!(trace["state_mutation_allowed"], true);
+        assert_eq!(trace["mutation_applied"], true);
+        assert_eq!(
+            trace["scene_evaluator_skipped_reason"],
+            "slash_persona_command"
+        );
+    }
+
+    #[test]
+    fn slash_commands_set_command_llm_called_when_llm_route_used() {
+        for (conversation_id, command, mode) in [
+            ("slash-llm-ooc", "/ooc inspect current state", "ooc"),
+            (
+                "slash-llm-setup",
+                "/setup Door chain stays engaged.",
+                "setup",
+            ),
+            (
+                "slash-llm-state-show",
+                "/state show aurora",
+                "state_summary",
+            ),
+            (
+                "slash-llm-state-update",
+                "/state update status Aurora is cautious",
+                "state_edit",
+            ),
+            ("slash-llm-status", "/status aurora", "state_summary"),
+            (
+                "slash-llm-ask",
+                "/ask plan inspect current state",
+                "soul_edit_agent",
+            ),
+            ("slash-llm-help", "/help", "help"),
+        ] {
+            let (conn, soul) = command_test_setup(conversation_id);
+            run_command_turn(&conn, conversation_id, &soul, command);
+            let trace = latest_command_trace(&conn, conversation_id);
+            assert_eq!(trace["command_llm_called"], true);
+            assert_eq!(trace["command_llm_mode"], mode);
+            assert_command_trace_skips_rp(&trace);
+        }
+    }
+
+    #[test]
+    fn slash_commands_do_not_call_rp_narrator() {
+        for (conversation_id, command) in [
+            ("slash-no-rp-ooc", "/ooc pause"),
+            ("slash-no-rp-setup", "/setup short scene"),
+            ("slash-no-rp-state", "/state show"),
+            ("slash-no-rp-status", "/status"),
+            ("slash-no-rp-persona", "/persona list"),
+            ("slash-no-rp-ask-plan", "/ask plan make Aurora curious"),
+            ("slash-no-rp-ask-diff", "/ask diff make Aurora curious"),
+            ("slash-no-rp-help", "/help"),
+            ("slash-no-rp-unknown", "/diag now"),
+        ] {
+            let (conn, soul) = command_test_setup(conversation_id);
+            run_command_turn(&conn, conversation_id, &soul, command);
+            let trace = latest_command_trace(&conn, conversation_id);
+            assert_command_trace_skips_rp(&trace);
+        }
+    }
+
+    #[test]
+    fn normal_non_slash_calls_rp_narrator() {
+        let (conn, soul) = command_test_setup("normal-not-command");
+        let request_id = uuid_like_id();
+        let turn_id = format!("turn_{request_id}");
+        let routed = maybe_handle_chat_command_with_conn(
+            None,
+            &conn,
+            "normal-not-command".into(),
+            soul.character_id.clone(),
+            "I knock once.".into(),
+            &request_id,
+            &turn_id,
+            ContextMode::Brief,
+            None,
+        )
+        .expect("route");
+        assert!(routed.is_none());
+    }
+
+    #[test]
+    fn legacy_ooc_routes_same_or_remains_supported_no_mutation() {
+        assert_eq!(parse_chat_command("OOC: pause").kind, ChatCommandKind::None);
+        assert!(is_ooc_or_gm_prefix("OOC: pause"));
+    }
+
+    #[test]
+    fn slash_commands_do_not_consume_pending_setup() {
+        let (conn, soul) = command_test_setup("slash-pending");
+        run_command_turn(
+            &conn,
+            "slash-pending",
+            &soul,
+            "/setup Keep the apartment door chained.",
+        );
+        run_command_turn(&conn, "slash-pending", &soul, "/help");
+        assert_eq!(
+            db::get_pending_setup(&conn, "slash-pending")
+                .unwrap()
+                .as_deref(),
+            Some("Keep the apartment door chained.")
+        );
+    }
+
+    #[test]
+    fn next_normal_turn_consumes_pending_setup_with_high_priority_block() {
+        let (conn, _soul) = command_test_setup("slash-pending-consume");
+        db::set_pending_setup(
+            &conn,
+            "slash-pending-consume",
+            "Door chain remains engaged.",
+        )
+        .unwrap();
+        let pending =
+            take_pending_setup_for_normal_turn(&conn, "slash-pending-consume", "I wait.", None)
+                .expect("take");
+        assert_eq!(pending.as_deref(), Some("Door chain remains engaged."));
+        assert!(db::get_pending_setup(&conn, "slash-pending-consume")
+            .unwrap()
+            .is_none());
+
+        let preview = ContextPreview {
+            text: "Base context".into(),
+            estimated_tokens: 1,
+            truncated: false,
+            memory_slot_debug: Vec::new(),
+        };
+        let (preview, user_text) =
+            apply_pending_setup_to_turn(preview, "I wait.".into(), pending.as_deref());
+        assert!(preview.text.starts_with("[PENDING SETUP, HIGH PRIORITY]"));
+        assert!(user_text.contains("[PENDING SETUP, HIGH PRIORITY]"));
+    }
+
     #[test]
     fn normal_send_starts_with_one_visible_variant() {
         let (conn, _soul, _branch, assistant_id) = variant_test_setup("normal-one");
@@ -13703,7 +16433,7 @@ mod tests {
         assert!(message.contains("[ACTIVE ENTITIES]"));
         assert!(message.contains("[LATEST SPEAKER ENTITY]"));
         assert!(message.contains("junhwa"));
-        assert!(message.contains("Aurora -> junhwa"));
+        assert!(message.contains("Aurora -> Junhwa (junhwa)"));
         assert!(message.contains("[LATEST USER MESSAGE]"));
         assert!(message.contains("[NARRATOR RESPONSE]"));
     }
@@ -13814,6 +16544,7 @@ mod tests {
             &settings,
             "API",
             ContextMode::Brief,
+            None,
         );
         let serialized = serde_json::to_string(&preview).expect("serialize preview");
 
@@ -13849,6 +16580,7 @@ mod tests {
             &settings,
             "API",
             ContextMode::Brief,
+            None,
         );
 
         assert!(preview.estimated_tokens.system > 0);
@@ -13876,6 +16608,7 @@ mod tests {
             &settings,
             "API",
             ContextMode::Brief,
+            None,
         );
 
         assert_eq!(preview.context_mode, "brief");
@@ -13913,6 +16646,7 @@ mod tests {
             &settings,
             "API",
             ContextMode::FullChat,
+            None,
         );
 
         assert_eq!(preview.context_mode, "full_chat");
@@ -13957,6 +16691,7 @@ mod tests {
             &settings,
             "API",
             ContextMode::FullChat,
+            None,
         );
 
         assert!(preview.truncated);
@@ -14271,6 +17006,7 @@ mod tests {
             source_savepoint_id: soul.source_savepoint_id.clone(),
             world_id: Some(world_id.into()),
             source_setting_id: world.source_setting_id.clone(),
+            active_player_persona_id: "preset_male".into(),
             created_at: 1,
             updated_at: 1,
             last_message_preview: None,
@@ -14282,6 +17018,7 @@ mod tests {
             conversation_id: conversation_id.into(),
             role: "user".into(),
             content: "I knock on the door.".into(),
+            channel: db::MESSAGE_CHANNEL_RP_SCENE.into(),
             created_at: 1,
             status: "active".into(),
             origin: "active".into(),
@@ -14948,6 +17685,7 @@ mod tests {
             &messages_to_context(corrected.messages.clone()),
             Some("Continue from the kitchen. Do not replay the phone reveal."),
             None,
+            None,
         );
         assert!(context
             .text
@@ -15072,6 +17810,7 @@ mod tests {
                 conversation_id: "export".into(),
                 role: "user".into(),
                 content: "Hello.".into(),
+                channel: db::MESSAGE_CHANNEL_RP_SCENE.into(),
                 created_at: 10,
                 status: "active".into(),
                 origin: "active".into(),
@@ -15085,6 +17824,7 @@ mod tests {
                 content:
                     "Visible narrator text.\n[HIDDEN STATE]{\"tag\":\"observation\"}[/HIDDEN STATE]"
                         .into(),
+                channel: db::MESSAGE_CHANNEL_RP_SCENE.into(),
                 created_at: 11,
                 status: "active".into(),
                 origin: "active".into(),
@@ -17818,6 +20558,7 @@ mod tests {
             world_id: Some("world-1".into()),
             source_savepoint_id: None,
             source_setting_id: None,
+            active_player_persona_id: "preset_male".into(),
             title: "Original Title".into(),
             created_at: db::now_ts(),
             updated_at: db::now_ts(),
@@ -17831,6 +20572,7 @@ mod tests {
             conversation_id: "conv-1".into(),
             role: "user".into(),
             content: "Hello!".into(),
+            channel: db::MESSAGE_CHANNEL_RP_SCENE.into(),
             created_at: 100,
             status: "active".into(),
             origin: "active".into(),
@@ -17917,6 +20659,7 @@ mod tests {
             updated_at: db::now_ts(),
             last_message_preview: None,
             message_count: 0,
+            active_player_persona_id: "preset_male".into(),
             archived_at: None,
         };
 
@@ -17928,6 +20671,7 @@ mod tests {
             created_at: 100,
             status: "active".into(),
             origin: "active".into(),
+            channel: db::MESSAGE_CHANNEL_RP_SCENE.into(),
             attachments: Vec::new(),
             hidden_at: None,
         }];
@@ -18050,6 +20794,7 @@ mod tests {
             updated_at: db::now_ts(),
             last_message_preview: None,
             message_count: 0,
+            active_player_persona_id: "preset_male".into(),
             archived_at: None,
         };
 
@@ -18061,6 +20806,7 @@ mod tests {
             created_at: 100,
             status: "active".into(),
             origin: "active".into(),
+            channel: db::MESSAGE_CHANNEL_RP_SCENE.into(),
             attachments: Vec::new(),
             hidden_at: None,
         }];

@@ -70,10 +70,17 @@ pub(crate) fn resolve_active_entity_id(raw_id: &str, spec: &EvalFormSpec) -> Str
     }
     
     if normalized_raw == "user" || normalized_raw == "default_player" || normalized_raw == "player" {
-        return "default_player".to_string();
+        return active_player_entity_id(spec).unwrap_or_else(|| "default_player".to_string());
     }
     
     clean_raw.to_string()
+}
+
+pub(crate) fn active_player_entity_id(spec: &EvalFormSpec) -> Option<String> {
+    spec.active_entities
+        .iter()
+        .find(|entity| entity.entity_type == "player_persona" || entity.entity_type == "user")
+        .map(|entity| entity.entity_id.clone())
 }
 
 

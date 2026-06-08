@@ -33,6 +33,28 @@ pub fn build_eval_form_spec(
     latest_narrator_response: &str,
     top_k: usize,
 ) -> EvalFormSpec {
+    build_eval_form_spec_with_player_persona(
+        soul,
+        session_world,
+        latest_user_message,
+        latest_narrator_response,
+        top_k,
+        "default_player",
+        "User",
+    )
+}
+
+pub fn build_eval_form_spec_with_player_persona(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    latest_user_message: &str,
+    latest_narrator_response: &str,
+    top_k: usize,
+    player_persona_id: &str,
+    player_persona_display_name: &str,
+) -> EvalFormSpec {
+    let player_persona_id = clean(player_persona_id).unwrap_or("default_player");
+    let player_persona_display_name = clean(player_persona_display_name).unwrap_or("User");
     let world = session_world
         .map(SessionWorld::world_log)
         .unwrap_or_else(|| soul.world.clone());
@@ -54,13 +76,17 @@ pub fn build_eval_form_spec(
                 entity_type: "soul".into(),
             },
             FormEntityOption {
-                entity_id: "default_player".into(),
-                display_name: "User".into(),
-                entity_type: "user".into(),
+                entity_id: player_persona_id.into(),
+                display_name: player_persona_display_name.into(),
+                entity_type: if player_persona_id == "default_player" {
+                    "user".into()
+                } else {
+                    "player_persona".into()
+                },
             },
         ],
         active_soul_ids: vec![soul.character_id.clone()],
-        active_relationship_states: relationship_states_for_spec(soul),
+        active_relationship_states: relationship_states_for_spec(soul, player_persona_id),
         known_object_ids,
         allowed_memory_slots: vec![
             MemorySlot::RelationshipMemory,
@@ -117,12 +143,16 @@ pub fn build_eval_form_spec(
             .iter()
             .take(top_k)
             .map(|(target, relation)| ExistingStateRow {
-                existing_id: format!("rel:{}:{}", soul.character_id, normalize_player_id(target)),
+                existing_id: format!(
+                    "rel:{}:{}",
+                    soul.character_id,
+                    relationship_target_for_spec(target, player_persona_id)
+                ),
                 kind: ExistingStateKind::RelationshipFact,
                 summary: format!(
                     "{} -> {} trust {:.1}, affection {:.1}, comfort {:.1}, conflict {:.1}",
                     soul.character_name,
-                    normalize_player_id(target),
+                    relationship_target_for_spec(target, player_persona_id),
                     relation.trust,
                     relation.affection,
                     relation.comfort,
@@ -133,12 +163,12 @@ pub fn build_eval_form_spec(
     }
 }
 
-fn relationship_states_for_spec(soul: &Soul) -> Vec<FormRelationshipState> {
+fn relationship_states_for_spec(soul: &Soul, player_persona_id: &str) -> Vec<FormRelationshipState> {
     soul.relationships
         .iter()
         .map(|(target, relationship)| FormRelationshipState {
             source_soul_id: soul.character_id.clone(),
-            target_entity_id: normalize_player_id(target),
+            target_entity_id: relationship_target_for_spec(target, player_persona_id),
             trust: relationship.trust,
             affection: relationship.affection,
             intimacy: relationship.intimacy,
@@ -167,6 +197,15 @@ fn relationship_states_for_spec(soul: &Soul) -> Vec<FormRelationshipState> {
             reappraisal_state_code: relationship.reappraisal_state_code,
         })
         .collect()
+}
+
+fn relationship_target_for_spec(target: &str, player_persona_id: &str) -> String {
+    let normalized = normalize_player_id(target);
+    if normalized == "default_player" || normalized == "user" {
+        player_persona_id.to_string()
+    } else {
+        normalized
+    }
 }
 
 pub fn compile_eval_form_response(

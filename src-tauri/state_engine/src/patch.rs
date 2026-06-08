@@ -1265,6 +1265,16 @@ fn apply_relationship_delta(soul: &mut Soul, delta: &RelationshipDelta) -> bool 
     }
 
     let target = relationship_storage_target(soul, &delta.target_name());
+    if !soul.relationships.contains_key(&target) && is_player_persona_target(&target) {
+        if let Some(existing) = soul
+            .relationships
+            .get("default_player")
+            .or_else(|| soul.relationships.get("user"))
+            .cloned()
+        {
+            soul.relationships.insert(target.clone(), existing);
+        }
+    }
     let relationship = soul
         .relationships
         .entry(target)
@@ -1357,6 +1367,11 @@ fn relationship_storage_target(soul: &Soul, target: &str) -> String {
     } else {
         target.to_string()
     }
+}
+
+fn is_player_persona_target(target: &str) -> bool {
+    let normalized = target.trim().to_ascii_lowercase();
+    normalized.starts_with("preset_") || normalized.starts_with("persona_")
 }
 
 fn default_relationship() -> Relationship {
@@ -2142,6 +2157,35 @@ mod tests {
 
         assert_eq!(soul.relationships["user"].trust, 14.0);
         assert!(!soul.relationships.contains_key("default_player"));
+    }
+
+    #[test]
+    fn player_persona_delta_preserves_legacy_relationship_values() {
+        let mut soul = new_default_soul("Aurora");
+        soul.relationships.get_mut("user").unwrap().trust = 27.0;
+        soul.relationships.get_mut("user").unwrap().fear = 9.0;
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                relationship_deltas: vec![RelationshipDelta {
+                    target: Some("persona_jun".into()),
+                    trust: Some(3.0),
+                    ..RelationshipDelta::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        patch.apply_to_soul(&mut soul).expect("patch applies");
+
+        let persona_relationship = soul
+            .relationships
+            .get("persona_jun")
+            .expect("persona relationship");
+        assert_eq!(persona_relationship.trust, 30.0);
+        assert_eq!(persona_relationship.fear, 9.0);
+        assert_eq!(soul.relationships["user"].trust, 27.0);
     }
 
     #[test]

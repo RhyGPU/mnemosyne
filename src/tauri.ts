@@ -171,11 +171,40 @@ export type ConversationSummary = {
   source_savepoint_id: string | null;
   world_id?: string | null;
   source_setting_id?: string | null;
+  active_player_persona_id: string;
   created_at: number;
   updated_at: number;
   last_message_preview: string | null;
   message_count: number;
   archived_at?: number | null;
+};
+
+export type PlayerPersona = {
+  persona_id: string;
+  display_name: string;
+  description: string;
+  gender_code: string;
+  pronouns: string;
+  is_builtin: boolean;
+  is_archived: boolean;
+  created_at: number;
+  updated_at: number;
+  appearance?: string | null;
+  voice_style?: string | null;
+  boundaries?: string | null;
+  notes?: string | null;
+};
+
+export type PlayerPersonaInput = {
+  persona_id?: string | null;
+  display_name: string;
+  description: string;
+  gender_code: string;
+  pronouns: string;
+  appearance?: string | null;
+  voice_style?: string | null;
+  boundaries?: string | null;
+  notes?: string | null;
 };
 
 export type RestoreTurnsPreview = {
@@ -277,6 +306,7 @@ export type ChatMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   created_at: number;
+  channel?: string;
   status?: "active" | "hidden" | "pending" | "failed" | "retry_attempt" | "regenerated_discarded" | string;
   origin?: "active" | "restored" | string;
   attachments?: MessageAttachment[];
@@ -566,6 +596,10 @@ Engine-controlled characters: may speak, act, react, misunderstand, interrupt, r
 
 [USER ACTION BOUNDARY]
 User-controlled characters own their decisions, thoughts, dialogue, intentions, and major voluntary actions.
+If the user says "I", resolve "I" to the active player persona, not to Aurora Schwarz.
+Aurora Schwarz is narrator-controlled. The user is not Aurora Schwarz.
+Do not use second-person "you" to describe Aurora. Use third-person narration by default.
+If no persona exists, use the selected built-in preset. Do not fall back to default_player in visible text.
 The narrator may describe user-provided actions in concrete physical detail, including immediate follow-through, contact, momentum, posture, physical consequences, and observable effects.
 The narrator may describe unavoidable physical consequences caused by engine-controlled characters or the environment, such as being shoved off-balance, forced to brace, blocked, grabbed, pulled, interrupted, or pressured.
 Do not invent new user decisions, hidden motives, emotional reactions, dialogue, or major strategic choices.
@@ -579,8 +613,8 @@ When the user declares a combat, chase, argument, or struggle action, render the
 Engine-controlled characters may resist, counter, retreat, escalate, or exploit openings.
 Do not choose the user's next tactic or final decision.
 
-[GM CHANNEL]
-If the user directly addresses the Narrator, GM, or OOC layer, respond as the GM/narrator in plain text unless the user asks to resume the scene. Do not force an Aurora scene response for GM-facing instructions.
+[SCENE TURN ASSUMPTION]
+If this narrator prompt is called, the input is a scene/RP turn. Slash commands and meta/control messages have already been handled by the router.
 
 [CONTINUITY PRIORITY]
 Recent Chat is lower priority than Latest Exchange. Continue from Latest Exchange and current user input; do not replay completed beats.
@@ -600,13 +634,17 @@ Scene | Focus: [primary active character(s)] | Physical state: [brief] | Atmosph
 `;
 
 const NARRATOR_VISIBLE_ONLY_PROMPT = `[OUTPUT]
-Write visible scene narration or a brief GM/narrator reply. For scene narration, include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, or implementation notes.`;
+Write visible scene narration only. Include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, implementation notes, or command/help text.`;
 
 const VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT = `[VERIFIED DIAGNOSTICS BOUNDARY]
 When asked about backend tests, logs, imports, exports, memory hygiene, world routing, or engine internals, distinguish verified engine data from fictional/in-scene diagnostics. Do not claim a backend test passed unless the result is present in Dev Console logs, payload metadata, or a verified engine/debug section. If only roleplaying a test, say it is a simulated/in-scene diagnostic.`;
 
 const USER_ACTION_AND_CONFLICT_PROMPT = `[USER ACTION BOUNDARY]
 User-controlled characters own their decisions, thoughts, dialogue, intentions, and major voluntary actions.
+If the user says "I", resolve "I" to the active player persona, not to Aurora Schwarz.
+Aurora Schwarz is narrator-controlled. The user is not Aurora Schwarz.
+Do not use second-person "you" to describe Aurora. Use third-person narration by default.
+If no persona exists, use the selected built-in preset. Do not fall back to default_player in visible text.
 The narrator may describe user-provided actions in concrete physical detail, including immediate follow-through, contact, momentum, posture, physical consequences, and observable effects.
 The narrator may describe unavoidable physical consequences caused by engine-controlled characters or the environment, such as being shoved off-balance, forced to brace, blocked, grabbed, pulled, interrupted, or pressured.
 Do not invent new user decisions, hidden motives, emotional reactions, dialogue, or major strategic choices.
@@ -660,12 +698,38 @@ let browserPayloadLogs: LlmPayloadLog[] = [];
 let browserProviderProfiles: ProviderProfile[] = [];
 let browserImageAssets: ImageAsset[] = [];
 let browserMessageAttachments: MessageAttachment[] = [];
+const BUILT_IN_PLAYER_PERSONAS: PlayerPersona[] = [
+  {
+    persona_id: "preset_male",
+    display_name: "Male Persona",
+    description: "User-controlled male RP persona. No additional traits specified.",
+    gender_code: "male",
+    pronouns: "he/him",
+    is_builtin: true,
+    is_archived: false,
+    created_at: 0,
+    updated_at: 0,
+  },
+  {
+    persona_id: "preset_female",
+    display_name: "Female Persona",
+    description: "User-controlled female RP persona. No additional traits specified.",
+    gender_code: "female",
+    pronouns: "she/her",
+    is_builtin: true,
+    is_archived: false,
+    created_at: 0,
+    updated_at: 0,
+  },
+];
+let browserPlayerPersonas: PlayerPersona[] = [];
 let browserConversations: Array<{
   conversation_id: string;
   title: string;
   soul_id: string;
   world_id?: string | null;
   source_setting_id?: string | null;
+  active_player_persona_id?: string;
   created_at: number;
   updated_at: number;
 }> = [];
@@ -781,6 +845,95 @@ export function listConversations(): Promise<ConversationSummary[]> {
   return invokeOrPreview("list_conversations", {}, () =>
     browserConversations.map(summarizePreviewConversation),
   );
+}
+
+export function listPlayerPersonas(): Promise<PlayerPersona[]> {
+  return invokeOrPreview("list_player_personas", {}, () =>
+    [...BUILT_IN_PLAYER_PERSONAS, ...browserPlayerPersonas.filter((persona) => !persona.is_archived)],
+  );
+}
+
+export function getActivePlayerPersona(conversationId: string): Promise<PlayerPersona> {
+  return invokeOrPreview("get_active_player_persona", { conversationId }, () => {
+    const conversation = browserConversations.find((item) => item.conversation_id === conversationId);
+    const personaId = conversation?.active_player_persona_id ?? "preset_male";
+    return (
+      [...BUILT_IN_PLAYER_PERSONAS, ...browserPlayerPersonas].find(
+        (persona) => persona.persona_id === personaId,
+      ) ?? BUILT_IN_PLAYER_PERSONAS[0]
+    );
+  });
+}
+
+export function setActivePlayerPersona(
+  conversationId: string,
+  personaId: string,
+): Promise<PlayerPersona> {
+  return invokeOrPreview("set_active_player_persona", { conversationId, personaId }, () => {
+    const persona = [...BUILT_IN_PLAYER_PERSONAS, ...browserPlayerPersonas].find(
+      (item) => item.persona_id === personaId && !item.is_archived,
+    );
+    if (!persona) throw new Error(`Persona not found: ${personaId}`);
+    const conversation = ensurePreviewConversation(conversationId, "", undefined);
+    conversation.active_player_persona_id = persona.persona_id;
+    conversation.updated_at = Math.floor(Date.now() / 1000);
+    return persona;
+  });
+}
+
+export function upsertPlayerPersona(input: PlayerPersonaInput): Promise<PlayerPersona> {
+  return invokeOrPreview("upsert_player_persona", { input }, () => {
+    const now = Math.floor(Date.now() / 1000);
+    const personaId =
+      input.persona_id?.trim() ||
+      `persona_${input.display_name
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "") || now}`;
+    if (BUILT_IN_PLAYER_PERSONAS.some((persona) => persona.persona_id === personaId)) {
+      throw new Error("Built-in personas cannot be edited.");
+    }
+    const persona: PlayerPersona = {
+      persona_id: personaId,
+      display_name: input.display_name.trim(),
+      description: input.description.trim(),
+      gender_code: input.gender_code.trim(),
+      pronouns: input.pronouns.trim(),
+      appearance: input.appearance?.trim() || null,
+      voice_style: input.voice_style?.trim() || null,
+      boundaries: input.boundaries?.trim() || null,
+      notes: input.notes?.trim() || null,
+      is_builtin: false,
+      is_archived: false,
+      created_at: now,
+      updated_at: now,
+    };
+    const index = browserPlayerPersonas.findIndex((item) => item.persona_id === personaId);
+    if (index >= 0) browserPlayerPersonas[index] = persona;
+    else browserPlayerPersonas.push(persona);
+    return persona;
+  });
+}
+
+export function archivePlayerPersona(personaId: string): Promise<boolean> {
+  return invokeOrPreview("archive_player_persona", { personaId }, () => {
+    const persona = browserPlayerPersonas.find((item) => item.persona_id === personaId);
+    if (!persona) return false;
+    persona.is_archived = true;
+    persona.updated_at = Math.floor(Date.now() / 1000);
+    return true;
+  });
+}
+
+export function restorePlayerPersona(personaId: string): Promise<boolean> {
+  return invokeOrPreview("restore_player_persona", { personaId }, () => {
+    const persona = browserPlayerPersonas.find((item) => item.persona_id === personaId);
+    if (!persona) return false;
+    persona.is_archived = false;
+    persona.updated_at = Math.floor(Date.now() / 1000);
+    return true;
+  });
 }
 
 export function listArchivedSessions(): Promise<ConversationSummary[]> {
@@ -1848,6 +2001,7 @@ function ensurePreviewConversation(conversationId: string, soulId: string, title
       soul_id: soulId,
       world_id: null,
       source_setting_id: null,
+      active_player_persona_id: "preset_male",
       created_at: now,
       updated_at: now,
     };
@@ -1865,6 +2019,7 @@ function summarizePreviewConversation(conversation: {
   soul_id: string;
   world_id?: string | null;
   source_setting_id?: string | null;
+  active_player_persona_id?: string;
   created_at: number;
   updated_at: number;
 }): ConversationSummary {
@@ -1880,6 +2035,7 @@ function summarizePreviewConversation(conversation: {
     source_savepoint_id: soul?.source_savepoint_id ?? null,
     world_id: conversation.world_id ?? null,
     source_setting_id: conversation.source_setting_id ?? null,
+    active_player_persona_id: conversation.active_player_persona_id ?? "preset_male",
     created_at: conversation.created_at,
     updated_at: conversation.updated_at,
     last_message_preview: lastMessage?.content.split(/\s+/).join(" ").slice(0, 140) ?? null,
@@ -2413,6 +2569,7 @@ function makePreviewMessage(
     role,
     content,
     created_at: now,
+    channel: "rp_scene",
     attachments: [],
   };
 }

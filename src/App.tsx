@@ -22,6 +22,13 @@ import {
 } from "lucide-react";
 import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
+  completeSlashCommandInput,
+  canEnterSelectSlashSuggestion,
+  filteredSlashCommands,
+  nextSlashCommandIndex,
+  shouldOpenSlashMenu,
+} from "./slashCommands";
+import {
   ApiProviderSettings,
   AssistantMessageVariant,
   ChatMessage,
@@ -35,6 +42,8 @@ import {
   TurnPipelineTrace,
   PipelineStageTrace,
   ImageAsset,
+  PlayerPersona,
+  PlayerPersonaInput,
   ProviderProfile,
   SettingSoul,
   SettingSummary,
@@ -75,6 +84,7 @@ import {
   getSetting,
   getImageAsset,
   getImageAssetDataUrl,
+  getActivePlayerPersona,
   getSoul,
   inspectTurnBranchIntegrity,
   importImageAssetFromFile,
@@ -86,6 +96,7 @@ import {
   listArchivedSessions,
   openSessionDataLocation,
   listProviderProfiles,
+  listPlayerPersonas,
   listAssistantMessageVariants,
   listConversationMessages,
   listSettings,
@@ -108,7 +119,9 @@ import {
   selectAssistantMessageVariant,
   sendApiTurn,
   sendMockTurn,
+  setActivePlayerPersona,
   updateUserMessage,
+  upsertPlayerPersona,
   upsertProviderProfile,
   upsertSetting,
   upsertSoul,
@@ -422,6 +435,20 @@ export function App() {
   const [context, setContext] = useState<ContextPreview | null>(null);
   const [llmPayload, setLlmPayload] = useState<LlmPayloadPreview | null>(null);
   const [draft, setDraft] = useState("");
+  const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
+  const [slashSelectedIndex, setSlashSelectedIndex] = useState(0);
+  const [playerPersonas, setPlayerPersonas] = useState<PlayerPersona[]>([]);
+  const [activePlayerPersona, setActivePlayerPersonaState] = useState<PlayerPersona | null>(null);
+  const [personaModalMode, setPersonaModalMode] = useState<"list" | "add" | "edit" | null>(null);
+  const [personaEditingId, setPersonaEditingId] = useState<string | null>(null);
+  const [personaForm, setPersonaForm] = useState<PlayerPersonaInput>({
+    display_name: "",
+    gender_code: "custom",
+    pronouns: "",
+    description: "",
+    appearance: "",
+    notes: "",
+  });
   const [characterName, setCharacterName] = useState("Aurora Schwarz");
   const [characterDescription, setCharacterDescription] = useState("");
   const [characterAppearance, setCharacterAppearance] = useState("");
@@ -770,6 +797,21 @@ export function App() {
     contextMode,
     view,
   ]);
+
+  const slashSuggestions = useMemo(() => filteredSlashCommands(draft), [draft]);
+  const slashMenuOpen =
+    !busy &&
+    !slashMenuDismissed &&
+    shouldOpenSlashMenu(draft) &&
+    slashSuggestions.length > 0;
+  const selectedSlashCommand =
+    slashSuggestions[Math.min(slashSelectedIndex, Math.max(0, slashSuggestions.length - 1))];
+
+  useEffect(() => {
+    if (slashSelectedIndex >= slashSuggestions.length) {
+      setSlashSelectedIndex(Math.max(0, slashSuggestions.length - 1));
+    }
+  }, [slashSelectedIndex, slashSuggestions.length]);
 
   const soulRef = useRef(soul);
   useEffect(() => {
@@ -1546,8 +1588,18 @@ export function App() {
     const text = draft.trim();
     if (!text || busy || stateUpdating || !soul) return;
 
+    const personaUiAction = personaUiActionForText(text);
     setDraft("");
+    setSlashMenuDismissed(false);
+    setSlashSelectedIndex(0);
     await executeTurn(text);
+    if (personaUiAction === "list") {
+      await openPersonaList();
+    } else if (personaUiAction === "add") {
+      openPersonaAdd();
+    } else if (personaUiAction === "edit") {
+      await openPersonaEdit();
+    }
   }
 
   async function handleSubmit(event: FormEvent) {
@@ -1555,7 +1607,135 @@ export function App() {
     await submitDraft();
   }
 
+  function handleDraftChange(value: string) {
+    setDraft(value);
+    setSlashMenuDismissed(false);
+    setSlashSelectedIndex(0);
+  }
+
+  function insertSlashCommand(command = selectedSlashCommand?.command) {
+    if (!command) return;
+    setDraft((current) => completeSlashCommandInput(current, command));
+    setSlashMenuDismissed(true);
+    setSlashSelectedIndex(0);
+  }
+
+  async function refreshPlayerPersonas(conversationId = currentConversationId) {
+    const personas = await listPlayerPersonas();
+    setPlayerPersonas(personas);
+    if (conversationId) {
+      const active = await getActivePlayerPersona(conversationId);
+      setActivePlayerPersonaState(active);
+    }
+    return personas;
+  }
+
+  async function openPersonaList(conversationId = currentConversationId) {
+    await refreshPlayerPersonas(conversationId);
+    setPersonaModalMode("list");
+  }
+
+  function openPersonaAdd() {
+    setPersonaEditingId(null);
+    setPersonaForm({
+      display_name: "",
+      gender_code: "custom",
+      pronouns: "",
+      description: "",
+      appearance: "",
+      notes: "",
+    });
+    setPersonaModalMode("add");
+  }
+
+  async function openPersonaEdit(personaId?: string | null) {
+    const personas = await refreshPlayerPersonas();
+    const target =
+      personas.find((persona) => persona.persona_id === personaId) ??
+      activePlayerPersona ??
+      personas.find((persona) => !persona.is_builtin);
+    if (!target || target.is_builtin) {
+      setStatus("Built-in personas cannot be edited; create a custom persona first.");
+      setPersonaModalMode("list");
+      return;
+    }
+    setPersonaEditingId(target.persona_id);
+    setPersonaForm({
+      persona_id: target.persona_id,
+      display_name: target.display_name,
+      gender_code: target.gender_code,
+      pronouns: target.pronouns,
+      description: target.description,
+      appearance: target.appearance ?? "",
+      notes: target.notes ?? "",
+    });
+    setPersonaModalMode("edit");
+  }
+
+  async function handleSelectPersona(personaId: string) {
+    if (!currentConversationId) return;
+    const active = await setActivePlayerPersona(currentConversationId, personaId);
+    setActivePlayerPersonaState(active);
+    await refreshPlayerPersonas(currentConversationId);
+    setStatus(`Active persona: ${active.display_name}`);
+  }
+
+  async function handleSavePersona() {
+    const saved = await upsertPlayerPersona({
+      ...personaForm,
+      persona_id: personaEditingId ?? personaForm.persona_id ?? null,
+    });
+    await refreshPlayerPersonas();
+    if (currentConversationId) {
+      await handleSelectPersona(saved.persona_id);
+    }
+    setPersonaModalMode("list");
+  }
+
+  function personaUiActionForText(text: string) {
+    const trimmed = text.trim().toLowerCase();
+    if (trimmed === "/persona list") return "list";
+    if (trimmed === "/persona add") return "add";
+    if (trimmed.startsWith("/persona edit")) return "edit";
+    return null;
+  }
+
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (slashMenuOpen && slashSuggestions.length > 0) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setSlashSelectedIndex((current) =>
+          nextSlashCommandIndex(current, slashSuggestions.length, 1),
+        );
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setSlashSelectedIndex((current) =>
+          nextSlashCommandIndex(current, slashSuggestions.length, -1),
+        );
+        return;
+      }
+      if (event.key === "Tab") {
+        event.preventDefault();
+        insertSlashCommand();
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSlashMenuDismissed(true);
+        return;
+      }
+      if (
+        event.key === "Enter" &&
+        !event.shiftKey &&
+        !event.nativeEvent.isComposing
+      ) {
+        event.preventDefault();
+        insertSlashCommand();
+        return;
+      }
+    }
     if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
       return;
     }
@@ -1868,6 +2048,7 @@ export function App() {
       setCreatorFieldsFromSoul(sessionSoul);
       setMessages(session.messages);
       setContext(await compileContext(sessionSoul.character_id, nextConversationId));
+      await refreshPlayerPersonas(nextConversationId);
       setSouls(await listSouls());
       await refreshConversations();
       setLastTurnDebug(null);
@@ -1885,6 +2066,7 @@ export function App() {
         relationship_targets: Object.keys(sessionSoul.relationships),
       });
       setView("chat");
+      setPersonaModalMode("list");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1944,6 +2126,7 @@ export function App() {
           : "Loaded persistent Soul continuity chat",
       );
       setMessages(await listConversationMessages(conversation.conversation_id));
+      await refreshPlayerPersonas(conversation.conversation_id);
       setLastTurnDebug(null);
       setView("chat");
       setStatus(`Loaded chat: ${conversation.title}`);
@@ -3915,7 +4098,13 @@ export function App() {
               return (
                 <article className={`message ${message.role}`} key={message.id}>
                   <div className="message-heading">
-                    <span>{message.role === "user" ? "User" : "Narrator"}</span>
+                    <span>
+                      {message.channel?.startsWith("command_")
+                        ? "Command"
+                        : message.role === "user"
+                          ? "User"
+                          : "Narrator"}
+                    </span>
                     {message.role === "assistant" ? (
                       <div className="message-tools">
                         <div className="variant-switcher" aria-label="Response variants">
@@ -4063,6 +4252,126 @@ export function App() {
           </section>
         ) : null}
 
+        {personaModalMode ? (
+          <section className="persona-modal-backdrop" role="dialog" aria-modal="true">
+            <div className="persona-modal">
+              <header>
+                <div>
+                  <span className="eyebrow">Persona</span>
+                  <h2>
+                    {personaModalMode === "list"
+                      ? "Player Persona"
+                      : personaModalMode === "add"
+                        ? "Add Persona"
+                        : "Edit Persona"}
+                  </h2>
+                </div>
+                <button type="button" title="Close" onClick={() => setPersonaModalMode(null)}>
+                  <X size={16} />
+                </button>
+              </header>
+              {personaModalMode === "list" ? (
+                <div className="persona-list">
+                  {playerPersonas.map((persona) => (
+                    <article
+                      key={persona.persona_id}
+                      className={
+                        activePlayerPersona?.persona_id === persona.persona_id
+                          ? "persona-row selected"
+                          : "persona-row"
+                      }
+                    >
+                      <div>
+                        <strong>{persona.display_name}</strong>
+                        <span>{persona.persona_id}</span>
+                        <p>{persona.description}</p>
+                      </div>
+                      <div className="persona-row-actions">
+                        <button type="button" onClick={() => handleSelectPersona(persona.persona_id)}>
+                          Select
+                        </button>
+                        {!persona.is_builtin ? (
+                          <button type="button" onClick={() => openPersonaEdit(persona.persona_id)}>
+                            Edit
+                          </button>
+                        ) : null}
+                      </div>
+                    </article>
+                  ))}
+                  <button type="button" className="persona-add-button" onClick={openPersonaAdd}>
+                    Add Persona
+                  </button>
+                </div>
+              ) : (
+                <div className="persona-form">
+                  <label>
+                    <span>Name</span>
+                    <input
+                      value={personaForm.display_name}
+                      onChange={(event) =>
+                        setPersonaForm((current) => ({ ...current, display_name: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>Gender code</span>
+                    <input
+                      value={personaForm.gender_code}
+                      onChange={(event) =>
+                        setPersonaForm((current) => ({ ...current, gender_code: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>Pronouns</span>
+                    <input
+                      value={personaForm.pronouns}
+                      onChange={(event) =>
+                        setPersonaForm((current) => ({ ...current, pronouns: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>Description</span>
+                    <textarea
+                      value={personaForm.description}
+                      onChange={(event) =>
+                        setPersonaForm((current) => ({ ...current, description: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>Appearance</span>
+                    <textarea
+                      value={personaForm.appearance ?? ""}
+                      onChange={(event) =>
+                        setPersonaForm((current) => ({ ...current, appearance: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>Notes</span>
+                    <textarea
+                      value={personaForm.notes ?? ""}
+                      onChange={(event) =>
+                        setPersonaForm((current) => ({ ...current, notes: event.target.value }))
+                      }
+                    />
+                  </label>
+                  <div className="persona-form-actions">
+                    <button type="button" onClick={() => setPersonaModalMode("list")}>
+                      Cancel
+                    </button>
+                    <button type="button" onClick={handleSavePersona}>
+                      Save
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </section>
+        ) : null}
+
         <form className="chat-only-composer" onSubmit={handleSubmit}>
           <input
             ref={chatImageInputRef}
@@ -4071,14 +4380,38 @@ export function App() {
             accept="image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif"
             onChange={handleChatImageSelected}
           />
-          <textarea
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={handleComposerKeyDown}
-            placeholder="Type message... Enter to send, Shift+Enter for a new line."
-            disabled={busy}
-            rows={2}
-          />
+          <div className="composer-input-shell">
+            <textarea
+              value={draft}
+              onChange={(event) => handleDraftChange(event.target.value)}
+              onKeyDown={handleComposerKeyDown}
+              placeholder="Type message... Enter to send, Shift+Enter for a new line."
+              disabled={busy}
+              rows={2}
+              aria-autocomplete="list"
+              aria-controls="slash-command-menu"
+              aria-expanded={slashMenuOpen}
+            />
+            {slashMenuOpen ? (
+              <div id="slash-command-menu" className="slash-command-menu" role="listbox">
+                {slashSuggestions.map((item, index) => (
+                  <button
+                    key={item.command}
+                    type="button"
+                    className={index === slashSelectedIndex ? "selected" : ""}
+                    role="option"
+                    aria-selected={index === slashSelectedIndex}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => insertSlashCommand(item.command)}
+                  >
+                    <strong>{item.command}</strong>
+                    <span>{item.usage}</span>
+                    <small>{item.description}</small>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
           {busy ? (
             <button type="button" aria-label="Stop generation" onClick={handleStopGeneration}>
               <Square size={16} />

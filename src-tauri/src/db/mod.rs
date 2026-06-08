@@ -48,6 +48,8 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub created_at: i64,
+    #[serde(default = "default_message_channel")]
+    pub channel: String,
     #[serde(default = "default_message_status")]
     pub status: String,
     #[serde(default = "default_message_origin")]
@@ -61,8 +63,38 @@ fn default_message_status() -> String {
     "active".into()
 }
 
+fn default_message_channel() -> String {
+    MESSAGE_CHANNEL_RP_SCENE.into()
+}
+
 fn default_message_origin() -> String {
     "active".into()
+}
+
+pub const MESSAGE_CHANNEL_RP_SCENE: &str = "rp_scene";
+pub const MESSAGE_CHANNEL_COMMAND_OOC: &str = "command_ooc";
+pub const MESSAGE_CHANNEL_COMMAND_SETUP: &str = "command_setup";
+pub const MESSAGE_CHANNEL_COMMAND_STATE: &str = "command_state";
+pub const MESSAGE_CHANNEL_COMMAND_PERSONA: &str = "command_persona";
+pub const MESSAGE_CHANNEL_COMMAND_ASK: &str = "command_ask";
+pub const MESSAGE_CHANNEL_COMMAND_HELP: &str = "command_help";
+pub const MESSAGE_CHANNEL_SYSTEM_DEBUG: &str = "system_debug";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlayerPersona {
+    pub persona_id: String,
+    pub display_name: String,
+    pub description: String,
+    pub gender_code: String,
+    pub pronouns: String,
+    pub is_builtin: bool,
+    pub is_archived: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub appearance: Option<String>,
+    pub voice_style: Option<String>,
+    pub boundaries: Option<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,6 +132,7 @@ pub struct ConversationSummary {
     pub source_savepoint_id: Option<String>,
     pub world_id: Option<String>,
     pub source_setting_id: Option<String>,
+    pub active_player_persona_id: String,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_message_preview: Option<String>,
@@ -449,6 +482,7 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             soul_id TEXT NOT NULL,
             world_id TEXT,
             source_setting_id TEXT,
+            active_player_persona_id TEXT NOT NULL DEFAULT 'preset_male',
             title TEXT NOT NULL DEFAULT 'Untitled Session',
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
@@ -457,17 +491,40 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY (source_setting_id) REFERENCES settings(setting_id) ON DELETE SET NULL
         );
 
+        CREATE TABLE IF NOT EXISTS conversation_command_state (
+            conversation_id TEXT PRIMARY KEY,
+            pending_setup_text TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             conversation_id TEXT NOT NULL,
             role TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system')),
             content TEXT NOT NULL,
+            message_channel TEXT NOT NULL DEFAULT 'rp_scene',
             created_at INTEGER NOT NULL,
             FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_id
         ON messages(conversation_id, id);
+
+        CREATE TABLE IF NOT EXISTS player_personas (
+            persona_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            gender_code TEXT NOT NULL,
+            pronouns TEXT NOT NULL,
+            appearance TEXT,
+            voice_style TEXT,
+            boundaries TEXT,
+            notes TEXT,
+            is_archived INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS provider_profiles (
             id TEXT PRIMARY KEY,
@@ -708,7 +765,19 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "conversations", "world_id", "TEXT")?;
     add_column_if_missing(conn, "conversations", "source_setting_id", "TEXT")?;
     add_column_if_missing(conn, "conversations", "archived_at", "INTEGER")?;
+    add_column_if_missing(
+        conn,
+        "conversations",
+        "active_player_persona_id",
+        "TEXT NOT NULL DEFAULT 'preset_male'",
+    )?;
     add_column_if_missing(conn, "messages", "branch_id", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "messages",
+        "message_channel",
+        "TEXT NOT NULL DEFAULT 'rp_scene'",
+    )?;
     add_column_if_missing(conn, "messages", "is_active", "INTEGER NOT NULL DEFAULT 1")?;
     add_column_if_missing(
         conn,
@@ -1441,8 +1510,8 @@ pub fn ensure_conversation_with_title_and_world(
     let title = sanitize_conversation_title(title.unwrap_or("Untitled Session"));
     conn.execute(
         "
-        INSERT INTO conversations (id, soul_id, world_id, source_setting_id, title, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+        INSERT INTO conversations (id, soul_id, world_id, source_setting_id, active_player_persona_id, title, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, 'preset_male', ?5, ?6, ?6)
         ON CONFLICT(id) DO UPDATE SET
             soul_id = excluded.soul_id,
             world_id = COALESCE(excluded.world_id, conversations.world_id),
@@ -1452,6 +1521,55 @@ pub fn ensure_conversation_with_title_and_world(
         params![conversation_id, soul_id, world_id, source_setting_id, title, now],
     )?;
     get_conversation_summary(conn, conversation_id)
+}
+
+pub fn get_pending_setup(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "
+        SELECT pending_setup_text
+        FROM conversation_command_state
+        WHERE conversation_id = ?1
+        ",
+        [conversation_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|value| value.and_then(|text| (!text.trim().is_empty()).then_some(text)))
+}
+
+pub fn set_pending_setup(
+    conn: &Connection,
+    conversation_id: &str,
+    pending_setup_text: &str,
+) -> rusqlite::Result<()> {
+    let text = pending_setup_text.trim();
+    if text.is_empty() {
+        clear_pending_setup(conn, conversation_id)?;
+        return Ok(());
+    }
+    let now = now_ts();
+    conn.execute(
+        "
+        INSERT INTO conversation_command_state (conversation_id, pending_setup_text, updated_at)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(conversation_id) DO UPDATE SET
+            pending_setup_text = excluded.pending_setup_text,
+            updated_at = excluded.updated_at
+        ",
+        params![conversation_id, text, now],
+    )?;
+    Ok(())
+}
+
+pub fn clear_pending_setup(conn: &Connection, conversation_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM conversation_command_state WHERE conversation_id = ?1",
+        [conversation_id],
+    )?;
+    Ok(())
 }
 
 pub fn rename_conversation(
@@ -1478,6 +1596,7 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             COALESCE(s.source_savepoint_id, NULL),
             c.world_id,
             c.source_setting_id,
+            c.active_player_persona_id,
             c.created_at,
             c.updated_at,
             (
@@ -1500,7 +1619,7 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
         ",
     )?;
     let rows = stmt.query_map([], |row| {
-        let preview: Option<String> = row.get(8)?;
+        let preview: Option<String> = row.get(9)?;
         Ok(ConversationSummary {
             conversation_id: row.get(0)?,
             title: row.get(1)?,
@@ -1508,11 +1627,12 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             source_savepoint_id: row.get(3)?,
             world_id: row.get(4)?,
             source_setting_id: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
+            active_player_persona_id: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
             last_message_preview: preview.map(compact_preview),
-            message_count: row.get(9)?,
-            archived_at: row.get(10)?,
+            message_count: row.get(10)?,
+            archived_at: row.get(11)?,
         })
     })?;
     rows.collect()
@@ -1524,7 +1644,7 @@ pub fn get_conversation_summary(
 ) -> rusqlite::Result<ConversationSummary> {
     conn.query_row(
         "
-        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL), c.world_id, c.source_setting_id, c.archived_at
+        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL), c.world_id, c.source_setting_id, c.active_player_persona_id, c.archived_at
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
         WHERE c.id = ?1
@@ -1543,9 +1663,10 @@ pub fn get_conversation_summary(
                 source_savepoint_id: row.get(5)?,
                 world_id: row.get(6)?,
                 source_setting_id: row.get(7)?,
+                active_player_persona_id: row.get(8)?,
                 last_message_preview,
                 message_count,
-                archived_at: row.get(8)?,
+                archived_at: row.get(9)?,
             })
         },
     )
@@ -1564,6 +1685,256 @@ fn sanitize_conversation_title(title: &str) -> String {
 fn compact_preview(content: String) -> String {
     let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
     compact.chars().take(140).collect()
+}
+
+pub fn built_in_player_personas() -> Vec<PlayerPersona> {
+    vec![
+        PlayerPersona {
+            persona_id: "preset_male".into(),
+            display_name: "Male Persona".into(),
+            description: "User-controlled male RP persona. No additional traits specified.".into(),
+            gender_code: "male".into(),
+            pronouns: "he/him".into(),
+            is_builtin: true,
+            is_archived: false,
+            created_at: 0,
+            updated_at: 0,
+            appearance: None,
+            voice_style: None,
+            boundaries: None,
+            notes: None,
+        },
+        PlayerPersona {
+            persona_id: "preset_female".into(),
+            display_name: "Female Persona".into(),
+            description: "User-controlled female RP persona. No additional traits specified."
+                .into(),
+            gender_code: "female".into(),
+            pronouns: "she/her".into(),
+            is_builtin: true,
+            is_archived: false,
+            created_at: 0,
+            updated_at: 0,
+            appearance: None,
+            voice_style: None,
+            boundaries: None,
+            notes: None,
+        },
+    ]
+}
+
+pub fn list_player_personas(conn: &Connection) -> rusqlite::Result<Vec<PlayerPersona>> {
+    let mut personas = built_in_player_personas();
+    let mut stmt = conn.prepare(
+        "
+        SELECT persona_id, display_name, description, gender_code, pronouns, appearance, voice_style, boundaries, notes, is_archived, created_at, updated_at
+        FROM player_personas
+        WHERE is_archived = 0
+        ORDER BY display_name COLLATE NOCASE ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], player_persona_from_row)?;
+    for row in rows {
+        personas.push(row?);
+    }
+    Ok(personas)
+}
+
+pub fn get_player_persona(
+    conn: &Connection,
+    persona_id: &str,
+) -> rusqlite::Result<Option<PlayerPersona>> {
+    if let Some(persona) = built_in_player_personas()
+        .into_iter()
+        .find(|persona| persona.persona_id == persona_id)
+    {
+        return Ok(Some(persona));
+    }
+    conn.query_row(
+        "
+        SELECT persona_id, display_name, description, gender_code, pronouns, appearance, voice_style, boundaries, notes, is_archived, created_at, updated_at
+        FROM player_personas
+        WHERE persona_id = ?1
+        ",
+        [persona_id],
+        player_persona_from_row,
+    )
+    .optional()
+}
+
+pub fn find_player_persona(
+    conn: &Connection,
+    lookup: &str,
+) -> rusqlite::Result<Option<PlayerPersona>> {
+    let lookup = lookup.trim();
+    if lookup.is_empty() {
+        return Ok(None);
+    }
+    let normalized = normalize_lookup(lookup);
+    if let Some(persona) = built_in_player_personas().into_iter().find(|persona| {
+        normalize_lookup(&persona.persona_id) == normalized
+            || normalize_lookup(&persona.display_name) == normalized
+    }) {
+        return Ok(Some(persona));
+    }
+    conn.query_row(
+        "
+        SELECT persona_id, display_name, description, gender_code, pronouns, appearance, voice_style, boundaries, notes, is_archived, created_at, updated_at
+        FROM player_personas
+        WHERE is_archived = 0
+          AND (lower(persona_id) = lower(?1) OR lower(display_name) = lower(?1))
+        LIMIT 1
+        ",
+        [lookup],
+        player_persona_from_row,
+    )
+    .optional()
+}
+
+pub fn upsert_player_persona(
+    conn: &Connection,
+    persona: &PlayerPersona,
+) -> rusqlite::Result<PlayerPersona> {
+    if persona.is_builtin {
+        return Ok(persona.clone());
+    }
+    let now = now_ts();
+    let created_at = if persona.created_at > 0 {
+        persona.created_at
+    } else {
+        now
+    };
+    conn.execute(
+        "
+        INSERT INTO player_personas
+            (persona_id, display_name, description, gender_code, pronouns, appearance, voice_style, boundaries, notes, is_archived, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(persona_id) DO UPDATE SET
+            display_name = excluded.display_name,
+            description = excluded.description,
+            gender_code = excluded.gender_code,
+            pronouns = excluded.pronouns,
+            appearance = excluded.appearance,
+            voice_style = excluded.voice_style,
+            boundaries = excluded.boundaries,
+            notes = excluded.notes,
+            is_archived = excluded.is_archived,
+            updated_at = excluded.updated_at
+        ",
+        params![
+            persona.persona_id.trim(),
+            persona.display_name.trim(),
+            persona.description.trim(),
+            persona.gender_code.trim(),
+            persona.pronouns.trim(),
+            persona.appearance.as_deref(),
+            persona.voice_style.as_deref(),
+            persona.boundaries.as_deref(),
+            persona.notes.as_deref(),
+            if persona.is_archived { 1 } else { 0 },
+            created_at,
+            now,
+        ],
+    )?;
+    get_player_persona(conn, persona.persona_id.trim())?
+        .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)
+}
+
+pub fn archive_player_persona(conn: &Connection, persona_id: &str) -> rusqlite::Result<bool> {
+    if built_in_player_personas()
+        .iter()
+        .any(|persona| persona.persona_id == persona_id)
+    {
+        return Ok(false);
+    }
+    let affected = conn.execute(
+        "UPDATE player_personas SET is_archived = 1, updated_at = ?1 WHERE persona_id = ?2",
+        params![now_ts(), persona_id],
+    )?;
+    Ok(affected > 0)
+}
+
+pub fn restore_player_persona(conn: &Connection, persona_id: &str) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE player_personas SET is_archived = 0, updated_at = ?1 WHERE persona_id = ?2",
+        params![now_ts(), persona_id],
+    )?;
+    Ok(affected > 0)
+}
+
+pub fn get_active_player_persona_id(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<String> {
+    conn.query_row(
+        "SELECT active_player_persona_id FROM conversations WHERE id = ?1",
+        [conversation_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|value| {
+        value
+            .and_then(|id| (!id.trim().is_empty()).then_some(id))
+            .unwrap_or_else(|| "preset_male".into())
+    })
+}
+
+pub fn get_active_player_persona(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<PlayerPersona> {
+    let persona_id = get_active_player_persona_id(conn, conversation_id)?;
+    get_player_persona(conn, &persona_id).map(|persona| {
+        persona.unwrap_or_else(|| {
+            built_in_player_personas()
+                .into_iter()
+                .find(|persona| persona.persona_id == "preset_male")
+                .expect("built-in male persona exists")
+        })
+    })
+}
+
+pub fn set_active_player_persona(
+    conn: &Connection,
+    conversation_id: &str,
+    persona_id: &str,
+) -> rusqlite::Result<PlayerPersona> {
+    let persona = get_player_persona(conn, persona_id)?
+        .filter(|persona| !persona.is_archived)
+        .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
+    conn.execute(
+        "UPDATE conversations SET active_player_persona_id = ?1, updated_at = ?2 WHERE id = ?3",
+        params![persona.persona_id.as_str(), now_ts(), conversation_id],
+    )?;
+    Ok(persona)
+}
+
+fn player_persona_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlayerPersona> {
+    Ok(PlayerPersona {
+        persona_id: row.get(0)?,
+        display_name: row.get(1)?,
+        description: row.get(2)?,
+        gender_code: row.get(3)?,
+        pronouns: row.get(4)?,
+        appearance: row.get(5)?,
+        voice_style: row.get(6)?,
+        boundaries: row.get(7)?,
+        notes: row.get(8)?,
+        is_archived: row.get::<_, i64>(9)? != 0,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        is_builtin: false,
+    })
+}
+
+fn normalize_lookup(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 fn last_message_preview(
@@ -1681,10 +2052,26 @@ pub fn insert_message(
     role: &str,
     content: &str,
 ) -> rusqlite::Result<()> {
+    insert_message_with_channel(
+        conn,
+        conversation_id,
+        role,
+        content,
+        MESSAGE_CHANNEL_RP_SCENE,
+    )
+}
+
+pub fn insert_message_with_channel(
+    conn: &Connection,
+    conversation_id: &str,
+    role: &str,
+    content: &str,
+    channel: &str,
+) -> rusqlite::Result<()> {
     let now = now_ts();
     conn.execute(
-        "INSERT INTO messages (conversation_id, role, content, created_at, message_status, message_origin) VALUES (?1, ?2, ?3, ?4, 'active', 'active')",
-        params![conversation_id, role, content, now],
+        "INSERT INTO messages (conversation_id, role, content, message_channel, created_at, message_status, message_origin) VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'active')",
+        params![conversation_id, role, content, normalize_message_channel(channel), now],
     )?;
     let _message_id = conn.last_insert_rowid();
     conn.execute(
@@ -1700,10 +2087,26 @@ pub fn insert_message_and_get_id(
     role: &str,
     content: &str,
 ) -> rusqlite::Result<i64> {
+    insert_message_with_channel_and_get_id(
+        conn,
+        conversation_id,
+        role,
+        content,
+        MESSAGE_CHANNEL_RP_SCENE,
+    )
+}
+
+pub fn insert_message_with_channel_and_get_id(
+    conn: &Connection,
+    conversation_id: &str,
+    role: &str,
+    content: &str,
+    channel: &str,
+) -> rusqlite::Result<i64> {
     let now = now_ts();
     conn.execute(
-        "INSERT INTO messages (conversation_id, role, content, created_at, message_status, message_origin) VALUES (?1, ?2, ?3, ?4, 'active', 'active')",
-        params![conversation_id, role, content, now],
+        "INSERT INTO messages (conversation_id, role, content, message_channel, created_at, message_status, message_origin) VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'active')",
+        params![conversation_id, role, content, normalize_message_channel(channel), now],
     )?;
     let message_id = conn.last_insert_rowid();
     conn.execute(
@@ -1711,6 +2114,20 @@ pub fn insert_message_and_get_id(
         params![now, conversation_id],
     )?;
     Ok(message_id)
+}
+
+fn normalize_message_channel(channel: &str) -> &str {
+    match channel {
+        MESSAGE_CHANNEL_RP_SCENE
+        | MESSAGE_CHANNEL_COMMAND_OOC
+        | MESSAGE_CHANNEL_COMMAND_SETUP
+        | MESSAGE_CHANNEL_COMMAND_STATE
+        | MESSAGE_CHANNEL_COMMAND_PERSONA
+        | MESSAGE_CHANNEL_COMMAND_ASK
+        | MESSAGE_CHANNEL_COMMAND_HELP
+        | MESSAGE_CHANNEL_SYSTEM_DEBUG => channel,
+        _ => MESSAGE_CHANNEL_RP_SCENE,
+    }
 }
 
 pub fn find_reusable_active_user_message(
@@ -2356,9 +2773,9 @@ pub fn list_messages_before_id(
 ) -> rusqlite::Result<Vec<ChatMessage>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
+        SELECT id, conversation_id, role, content, message_channel, created_at, message_status, message_origin, hidden_at
         FROM (
-            SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
+            SELECT id, conversation_id, role, content, message_channel, created_at, message_status, message_origin, hidden_at
             FROM messages
             WHERE conversation_id = ?1 AND id < ?2 AND is_active != 0 AND message_status = 'active'
             ORDER BY id DESC
@@ -2377,11 +2794,12 @@ pub fn list_messages_before_id(
                 conversation_id: row.get(1)?,
                 role: row.get(2)?,
                 content: row.get(3)?,
-                created_at: row.get(4)?,
-                status: row.get(5)?,
-                origin: row.get(6)?,
+                channel: row.get(4)?,
+                created_at: row.get(5)?,
+                status: row.get(6)?,
+                origin: row.get(7)?,
                 attachments: list_message_attachments(conn, message_id)?,
-                hidden_at: row.get(7)?,
+                hidden_at: row.get(8)?,
             })
         },
     )?;
@@ -2445,6 +2863,7 @@ pub fn list_archived_sessions(conn: &Connection) -> rusqlite::Result<Vec<Convers
             COALESCE(s.source_savepoint_id, NULL),
             c.world_id,
             c.source_setting_id,
+            c.active_player_persona_id,
             c.created_at,
             c.updated_at,
             (
@@ -2467,7 +2886,7 @@ pub fn list_archived_sessions(conn: &Connection) -> rusqlite::Result<Vec<Convers
         ",
     )?;
     let rows = stmt.query_map([], |row| {
-        let preview: Option<String> = row.get(8)?;
+        let preview: Option<String> = row.get(9)?;
         Ok(ConversationSummary {
             conversation_id: row.get(0)?,
             title: row.get(1)?,
@@ -2475,11 +2894,12 @@ pub fn list_archived_sessions(conn: &Connection) -> rusqlite::Result<Vec<Convers
             source_savepoint_id: row.get(3)?,
             world_id: row.get(4)?,
             source_setting_id: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
+            active_player_persona_id: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
             last_message_preview: preview.map(compact_preview),
-            message_count: row.get(9)?,
-            archived_at: row.get(10)?,
+            message_count: row.get(10)?,
+            archived_at: row.get(11)?,
         })
     })?;
     rows.collect()
@@ -2682,7 +3102,7 @@ pub fn list_hidden_turns(
 ) -> rusqlite::Result<Vec<ChatMessage>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
+        SELECT id, conversation_id, role, content, message_channel, created_at, message_status, message_origin, hidden_at
         FROM messages
         WHERE conversation_id = ?1 AND (hidden_at IS NOT NULL OR message_status = 'hidden')
         ORDER BY id ASC
@@ -2695,11 +3115,12 @@ pub fn list_hidden_turns(
             conversation_id: row.get(1)?,
             role: row.get(2)?,
             content: row.get(3)?,
-            created_at: row.get(4)?,
-            status: row.get(5)?,
-            origin: row.get(6)?,
+            channel: row.get(4)?,
+            created_at: row.get(5)?,
+            status: row.get(6)?,
+            origin: row.get(7)?,
             attachments: list_message_attachments(conn, message_id)?,
-            hidden_at: row.get(7)?,
+            hidden_at: row.get(8)?,
         })
     })?;
     rows.collect()
@@ -3022,9 +3443,9 @@ pub fn list_messages(
 ) -> rusqlite::Result<Vec<ChatMessage>> {
     let mut stmt = conn.prepare(
         "
-        SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
+        SELECT id, conversation_id, role, content, message_channel, created_at, message_status, message_origin, hidden_at
         FROM (
-            SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
+            SELECT id, conversation_id, role, content, message_channel, created_at, message_status, message_origin, hidden_at
             FROM messages
             WHERE conversation_id = ?1 AND is_active != 0 AND message_status = 'active'
             ORDER BY id DESC
@@ -3041,11 +3462,12 @@ pub fn list_messages(
             conversation_id: row.get(1)?,
             role: row.get(2)?,
             content: row.get(3)?,
-            created_at: row.get(4)?,
-            status: row.get(5)?,
-            origin: row.get(6)?,
+            channel: row.get(4)?,
+            created_at: row.get(5)?,
+            status: row.get(6)?,
+            origin: row.get(7)?,
             attachments: list_message_attachments(conn, message_id)?,
-            hidden_at: row.get(7)?,
+            hidden_at: row.get(8)?,
         })
     })?;
 
@@ -3059,7 +3481,7 @@ pub fn get_message(
 ) -> rusqlite::Result<ChatMessage> {
     conn.query_row(
         "
-        SELECT id, conversation_id, role, content, created_at, message_status, message_origin, hidden_at
+        SELECT id, conversation_id, role, content, message_channel, created_at, message_status, message_origin, hidden_at
         FROM messages
         WHERE conversation_id = ?1 AND id = ?2
         ",
@@ -3071,11 +3493,12 @@ pub fn get_message(
                 conversation_id: row.get(1)?,
                 role: row.get(2)?,
                 content: row.get(3)?,
-                created_at: row.get(4)?,
-                status: row.get(5)?,
-                origin: row.get(6)?,
+                channel: row.get(4)?,
+                created_at: row.get(5)?,
+                status: row.get(6)?,
+                origin: row.get(7)?,
                 attachments: list_message_attachments(conn, message_id)?,
-                hidden_at: row.get(7)?,
+                hidden_at: row.get(8)?,
             })
         },
     )
@@ -4445,6 +4868,69 @@ mod tests {
             .expect("table query");
 
         assert_eq!(exists, 1);
+    }
+
+    #[test]
+    fn player_personas_have_two_builtins_and_custom_lifecycle() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "persona-session", &soul.character_id).expect("conversation");
+
+        let builtins = built_in_player_personas();
+        assert_eq!(builtins.len(), 2);
+        assert!(builtins
+            .iter()
+            .any(|persona| persona.persona_id == "preset_male"));
+        assert!(builtins
+            .iter()
+            .any(|persona| persona.persona_id == "preset_female"));
+        assert_eq!(
+            get_active_player_persona_id(&conn, "persona-session").expect("active id"),
+            "preset_male"
+        );
+        assert!(!archive_player_persona(&conn, "preset_male").expect("archive builtin"));
+
+        let custom = PlayerPersona {
+            persona_id: "persona_jun".into(),
+            display_name: "Jun Persona".into(),
+            description: "User-controlled custom RP persona.".into(),
+            gender_code: "custom".into(),
+            pronouns: "they/them".into(),
+            is_builtin: false,
+            is_archived: false,
+            created_at: 0,
+            updated_at: 0,
+            appearance: Some("Black coat.".into()),
+            voice_style: None,
+            boundaries: None,
+            notes: Some("Test persona.".into()),
+        };
+        let saved = upsert_player_persona(&conn, &custom).expect("save custom");
+        assert_eq!(saved.persona_id, "persona_jun");
+        assert!(saved.created_at > 0);
+
+        let active =
+            set_active_player_persona(&conn, "persona-session", "persona_jun").expect("set active");
+        assert_eq!(active.display_name, "Jun Persona");
+        assert_eq!(
+            get_active_player_persona_id(&conn, "persona-session").expect("active id"),
+            "persona_jun"
+        );
+
+        set_active_player_persona(&conn, "persona-session", "preset_male")
+            .expect("switch away before archive");
+        assert!(archive_player_persona(&conn, "persona_jun").expect("archive custom"));
+        assert!(set_active_player_persona(&conn, "persona-session", "persona_jun").is_err());
+        assert!(!list_player_personas(&conn)
+            .expect("list")
+            .iter()
+            .any(|persona| persona.persona_id == "persona_jun"));
+        assert!(restore_player_persona(&conn, "persona_jun").expect("restore custom"));
+        assert!(list_player_personas(&conn)
+            .expect("list restored")
+            .iter()
+            .any(|persona| persona.persona_id == "persona_jun"));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::{
     evaluator::{EvaluatorConversionContext, MemorySlot},
     evaluator_form::{
-        clean, resolve_active_entity_id, slugify, stable_id, EvalFormRepairTrace,
+        active_player_entity_id, clean, resolve_active_entity_id, slugify, stable_id, EvalFormRepairTrace,
         EvalFormResponse, EvalFormSpec, EventRow, EventType, ImportanceTier, MagnitudeTier,
         MemoryRow, ObjectRow, RelationshipDimension, RelationshipDirection, RelationshipRow,
     },
@@ -981,6 +981,9 @@ pub fn normalize_eval_form_response(
         normalize_relationship_aliases(row, spec);
         normalize_relationship_defaults(row);
     }
+    for row in &mut normalized.relationship_event_rows {
+        normalize_relationship_event_entities(row, spec);
+    }
     for row in &mut normalized.object_rows {
         normalize_child_link(
             &mut row.linked_event_id,
@@ -1016,8 +1019,11 @@ pub fn normalize_relationship_event_entities(row: &mut Value, spec: &EvalFormSpe
         return;
     };
     for key in [
+        "actor_entity_id",
         "source_entity_id",
         "target_entity_id",
+        "relationship_source_soul_id",
+        "relationship_target_entity_id",
         "perceived_by_entity_id",
     ] {
         let Some(raw) = object.get(key).and_then(Value::as_str) else {
@@ -1030,8 +1036,9 @@ pub fn normalize_relationship_event_entities(row: &mut Value, spec: &EvalFormSpe
 
 pub fn default_participants(spec: &EvalFormSpec) -> Vec<String> {
     let mut participants = spec.active_soul_ids.clone();
-    if !participants.iter().any(|id| id == "default_player") {
-        participants.push("default_player".into());
+    let player_id = active_player_entity_id(spec).unwrap_or_else(|| "default_player".into());
+    if !participants.iter().any(|id| id == &player_id) {
+        participants.push(player_id);
     }
     participants
 }
@@ -1133,21 +1140,18 @@ pub fn normalize_relationship_aliases(row: &mut RelationshipRow, spec: &EvalForm
         row.target_entity_id = resolve_active_entity_id(&row.target_entity_id, spec);
     }
 
-    let has_default_player = spec
-        .active_entities
-        .iter()
-        .any(|e| e.entity_id == "default_player");
+    let active_player_id = active_player_entity_id(spec).unwrap_or_else(|| "default_player".into());
     if spec.active_soul_ids.len() == 1 {
         let active_soul_id = &spec.active_soul_ids[0];
         if row.source_soul_id.trim().is_empty() {
             row.source_soul_id = active_soul_id.clone();
         }
         if row.target_entity_id.trim().is_empty() {
-            row.target_entity_id = "default_player".to_string();
+            row.target_entity_id = active_player_id.clone();
         }
-    } else if has_default_player {
+    } else if !active_player_id.trim().is_empty() {
         if row.target_entity_id.trim().is_empty() {
-            row.target_entity_id = "default_player".to_string();
+            row.target_entity_id = active_player_id.clone();
         }
     }
 
@@ -1156,9 +1160,9 @@ pub fn normalize_relationship_aliases(row: &mut RelationshipRow, spec: &EvalForm
 
     if spec.active_soul_ids.len() == 1 {
         let active_soul_id = &spec.active_soul_ids[0];
-        if row.source_soul_id == "default_player" {
+        if row.source_soul_id == active_player_id || row.source_soul_id == "default_player" {
             row.source_soul_id = active_soul_id.clone();
-            row.target_entity_id = "default_player".to_string();
+            row.target_entity_id = active_player_id;
         }
     }
 }

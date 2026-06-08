@@ -91,8 +91,14 @@ fn primary_soul_id(spec: &EvalFormSpec) -> &str {
 fn default_player_id(spec: &EvalFormSpec) -> &str {
     spec.active_entities
         .iter()
-        .find(|entity| entity.entity_id == "default_player")
+        .find(|entity| entity.entity_type == "player_persona")
         .map(|entity| entity.entity_id.as_str())
+        .or_else(|| {
+            spec.active_entities
+                .iter()
+                .find(|entity| entity.entity_id == "default_player")
+                .map(|entity| entity.entity_id.as_str())
+        })
         .or_else(|| {
             spec.active_entities
                 .iter()

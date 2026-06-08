@@ -1,3 +1,4 @@
+pub mod chat_commands;
 pub mod commands;
 pub mod db;
 pub mod pipeline_trace;
@@ -44,6 +45,12 @@ pub fn run() {
             commands::list_souls,
             commands::list_souls_debug,
             commands::list_conversations,
+            commands::list_player_personas,
+            commands::get_active_player_persona,
+            commands::set_active_player_persona,
+            commands::upsert_player_persona,
+            commands::archive_player_persona,
+            commands::restore_player_persona,
             commands::rename_conversation,
             commands::import_image_asset,
             commands::import_image_asset_bytes,

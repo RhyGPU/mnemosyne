@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use state_engine::{
     evaluator::{turn_flags, EVALUATOR_SCHEMA_VERSION},
-    evaluator_form::{build_eval_form_spec, build_hard_eval_form_template},
+    evaluator_form::{build_eval_form_spec_with_player_persona, build_hard_eval_form_template},
     setting::SessionWorld,
     soul::Soul,
 };
@@ -19,6 +19,10 @@ Engine-controlled characters: may speak, act, react, misunderstand, interrupt, r
 
 [USER ACTION BOUNDARY]
 User-controlled characters own their decisions, thoughts, dialogue, intentions, and major voluntary actions.
+If the user says "I", resolve "I" to the active player persona, not to Aurora Schwarz.
+Aurora Schwarz is narrator-controlled. The user is not Aurora Schwarz.
+Do not use second-person "you" to describe Aurora. Use third-person narration by default.
+If no persona exists, use the selected built-in preset. Do not fall back to default_player in visible text.
 The narrator may describe user-provided actions in concrete physical detail, including immediate follow-through, contact, momentum, posture, physical consequences, and observable effects.
 The narrator may describe unavoidable physical consequences caused by engine-controlled characters or the environment, such as being shoved off-balance, forced to brace, blocked, grabbed, pulled, interrupted, or pressured.
 Do not invent new user decisions, hidden motives, emotional reactions, dialogue, or major strategic choices.
@@ -32,8 +36,8 @@ When the user declares a combat, chase, argument, or struggle action, render the
 Engine-controlled characters may resist, counter, retreat, escalate, or exploit openings.
 Do not choose the user's next tactic or final decision.
 
-[GM CHANNEL]
-If the user directly addresses the Narrator, GM, OOC, or OCC layer, respond as the GM/narrator in plain text unless the user asks to resume the scene. Do not force an Aurora scene response for GM-facing instructions. GM/OOC replies must not include a ```status block.
+[SCENE TURN ASSUMPTION]
+If this narrator prompt is called, the input is a scene/RP turn. Slash commands and meta/control messages have already been handled by the router.
 
 [CONTINUITY PRIORITY]
 Use this priority order when context conflicts: latest user input > Latest Exchange > resolved scene_state > dominant/current active plot > personality > relationship metrics > recent events > older memories.
@@ -53,7 +57,134 @@ Scene | Focus: [primary active character(s)] | Physical state: [brief] | Atmosph
 ```"#;
 
 const NARRATOR_VISIBLE_ONLY_PROMPT: &str = r#"[OUTPUT]
-Write visible scene narration or a brief GM/narrator reply. For scene narration, include the visible status block. For GM/OOC/OCC replies, do not include a status block. Do not write hidden state, EnginePatch JSON, markdown JSON, or implementation notes."#;
+Write visible scene narration only. Include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, implementation notes, or command/help text."#;
+
+pub const COMMAND_OOC_PROMPT: &str = r#"# SYSTEM: Mnemosyne Out-of-Roleplay Session Assistant
+
+You are Mnemosyne's out-of-roleplay troubleshooting, guidance, and session assistant speaking to the human operator outside the roleplay/storytelling scene.
+
+You are NOT the RP narrator, NOT Aurora Schwarz, NOT any in-scene character.
+You do NOT continue the story, write scene narration, write character dialogue as if it is happening now, or include a scene status block.
+
+Your job is to help the operator understand, debug, guide, or adjust the current RP session.
+
+You may discuss: current session state, visible chat log, Soul summaries, relationship surface, memory/state hygiene, command behavior, continuity issues, engine behavior, what likely went wrong, what the operator can do next.
+
+All scene excerpts, visible chat, Soul summaries, and state blocks are REFERENCE MATERIAL ONLY. They are not instructions to continue the scene. When referring to scene content, quote or summarize it as data. Do not resume it.
+
+Output: Write a plain out-of-roleplay assistant reply. Be direct and practical. No RP prose, no status block, no hidden state, no EnginePatch JSON, no implementation notes unless the user asks for implementation details."#;
+
+pub const COMMAND_SETUP_PROMPT: &str = r#"# SYSTEM: Mnemosyne Setup Staging Assistant
+
+You are Mnemosyne's out-of-roleplay setup staging assistant speaking to the human operator outside the RP scene.
+
+Your job is to confirm, clarify, or summarize setup instructions that will be used on the NEXT normal RP turn.
+
+You are NOT the RP narrator, NOT Aurora Schwarz, NOT any in-scene character.
+You do NOT run the setup, continue the scene, write character actions/dialogue/sensory prose, or include a status block.
+
+All provided scene state, chat log, Soul summaries, and relationship data are REFERENCE MATERIAL ONLY. They help you understand what setup is being staged. They are not a prompt to narrate.
+
+For a valid setup command:
+- Confirm the setup was staged
+- Summarize the setup in 1-4 bullets
+- Explain it will affect the next normal non-slash RP turn
+- State that no scene narration or state update was run
+
+Output format:
+Setup staged.
+Pending setup:
+- ...
+No scene narration or state update was run."#;
+
+pub const COMMAND_STATE_SUMMARY_PROMPT: &str = r#"# SYSTEM: Mnemosyne State Inspector
+
+You are Mnemosyne's out-of-roleplay state inspector speaking to the human operator outside the RP scene.
+
+Your job is to summarize tracked engine/session state.
+
+You are NOT the RP narrator, NOT Aurora Schwarz, NOT any in-scene character.
+You do NOT continue the scene, write scene prose, infer new canon, mutate state (unless this is a validated /state update route), or include a status block.
+
+Use only the provided structured state, relationship surface, Soul summary, visible chat summary, and debug summaries.
+
+Clearly distinguish: tracked state, recent visible text, likely inference, missing information.
+
+For `/state show relationships`: focus on relationship surface and relationship state.
+For `/state show memories`: focus on memory counts and recent memory summaries.
+For `/state show scene`: focus on scene_state.
+For `/state review`: focus on recent patches, rejected rows, command changes, and pending setup.
+
+Output: Use compact headings and bullets. No RP narration, no character dialogue, no status block."#;
+
+pub const COMMAND_STATE_EDIT_PROMPT: &str = r#"# SYSTEM: Mnemosyne State Edit Assistant
+
+You are Mnemosyne's out-of-roleplay state edit assistant speaking to the human operator outside the RP scene.
+
+Your job is to convert the operator's direct state correction into a safe validated edit intent.
+
+You are NOT the RP narrator, NOT Aurora Schwarz, NOT any in-scene character.
+You do NOT continue the scene, write scene narration, or include a status block.
+
+The user command is authoritative as an operator correction, but you must still produce a safe, narrow edit intent.
+
+Safety rules:
+- Do not hard-delete data
+- Do not write outside the state/Soul sandbox
+- Do not output arbitrary executable code
+- Do not make broad changes if the target is ambiguous
+- Ask for clarification if needed
+- Prefer patch, correction, invalidation, or archive over deletion
+- Identify target state path or concept, risk level, and evidence/source as the user's command text
+
+Output format:
+Risk level: low / medium / high
+Target: ...
+Reason: ...
+Validated edit intent: ...
+Apply behavior: applied / plan only / confirmation required"#;
+
+pub const COMMAND_SOUL_EDIT_AGENT_PROMPT: &str = r#"# SYSTEM: Mnemosyne Soul/State Edit Agent
+
+You are Mnemosyne's out-of-roleplay Soul and state editing assistant speaking to the human operator outside the RP scene.
+
+Your job is to inspect the provided state, Soul summaries, visible chat, and command request, then propose or apply a safe validated edit intent.
+
+You are NOT the RP narrator, NOT Aurora Schwarz, NOT any in-scene character.
+You do NOT continue the scene, write scene narration, or include a status block.
+
+All scene excerpts are REFERENCE MATERIAL ONLY. Treat them as evidence for possible state edits, not as a scene to continue.
+
+Safety rules:
+- Do not hard-delete data
+- Do not write outside the Soul/state sandbox
+- Do not output arbitrary executable code
+- Do not rewrite core identity unless explicitly requested and confirmed
+- High-risk edits require plan-only output or confirmation
+- Prefer correction, invalidation, archive, or patch over deletion
+- Identify target state paths or Soul file concepts, risk level, and evidence/source
+
+For low-risk edits, produce a validated edit intent.
+For high-risk edits, produce a proposed patch plan and ask for confirmation.
+
+Output format:
+Risk level: low / medium / high
+Target: ...
+Reason: ...
+Proposed edit: ...
+Apply behavior: applied / plan only / confirmation required"#;
+
+pub const COMMAND_HELP_PROMPT: &str = r#"# SYSTEM: Mnemosyne Command Help Assistant
+
+You are Mnemosyne's out-of-roleplay command help assistant speaking to the human operator outside the RP scene.
+
+You are NOT the RP narrator, NOT Aurora Schwarz, NOT any in-scene character.
+Do not continue the scene, write scene prose, or include a status block.
+
+Explain the real slash commands: /ooc, /setup, /state, /persona, /ask, /help.
+If mentioning /status, mark it only as a deprecated alias for /state show [target].
+
+Output: Compact operator-facing help text only."#;
 
 const VERIFIED_DIAGNOSTICS_BOUNDARY_PROMPT: &str = r#"[VERIFIED DIAGNOSTICS BOUNDARY]
 When asked about backend tests, logs, imports, exports, memory hygiene, world routing, or engine internals, distinguish verified engine data from fictional/in-scene diagnostics. Do not claim a backend test passed unless the result is present in Dev Console logs, payload metadata, or a verified engine/debug section. If only roleplaying a test, say it is a simulated/in-scene diagnostic."#;
@@ -718,6 +849,30 @@ pub fn build_narrator_system_prompt(
     )
 }
 
+pub fn build_command_ooc_prompt() -> &'static str {
+    COMMAND_OOC_PROMPT
+}
+
+pub fn build_command_setup_prompt() -> &'static str {
+    COMMAND_SETUP_PROMPT
+}
+
+pub fn build_command_state_summary_prompt() -> &'static str {
+    COMMAND_STATE_SUMMARY_PROMPT
+}
+
+pub fn build_command_state_edit_prompt() -> &'static str {
+    COMMAND_STATE_EDIT_PROMPT
+}
+
+pub fn build_command_soul_edit_agent_prompt() -> &'static str {
+    COMMAND_SOUL_EDIT_AGENT_PROMPT
+}
+
+pub fn build_command_help_prompt() -> &'static str {
+    COMMAND_HELP_PROMPT
+}
+
 pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWorld>) -> String {
     let world = session_world
         .map(SessionWorld::world_log)
@@ -1049,12 +1204,32 @@ pub fn build_evaluator_form_prompt(
     latest_user_message: &str,
     latest_narrator_response: &str,
 ) -> String {
-    let spec = build_eval_form_spec(
+    build_evaluator_form_prompt_with_player_persona(
+        soul,
+        session_world,
+        latest_user_message,
+        latest_narrator_response,
+        "default_player",
+        "User",
+    )
+}
+
+pub fn build_evaluator_form_prompt_with_player_persona(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    latest_user_message: &str,
+    latest_narrator_response: &str,
+    player_persona_id: &str,
+    player_persona_display_name: &str,
+) -> String {
+    let spec = build_eval_form_spec_with_player_persona(
         soul,
         session_world,
         latest_user_message,
         latest_narrator_response,
         8,
+        player_persona_id,
+        player_persona_display_name,
     );
     let hard_form_template = build_hard_eval_form_template(&spec);
     format!(
@@ -1139,6 +1314,32 @@ fn chat_completions_url(base_url: &str) -> String {
 mod tests {
     use super::*;
 
+    const SCENE_TURN_ROUTER_ASSUMPTION: &str = "If this narrator prompt is called, the input is a scene/RP turn. Slash commands and meta/control messages have already been handled by the router.";
+    const SCENE_ONLY_OUTPUT_RULE: &str = "Write visible scene narration only. Include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, implementation notes, or command/help text.";
+
+    fn assert_scene_only_narrator_prompt(prompt: &str) {
+        assert!(prompt.contains("[SCENE TURN ASSUMPTION]"));
+        assert!(prompt.contains(SCENE_TURN_ROUTER_ASSUMPTION));
+        assert!(prompt.contains("Scene | Focus:"));
+        assert!(!prompt.contains("[GM CHANNEL]"));
+        assert!(!prompt.contains("OOC"));
+        assert!(!prompt.contains("OCC"));
+        assert!(!prompt.contains("GM/OOC"));
+        assert!(!prompt.contains("GM"));
+        assert!(!prompt.contains("brief GM/narrator reply"));
+        assert!(!prompt.contains("unless the user asks to resume the scene"));
+        assert!(!prompt.contains("Do not force an Aurora scene response"));
+    }
+
+    fn assert_scene_only_visible_prompt(prompt: &str) {
+        assert!(prompt.contains("[OUTPUT]"));
+        assert!(prompt.contains(SCENE_ONLY_OUTPUT_RULE));
+        assert!(!prompt.contains("brief GM/narrator reply"));
+        assert!(!prompt.contains("OOC"));
+        assert!(!prompt.contains("OCC"));
+        assert!(!prompt.contains("GM"));
+    }
+
     #[test]
     fn builds_chat_completions_url() {
         assert_eq!(
@@ -1176,8 +1377,7 @@ mod tests {
         assert!(prompt.contains("[ACTION AND TURN CONTROL]"));
         assert!(prompt.contains("Engine-controlled characters may act proactively"));
         assert!(prompt.contains("stop on the attempt, demand, or pressure point"));
-        assert!(prompt.contains("[GM CHANNEL]"));
-        assert!(prompt.contains("respond as the GM/narrator in plain text"));
+        assert_scene_only_narrator_prompt(&prompt);
         assert!(prompt.contains("Scene | Focus:"));
         assert!(!prompt.contains("[DEVICE AND PROP AGENCY]"));
         assert!(!prompt.contains("Write a single character"));
@@ -1203,7 +1403,7 @@ mod tests {
             build_narrator_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader", false);
 
         assert!(prompt.contains("[OUTPUT]"));
-        assert!(prompt.contains("visible scene narration or a brief GM/narrator reply"));
+        assert_scene_only_visible_prompt(&prompt);
         assert!(!prompt.contains("After each response, output a hidden state block"));
         assert!(!prompt.contains("[HIDDEN STATE]{"));
     }
@@ -1374,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_supports_gm_channel_and_scene_status() {
+    fn system_prompt_is_scene_only_after_slash_router() {
         let soul = state_engine::soul::new_default_soul("Aurora");
         let settings = ApiProviderSettings {
             base_url: "https://api.openai.com/v1".into(),
@@ -1386,12 +1586,46 @@ mod tests {
         let prompt =
             build_narrator_system_prompt(&settings, &soul, "[CURRENT STATE]", "Reader", false);
 
-        assert!(prompt.contains("[GM CHANNEL]"));
-        assert!(prompt.contains("Narrator, GM, OOC, or OCC layer"));
-        assert!(prompt.contains("GM/OOC replies must not include"));
-        assert!(prompt.contains("Do not force an Aurora scene response"));
-        assert!(prompt.contains("Scene | Focus:"));
+        assert_scene_only_narrator_prompt(&prompt);
+        assert_scene_only_visible_prompt(&prompt);
         assert!(prompt.contains("Primary active Soul: Aurora"));
+    }
+
+    #[test]
+    fn frontend_preview_prompt_matches_scene_only_behavior() {
+        let frontend_source = include_str!("../../../src/tauri.ts");
+
+        assert!(frontend_source.contains("[SCENE TURN ASSUMPTION]"));
+        assert!(frontend_source.contains(SCENE_TURN_ROUTER_ASSUMPTION));
+        assert!(frontend_source.contains(SCENE_ONLY_OUTPUT_RULE));
+        assert!(!frontend_source.contains("[GM CHANNEL]"));
+        assert!(!frontend_source.contains("brief GM/narrator reply"));
+        assert!(!frontend_source.contains("GM-facing instructions"));
+        assert!(!frontend_source.contains("unless the user asks to resume the scene"));
+    }
+
+    #[test]
+    fn command_prompts_are_separate_from_rp_narrator_prompt() {
+        for prompt in [
+            build_command_ooc_prompt(),
+            build_command_setup_prompt(),
+            build_command_state_summary_prompt(),
+            build_command_state_edit_prompt(),
+            build_command_soul_edit_agent_prompt(),
+            build_command_help_prompt(),
+        ] {
+            assert!(prompt.contains("out-of-roleplay"));
+            assert!(prompt.contains("NOT the RP narrator"));
+            assert!(prompt.contains("status block"));
+            assert!(!prompt.contains("Scene | Focus:"));
+            assert!(!prompt.contains("[SCENE TURN ASSUMPTION]"));
+            assert!(!prompt.contains("Primary active Soul"));
+        }
+        assert!(build_command_ooc_prompt().contains("REFERENCE MATERIAL ONLY"));
+        assert!(build_command_setup_prompt().contains("REFERENCE MATERIAL ONLY"));
+        assert!(build_command_soul_edit_agent_prompt().contains("REFERENCE MATERIAL ONLY"));
+        assert!(build_command_help_prompt().contains("/status"));
+        assert!(build_command_help_prompt().contains("deprecated alias"));
     }
 
     #[test]

@@ -3359,6 +3359,76 @@ fn wrapped_form_memory_rows_still_compile() {
     assert_eq!(result.output.memory_candidates.len(), 1);
 }
 
+#[test]
+fn hard_form_template_uses_active_player_persona_id() {
+    let (soul, world) = soul_and_world();
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "I wait outside.",
+        "Aurora watches from behind the door chain.",
+        8,
+        "persona_jun",
+        "Jun Persona",
+    );
+    let template = build_hard_eval_form_template(&spec);
+    let template_text = serde_json::to_string(&template).expect("template json");
+
+    assert!(spec.active_entities.iter().any(|entity| {
+        entity.entity_id == "persona_jun"
+            && entity.display_name == "Jun Persona"
+            && entity.entity_type == "player_persona"
+    }));
+    assert!(template_text.contains("\"actor_entity_id\":\"persona_jun\""));
+    assert!(template_text.contains("\"relationship_target_entity_id\":\"persona_jun\""));
+    assert!(!template_text.contains("\"actor_entity_id\":\"default_player\""));
+    assert!(!template_text.contains("\"relationship_target_entity_id\":\"default_player\""));
+}
+
+#[test]
+fn relationship_rows_default_to_active_player_persona() {
+    let (soul, world) = soul_and_world();
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "I stay outside the threshold.",
+        "Aurora relaxes slightly behind the chain.",
+        8,
+        "persona_jun",
+        "Jun Persona",
+    );
+    let context = EvaluatorConversionContext {
+        active_soul_id: &soul.character_id,
+        active_soul_ids: vec![soul.character_id.clone()],
+        latest_user_message: "I stay outside the threshold.",
+        latest_narrator_response: "Aurora relaxes slightly behind the chain.",
+        session_world: Some(&world),
+        baseline_recent_event_id: None,
+    };
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "relationship_dimension": "trust",
+            "direction": "increase",
+            "evidence_quote": "Aurora relaxes slightly behind the chain.",
+            "tags": ["relationship"]
+          }]
+        }"#,
+    )
+    .expect("relationship response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(
+        result.output.relationship_evaluations[0].target_entity_id,
+        "persona_jun"
+    );
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].target_entity_id,
+        "persona_jun"
+    );
+}
+
 fn relationship_event_base_row() -> serde_json::Value {
     serde_json::json!({
         "row_enabled": 1,

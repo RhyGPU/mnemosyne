@@ -39,6 +39,27 @@ pub struct ContextMessage {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlayerPersonaContext {
+    pub persona_id: String,
+    pub display_name: String,
+    pub gender_code: String,
+    pub pronouns: String,
+    pub description: String,
+}
+
+impl Default for PlayerPersonaContext {
+    fn default() -> Self {
+        Self {
+            persona_id: "preset_male".into(),
+            display_name: "Male Persona".into(),
+            gender_code: "male".into(),
+            pronouns: "he/him".into(),
+            description: "User-controlled male RP persona. No additional traits specified.".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextPreview {
     pub text: String,
@@ -185,6 +206,24 @@ pub fn compile_context_for_session(
     compile_context_with_budget_and_world(soul, session_world, messages, &ContextBudget::default())
 }
 
+pub fn compile_context_for_session_with_player_persona(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    messages: &[ContextMessage],
+    player_persona: &PlayerPersonaContext,
+) -> ContextPreview {
+    compile_context_with_budget_and_options(
+        soul,
+        session_world,
+        messages,
+        &ContextBudget::default(),
+        false,
+        false,
+        None,
+        Some(player_persona),
+    )
+}
+
 pub fn compile_context_for_separate_user_message(
     soul: &Soul,
     messages: &[ContextMessage],
@@ -196,6 +235,7 @@ pub fn compile_context_for_separate_user_message(
         &ContextBudget::default(),
         true,
         false,
+        None,
         None,
     )
 }
@@ -219,6 +259,22 @@ pub fn compile_context_for_session_separate_user_message_with_pending(
     messages: &[ContextMessage],
     pending_user_text: Option<&str>,
 ) -> ContextPreview {
+    compile_context_for_session_separate_user_message_with_player_persona_pending(
+        soul,
+        session_world,
+        messages,
+        pending_user_text,
+        None,
+    )
+}
+
+pub fn compile_context_for_session_separate_user_message_with_player_persona_pending(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    messages: &[ContextMessage],
+    pending_user_text: Option<&str>,
+    player_persona: Option<&PlayerPersonaContext>,
+) -> ContextPreview {
     compile_context_with_budget_and_options(
         soul,
         session_world,
@@ -227,6 +283,7 @@ pub fn compile_context_for_session_separate_user_message_with_pending(
         true,
         false,
         pending_user_text,
+        player_persona,
     )
 }
 
@@ -252,6 +309,7 @@ pub fn compile_context_with_budget_and_world(
         false,
         false,
         None,
+        None,
     )
 }
 
@@ -268,6 +326,7 @@ pub fn compile_context_for_session_with_debug_replies(
         false,
         true,
         None,
+        None,
     )
 }
 
@@ -279,13 +338,22 @@ fn compile_context_with_budget_and_options(
     separate_user_message_follows: bool,
     include_debug_replies: bool,
     pending_user_text: Option<&str>,
+    player_persona: Option<&PlayerPersonaContext>,
 ) -> ContextPreview {
+    let default_persona;
+    let player_persona = if let Some(player_persona) = player_persona {
+        player_persona
+    } else {
+        default_persona = PlayerPersonaContext::default();
+        &default_persona
+    };
     let mut truncated = false;
     let mut section_builders = vec![
+        build_controlled_entities_section(soul, player_persona, budget),
         build_world_section(soul, session_world, budget, pending_user_text),
         build_profile_section(soul, budget),
         build_memory_section(soul, messages, budget),
-        build_relationship_section(soul, budget),
+        build_relationship_section(soul, budget, player_persona),
         build_recent_chat_section(messages, budget),
         build_latest_exchange_section(messages, budget, separate_user_message_follows),
     ];
@@ -360,6 +428,35 @@ fn build_profile_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
         "[CHARACTER SNAPSHOT]",
         lines,
         budget.profile_tokens.min(budget.max_tokens),
+    )
+}
+
+fn build_controlled_entities_section(
+    soul: &Soul,
+    player_persona: &PlayerPersonaContext,
+    budget: &ContextBudget,
+) -> BuiltSection {
+    let character_name = fallback(&soul.character_name, "Unnamed Character");
+    let lines = vec![
+        "Narrator-controlled Souls:".into(),
+        format!("- {character_name} = engine-controlled character. The user is not {character_name}."),
+        "User-controlled player persona:".into(),
+        format!("- persona_id: {}", player_persona.persona_id),
+        format!("- display_name: {}", player_persona.display_name),
+        format!("- gender_code: {}", player_persona.gender_code),
+        format!("- pronouns: {}", player_persona.pronouns),
+        format!("- description: {}", player_persona.description),
+        "- controlled_by: user".into(),
+        "Operator: the real app user outside RP, appears only through slash commands".into(),
+        format!(
+            "If the user says \"I\", resolve \"I\" to {}, not to {character_name}.",
+            player_persona.display_name
+        ),
+    ];
+    section_from_lines(
+        "[CONTROLLED ENTITIES]",
+        lines,
+        budget.context_priority_tokens.min(budget.max_tokens),
     )
 }
 
@@ -1062,7 +1159,11 @@ fn build_world_section(
     )
 }
 
-fn build_relationship_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
+fn build_relationship_section(
+    soul: &Soul,
+    budget: &ContextBudget,
+    player_persona: &PlayerPersonaContext,
+) -> BuiltSection {
     if soul.relationships.is_empty() {
         return section_from_lines(
             "[RELATIONSHIPS]",
@@ -1072,14 +1173,17 @@ fn build_relationship_section(soul: &Soul, budget: &ContextBudget) -> BuiltSecti
     }
 
     let mut relationships = soul.relationships.iter().collect::<Vec<_>>();
-    relationships.sort_by(|left, right| display_entity_id(left.0).cmp(&display_entity_id(right.0)));
+    relationships.sort_by(|left, right| {
+        display_entity_id_for_persona(left.0, player_persona)
+            .cmp(&display_entity_id_for_persona(right.0, player_persona))
+    });
     let lines = relationships
         .into_iter()
         .map(|(target, relationship)| {
             format!(
                 "{} -> {}: {} Label/style: {}.",
                 fallback(&soul.character_name, "Character"),
-                display_entity_id(target),
+                display_entity_id_for_persona(target, player_persona),
                 relationship_surface_summary(relationship),
                 fallback(&relationship.love_type, "not yet named"),
             )
@@ -1636,6 +1740,24 @@ fn display_entity_id(entity_id: &str) -> String {
     trimmed.to_string()
 }
 
+fn display_entity_id_for_persona(
+    entity_id: &str,
+    player_persona: &PlayerPersonaContext,
+) -> String {
+    let trimmed = entity_id.trim();
+    if trimmed.eq_ignore_ascii_case("user")
+        || trimmed.eq_ignore_ascii_case("default_player")
+        || trimmed.eq_ignore_ascii_case(&player_persona.persona_id)
+    {
+        return format!(
+            "{} ({})",
+            fallback(&player_persona.display_name, "Player Persona"),
+            fallback(&player_persona.persona_id, "active_player_persona")
+        );
+    }
+    display_entity_id(trimmed)
+}
+
 fn excerpt(text: &str, max_chars: usize) -> String {
     let text = text.trim();
     if text.chars().count() <= max_chars {
@@ -1781,6 +1903,31 @@ mod tests {
             .text
             .contains("Aurora -> rhy: Trust feels faint and comfort feels faint"));
         assert!(!preview.text.contains("curiosity 35"));
+    }
+
+    #[test]
+    fn active_player_persona_replaces_default_player_in_context_surface() {
+        let mut soul = new_default_soul("Aurora");
+        soul.relationships.get_mut("user").unwrap().trust = 42.0;
+        let persona = PlayerPersonaContext {
+            persona_id: "persona_jun".into(),
+            display_name: "Jun Persona".into(),
+            gender_code: "custom".into(),
+            pronouns: "they/them".into(),
+            description: "User-controlled custom RP persona.".into(),
+        };
+        let preview = compile_context_for_session_with_player_persona(&soul, None, &[], &persona);
+
+        assert!(preview.text.contains("[CONTROLLED ENTITIES]"));
+        assert!(preview.text.contains("- persona_id: persona_jun"));
+        assert!(preview.text.contains("- display_name: Jun Persona"));
+        assert!(preview
+            .text
+            .contains("If the user says \"I\", resolve \"I\" to Jun Persona"));
+        assert!(preview
+            .text
+            .contains("Aurora -> Jun Persona (persona_jun):"));
+        assert!(!preview.text.contains("Aurora -> default_player:"));
     }
 
     #[test]
