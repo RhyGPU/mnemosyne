@@ -2987,6 +2987,7 @@ mod tests {
     ) -> MemoryEntry {
         MemoryEntry {
             archived: false,
+            is_pinned: false,
             id: id.into(),
             timestamp,
             content: content.into(),

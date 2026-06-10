@@ -79,6 +79,26 @@ Pillar 1 step 1. The provider layer can now request provider-enforced JSON.
   schema-shaped output parses into `EnginePatch` with serde alone — no repair
   layer involved.
 
+### 5. Memory pinning + archive restore (commit "Add memory pinning…")
+
+Pillar 3 / Memory Inspector prerequisite.
+
+- `MemoryEntry` gains `is_pinned: bool` (serde-default false). Pinned memories
+  are exempt from archival eviction and the stored-pool hard ceiling, and do
+  not consume active-cap slots.
+- Engine helpers in `memory.rs`: `set_memory_pinned` (pinning an archived
+  memory also restores it) and `restore_archived_memory` (refuses
+  invalidated/retconned memories — those are corrections, not evictions).
+- IMPORTANT DESIGN CONSTRAINT: pin/restore are wired as **patch operations**
+  (`operation: "pin" | "unpin" | "restore_archived"` in
+  `memory_operations`/`new_memories`), NOT direct soul mutation, because the
+  materialized soul is rebuilt by replaying the patch ledger — direct mutation
+  would be silently lost on rebuild. Any future UI command for pin/edit/
+  invalidate must write a patch through the ledger, not poke the soul.
+- Tests: `pin_and_restore_flow_through_patch_operations` (ledger replay
+  reproduces pin state), `pinned_memory_is_exempt_from_archival_eviction`,
+  plus helper tests in memory.rs.
+
 ## Next steps, in order (the wiring plan)
 
 ### A. New evaluator mode `evaluator_structured_v1` (the Pillar 1 payoff)
@@ -122,8 +142,8 @@ All evaluator LLM calls already funnel through ONE function:
   placeholder) + reinforcement on retrieval.
 - Pinning: `is_pinned: bool` on MemoryEntry; pinned memories are exempt from
   archival eviction and decay.
-- Restore path: command to un-archive a memory (set `archived = false,
-  is_active = true`) — needed by the Memory Inspector.
+- Restore path: DONE at the engine level (see item 5). Still needed: a Tauri
+  command that writes the pin/restore patch through the ledger + UI buttons.
 
 ### D. Memory Inspector / State Map V1 (Pillar 4)
 

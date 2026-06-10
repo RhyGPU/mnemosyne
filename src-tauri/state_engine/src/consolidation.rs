@@ -135,6 +135,7 @@ mod tests {
         for index in 0..4 {
             soul.memory.recent.push(MemoryEntry {
                 archived: false,
+            is_pinned: false,
                 id: format!("mid_{index}"),
                 timestamp: index,
                 content: format!("The room repeats a routine check number {index}."),
@@ -167,6 +168,7 @@ mod tests {
         }
         soul.memory.recent.push(MemoryEntry {
             archived: false,
+            is_pinned: false,
             id: "strong".into(),
             timestamp: 10,
             content: "Aurora survives a near death confrontation and chooses to keep moving."
@@ -199,6 +201,7 @@ mod tests {
         });
         soul.memory.recent.push(MemoryEntry {
             archived: false,
+            is_pinned: false,
             id: "weak".into(),
             timestamp: 11,
             content: "A forgettable wall mark is noticed.".into(),

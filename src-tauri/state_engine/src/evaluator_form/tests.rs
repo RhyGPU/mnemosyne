@@ -15,6 +15,7 @@ fn soul_and_world() -> (Soul, SessionWorld) {
     soul.character_id = "aurora_soul".into();
     soul.memory.recent.push(MemoryEntry {
         archived: false,
+            is_pinned: false,
         id: "mem_existing".into(),
         timestamp: 1,
         content: "Aurora remembers that the visitor knocked before entering.".into(),

@@ -88,6 +88,7 @@ impl<E: Embedder> MemoryScorer<E> {
 pub fn create_scored_memory(soul: &Soul, content: &str, tag: &str) -> MemoryEntry {
     let mut memory = MemoryEntry {
         archived: false,
+            is_pinned: false,
         id: format!("mem_{}", Uuid::new_v4()),
         timestamp: current_timestamp(),
         content: content.trim().to_string(),
@@ -122,6 +123,44 @@ pub fn create_scored_memory(soul: &Soul, content: &str, tag: &str) -> MemoryEntr
     memory.salience = salience;
     memory.retrieval_strength = salience;
     memory
+}
+
+/// Pin or unpin a stored memory. Pinning also restores an archived memory to
+/// the active pool, since a pinned memory must be retrievable. Returns false
+/// if no memory with the given id exists.
+pub fn set_memory_pinned(soul: &mut Soul, memory_id: &str, pinned: bool) -> bool {
+    let Some(memory) = soul
+        .memory
+        .recent
+        .iter_mut()
+        .find(|memory| memory.id == memory_id)
+    else {
+        return false;
+    };
+    memory.is_pinned = pinned;
+    if pinned && memory.archived {
+        memory.archived = false;
+        memory.is_active = true;
+    }
+    true
+}
+
+/// Restore a cap-evicted (archived) memory to the active pool. Memories that
+/// were invalidated or retconned (inactive but not archived) are not touched —
+/// those represent corrections, not evictions. Returns false if no archived
+/// memory with the given id exists.
+pub fn restore_archived_memory(soul: &mut Soul, memory_id: &str) -> bool {
+    let Some(memory) = soul
+        .memory
+        .recent
+        .iter_mut()
+        .find(|memory| memory.id == memory_id && memory.archived)
+    else {
+        return false;
+    };
+    memory.archived = false;
+    memory.is_active = true;
+    true
 }
 
 fn emotional_score(tag: &str) -> f32 {
@@ -215,6 +254,7 @@ mod tests {
         soul.global.maslow[2] = 5.0;
         let memory = MemoryEntry {
             archived: false,
+            is_pinned: false,
             id: "mem".into(),
             timestamp: 1,
             content: "Aurora accepts a careful promise and feels less alone.".into(),
@@ -254,6 +294,7 @@ mod tests {
         let mut soul = new_default_soul("Aurora");
         soul.memory.recent.push(MemoryEntry {
             archived: false,
+            is_pinned: false,
             id: "old".into(),
             timestamp: 1,
             content: "Aurora accepts a careful promise from the user.".into(),
@@ -286,6 +327,7 @@ mod tests {
 
         let duplicate = MemoryEntry {
             archived: false,
+            is_pinned: false,
             id: "new".into(),
             timestamp: 2,
             content: "Aurora accepts a careful promise from the user again.".into(),
@@ -318,6 +360,7 @@ mod tests {
 
         let fresh = MemoryEntry {
             archived: false,
+            is_pinned: false,
             id: "fresh".into(),
             timestamp: 2,
             content: "A hidden map reveals a route through the service tunnels.".into(),
@@ -350,5 +393,49 @@ mod tests {
 
         let scorer = MemoryScorer::default();
         assert!(scorer.score(&soul, &duplicate) < scorer.score(&soul, &fresh));
+    }
+
+    #[test]
+    fn pinning_restores_archived_memory() {
+        let mut soul = new_default_soul("Aurora");
+        let mut memory = create_scored_memory(&soul, "Aurora keeps the brass key.", "orientation");
+        memory.id = "mem_pin".into();
+        memory.archived = true;
+        memory.is_active = false;
+        soul.memory.recent.push(memory);
+
+        assert!(set_memory_pinned(&mut soul, "mem_pin", true));
+        let memory = &soul.memory.recent[0];
+        assert!(memory.is_pinned);
+        assert!(!memory.archived);
+        assert!(memory.is_active);
+
+        assert!(set_memory_pinned(&mut soul, "mem_pin", false));
+        assert!(!soul.memory.recent[0].is_pinned);
+        assert!(!set_memory_pinned(&mut soul, "missing", true));
+    }
+
+    #[test]
+    fn restore_only_touches_archived_memories() {
+        let mut soul = new_default_soul("Aurora");
+        let mut archived = create_scored_memory(&soul, "Aurora mapped the cellar.", "orientation");
+        archived.id = "mem_archived".into();
+        archived.archived = true;
+        archived.is_active = false;
+        let mut invalidated =
+            create_scored_memory(&soul, "Aurora misread the letter.", "orientation");
+        invalidated.id = "mem_invalidated".into();
+        invalidated.is_active = false;
+        soul.memory.recent.push(archived);
+        soul.memory.recent.push(invalidated);
+
+        assert!(restore_archived_memory(&mut soul, "mem_archived"));
+        assert!(soul.memory.recent[0].is_active);
+        assert!(!soul.memory.recent[0].archived);
+
+        // Invalidated (inactive, not archived) memories represent corrections
+        // and must not be resurrected by the archive-restore path.
+        assert!(!restore_archived_memory(&mut soul, "mem_invalidated"));
+        assert!(!soul.memory.recent[1].is_active);
     }
 }

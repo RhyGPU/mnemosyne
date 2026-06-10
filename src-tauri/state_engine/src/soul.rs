@@ -275,6 +275,10 @@ pub struct MemoryEntry {
     /// Archived memories stay stored, queryable, and restorable.
     #[serde(default)]
     pub archived: bool,
+    /// Pinned memories are exempt from archival eviction and future decay,
+    /// and do not consume active-pool cap slots.
+    #[serde(default)]
+    pub is_pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -772,6 +776,7 @@ mod tests {
         soul.world.time_elapsed = "One year after the first meeting.".into();
         soul.memory.recent.push(MemoryEntry {
             archived: false,
+            is_pinned: false,
             id: "recent".into(),
             timestamp: 1,
             content: "Aurora warmed to the user.".into(),

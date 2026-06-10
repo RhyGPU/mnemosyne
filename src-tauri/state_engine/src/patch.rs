@@ -503,7 +503,15 @@ impl SoulPatch {
             if memory.operation.as_deref().is_some_and(|op| {
                 matches!(
                     normalized_operation(op).as_str(),
-                    "invalidate" | "replace" | "update" | "mark_retconned" | "supersede"
+                    "invalidate"
+                        | "replace"
+                        | "update"
+                        | "mark_retconned"
+                        | "supersede"
+                        | "pin"
+                        | "unpin"
+                        | "restore_archived"
+                        | "unarchive"
                 )
             }) {
                 if apply_memory_operation(soul, memory) {
@@ -644,10 +652,11 @@ impl SoulPatch {
             });
             // Archive overflow beyond the active cap instead of deleting it.
             // Archived memories leave the prompt-candidate pool but stay stored,
-            // restorable, and exportable.
+            // restorable, and exportable. Pinned memories are exempt and do not
+            // consume cap slots.
             let mut active_seen = 0usize;
             for memory in soul.memory.recent.iter_mut() {
-                if memory.archived || !memory.is_active {
+                if memory.is_pinned || memory.archived || !memory.is_active {
                     continue;
                 }
                 active_seen += 1;
@@ -657,8 +666,18 @@ impl SoulPatch {
                 }
             }
             // Hard ceiling so the stored pool cannot grow without bound; the vec is
-            // salience-sorted, so this drops only the lowest-salience overflow.
-            soul.memory.recent.truncate(MAX_STORED_MEMORIES);
+            // salience-sorted, so this drops the lowest-salience unpinned overflow.
+            if soul.memory.recent.len() > MAX_STORED_MEMORIES {
+                let mut overflow = soul.memory.recent.len() - MAX_STORED_MEMORIES;
+                let mut index = soul.memory.recent.len();
+                while overflow > 0 && index > 0 {
+                    index -= 1;
+                    if !soul.memory.recent[index].is_pinned {
+                        soul.memory.recent.remove(index);
+                        overflow -= 1;
+                    }
+                }
+            }
         }
         report
     }
@@ -720,6 +739,21 @@ fn apply_memory_operation(soul: &mut Soul, memory: &MemoryPatch) -> bool {
                 return changed;
             }
             changed
+        }
+        // Ledger-replayable curation operations: pin state and archive
+        // restoration must flow through patches so a materialized rebuild
+        // reproduces them.
+        "pin" | "unpin" => {
+            let Some(target_id) = target_id else {
+                return false;
+            };
+            crate::memory::set_memory_pinned(soul, &target_id, operation == "pin")
+        }
+        "restore_archived" | "unarchive" => {
+            let Some(target_id) = target_id else {
+                return false;
+            };
+            crate::memory::restore_archived_memory(soul, &target_id)
         }
         _ => false,
     }
@@ -2390,6 +2424,116 @@ mod tests {
             .map(|memory| memory.salience)
             .fold(f32::NEG_INFINITY, f32::max);
         assert!(min_active >= max_archived);
+    }
+
+    #[test]
+    fn pin_and_restore_flow_through_patch_operations() {
+        // Pin state must be reproducible by replaying the ledger, so it is
+        // applied via memory_operations rather than direct soul mutation.
+        let add = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                new_memories: vec![MemoryPatch {
+                    memory_id: Some("mem_oath".into()),
+                    content: "Aurora swore the river oath at dawn.".into(),
+                    tag: Some("promise".into()),
+                    ..MemoryPatch::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        let pin = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                memory_operations: vec![MemoryPatch {
+                    operation: Some("pin".into()),
+                    target_memory_id: Some("mem_oath".into()),
+                    ..MemoryPatch::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        // Apply on one soul, then replay the same ledger on a fresh soul:
+        // both must agree.
+        for replay in 0..2 {
+            let mut soul = new_default_soul("Aurora");
+            add.apply_to_soul(&mut soul).expect("add applies");
+            pin.apply_to_soul(&mut soul).expect("pin applies");
+            let memory = soul
+                .memory
+                .recent
+                .iter()
+                .find(|memory| memory.id == "mem_oath")
+                .expect("memory exists");
+            assert!(memory.is_pinned, "replay {replay}: memory is pinned");
+        }
+    }
+
+    #[test]
+    fn pinned_memory_is_exempt_from_archival_eviction() {
+        let mut soul = new_default_soul("Aurora");
+        let mut pinned =
+            crate::memory::create_scored_memory(&soul, "Aurora swore the river oath.", "promise");
+        pinned.id = "mem_pinned".into();
+        pinned.salience = 1.0; // lowest salience: first in line for eviction
+        pinned.is_pinned = true;
+        soul.memory.recent.push(pinned);
+
+        let contents = [
+            "Aurora found a brass key beneath the chapel flagstones.",
+            "The northern bridge collapsed during the spring flood.",
+            "Marlow keeps carrier pigeons trained for coded letters.",
+            "A silver coin from Veldt buys passage on the ferry.",
+            "The lighthouse keeper sleeps through every second watch.",
+            "Wild thyme grows along the ruined aqueduct walls.",
+            "The blacksmith owes a gambling debt to the harbor guild.",
+            "Lantern oil is rationed after the warehouse fire.",
+            "An old map marks a well hidden inside the orchard.",
+            "The mayor's daughter studies astronomy in secret.",
+            "Wolves avoid the valley when the mill wheel turns.",
+            "A sealed letter waits under the tavern floorboard.",
+            "The glassblower trades mirrors for foreign spices.",
+            "Frost ruined the eastern vineyard two winters back.",
+        ];
+        for (index, content) in contents.iter().enumerate() {
+            let patch = EnginePatch {
+                schema_version: Some(PATCH_PROTOCOL_VERSION),
+                soul_patch: Some(SoulPatch {
+                    new_memories: vec![MemoryPatch {
+                        content: (*content).into(),
+                        tag: Some("orientation".into()),
+                        salience: Some(40.0 + index as f32),
+                        ..MemoryPatch::default()
+                    }],
+                    ..SoulPatch::default()
+                }),
+                ..EnginePatch::default()
+            };
+            patch.apply_to_soul(&mut soul).expect("patch applies");
+        }
+
+        let pinned = soul
+            .memory
+            .recent
+            .iter()
+            .find(|memory| memory.id == "mem_pinned")
+            .expect("pinned memory still stored");
+        assert!(pinned.is_active, "pinned memory must never be archived");
+        assert!(!pinned.archived);
+
+        let active_unpinned = soul
+            .memory
+            .recent
+            .iter()
+            .filter(|memory| memory.is_active && !memory.is_pinned)
+            .count();
+        assert_eq!(
+            active_unpinned, MAX_RECENT_MEMORIES,
+            "unpinned active pool stays capped"
+        );
     }
 
     #[test]
