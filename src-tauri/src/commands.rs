@@ -19309,6 +19309,7 @@ mod tests {
     fn soul_with_existing_memory() -> Soul {
         let mut soul = new_default_soul("Aurora Schwarz");
         soul.memory.recent.push(state_engine::soul::MemoryEntry {
+            archived: false,
             id: "existing-memory-1".into(),
             timestamp: 1,
             content: "The visitor entered Aurora's apartment.".into(),
@@ -21239,6 +21240,7 @@ mod tests {
         soul.world.object_states.push(ObjectState::default());
         soul.world.recent_events.push("An event occurred".into());
         soul.memory.recent.push(MemoryEntry {
+            archived: false,
             id: "mem1".into(),
             timestamp: 100,
             content: "recent observation".into(),

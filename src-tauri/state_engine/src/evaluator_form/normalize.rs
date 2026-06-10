@@ -5,9 +5,10 @@ use serde_json::Value;
 use crate::{
     evaluator::{EvaluatorConversionContext, MemorySlot},
     evaluator_form::{
-        active_player_entity_id, clean, resolve_active_entity_id, slugify, stable_id, EvalFormRepairTrace,
-        EvalFormResponse, EvalFormSpec, EventRow, EventType, ImportanceTier, MagnitudeTier,
-        MemoryRow, ObjectRow, RelationshipDimension, RelationshipDirection, RelationshipRow,
+        active_player_entity_id, clean, resolve_active_entity_id, slugify, stable_id,
+        EvalFormRepairTrace, EvalFormResponse, EvalFormSpec, EventRow, EventType, ImportanceTier,
+        MagnitudeTier, MemoryRow, ObjectRow, RelationshipDimension, RelationshipDirection,
+        RelationshipRow,
     },
 };
 
@@ -139,28 +140,57 @@ pub fn normalize_object_row_value(
             let s_norm = s.trim().to_ascii_lowercase();
             if s_norm == "object_change" {
                 *val = Value::String("state_change".into());
-                trace.raw_form_repair_warnings.push("change_type object_change normalized to state_change".into());
+                trace
+                    .raw_form_repair_warnings
+                    .push("change_type object_change normalized to state_change".into());
                 trace.raw_form_repair_applied = true;
             }
         }
     }
 
     // Part A: change_type-only normalizations
-    let change_type = row.get("change_type").and_then(Value::as_str).map(|s| s.trim().to_ascii_lowercase());
-    let prop_empty = row.get("property_changed").and_then(Value::as_str).unwrap_or("").trim().is_empty();
-    let val_empty = row.get("new_value").and_then(Value::as_str).unwrap_or("").trim().is_empty();
-    let evidence_quote = row.get("evidence_quote").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    let new_object_label = row.get("new_object_label").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let change_type = row
+        .get("change_type")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase());
+    let prop_empty = row
+        .get("property_changed")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .is_empty();
+    let val_empty = row
+        .get("new_value")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .is_empty();
+    let evidence_quote = row
+        .get("evidence_quote")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let new_object_label = row
+        .get("new_object_label")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
 
     if prop_empty {
         if let Some(ref ct) = change_type {
             if ct == "state_change" {
                 row.insert("property_changed".into(), Value::String("state".into()));
-                trace.raw_form_repair_warnings.push("property_changed derived as state".into());
+                trace
+                    .raw_form_repair_warnings
+                    .push("property_changed derived as state".into());
                 trace.raw_form_repair_applied = true;
             } else if ct == "new_object_observation" {
                 row.insert("property_changed".into(), Value::String("presence".into()));
-                trace.raw_form_repair_warnings.push("property_changed derived as presence".into());
+                trace
+                    .raw_form_repair_warnings
+                    .push("property_changed derived as presence".into());
                 trace.raw_form_repair_applied = true;
             }
         }
@@ -175,7 +205,9 @@ pub fn normalize_object_row_value(
                     "state_changed".to_string()
                 };
                 row.insert("new_value".into(), Value::String(nv));
-                trace.raw_form_repair_warnings.push("new_value derived for state_change".into());
+                trace
+                    .raw_form_repair_warnings
+                    .push("new_value derived for state_change".into());
                 trace.raw_form_repair_applied = true;
             } else if ct == "new_object_observation" {
                 let nv = if !new_object_label.is_empty() {
@@ -186,18 +218,27 @@ pub fn normalize_object_row_value(
                     "presence_observed".to_string()
                 };
                 row.insert("new_value".into(), Value::String(nv));
-                trace.raw_form_repair_warnings.push("new_value derived for new_object_observation".into());
+                trace
+                    .raw_form_repair_warnings
+                    .push("new_value derived for new_object_observation".into());
                 trace.raw_form_repair_applied = true;
             }
         }
     }
 
-    let obj_id_empty = row.get("object_id").and_then(Value::as_str).unwrap_or("").trim().is_empty();
+    let obj_id_empty = row
+        .get("object_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .is_empty();
     if obj_id_empty {
         if !new_object_label.is_empty() {
             let slug = slugify(&new_object_label);
             row.insert("object_id".into(), Value::String(slug));
-            trace.raw_form_repair_warnings.push("object_id canonicalized from new_object_label".into());
+            trace
+                .raw_form_repair_warnings
+                .push("object_id canonicalized from new_object_label".into());
             trace.raw_form_repair_applied = true;
         }
     }
@@ -243,7 +284,9 @@ pub fn normalize_relationship_row_value(
                 row.insert("source_soul_id".into(), Value::String(left));
                 row.insert("target_entity_id".into(), Value::String(right));
                 row.remove("direction");
-                trace.raw_form_repair_warnings.push("arrow direction parsed as source and target".into());
+                trace
+                    .raw_form_repair_warnings
+                    .push("arrow direction parsed as source and target".into());
                 trace.raw_form_repair_applied = true;
             }
         }
@@ -254,7 +297,9 @@ pub fn normalize_relationship_row_value(
             let s_norm = s.trim().to_ascii_lowercase();
             if s_norm == "relationship_shift" {
                 *val = Value::String("shift".into());
-                trace.raw_form_repair_warnings.push("change_type relationship_shift normalized to shift".into());
+                trace
+                    .raw_form_repair_warnings
+                    .push("change_type relationship_shift normalized to shift".into());
                 trace.raw_form_repair_applied = true;
             }
         }
@@ -387,10 +432,25 @@ pub fn infer_relationship_direction_from_shift(
     }
 
     if !traditional_inferred {
-        let change_type = row.get("change_type").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+        let change_type = row
+            .get("change_type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         if change_type == "shift" {
-            let dimension = row.get("dimension").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
-            let evidence = row.get("evidence_quote").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+            let dimension = row
+                .get("dimension")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let evidence = row
+                .get("evidence_quote")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
 
             let has_increase_word = evidence.contains("increase")
                 || evidence.contains("grew")
@@ -440,11 +500,39 @@ pub fn infer_relationship_direction_from_shift(
                 let has_decrease = has_decrease_word && !has_increase_word;
                 let direction = if has_decrease {
                     Some("decrease")
-                } else if dimension == "trust" || dimension == "affection" || dimension == "intimacy" || dimension == "passion" || dimension == "commitment" || dimension == "desire" || dimension == "respect" || dimension == "curiosity" || dimension == "interest" || dimension == "comfort" {
+                } else if dimension == "trust"
+                    || dimension == "affection"
+                    || dimension == "intimacy"
+                    || dimension == "passion"
+                    || dimension == "commitment"
+                    || dimension == "desire"
+                    || dimension == "respect"
+                    || dimension == "curiosity"
+                    || dimension == "interest"
+                    || dimension == "comfort"
+                {
                     Some("increase")
-                } else if dimension == "boundary_pressure" || dimension == "boundarypressure" || dimension == "conflict" || dimension == "fear" {
-                    let has_escalation = evidence.contains("pressure") || evidence.contains("conflict") || evidence.contains("fear") || evidence.contains("tension") || evidence.contains("wary") || evidence.contains("guarded") || evidence.contains("edge") || evidence.contains("escalation")
-                        || change_type.contains("pressure") || change_type.contains("conflict") || change_type.contains("fear") || change_type.contains("tension") || change_type.contains("wary") || change_type.contains("guarded") || change_type.contains("edge") || change_type.contains("escalation");
+                } else if dimension == "boundary_pressure"
+                    || dimension == "boundarypressure"
+                    || dimension == "conflict"
+                    || dimension == "fear"
+                {
+                    let has_escalation = evidence.contains("pressure")
+                        || evidence.contains("conflict")
+                        || evidence.contains("fear")
+                        || evidence.contains("tension")
+                        || evidence.contains("wary")
+                        || evidence.contains("guarded")
+                        || evidence.contains("edge")
+                        || evidence.contains("escalation")
+                        || change_type.contains("pressure")
+                        || change_type.contains("conflict")
+                        || change_type.contains("fear")
+                        || change_type.contains("tension")
+                        || change_type.contains("wary")
+                        || change_type.contains("guarded")
+                        || change_type.contains("edge")
+                        || change_type.contains("escalation");
                     if has_escalation {
                         Some("increase")
                     } else {
@@ -849,7 +937,10 @@ pub fn memory_slot_from_value(value: &Value) -> Option<&'static str> {
     }
 }
 
-pub fn normalize_tags_value(row: &mut serde_json::Map<String, Value>, trace: &mut EvalFormRepairTrace) {
+pub fn normalize_tags_value(
+    row: &mut serde_json::Map<String, Value>,
+    trace: &mut EvalFormRepairTrace,
+) {
     let Some(tags) = row.get_mut("selected_tags").and_then(Value::as_array_mut) else {
         return;
     };
@@ -1090,9 +1181,7 @@ pub fn compact_latest_turn_summary(context: &EvaluatorConversionContext<'_>) -> 
 
 pub fn choose_main_event_id(rows: &[EventRow]) -> Option<String> {
     rows.iter()
-        .max_by_key(|row| {
-            importance_rank(row.importance_tier.unwrap_or(ImportanceTier::Medium))
-        })
+        .max_by_key(|row| importance_rank(row.importance_tier.unwrap_or(ImportanceTier::Medium)))
         .and_then(|row| clean(&row.event_id).map(str::to_string))
 }
 
@@ -1114,10 +1203,9 @@ pub fn normalize_child_link(
 ) {
     let raw = linked_event_id.trim();
     if raw.is_empty() || raw == "event_latest_turn" {
-        if let Some(associated) = associated_event_ids
-            .iter()
-            .find(|id| *id != "event_latest_turn" && event_ids.iter().any(|event_id| event_id == *id))
-        {
+        if let Some(associated) = associated_event_ids.iter().find(|id| {
+            *id != "event_latest_turn" && event_ids.iter().any(|event_id| event_id == *id)
+        }) {
             *linked_event_id = associated.clone();
         } else if clean(main_event_id).is_some() {
             *linked_event_id = main_event_id.to_string();
@@ -1246,7 +1334,11 @@ pub fn normalize_relationship_defaults(row: &mut RelationshipRow) {
             );
 
             let evidence_lower = row.evidence_quote.to_ascii_lowercase();
-            let change_type_lower = row.change_type.as_deref().unwrap_or("").to_ascii_lowercase();
+            let change_type_lower = row
+                .change_type
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase();
 
             let has_escalation_keyword = evidence_lower.contains("pressure")
                 || evidence_lower.contains("conflict")
@@ -1689,7 +1781,10 @@ pub fn infer_relationship_direction_from_evidence(
             ];
             if strong_comfort.iter().any(|&p| evidence_lower.contains(p)) {
                 return Some(RelationshipDirection::Increase);
-            } else if strong_discomfort.iter().any(|&p| evidence_lower.contains(p)) {
+            } else if strong_discomfort
+                .iter()
+                .any(|&p| evidence_lower.contains(p))
+            {
                 return Some(RelationshipDirection::Decrease);
             }
         }

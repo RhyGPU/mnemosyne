@@ -1,5 +1,3 @@
-
-
 pub mod types;
 pub use types::*;
 
@@ -24,14 +22,6 @@ pub use validate::*;
 pub mod compile;
 pub use compile::*;
 
-
-
-
-
-
-
-
-
 pub(crate) fn slugify(label: &str) -> String {
     label
         .trim()
@@ -52,27 +42,28 @@ pub(crate) fn resolve_active_entity_id(raw_id: &str, spec: &EvalFormSpec) -> Str
     if clean_raw.is_empty() {
         return clean_raw.to_string();
     }
-    
+
     let normalized_raw = normalize_token(clean_raw);
-    
+
     for entity in &spec.active_entities {
         if entity.entity_id == clean_raw {
             return entity.entity_id.clone();
         }
-        
+
         if normalize_token(&entity.display_name) == normalized_raw {
             return entity.entity_id.clone();
         }
-        
+
         if normalize_token(&entity.entity_id) == normalized_raw {
             return entity.entity_id.clone();
         }
     }
-    
-    if normalized_raw == "user" || normalized_raw == "default_player" || normalized_raw == "player" {
+
+    if normalized_raw == "user" || normalized_raw == "default_player" || normalized_raw == "player"
+    {
         return active_player_entity_id(spec).unwrap_or_else(|| "default_player".to_string());
     }
-    
+
     clean_raw.to_string()
 }
 
@@ -82,8 +73,6 @@ pub(crate) fn active_player_entity_id(spec: &EvalFormSpec) -> Option<String> {
         .find(|entity| entity.entity_type == "player_persona" || entity.entity_type == "user")
         .map(|entity| entity.entity_id.clone())
 }
-
-
 
 #[cfg(test)]
 mod tests;

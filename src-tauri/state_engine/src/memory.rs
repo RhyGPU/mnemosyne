@@ -87,6 +87,7 @@ impl<E: Embedder> MemoryScorer<E> {
 
 pub fn create_scored_memory(soul: &Soul, content: &str, tag: &str) -> MemoryEntry {
     let mut memory = MemoryEntry {
+        archived: false,
         id: format!("mem_{}", Uuid::new_v4()),
         timestamp: current_timestamp(),
         content: content.trim().to_string(),
@@ -213,6 +214,7 @@ mod tests {
         let mut soul = new_default_soul("Aurora");
         soul.global.maslow[2] = 5.0;
         let memory = MemoryEntry {
+            archived: false,
             id: "mem".into(),
             timestamp: 1,
             content: "Aurora accepts a careful promise and feels less alone.".into(),
@@ -251,6 +253,7 @@ mod tests {
     fn repetition_discount_reduces_duplicate_score() {
         let mut soul = new_default_soul("Aurora");
         soul.memory.recent.push(MemoryEntry {
+            archived: false,
             id: "old".into(),
             timestamp: 1,
             content: "Aurora accepts a careful promise from the user.".into(),
@@ -282,6 +285,7 @@ mod tests {
         });
 
         let duplicate = MemoryEntry {
+            archived: false,
             id: "new".into(),
             timestamp: 2,
             content: "Aurora accepts a careful promise from the user again.".into(),
@@ -313,6 +317,7 @@ mod tests {
         };
 
         let fresh = MemoryEntry {
+            archived: false,
             id: "fresh".into(),
             timestamp: 2,
             content: "A hidden map reveals a route through the service tunnels.".into(),

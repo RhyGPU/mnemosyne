@@ -154,7 +154,12 @@ impl BiasDeltas {
         cap: f32,
     ) -> Self {
         Self {
-            trustable: bias_delta(current.trustable_bias, evidence.trustable, event_strength, cap),
+            trustable: bias_delta(
+                current.trustable_bias,
+                evidence.trustable,
+                event_strength,
+                cap,
+            ),
             untrustworthy: bias_delta(
                 current.untrustworthy_bias,
                 evidence.untrustworthy,
@@ -251,13 +256,13 @@ impl StateTargets {
                 + 15.0 * pos(row.reciprocity)
                 + 0.10 * current.attachment_pull
                 - 0.20 * current.boundary_pressure)
-            .clamp(0.0, 100.0),
+                .clamp(0.0, 100.0),
             respect: (0.35 * biases.competence
                 + 0.25 * biases.autonomy_respect
                 + 0.20 * biases.trustable
                 + 10.0 * pos(row.evaluation_tone)
                 - 0.15 * biases.asshole)
-            .clamp(0.0, 100.0),
+                .clamp(0.0, 100.0),
         }
     }
 }
@@ -376,7 +381,9 @@ fn first_impression_deltas(
         return (0.0, 0.0);
     }
     let next_strength = current.first_impression_strength.max(row.salience as f32);
-    let next_confidence = current.first_impression_confidence.max(row.certainty as f32);
+    let next_confidence = current
+        .first_impression_confidence
+        .max(row.certainty as f32);
     (
         (next_strength - current.first_impression_strength).clamp(-cap, cap),
         (next_confidence - current.first_impression_confidence).clamp(-cap, cap),

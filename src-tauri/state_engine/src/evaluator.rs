@@ -1419,10 +1419,7 @@ mod tests {
     #[test]
     fn single_continuous_exact_quote_passes_validation() {
         let evidence = "Aurora hears it: Don't mind the chain. Knock knock. Come in.";
-        assert!(claim_has_evidence(
-            Some("Don't mind the chain"),
-            evidence
-        ));
+        assert!(claim_has_evidence(Some("Don't mind the chain"), evidence));
     }
 
     #[test]

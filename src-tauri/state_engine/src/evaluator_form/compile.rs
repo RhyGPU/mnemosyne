@@ -8,18 +8,16 @@ use crate::{
         TurnClassification, WorldChangeEvaluation, EVALUATOR_SCHEMA_VERSION,
     },
     evaluator_form::{
-        active_player_entity_id,
-        clean, resolve_active_entity_id, slugify,
+        active_player_entity_id, clean, normalize_eval_form_response, normalize_player_id,
         relationship_evaluation_has_delta, relationship_event_row_id,
-        relationship_from_numeric_event_row,
-        validate_event_row, validate_memory_row, validate_object_row,
-        validate_relationship_event_row, validate_relationship_row, validate_review_row,
-        ConfidenceTier, EvalFormCompileResult, EvalFormResponse, EvalFormRowRejection,
-        EvalFormSpec, EvalFormTrace, EvalRowTrace, EventRow, EventType, ExistingStateKind,
-        ExistingStateRow, FormDedupeDecisionTrace, FormEntityOption, FormRelationshipState,
-        ImportanceTier, MagnitudeTier, MemoryRow, ObjectRow, RelationshipDimension, RelationshipDirection,
-        RelationshipEventValidation, RelationshipRow, ReviewDecision, ReviewRow,
-        RELATIONSHIP_EVENT_TEMPLATE_VERSION, normalize_eval_form_response, normalize_player_id,
+        relationship_from_numeric_event_row, resolve_active_entity_id, slugify, validate_event_row,
+        validate_memory_row, validate_object_row, validate_relationship_event_row,
+        validate_relationship_row, validate_review_row, ConfidenceTier, EvalFormCompileResult,
+        EvalFormResponse, EvalFormRowRejection, EvalFormSpec, EvalFormTrace, EvalRowTrace,
+        EventRow, EventType, ExistingStateKind, ExistingStateRow, FormDedupeDecisionTrace,
+        FormEntityOption, FormRelationshipState, ImportanceTier, MagnitudeTier, MemoryRow,
+        ObjectRow, RelationshipDimension, RelationshipDirection, RelationshipEventValidation,
+        RelationshipRow, ReviewDecision, ReviewRow, RELATIONSHIP_EVENT_TEMPLATE_VERSION,
     },
     evaluator_ingest::NormalizedEvaluationDraft,
     patch::{MemoryPatch, SceneStatePatch, PATCH_PROTOCOL_VERSION},
@@ -164,7 +162,10 @@ pub fn build_eval_form_spec_with_player_persona(
     }
 }
 
-fn relationship_states_for_spec(soul: &Soul, player_persona_id: &str) -> Vec<FormRelationshipState> {
+fn relationship_states_for_spec(
+    soul: &Soul,
+    player_persona_id: &str,
+) -> Vec<FormRelationshipState> {
     soul.relationships
         .iter()
         .map(|(target, relationship)| FormRelationshipState {
@@ -221,7 +222,7 @@ pub fn compile_eval_form_response(
         schema_version: EVALUATOR_SCHEMA_VERSION,
         ..EvaluatorOutputV1::default()
     };
-    
+
     let mut evaluator_row_traces = Vec::new();
     let mut object_row_results = HashMap::new();
     let mut memory_row_results = HashMap::new();
@@ -290,13 +291,29 @@ pub fn compile_eval_form_response(
         .collect::<HashMap<_, _>>();
 
     for (idx, row) in response.event_rows.iter().enumerate() {
-        let raw_row = raw_response_struct.event_rows.get(idx).cloned().unwrap_or_else(|| row.clone());
+        let raw_row = raw_response_struct
+            .event_rows
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| row.clone());
         let valid = validate_event_row(row, spec, &allowed_entities, &mut rejected_rows);
-        
-        let validation_status = if valid { "accepted".to_string() } else { "rejected".to_string() };
-        let rejection_reason = if valid { None } else { rejected_rows.last().map(|r| r.reason.clone()) };
-        let compiler_result = if valid { "world_event_created".to_string() } else { "rejected".to_string() };
-        
+
+        let validation_status = if valid {
+            "accepted".to_string()
+        } else {
+            "rejected".to_string()
+        };
+        let rejection_reason = if valid {
+            None
+        } else {
+            rejected_rows.last().map(|r| r.reason.clone())
+        };
+        let compiler_result = if valid {
+            "world_event_created".to_string()
+        } else {
+            "rejected".to_string()
+        };
+
         evaluator_row_traces.push(EvalRowTrace {
             row_kind: "event".to_string(),
             row_index: idx,
@@ -434,7 +451,9 @@ pub fn compile_eval_form_response(
         let rejection_reason = if validated.is_some() {
             None
         } else {
-            rejected_rows.get(rejected_before).map(|row| row.reason.clone())
+            rejected_rows
+                .get(rejected_before)
+                .map(|row| row.reason.clone())
         };
 
         let (validation_status, compiler_result, normalized_row) = match validated.as_ref() {
@@ -503,7 +522,11 @@ pub fn compile_eval_form_response(
     }
 
     for (idx, row) in response.relationship_rows.iter().enumerate() {
-        let raw_row = raw_response_struct.relationship_rows.get(idx).cloned().unwrap_or_else(|| row.clone());
+        let raw_row = raw_response_struct
+            .relationship_rows
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| row.clone());
         let row_id = format!(
             "{}:{}:{}:{}",
             row.linked_event_id,
@@ -512,7 +535,9 @@ pub fn compile_eval_form_response(
             row.dimension.map(|d| d.as_label()).unwrap_or("unknown")
         );
 
-        if numeric_relationship_pairs.contains(&(row.source_soul_id.clone(), row.target_entity_id.clone())) {
+        if numeric_relationship_pairs
+            .contains(&(row.source_soul_id.clone(), row.target_entity_id.clone()))
+        {
             evaluator_row_traces.push(EvalRowTrace {
                 row_kind: "relationship".to_string(),
                 row_index: idx,
@@ -523,17 +548,24 @@ pub fn compile_eval_form_response(
                 compiler_result: "deduped_numeric_event_v2_priority".to_string(),
             });
             trace.form_rows_accepted += 1;
-            relationship_row_results.insert(
-                row_id,
-                "deduped_numeric_event_v2_priority".to_string(),
-            );
+            relationship_row_results
+                .insert(row_id, "deduped_numeric_event_v2_priority".to_string());
             continue;
         }
 
-        let valid = validate_relationship_row(row, spec, &allowed_entities, &event_ids, &mut rejected_rows);
-        
-        let validation_status = if valid { "accepted".to_string() } else { "rejected".to_string() };
-        let rejection_reason = if valid { None } else { rejected_rows.last().map(|r| r.reason.clone()) };
+        let valid =
+            validate_relationship_row(row, spec, &allowed_entities, &event_ids, &mut rejected_rows);
+
+        let validation_status = if valid {
+            "accepted".to_string()
+        } else {
+            "rejected".to_string()
+        };
+        let rejection_reason = if valid {
+            None
+        } else {
+            rejected_rows.last().map(|r| r.reason.clone())
+        };
         let compiler_result = if valid {
             if row.direction != Some(RelationshipDirection::NoChange) {
                 "relationship_delta_created".to_string()
@@ -543,7 +575,7 @@ pub fn compile_eval_form_response(
         } else {
             "rejected".to_string()
         };
-        
+
         evaluator_row_traces.push(EvalRowTrace {
             row_kind: "relationship".to_string(),
             row_index: idx,
@@ -562,8 +594,7 @@ pub fn compile_eval_form_response(
                     .push(relationship_from_row(row));
                 output.turn_flags_u64 |= turn_flags::RELATIONSHIP_SHIFT;
                 relationship_row_results.insert(row_id.clone(), "delta_created".to_string());
-                relationship_delta_source
-                    .insert(row_id, "legacy_relationship_row".to_string());
+                relationship_delta_source.insert(row_id, "legacy_relationship_row".to_string());
             } else {
                 relationship_non_delta_count += 1;
                 relationship_row_results.insert(row_id, "non_delta_no_change".to_string());
@@ -579,7 +610,11 @@ pub fn compile_eval_form_response(
     trace.relationship_delta_source = relationship_delta_source;
 
     for (idx, row) in response.memory_rows.iter().enumerate() {
-        let raw_row = raw_response_struct.memory_rows.get(idx).cloned().unwrap_or_else(|| row.clone());
+        let raw_row = raw_response_struct
+            .memory_rows
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| row.clone());
         let candidate_id = memory_candidate_id(row);
         if memory_row_disabled(row) {
             memory_row_results.insert(candidate_id, "disabled_row_ignored".to_string());
@@ -595,12 +630,20 @@ pub fn compile_eval_form_response(
             continue;
         }
         let review = review_map.get(&candidate_id).copied();
-        
+
         let valid = validate_memory_row(row, spec, &event_ids, &mut rejected_rows);
-        
-        let validation_status = if valid { "accepted".to_string() } else { "rejected".to_string() };
-        let rejection_reason = if valid { None } else { rejected_rows.last().map(|r| r.reason.clone()) };
-        
+
+        let validation_status = if valid {
+            "accepted".to_string()
+        } else {
+            "rejected".to_string()
+        };
+        let rejection_reason = if valid {
+            None
+        } else {
+            rejected_rows.last().map(|r| r.reason.clone())
+        };
+
         let compiler_result = if valid {
             if matches!(
                 review.map(|(decision, _)| decision),
@@ -617,7 +660,7 @@ pub fn compile_eval_form_response(
         } else {
             "rejected".to_string()
         };
-        
+
         evaluator_row_traces.push(EvalRowTrace {
             row_kind: "memory".to_string(),
             row_index: idx,
@@ -657,7 +700,7 @@ pub fn compile_eval_form_response(
         }
         trace.form_rows_accepted += 1;
         memory_row_results.insert(candidate_id.clone(), "candidate_created".to_string());
-        
+
         let candidate = memory_candidate_from_row(row, &candidate_id, spec);
         if row.owner_soul_id == "session_world" {
             output.world_changes.push(WorldChangeEvaluation {
@@ -674,19 +717,35 @@ pub fn compile_eval_form_response(
     }
 
     for (idx, row) in response.review_rows.iter().enumerate() {
-        let raw_row = raw_response_struct.review_rows.get(idx).cloned().unwrap_or_else(|| row.clone());
+        let raw_row = raw_response_struct
+            .review_rows
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| row.clone());
         let valid = validate_review_row(row, spec, &mut rejected_rows);
-        
-        let validation_status = if valid { "accepted".to_string() } else { "rejected".to_string() };
-        let compiler_result = if valid { "advisory_only".to_string() } else { "rejected".to_string() };
-        
+
+        let validation_status = if valid {
+            "accepted".to_string()
+        } else {
+            "rejected".to_string()
+        };
+        let compiler_result = if valid {
+            "advisory_only".to_string()
+        } else {
+            "rejected".to_string()
+        };
+
         evaluator_row_traces.push(EvalRowTrace {
             row_kind: "review".to_string(),
             row_index: idx,
             raw_row: serde_json::to_value(&raw_row).unwrap_or_default(),
             normalized_row: serde_json::to_value(row).unwrap_or_default(),
             validation_status,
-            rejection_reason: if valid { None } else { Some("missing_decision_or_candidate_id".to_string()) },
+            rejection_reason: if valid {
+                None
+            } else {
+                Some("missing_decision_or_candidate_id".to_string())
+            },
             compiler_result,
         });
 
@@ -835,7 +894,11 @@ impl ObjectIdentityRegistry {
     fn assign(&mut self, owner_id: &str, object_type: &str, prefer_new_instance: bool) -> String {
         let owner = slugify(owner_id).trim().to_string();
         let object_type = slugify(object_type).trim().to_string();
-        let owner = if owner.is_empty() { "unknown".into() } else { owner };
+        let owner = if owner.is_empty() {
+            "unknown".into()
+        } else {
+            owner
+        };
         let object_type = if object_type.is_empty() {
             "object".into()
         } else {
@@ -988,8 +1051,22 @@ fn is_temporary_state_object_id(object_id: &str, object_type: &str) -> bool {
         return false;
     }
     let state_words = [
-        "wet", "soaked", "damp", "dry", "broken", "shattered", "open", "closed", "locked",
-        "unlocked", "dirty", "clean", "torn", "bloodied", "empty", "full",
+        "wet",
+        "soaked",
+        "damp",
+        "dry",
+        "broken",
+        "shattered",
+        "open",
+        "closed",
+        "locked",
+        "unlocked",
+        "dirty",
+        "clean",
+        "torn",
+        "bloodied",
+        "empty",
+        "full",
     ];
     state_words.iter().any(|word| {
         normalized == format!("{word}_{object_type}")
@@ -1042,7 +1119,10 @@ fn infer_object_type(row: &ObjectRow, text: &str) -> String {
 }
 
 fn is_generic_object_kind(kind: &str) -> bool {
-    matches!(kind, "clothing" | "clothes" | "item" | "object" | "thing" | "unknown")
+    matches!(
+        kind,
+        "clothing" | "clothes" | "item" | "object" | "thing" | "unknown"
+    )
 }
 
 fn strip_state_words_from_type(value: &str) -> String {
@@ -1094,7 +1174,12 @@ fn strip_state_words_from_type(value: &str) -> String {
     }
 }
 
-fn infer_object_owner_id(row: &ObjectRow, text: &str, object_type: &str, spec: &EvalFormSpec) -> String {
+fn infer_object_owner_id(
+    row: &ObjectRow,
+    text: &str,
+    object_type: &str,
+    spec: &EvalFormSpec,
+) -> String {
     if let Some(owner_id) = row.owner_entity_id.as_deref().and_then(clean) {
         let resolved = resolve_active_entity_id(owner_id, spec);
         if spec
@@ -1162,19 +1247,11 @@ fn infer_object_status(row: &ObjectRow, text: &str) -> String {
 fn infer_object_location(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
     [
-        "chair",
-        "table",
-        "couch",
-        "sofa",
-        "floor",
-        "door",
-        "counter",
-        "bed",
-        "desk",
+        "chair", "table", "couch", "sofa", "floor", "door", "counter", "bed", "desk",
     ]
     .iter()
-        .find(|location| lower.contains(**location))
-        .map(|location| (*location).to_string())
+    .find(|location| lower.contains(**location))
+    .map(|location| (*location).to_string())
 }
 
 fn object_row_disabled(row: &ObjectRow) -> bool {

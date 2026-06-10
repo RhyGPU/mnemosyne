@@ -19,6 +19,7 @@ const MAX_RELATIONSHIP_DELTA: f32 = 10.0;
 const RELATIONSHIP_SCALAR_MIN: f32 = 0.0;
 const RELATIONSHIP_SCALAR_MAX: f32 = 300.0;
 const MAX_RECENT_MEMORIES: usize = 12;
+const MAX_STORED_MEMORIES: usize = 200;
 const MAX_RECENT_EVENTS: usize = 12;
 const MEMORY_HYGIENE_SCAN_LIMIT: usize = 30;
 
@@ -641,7 +642,23 @@ impl SoulPatch {
                     .partial_cmp(&left.salience)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
-            soul.memory.recent.truncate(MAX_RECENT_MEMORIES);
+            // Archive overflow beyond the active cap instead of deleting it.
+            // Archived memories leave the prompt-candidate pool but stay stored,
+            // restorable, and exportable.
+            let mut active_seen = 0usize;
+            for memory in soul.memory.recent.iter_mut() {
+                if memory.archived || !memory.is_active {
+                    continue;
+                }
+                active_seen += 1;
+                if active_seen > MAX_RECENT_MEMORIES {
+                    memory.archived = true;
+                    memory.is_active = false;
+                }
+            }
+            // Hard ceiling so the stored pool cannot grow without bound; the vec is
+            // salience-sorted, so this drops only the lowest-salience overflow.
+            soul.memory.recent.truncate(MAX_STORED_MEMORIES);
         }
         report
     }
@@ -1242,13 +1259,8 @@ impl SensoryPatch {
 
 fn apply_delta_with_cap(value: &mut f32, delta: Option<f32>, max_abs_delta: f32) {
     let max_abs_delta = finite_delta(max_abs_delta, 0.0, 30.0);
-    *value = (*value
-        + finite_delta(
-            delta.unwrap_or(0.0),
-            -max_abs_delta,
-            max_abs_delta,
-        ))
-    .clamp(RELATIONSHIP_SCALAR_MIN, RELATIONSHIP_SCALAR_MAX);
+    *value = (*value + finite_delta(delta.unwrap_or(0.0), -max_abs_delta, max_abs_delta))
+        .clamp(RELATIONSHIP_SCALAR_MIN, RELATIONSHIP_SCALAR_MAX);
 }
 
 fn finite_delta(value: f32, min: f32, max: f32) -> f32 {
@@ -1287,12 +1299,20 @@ fn apply_relationship_delta(soul: &mut Soul, delta: &RelationshipDelta) -> bool 
     apply_delta_with_cap(&mut relationship.affection, delta.affection, max_abs_delta);
     apply_delta_with_cap(&mut relationship.intimacy, delta.intimacy, max_abs_delta);
     apply_delta_with_cap(&mut relationship.passion, delta.passion, max_abs_delta);
-    apply_delta_with_cap(&mut relationship.commitment, delta.commitment, max_abs_delta);
+    apply_delta_with_cap(
+        &mut relationship.commitment,
+        delta.commitment,
+        max_abs_delta,
+    );
     apply_delta_with_cap(&mut relationship.fear, delta.fear, max_abs_delta);
     apply_delta_with_cap(&mut relationship.desire, delta.desire, max_abs_delta);
     apply_delta_with_cap(&mut relationship.respect, delta.respect, max_abs_delta);
     apply_delta_with_cap(&mut relationship.conflict, delta.conflict, max_abs_delta);
-    apply_delta_with_cap(&mut relationship.dependency, delta.dependency, max_abs_delta);
+    apply_delta_with_cap(
+        &mut relationship.dependency,
+        delta.dependency,
+        max_abs_delta,
+    );
     apply_delta_with_cap(&mut relationship.curiosity, delta.curiosity, max_abs_delta);
     apply_delta_with_cap(&mut relationship.comfort, delta.comfort, max_abs_delta);
     apply_delta_with_cap(
@@ -1310,9 +1330,17 @@ fn apply_relationship_delta(soul: &mut Soul, delta: &RelationshipDelta) -> bool 
         delta.untrustworthy_bias,
         max_abs_delta,
     );
-    apply_delta_with_cap(&mut relationship.asshole_bias, delta.asshole_bias, max_abs_delta);
+    apply_delta_with_cap(
+        &mut relationship.asshole_bias,
+        delta.asshole_bias,
+        max_abs_delta,
+    );
     apply_delta_with_cap(&mut relationship.care_bias, delta.care_bias, max_abs_delta);
-    apply_delta_with_cap(&mut relationship.danger_bias, delta.danger_bias, max_abs_delta);
+    apply_delta_with_cap(
+        &mut relationship.danger_bias,
+        delta.danger_bias,
+        max_abs_delta,
+    );
     apply_delta_with_cap(
         &mut relationship.competence_bias,
         delta.competence_bias,
@@ -1700,14 +1728,16 @@ fn upsert_object_state(world: &mut WorldLog, object_state: &ObjectState) -> bool
 }
 
 fn unknown_owner_object_alias_index(world: &WorldLog, object_state: &ObjectState) -> Option<usize> {
-    let new_owner = object_state.owner_entity_id.as_deref().and_then(clean_str)?;
+    let new_owner = object_state
+        .owner_entity_id
+        .as_deref()
+        .and_then(clean_str)?;
     if new_owner.eq_ignore_ascii_case("unknown") {
         return None;
     }
     let object_kind = clean_str(&object_state.object_kind)?;
     world.object_states.iter().position(|existing| {
-        clean_str(&existing.object_kind)
-            .is_some_and(|kind| kind.eq_ignore_ascii_case(object_kind))
+        clean_str(&existing.object_kind).is_some_and(|kind| kind.eq_ignore_ascii_case(object_kind))
             && existing
                 .owner_entity_id
                 .as_deref()
@@ -2281,6 +2311,85 @@ mod tests {
             MemorySourceType::CurrentSession
         );
         assert!(soul.memory.recent[0].is_lived_experience);
+    }
+
+    #[test]
+    fn memory_overflow_is_archived_not_deleted() {
+        let mut soul = new_default_soul("Aurora");
+        // Contents must be lexically distinct or they merge instead of adding.
+        let contents = [
+            "Aurora found a brass key beneath the chapel flagstones.",
+            "The northern bridge collapsed during the spring flood.",
+            "Marlow keeps carrier pigeons trained for coded letters.",
+            "A silver coin from Veldt buys passage on the ferry.",
+            "The lighthouse keeper sleeps through every second watch.",
+            "Wild thyme grows along the ruined aqueduct walls.",
+            "The blacksmith owes a gambling debt to the harbor guild.",
+            "Lantern oil is rationed after the warehouse fire.",
+            "An old map marks a well hidden inside the orchard.",
+            "The mayor's daughter studies astronomy in secret.",
+            "Wolves avoid the valley when the mill wheel turns.",
+            "A sealed letter waits under the tavern floorboard.",
+            "The glassblower trades mirrors for foreign spices.",
+            "Frost ruined the eastern vineyard two winters back.",
+            "The chapel bell cracks slightly on every third toll.",
+            "Smugglers use the tide caves below the white cliffs.",
+            "A retired soldier tends the graves outside the gate.",
+        ];
+        assert!(contents.len() > MAX_RECENT_MEMORIES);
+        for (index, content) in contents.iter().enumerate() {
+            let patch = EnginePatch {
+                schema_version: Some(PATCH_PROTOCOL_VERSION),
+                soul_patch: Some(SoulPatch {
+                    new_memories: vec![MemoryPatch {
+                        content: (*content).into(),
+                        tag: Some("orientation".into()),
+                        salience: Some(40.0 + index as f32),
+                        ..MemoryPatch::default()
+                    }],
+                    ..SoulPatch::default()
+                }),
+                ..EnginePatch::default()
+            };
+            patch.apply_to_soul(&mut soul).expect("patch applies");
+        }
+
+        let active = soul
+            .memory
+            .recent
+            .iter()
+            .filter(|memory| memory.is_active && !memory.archived)
+            .count();
+        let archived = soul
+            .memory
+            .recent
+            .iter()
+            .filter(|memory| memory.archived && !memory.is_active)
+            .count();
+
+        assert_eq!(active, MAX_RECENT_MEMORIES, "active pool stays capped");
+        assert!(archived >= 1, "overflow is archived instead of deleted");
+        assert_eq!(
+            soul.memory.recent.len(),
+            active + archived,
+            "no memory is hard-deleted below the stored ceiling"
+        );
+        // Archived entries are the lower-salience ones.
+        let min_active = soul
+            .memory
+            .recent
+            .iter()
+            .filter(|memory| memory.is_active)
+            .map(|memory| memory.salience)
+            .fold(f32::INFINITY, f32::min);
+        let max_archived = soul
+            .memory
+            .recent
+            .iter()
+            .filter(|memory| memory.archived)
+            .map(|memory| memory.salience)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(min_active >= max_archived);
     }
 
     #[test]

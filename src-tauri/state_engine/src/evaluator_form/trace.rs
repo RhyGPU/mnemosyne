@@ -6,7 +6,8 @@ pub fn format_honest_ui_status(
     materialized_session_world_updated: bool,
     rejected_rows: &[EvalFormRowRejection],
 ) -> String {
-    let was_applied = patch_applied && materialized_soul_updated && materialized_session_world_updated;
+    let was_applied =
+        patch_applied && materialized_soul_updated && materialized_session_world_updated;
     let rows_rejected = rejected_rows.len();
 
     if was_applied {
@@ -32,19 +33,39 @@ pub fn format_honest_ui_status(
 
             let mut kinds = Vec::new();
             if object_count > 0 {
-                kinds.push(format!("{} object row{}", object_count, if object_count == 1 { "" } else { "s" }));
+                kinds.push(format!(
+                    "{} object row{}",
+                    object_count,
+                    if object_count == 1 { "" } else { "s" }
+                ));
             }
             if relationship_count > 0 {
-                kinds.push(format!("{} relationship row{}", relationship_count, if relationship_count == 1 { "" } else { "s" }));
+                kinds.push(format!(
+                    "{} relationship row{}",
+                    relationship_count,
+                    if relationship_count == 1 { "" } else { "s" }
+                ));
             }
             if memory_count > 0 {
-                kinds.push(format!("{} memory row{}", memory_count, if memory_count == 1 { "" } else { "s" }));
+                kinds.push(format!(
+                    "{} memory row{}",
+                    memory_count,
+                    if memory_count == 1 { "" } else { "s" }
+                ));
             }
             if event_count > 0 {
-                kinds.push(format!("{} event row{}", event_count, if event_count == 1 { "" } else { "s" }));
+                kinds.push(format!(
+                    "{} event row{}",
+                    event_count,
+                    if event_count == 1 { "" } else { "s" }
+                ));
             }
             if review_count > 0 {
-                kinds.push(format!("{} review row{}", review_count, if review_count == 1 { "" } else { "s" }));
+                kinds.push(format!(
+                    "{} review row{}",
+                    review_count,
+                    if review_count == 1 { "" } else { "s" }
+                ));
             }
 
             if kinds.len() == 1 {

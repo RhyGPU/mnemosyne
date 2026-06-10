@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use crate::evaluator_form::{
-    clean, memory_candidate_id, EvalFormRowRejection, EvalFormSpec, EventRow, MemoryRow,
-    ObjectRow, RelationshipRow, ReviewDecision, ReviewRow,
+    clean, memory_candidate_id, EvalFormRowRejection, EvalFormSpec, EventRow, MemoryRow, ObjectRow,
+    RelationshipRow, ReviewDecision, ReviewRow,
 };
 
 pub fn validate_event_row(
@@ -273,7 +273,9 @@ pub fn validate_evaluator_contract(
         .ok_or_else(|| "Root of response must be a JSON object".to_string())?;
 
     if root_obj.len() != 1 || !root_obj.contains_key("evaluator_form_v1") {
-        return Err("Root JSON envelope must contain exactly one key: 'evaluator_form_v1'".to_string());
+        return Err(
+            "Root JSON envelope must contain exactly one key: 'evaluator_form_v1'".to_string(),
+        );
     }
 
     let form_v1 = &root_obj["evaluator_form_v1"];
@@ -297,7 +299,10 @@ pub fn validate_evaluator_contract(
     }
 
     let mut has_rel_delta = false;
-    if let Some(rows) = form_obj.get("relationship_event_rows").and_then(|v| v.as_array()) {
+    if let Some(rows) = form_obj
+        .get("relationship_event_rows")
+        .and_then(|v| v.as_array())
+    {
         for row in rows {
             let row_obj = row
                 .as_object()
@@ -312,7 +317,9 @@ pub fn validate_evaluator_contract(
 
             for key in row_obj.keys() {
                 if !RELATIONSHIP_EVENT_REQUIRED_KEYS.contains(&key.as_str()) {
-                    return Err(format!("relationship_event_row contains unknown key: '{key}'"));
+                    return Err(format!(
+                        "relationship_event_row contains unknown key: '{key}'"
+                    ));
                 }
                 if FORBIDDEN_RELATIONSHIP_SURFACE_KEYS.contains(&key.as_str()) {
                     return Err(format!(
@@ -321,7 +328,10 @@ pub fn validate_evaluator_contract(
                 }
             }
 
-            let enabled = row_obj.get("row_enabled").and_then(|v| v.as_i64()).unwrap_or(0);
+            let enabled = row_obj
+                .get("row_enabled")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             if enabled == 1 {
                 has_rel_delta = true;
             }
@@ -357,7 +367,10 @@ pub fn validate_evaluator_contract(
                 }
             }
 
-            let enabled = row_obj.get("row_enabled").and_then(|v| v.as_i64()).unwrap_or(1);
+            let enabled = row_obj
+                .get("row_enabled")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1);
             if enabled == 1 {
                 has_memory_delta = true;
             }
@@ -378,13 +391,20 @@ pub fn validate_evaluator_contract(
         if let Some(rows) = form_obj.get(*field).and_then(|v| v.as_array()) {
             for row in rows {
                 if let Some(row_obj) = row.as_object() {
-                    let enabled = row_obj.get("row_enabled").and_then(|v| v.as_i64()).unwrap_or(1);
+                    let enabled = row_obj
+                        .get("row_enabled")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(1);
                     if enabled == 0 {
                         continue;
                     }
-                    if let Some(quote_val) = row_obj.get("evidence_quote").and_then(|v| v.as_str()) {
+                    if let Some(quote_val) = row_obj.get("evidence_quote").and_then(|v| v.as_str())
+                    {
                         if !quote_val.trim().is_empty()
-                            && !crate::evaluator::claim_has_evidence(Some(quote_val), &evidence_text)
+                            && !crate::evaluator::claim_has_evidence(
+                                Some(quote_val),
+                                &evidence_text,
+                            )
                         {
                             return Err(format!(
                                 "evidence_quote not found in scene context: '{quote_val}'"
@@ -397,7 +417,9 @@ pub fn validate_evaluator_contract(
     }
 
     if !has_rel_delta && !has_memory_delta {
-        return Err("Nontrivial test scene did not produce any memory or relationship delta".to_string());
+        return Err(
+            "Nontrivial test scene did not produce any memory or relationship delta".to_string(),
+        );
     }
 
     Ok(())

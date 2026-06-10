@@ -1,8 +1,6 @@
 use serde_json::Value;
 
-use crate::evaluator_form::{
-    normalize_eval_form_value, EvalFormRepairTrace, EvalFormResponse,
-};
+use crate::evaluator_form::{normalize_eval_form_value, EvalFormRepairTrace, EvalFormResponse};
 
 pub fn parse_eval_form_response(raw_json: &str) -> Result<EvalFormResponse, String> {
     parse_eval_form_response_with_trace(raw_json).map(|(response, _)| response)
@@ -140,23 +138,27 @@ pub fn extract_first_balanced_json_object(raw: &str) -> Option<String> {
     None
 }
 
-pub fn repair_unescaped_quotes_in_field(raw: &str, field_name: &str, trace: &mut EvalFormRepairTrace) -> String {
+pub fn repair_unescaped_quotes_in_field(
+    raw: &str,
+    field_name: &str,
+    trace: &mut EvalFormRepairTrace,
+) -> String {
     let mut out = String::new();
     let mut current_pos = 0;
-    
+
     while let Some(field_pos) = raw[current_pos..].find(field_name) {
         let absolute_field_pos = current_pos + field_pos;
         out.push_str(&raw[current_pos..absolute_field_pos]);
-        
+
         let after_field = absolute_field_pos + field_name.len();
         if let Some(colon_offset) = raw[after_field..].find(':') {
             let colon_pos = after_field + colon_offset;
             if let Some(quote_offset) = raw[colon_pos..].find('"') {
                 let start_quote_pos = colon_pos + quote_offset;
-                
+
                 let search_start = start_quote_pos + 1;
                 let mut end_quote_pos = None;
-                
+
                 let bytes = raw.as_bytes();
                 for i in search_start..bytes.len() {
                     if bytes[i] == b'"' {
@@ -178,7 +180,8 @@ pub fn repair_unescaped_quotes_in_field(raw: &str, field_name: &str, trace: &mut
                                     break;
                                 } else if ch == b',' {
                                     let mut probe = next + 1;
-                                    while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+                                    while probe < bytes.len() && bytes[probe].is_ascii_whitespace()
+                                    {
                                         probe += 1;
                                     }
                                     if probe < bytes.len() && bytes[probe] == b'"' {
@@ -188,7 +191,9 @@ pub fn repair_unescaped_quotes_in_field(raw: &str, field_name: &str, trace: &mut
                                         }
                                         if key_end < bytes.len() {
                                             let mut colon = key_end + 1;
-                                            while colon < bytes.len() && bytes[colon].is_ascii_whitespace() {
+                                            while colon < bytes.len()
+                                                && bytes[colon].is_ascii_whitespace()
+                                            {
                                                 colon += 1;
                                             }
                                             if colon < bytes.len() && bytes[colon] == b':' {
@@ -196,7 +201,9 @@ pub fn repair_unescaped_quotes_in_field(raw: &str, field_name: &str, trace: &mut
                                                 break;
                                             }
                                         }
-                                    } else if probe < bytes.len() && (bytes[probe] == b'}' || bytes[probe] == b']') {
+                                    } else if probe < bytes.len()
+                                        && (bytes[probe] == b'}' || bytes[probe] == b']')
+                                    {
                                         end_quote_pos = Some(i);
                                         break;
                                     }
@@ -205,10 +212,10 @@ pub fn repair_unescaped_quotes_in_field(raw: &str, field_name: &str, trace: &mut
                         }
                     }
                 }
-                
+
                 if let Some(end_pos) = end_quote_pos {
                     let content = &raw[search_start..end_pos];
-                    
+
                     let mut escaped_content = String::new();
                     let content_bytes = content.as_bytes();
                     let mut idx = 0;
@@ -230,26 +237,28 @@ pub fn repair_unescaped_quotes_in_field(raw: &str, field_name: &str, trace: &mut
                         }
                         idx += 1;
                     }
-                    
+
                     if escaped_content != content {
-                        trace.raw_form_repair_warnings.push(format!("unescaped quotes in {} repaired", field_name));
+                        trace
+                            .raw_form_repair_warnings
+                            .push(format!("unescaped quotes in {} repaired", field_name));
                         trace.raw_form_repair_applied = true;
                     }
-                    
+
                     out.push_str(&raw[absolute_field_pos..=start_quote_pos]);
                     out.push_str(&escaped_content);
                     out.push('"');
-                    
+
                     current_pos = end_pos + 1;
                     continue;
                 }
             }
         }
-        
+
         out.push_str(&raw[absolute_field_pos..after_field]);
         current_pos = after_field;
     }
-    
+
     out.push_str(&raw[current_pos..]);
     out
 }

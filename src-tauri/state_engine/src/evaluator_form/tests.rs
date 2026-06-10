@@ -14,6 +14,7 @@ fn soul_and_world() -> (Soul, SessionWorld) {
     let mut soul = new_default_soul("Aurora");
     soul.character_id = "aurora_soul".into();
     soul.memory.recent.push(MemoryEntry {
+        archived: false,
         id: "mem_existing".into(),
         timestamp: 1,
         content: "Aurora remembers that the visitor knocked before entering.".into(),
@@ -202,8 +203,7 @@ fn form_dedupe_marks_duplicate_of_existing() {
 #[test]
 fn form_dedupe_marks_update_existing() {
     let (soul, world) = soul_and_world();
-    let (spec, context) =
-        spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+    let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
     let memory = memory(
         "entry",
         "Aurora updates the entry beat with the visitor inside.",
@@ -241,8 +241,7 @@ fn form_dedupe_marks_update_existing() {
 #[test]
 fn form_memory_row_compiles_to_normalized_draft() {
     let (soul, world) = soul_and_world();
-    let (spec, context) =
-        spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+    let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
     let result = compile_eval_form_response(
         &spec,
         &EvalFormResponse {
@@ -339,8 +338,7 @@ fn form_object_row_compiles_to_object_observation() {
 #[test]
 fn code_computes_turn_flags_not_llm() {
     let (soul, world) = soul_and_world();
-    let (spec, context) =
-        spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+    let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
     let result = compile_eval_form_response(
         &spec,
         &EvalFormResponse {
@@ -356,8 +354,7 @@ fn code_computes_turn_flags_not_llm() {
 #[test]
 fn code_assigns_decay_profile_not_llm() {
     let (soul, world) = soul_and_world();
-    let (spec, context) =
-        spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+    let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
     let memory = memory(
         "entry",
         "Aurora remembers the visitor came inside.",
@@ -512,8 +509,7 @@ fn form_accepts_event_id_alias_for_linked_event_id() {
 #[test]
 fn form_accepts_slot_id_alias_for_slot() {
     let (soul, world) = soul_and_world();
-    let (spec, context) =
-        spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+    let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
     let response = parse_eval_form_response(
         r#"{
             "event_rows": [{
@@ -589,8 +585,7 @@ fn form_relationship_id_parses_source_and_target() {
 #[test]
 fn form_memory_content_can_derive_from_linked_event() {
     let (soul, world) = soul_and_world();
-    let (spec, context) =
-        spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
+    let (spec, context) = spec_and_context(&soul, &world, "I walk in.", "The visitor walks in.");
     let response = parse_eval_form_response(
         r#"{
             "event_rows": [{
@@ -1839,56 +1834,80 @@ const LIVE_POOLSIDE_JSON: &str = r#"{
 #[test]
 fn live_poolside_relationship_dimension_alias_compiles() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+    let (spec, context) =
+        spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
     let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
 
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 2);
-    
-    let trust_delta = result.output.relationship_evaluations.iter().find(|r| r.trust.is_some()).unwrap();
+
+    let trust_delta = result
+        .output
+        .relationship_evaluations
+        .iter()
+        .find(|r| r.trust.is_some())
+        .unwrap();
     assert!(trust_delta.trust.unwrap() > 0.0);
 
-    let fear_delta = result.output.relationship_evaluations.iter().find(|r| r.fear.is_some()).unwrap();
+    let fear_delta = result
+        .output
+        .relationship_evaluations
+        .iter()
+        .find(|r| r.fear.is_some())
+        .unwrap();
     assert!(fear_delta.fear.unwrap() < 0.0);
 }
 
 #[test]
 fn live_poolside_memory_slot_alias_compiles() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+    let (spec, context) =
+        spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
     let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
 
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.memory_candidates.len(), 1);
-    assert_eq!(result.output.memory_candidates[0].slot, MemorySlot::RelationshipMemory);
+    assert_eq!(
+        result.output.memory_candidates[0].slot,
+        MemorySlot::RelationshipMemory
+    );
 }
 
 #[test]
 fn live_poolside_candidate_summary_becomes_content() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+    let (spec, context) =
+        spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
     let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
 
-    assert_eq!(result.output.memory_candidates[0].content, "Reunion with someone familiar who previously inspired Aurora's sketching");
+    assert_eq!(
+        result.output.memory_candidates[0].content,
+        "Reunion with someone familiar who previously inspired Aurora's sketching"
+    );
 }
 
 #[test]
 fn live_poolside_missing_owner_defaults_to_active_soul() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+    let (spec, context) =
+        spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
     let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
 
-    assert_eq!(result.output.memory_candidates[0].owner_soul_id, "aurora_soul");
+    assert_eq!(
+        result.output.memory_candidates[0].owner_soul_id,
+        "aurora_soul"
+    );
 }
 
 #[test]
 fn live_poolside_review_without_evidence_is_advisory_not_fatal() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+    let (spec, context) =
+        spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
     let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
 
@@ -1899,7 +1918,8 @@ fn live_poolside_review_without_evidence_is_advisory_not_fatal() {
 #[test]
 fn live_poolside_fixture_accepts_more_than_one_row() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+    let (spec, context) =
+        spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
     let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
 
@@ -1911,13 +1931,14 @@ fn live_poolside_fixture_accepts_more_than_one_row() {
 #[test]
 fn live_poolside_fixture_writes_memory_and_relationship_delta() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
+    let (spec, context) =
+        spec_and_context(&soul, &world, "Hey", "She smiles warm and lets you inside.");
     let response = parse_eval_form_response(LIVE_POOLSIDE_JSON).expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
 
     assert!(result.draft.memory_candidate_count > 0);
     assert!(result.draft.relationship_delta_count > 0);
-    
+
     // Also verify the converted report writes memories and relationship deltas
     let patch = &result.conversion.patch;
     let soul_patch = patch.soul_patch.as_ref().unwrap();
@@ -1936,8 +1957,12 @@ fn live_unescaped_evidence_quote_repairs_and_parses() {
         "evidence_quote": "You better not be late" she calls back, voice low and rough with wine"
       }]
     }"#;
-    let response = parse_eval_form_response(raw_json).expect("should repair unescaped quotes and parse successfully");
-    assert_eq!(response.event_rows[0].evidence_quote, "You better not be late\" she calls back, voice low and rough with wine");
+    let response = parse_eval_form_response(raw_json)
+        .expect("should repair unescaped quotes and parse successfully");
+    assert_eq!(
+        response.event_rows[0].evidence_quote,
+        "You better not be late\" she calls back, voice low and rough with wine"
+    );
 }
 
 #[test]
@@ -1953,8 +1978,9 @@ fn live_shift_direction_relationship_compiles_to_delta() {
             "shift_direction": "increased",
             "evidence_quote": "Warm smiles."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
     assert!(result.output.relationship_evaluations[0].trust.unwrap() > 0.0);
@@ -1973,16 +1999,26 @@ fn live_source_entity_id_maps_to_source_soul_id() {
             "shift_direction": "increased",
             "evidence_quote": "Warm smiles."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
-    assert_eq!(result.normalized_response.relationship_rows[0].source_soul_id, "aurora_soul");
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].source_soul_id,
+        "aurora_soul"
+    );
 }
 
 #[test]
-fn live_relationship_change_type_without_direction_infers_increase_when_dimension_boundary_pressure() {
+fn live_relationship_change_type_without_direction_infers_increase_when_dimension_boundary_pressure(
+) {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "increased tension, pressure, and conflict");
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "Hey",
+        "increased tension, pressure, and conflict",
+    );
     let response = parse_eval_form_response(
         r#"{
           "relationship_rows": [{
@@ -1992,11 +2028,15 @@ fn live_relationship_change_type_without_direction_infers_increase_when_dimensio
             "change_type": "shift",
             "evidence_quote": "increased tension, pressure, and conflict"
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
 }
 
 #[test]
@@ -2011,17 +2051,24 @@ fn live_object_state_new_object_label_compiles_to_object_patch() {
             "object_state": "placed on chair",
             "evidence_quote": "Fabric drips."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.output.object_changes.len(), 1);
     assert_eq!(
         result.output.object_changes[0].object_state.object_id,
         "unknown_jacket_1"
     );
-    assert_eq!(result.output.object_changes[0].object_state.object_kind, "jacket");
+    assert_eq!(
+        result.output.object_changes[0].object_state.object_kind,
+        "jacket"
+    );
     assert_eq!(result.output.object_changes[0].object_state.status, "wet");
-    assert_eq!(result.output.object_changes[0].object_state.location, "chair");
+    assert_eq!(
+        result.output.object_changes[0].object_state.location,
+        "chair"
+    );
 }
 
 #[test]
@@ -2036,10 +2083,14 @@ fn live_object_state_defaults_property_changed_state() {
             "object_state": "placed on chair",
             "evidence_quote": "Fabric drips."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
-    assert_eq!(result.normalized_response.object_rows[0].property_changed, "state");
+    assert_eq!(
+        result.normalized_response.object_rows[0].property_changed,
+        "state"
+    );
 }
 
 #[test]
@@ -2054,10 +2105,14 @@ fn live_content_summary_preserved_in_memory_content() {
             "evidence_quote": "Fabric drips.",
             "content_summary": "Reunion with someone familiar"
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
-    assert_eq!(result.output.memory_candidates[0].content, "Reunion with someone familiar");
+    assert_eq!(
+        result.output.memory_candidates[0].content,
+        "Reunion with someone familiar"
+    );
 }
 
 #[test]
@@ -2072,10 +2127,14 @@ fn live_candidate_summary_preserved_in_memory_content() {
             "evidence_quote": "Fabric drips.",
             "candidate_summary": "Reunion with someone familiar who previously inspired Aurora"
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
-    assert_eq!(result.output.memory_candidates[0].content, "Reunion with someone familiar who previously inspired Aurora");
+    assert_eq!(
+        result.output.memory_candidates[0].content,
+        "Reunion with someone familiar who previously inspired Aurora"
+    );
 }
 
 #[test]
@@ -2090,10 +2149,14 @@ fn live_memory_does_not_fallback_to_event_summary_when_candidate_exists() {
             "evidence_quote": "Fabric drips.",
             "candidate_summary": "Reunion with someone familiar who previously inspired Aurora"
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
-    assert_eq!(result.output.memory_candidates[0].content, "Reunion with someone familiar who previously inspired Aurora");
+    assert_eq!(
+        result.output.memory_candidates[0].content,
+        "Reunion with someone familiar who previously inspired Aurora"
+    );
 }
 
 #[test]
@@ -2135,18 +2198,18 @@ fn live_full_poolside_payload_writes_memory_relationship_and_object() {
           }]
         }"#
     ).expect("parse should succeed");
-    
+
     let result = compile_eval_form_response(&spec, &response, &context);
-    
+
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert!(result.trace.form_rows_accepted > 1);
     assert!(result.draft.memory_candidate_count > 0);
     assert!(result.draft.relationship_delta_count > 0);
-    
+
     let patch = &result.conversion.patch;
     let soul_patch = patch.soul_patch.as_ref().unwrap();
     let world_patch = patch.world_patch.as_ref().unwrap();
-    
+
     assert!(soul_patch.new_memories.len() > 0);
     assert!(soul_patch.relationship_deltas.len() > 0);
     assert!(world_patch.object_observation_operations.len() > 0);
@@ -2166,12 +2229,16 @@ fn relationship_source_slug_aurora_schwarz_resolves_to_active_soul_uuid() {
             "shift_direction": "increased",
             "evidence_quote": "Warm smiles."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.output.relationship_evaluations[0].source_soul_id, "aurora_soul");
+    assert_eq!(
+        result.output.relationship_evaluations[0].source_soul_id,
+        "aurora_soul"
+    );
 }
 
 #[test]
@@ -2188,19 +2255,28 @@ fn relationship_source_display_name_resolves_to_active_soul_uuid() {
             "shift_direction": "increased",
             "evidence_quote": "Warm smiles."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.output.relationship_evaluations[0].source_soul_id, "aurora_soul");
+    assert_eq!(
+        result.output.relationship_evaluations[0].source_soul_id,
+        "aurora_soul"
+    );
 }
 
 #[test]
 fn live_payload6_relationship_row_no_longer_rejected() {
     let (mut soul, world) = soul_and_world();
     soul.character_name = "Aurora Schwarz".into();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "Didn't expect you to actually show up");
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "Hey",
+        "Didn't expect you to actually show up",
+    );
     let response = parse_eval_form_response(
         r#"{
           "relationship_rows": [{
@@ -2210,13 +2286,20 @@ fn live_payload6_relationship_row_no_longer_rejected() {
             "shift_direction": "increased",
             "evidence_quote": "Didn't expect you to actually show up"
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.output.relationship_evaluations[0].source_soul_id, "aurora_soul");
-    assert_eq!(result.output.relationship_evaluations[0].target_entity_id, "default_player");
+    assert_eq!(
+        result.output.relationship_evaluations[0].source_soul_id,
+        "aurora_soul"
+    );
+    assert_eq!(
+        result.output.relationship_evaluations[0].target_entity_id,
+        "default_player"
+    );
 }
 
 #[test]
@@ -2229,15 +2312,21 @@ fn object_status_alias_becomes_new_value() {
             "status": "placed_on_chair",
             "evidence_quote": "and place a wet jacket over the chair."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     assert_eq!(response.object_rows[0].new_value, "placed_on_chair");
 }
 
 #[test]
 fn object_status_defaults_property_changed_state() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "and place a wet jacket over the chair.");
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "Hey",
+        "and place a wet jacket over the chair.",
+    );
     let response = parse_eval_form_response(
         r#"{
           "object_rows": [{
@@ -2246,12 +2335,16 @@ fn object_status_defaults_property_changed_state() {
             "status": "placed_on_chair",
             "evidence_quote": "and place a wet jacket over the chair."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.object_changes.len(), 1);
-    assert_eq!(result.normalized_response.object_rows[0].property_changed, "state");
+    assert_eq!(
+        result.normalized_response.object_rows[0].property_changed,
+        "state"
+    );
 }
 
 #[test]
@@ -2273,8 +2366,9 @@ fn live_payload8_object_rows_compile() {
               "evidence_quote": "water darkens the fabric before dripping onto the chair's arm"
             }
           ]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.object_changes.len(), 2);
@@ -2301,9 +2395,13 @@ fn memory_summary_alias_no_unreachable_pattern_warning() {
             "summary": "Reunion with someone familiar",
             "evidence_quote": "fabric drips"
           }]
-        }"#
-    ).expect("parse should succeed");
-    assert_eq!(response.memory_rows[0].content, "Reunion with someone familiar");
+        }"#,
+    )
+    .expect("parse should succeed");
+    assert_eq!(
+        response.memory_rows[0].content,
+        "Reunion with someone familiar"
+    );
 }
 
 #[test]
@@ -2329,7 +2427,7 @@ fn ui_status_reports_rows_skipped_not_enrichment_failed() {
             row_kind: "relationship".into(),
             row_id: "rel1".into(),
             reason: "invalid".into(),
-        }
+        },
     ];
     let status = format_honest_ui_status(true, true, true, &rejected);
     assert_eq!(status, "State updated; 2 evaluator rows skipped");
@@ -2338,7 +2436,12 @@ fn ui_status_reports_rows_skipped_not_enrichment_failed() {
 #[test]
 fn live_payload11_chain_lock_change_type_state_change_compiles() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "The chain lock still clicks softly...");
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "Hey",
+        "The chain lock still clicks softly...",
+    );
     let response = parse_eval_form_response(
         r#"{
           "object_rows": [{
@@ -2347,13 +2450,20 @@ fn live_payload11_chain_lock_change_type_state_change_compiles() {
             "importance_tier": "medium",
             "evidence_quote": "The chain lock still clicks softly against the doorframe..."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.object_changes.len(), 1);
-    assert_eq!(result.output.object_changes[0].object_state.object_id, "chain_lock");
-    assert_eq!(result.output.object_changes[0].object_state.status, "The chain lock still clicks softly against the doorframe...");
+    assert_eq!(
+        result.output.object_changes[0].object_state.object_id,
+        "chain_lock"
+    );
+    assert_eq!(
+        result.output.object_changes[0].object_state.status,
+        "The chain lock still clicks softly against the doorframe..."
+    );
 }
 
 #[test]
@@ -2369,8 +2479,9 @@ fn live_payload11_wet_jacket_new_object_observation_compiles() {
             "evidence_quote": "You hang your soaked jacket on the back of the kitchen chair...",
             "new_object_label": "wet_jacket"
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.object_changes.len(), 1);
@@ -2378,7 +2489,10 @@ fn live_payload11_wet_jacket_new_object_observation_compiles() {
         result.output.object_changes[0].object_state.object_id,
         "default_player_jacket_1"
     );
-    assert_eq!(result.output.object_changes[0].object_state.object_kind, "jacket");
+    assert_eq!(
+        result.output.object_changes[0].object_state.object_kind,
+        "jacket"
+    );
     assert_eq!(
         result.output.object_changes[0]
             .object_state
@@ -2406,8 +2520,9 @@ fn object_change_type_defaults_property_and_value() {
               "evidence_quote": "hang soaked jacket"
             }
           ]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     assert_eq!(response.object_rows[0].property_changed, "state");
     assert_eq!(response.object_rows[0].new_value, "clicks softly");
     assert_eq!(response.object_rows[1].property_changed, "presence");
@@ -2426,13 +2541,20 @@ fn live_payload11_intimacy_shift_infers_increase() {
             "importance_tier": "high",
             "evidence_quote": "\"Suit yourself,\" she says, voice dropping..."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
-    assert_eq!(result.output.relationship_evaluations[0].intimacy.is_some(), true);
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
+    assert_eq!(
+        result.output.relationship_evaluations[0].intimacy.is_some(),
+        true
+    );
 }
 
 #[test]
@@ -2447,13 +2569,20 @@ fn live_payload11_trust_shift_infers_increase() {
             "importance_tier": "high",
             "evidence_quote": "\"Suit yourself,\" she says, voice dropping..."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
-    assert_eq!(result.output.relationship_evaluations[0].trust.is_some(), true);
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
+    assert_eq!(
+        result.output.relationship_evaluations[0].trust.is_some(),
+        true
+    );
 }
 
 #[test]
@@ -2468,11 +2597,15 @@ fn relationship_shift_without_direction_compiles_for_positive_dimension() {
             "importance_tier": "high",
             "evidence_quote": "closer connection and deeper affection"
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
 }
 
 #[test]
@@ -2487,17 +2620,26 @@ fn relationship_missing_direction_rejects_as_uncertain() {
             "importance_tier": "high",
             "evidence_quote": "generic uninformative quote"
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 1);
-    assert_eq!(result.rejected_rows[0].reason, "direction_missing_uncertain");
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "direction_missing_uncertain"
+    );
 }
 
 #[test]
 fn live_exact_object_row_reaches_exported_object_state() {
     let (soul, mut world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "draping it over the back of the chair");
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "Hey",
+        "draping it over the back of the chair",
+    );
     let response = parse_eval_form_response(
         r#"{
           "object_rows": [{
@@ -2511,7 +2653,7 @@ fn live_exact_object_row_reaches_exported_object_state() {
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.object_changes.len(), 1);
-    
+
     let report = evaluator_output_to_engine_patch(&result.output, &context);
     assert!(!report.patch.is_empty());
     let world_patch = report.patch.world_patch.as_ref().unwrap();
@@ -2520,7 +2662,10 @@ fn live_exact_object_row_reaches_exported_object_state() {
     // Prove full path survival:
     // raw row -> normalized row -> validated row -> EvaluatorOutputV1 -> EnginePatch -> apply_to_session -> rebuilt/exported state
     let mut soul_mut = soul;
-    report.patch.apply_to_session(&mut soul_mut, Some(&mut world)).expect("apply to session succeeds");
+    report
+        .patch
+        .apply_to_session(&mut soul_mut, Some(&mut world))
+        .expect("apply to session succeeds");
 
     let found = world
         .object_states
@@ -2570,7 +2715,10 @@ fn live_exact_relationship_row_reaches_exported_relationship_delta() {
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
 
     let report = evaluator_output_to_engine_patch(&result.output, &context);
     assert!(!report.patch.is_empty());
@@ -2579,16 +2727,31 @@ fn live_exact_relationship_row_reaches_exported_relationship_delta() {
 
     // Prove full path survival:
     // raw row -> normalized row -> validated row -> EvaluatorOutputV1 -> EnginePatch -> apply_to_session -> rebuilt/exported state
-    report.patch.apply_to_session(&mut soul, Some(&mut world)).expect("apply to session succeeds");
+    report
+        .patch
+        .apply_to_session(&mut soul, Some(&mut world))
+        .expect("apply to session succeeds");
 
-    let updated_rel = soul.relationships.get("default_player").expect("relationship should exist");
-    assert!(updated_rel.comfort > 10.0, "comfort should have increased beyond 10.0, got {}", updated_rel.comfort);
+    let updated_rel = soul
+        .relationships
+        .get("default_player")
+        .expect("relationship should exist");
+    assert!(
+        updated_rel.comfort > 10.0,
+        "comfort should have increased beyond 10.0, got {}",
+        updated_rel.comfort
+    );
 }
 
 #[test]
 fn live_exact_memory_row_reaches_exported_memory_recent() {
     let (mut soul, mut world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "Aurora's cigarette trembles slightly in her fingers");
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "Hey",
+        "Aurora's cigarette trembles slightly in her fingers",
+    );
     let response = parse_eval_form_response(
         r#"{
           "memory_rows": [{
@@ -2597,8 +2760,9 @@ fn live_exact_memory_row_reaches_exported_memory_recent() {
             "evidence_quote": "Aurora's cigarette trembles slightly in her fingers",
             "content_summary": "Aurora is feeling highly anxious and emotional"
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.memory_candidates.len(), 1);
@@ -2610,23 +2774,29 @@ fn live_exact_memory_row_reaches_exported_memory_recent() {
 
     // Prove full path survival:
     // raw row -> normalized row -> validated row -> EvaluatorOutputV1 -> EnginePatch -> apply_to_session -> rebuilt/exported state
-    report.patch.apply_to_session(&mut soul, Some(&mut world)).expect("apply to session succeeds");
+    report
+        .patch
+        .apply_to_session(&mut soul, Some(&mut world))
+        .expect("apply to session succeeds");
 
-    let found_mem = soul.memory.recent.iter().find(|mem| {
-        mem.memory_slot.as_deref() == Some("recent_emotional_state")
-    }).expect("should have created a memory in the recent_emotional_state slot");
-    assert!(found_mem.content.contains("Aurora is feeling highly anxious and emotional"));
+    let found_mem = soul
+        .memory
+        .recent
+        .iter()
+        .find(|mem| mem.memory_slot.as_deref() == Some("recent_emotional_state"))
+        .expect("should have created a memory in the recent_emotional_state slot");
+    assert!(found_mem
+        .content
+        .contains("Aurora is feeling highly anxious and emotional"));
 }
 
 #[test]
 fn patch_applied_with_row_skips_does_not_show_hard_failure() {
-    let rejected = vec![
-        EvalFormRowRejection {
-            row_kind: "relationship".into(),
-            row_id: "event_latest_turn:aurora_soul:default_player".into(),
-            reason: "direction_missing_uncertain".into(),
-        }
-    ];
+    let rejected = vec![EvalFormRowRejection {
+        row_kind: "relationship".into(),
+        row_id: "event_latest_turn:aurora_soul:default_player".into(),
+        reason: "direction_missing_uncertain".into(),
+    }];
     let honest_status = format_honest_ui_status(
         true, // patch_applied
         true, // materialized_soul_updated
@@ -2647,18 +2817,32 @@ fn relationship_direction_arrow_parses_source_target_not_change_direction() {
             "direction": "default_player -> aurora_soul",
             "evidence_quote": "Warm smiles."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
-    assert_eq!(result.normalized_response.relationship_rows[0].source_soul_id, "aurora_soul");
-    assert_eq!(result.normalized_response.relationship_rows[0].target_entity_id, "default_player");
-    assert!(result.normalized_response.relationship_rows[0].direction.is_none());
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].source_soul_id,
+        "aurora_soul"
+    );
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].target_entity_id,
+        "default_player"
+    );
+    assert!(result.normalized_response.relationship_rows[0]
+        .direction
+        .is_none());
 }
 
 #[test]
 fn live_payload8_boundary_pressure_arrow_direction_compiles_delta() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "I'm studying the way you've positioned yourself just inside the doorway...");
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "Hey",
+        "I'm studying the way you've positioned yourself just inside the doorway...",
+    );
     let response = parse_eval_form_response(
         r#"{
           "relationship_rows": [{
@@ -2671,17 +2855,28 @@ fn live_payload8_boundary_pressure_arrow_direction_compiles_delta() {
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
-    
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
+
     let key = format!("event_latest_turn:aurora_soul:default_player:boundary_pressure");
-    assert_eq!(result.trace.relationship_row_results.get(&key), Some(&"delta_created".to_string()));
+    assert_eq!(
+        result.trace.relationship_row_results.get(&key),
+        Some(&"delta_created".to_string())
+    );
     assert_eq!(result.trace.relationship_non_delta_count, 0);
 }
 
 #[test]
 fn live_payload8_trust_arrow_direction_compiles_delta_or_explicit_uncertain() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "God, you actually look vulnerable standing there...");
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "Hey",
+        "God, you actually look vulnerable standing there...",
+    );
     let response = parse_eval_form_response(
         r#"{
           "relationship_rows": [{
@@ -2689,22 +2884,34 @@ fn live_payload8_trust_arrow_direction_compiles_delta_or_explicit_uncertain() {
             "direction": "aurora_soul -> default_player",
             "evidence_quote": "God, you actually look vulnerable standing there..."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
-    
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
+
     let key = format!("event_latest_turn:aurora_soul:default_player:trust");
-    assert_eq!(result.trace.relationship_row_results.get(&key), Some(&"delta_created".to_string()));
+    assert_eq!(
+        result.trace.relationship_row_results.get(&key),
+        Some(&"delta_created".to_string())
+    );
     assert_eq!(result.trace.relationship_non_delta_count, 0);
 }
 
 #[test]
 fn accepted_relationship_row_without_delta_is_reported_non_delta() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(&soul, &world, "Hey", "God, you actually look vulnerable standing there...");
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "Hey",
+        "God, you actually look vulnerable standing there...",
+    );
     let response = parse_eval_form_response(
         r#"{
           "relationship_rows": [{
@@ -2712,15 +2919,19 @@ fn accepted_relationship_row_without_delta_is_reported_non_delta() {
             "direction": "no_change",
             "evidence_quote": "God, you actually look vulnerable standing there..."
           }]
-        }"#
-    ).expect("parse should succeed");
+        }"#,
+    )
+    .expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 0);
     assert_eq!(result.trace.relationship_non_delta_count, 1);
-    
+
     let key = format!("event_latest_turn:aurora_soul:default_player:trust");
-    assert_eq!(result.trace.relationship_row_results.get(&key), Some(&"non_delta_no_change".to_string()));
+    assert_eq!(
+        result.trace.relationship_row_results.get(&key),
+        Some(&"non_delta_no_change".to_string())
+    );
 }
 
 // ---- Object-row defaulting tests (Gap 1 & Gap 2 fixes) ----
@@ -2852,8 +3063,16 @@ fn object_row_missing_id_infers_chair_from_evidence() {
 
     let norm_row = &result.normalized_response.object_rows[0];
     assert!(
-        norm_row.object_id.as_deref().map(|id| id.contains("chair")).unwrap_or(false)
-            || norm_row.new_object_label.as_deref().map(|l| l.contains("chair")).unwrap_or(false),
+        norm_row
+            .object_id
+            .as_deref()
+            .map(|id| id.contains("chair"))
+            .unwrap_or(false)
+            || norm_row
+                .new_object_label
+                .as_deref()
+                .map(|l| l.contains("chair"))
+                .unwrap_or(false),
         "should infer 'chair' after normalization, got object_id={:?} label={:?}",
         norm_row.object_id,
         norm_row.new_object_label
@@ -2861,7 +3080,10 @@ fn object_row_missing_id_infers_chair_from_evidence() {
 
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.object_changes.len(), 1);
-    assert!(result.output.object_changes[0].object_state.object_id.contains("chair"));
+    assert!(result.output.object_changes[0]
+        .object_state
+        .object_id
+        .contains("chair"));
 }
 
 #[test]
@@ -2941,7 +3163,11 @@ fn live_wet_jacket_chair_rows_create_object_patch() {
         "both rows should pass validation, rejected: {:?}",
         result.rejected_rows
     );
-    assert_eq!(result.output.object_changes.len(), 2, "expected 2 object patches");
+    assert_eq!(
+        result.output.object_changes.len(),
+        2,
+        "expected 2 object patches"
+    );
 
     let object_patch_count = result
         .trace
@@ -2967,12 +3193,16 @@ fn boundary_pressure_infers_increase_from_door_chain() {
             "dimension": "boundary_pressure",
             "evidence_quote": "keeps the door chained"
           }]
-        }"#
-    ).expect("parse response");
+        }"#,
+    )
+    .expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
 }
 
 #[test]
@@ -2987,12 +3217,16 @@ fn boundary_pressure_infers_increase_from_preparing_for_stranger() {
             "dimension": "boundary_pressure",
             "evidence_quote": "preparing for a stranger"
           }]
-        }"#
-    ).expect("parse response");
+        }"#,
+    )
+    .expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
 }
 
 #[test]
@@ -3007,12 +3241,16 @@ fn trust_infers_decrease_from_guarded_door_chain() {
             "dimension": "trust",
             "evidence_quote": "backs away suspiciously and keeps the chain on"
           }]
-        }"#
-    ).expect("parse response");
+        }"#,
+    )
+    .expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Decrease));
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Decrease)
+    );
     assert!(result.output.relationship_evaluations[0].trust.unwrap() < 0.0);
 }
 
@@ -3028,12 +3266,16 @@ fn comfort_infers_decrease_from_guarded_uncertain_entry() {
             "dimension": "comfort",
             "evidence_quote": "hesitates before opening and keeps distance"
           }]
-        }"#
-    ).expect("parse response");
+        }"#,
+    )
+    .expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Decrease));
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Decrease)
+    );
     assert!(result.output.relationship_evaluations[0].comfort.unwrap() < 0.0);
 }
 
@@ -3049,12 +3291,16 @@ fn fear_infers_increase_from_stiffens_and_pulse() {
             "dimension": "fear",
             "evidence_quote": "stiffens with her pulse thrumming"
           }]
-        }"#
-    ).expect("parse response");
+        }"#,
+    )
+    .expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
     assert!(result.output.relationship_evaluations[0].fear.unwrap() > 0.0);
 }
 
@@ -3070,11 +3316,15 @@ fn generic_watching_does_not_infer_direction() {
             "dimension": "trust",
             "evidence_quote": "she watches him look at the wall"
           }]
-        }"#
-    ).expect("parse response");
+        }"#,
+    )
+    .expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 1);
-    assert_eq!(result.rejected_rows[0].reason, "direction_missing_uncertain");
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "direction_missing_uncertain"
+    );
 }
 
 #[test]
@@ -3089,11 +3339,15 @@ fn ambiguous_relationship_row_still_rejects_direction_missing_uncertain() {
             "dimension": "comfort",
             "evidence_quote": "she smiles and she pauses and breathes"
           }]
-        }"#
-    ).expect("parse response");
+        }"#,
+    )
+    .expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 1);
-    assert_eq!(result.rejected_rows[0].reason, "direction_missing_uncertain");
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "direction_missing_uncertain"
+    );
 }
 
 #[test]
@@ -3113,8 +3367,16 @@ fn live_knock_boundary_pressure_row_compiles() {
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.relationship_evaluations.len(), 1);
-    assert_eq!(result.normalized_response.relationship_rows[0].direction, Some(RelationshipDirection::Increase));
-    assert!(result.output.relationship_evaluations[0].boundary_pressure.unwrap() > 0.0);
+    assert_eq!(
+        result.normalized_response.relationship_rows[0].direction,
+        Some(RelationshipDirection::Increase)
+    );
+    assert!(
+        result.output.relationship_evaluations[0]
+            .boundary_pressure
+            .unwrap()
+            > 0.0
+    );
 }
 
 #[test]
@@ -3129,13 +3391,22 @@ fn row_trace_records_relationship_direction_inference() {
             "dimension": "boundary_pressure",
             "evidence_quote": "keeps the door chained"
           }]
-        }"#
-    ).expect("parse response");
+        }"#,
+    )
+    .expect("parse response");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.trace.relationship_direction_inferred_from.len(), 1);
-    assert_eq!(result.trace.relationship_direction_inferred_from[0], "evidence");
-    let rel_trace = result.trace.evaluator_row_traces.iter().find(|t| t.row_kind == "relationship").unwrap();
+    assert_eq!(
+        result.trace.relationship_direction_inferred_from[0],
+        "evidence"
+    );
+    let rel_trace = result
+        .trace
+        .evaluator_row_traces
+        .iter()
+        .find(|t| t.row_kind == "relationship")
+        .unwrap();
     assert_eq!(rel_trace.compiler_result, "relationship_delta_created");
 }
 
@@ -3155,7 +3426,10 @@ fn unwraps_evaluator_form_v1_top_level_envelope() {
     .expect("wrapped evaluator_form_v1 should parse");
 
     assert_eq!(parsed.relationship_rows.len(), 1);
-    assert_eq!(parsed.relationship_rows[0].dimension, Some(RelationshipDimension::Trust));
+    assert_eq!(
+        parsed.relationship_rows[0].dimension,
+        Some(RelationshipDimension::Trust)
+    );
     assert!(trace
         .raw_form_repair_warnings
         .iter()
@@ -3490,11 +3764,17 @@ fn normal_rp_i_maps_scene_participants_to_active_persona() {
         .scene_state
         .as_ref()
         .expect("scene state");
-    assert!(scene_state.participants.contains(&"preset_male".to_string()));
+    assert!(scene_state
+        .participants
+        .contains(&"preset_male".to_string()));
     assert!(!scene_state
         .participants
         .contains(&"default_player".to_string()));
-    assert!(scene_state.focus.as_deref().unwrap_or("").contains("preset_male"));
+    assert!(scene_state
+        .focus
+        .as_deref()
+        .unwrap_or("")
+        .contains("preset_male"));
     assert!(!scene_state
         .focus
         .as_deref()
@@ -3753,12 +4033,8 @@ fn generic_clothing_kind_uses_specific_object_label_type_and_reuses_identity() {
 #[test]
 fn disabled_hard_object_row_is_ignored_without_rejection() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(
-        &soul,
-        &world,
-        "I wait.",
-        "Aurora waits behind the door.",
-    );
+    let (spec, context) =
+        spec_and_context(&soul, &world, "I wait.", "Aurora waits behind the door.");
     let response = parse_eval_form_response(
         r#"{
           "object_rows": [{
@@ -4248,8 +4524,7 @@ fn relationship_event_row_rejects_surface_fields_inside_numeric_event() {
             && row
                 .rejection_reason
                 .as_deref()
-                .is_some_and(|reason| reason
-                    == "relationship_event_forbidden_surface_field:trust")
+                .is_some_and(|reason| reason == "relationship_event_forbidden_surface_field:trust")
     }));
 }
 
@@ -4275,7 +4550,10 @@ fn hard_relationship_event_template_rejects_string_number() {
     let result = compile_relationship_event_row(row, |_| {});
 
     assert_eq!(result.trace.form_rows_rejected, 1);
-    assert_eq!(result.rejected_rows[0].reason, "numeric_field_non_numeric:intent");
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "numeric_field_non_numeric:intent"
+    );
 }
 
 #[test]
@@ -4554,7 +4832,10 @@ fn relationship_event_row_rejects_string_numeric_field() {
     let result = compile_relationship_event_row(row, |_| {});
 
     assert_eq!(result.trace.form_rows_rejected, 1);
-    assert_eq!(result.rejected_rows[0].reason, "numeric_field_non_numeric:intent");
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "numeric_field_non_numeric:intent"
+    );
 }
 
 #[test]
@@ -4587,15 +4868,19 @@ fn relationship_event_row_rejects_modifier_out_of_range() {
     let result = compile_relationship_event_row(row, |_| {});
 
     assert_eq!(result.trace.form_rows_rejected, 1);
-    assert_eq!(result.rejected_rows[0].reason, "modifier_out_of_range:salience");
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "modifier_out_of_range:salience"
+    );
 }
 
 #[test]
 fn relationship_event_row_rejects_missing_evidence() {
     let mut row = relationship_event_base_row();
-    row.as_object_mut()
-        .unwrap()
-        .insert("evidence_quote".into(), serde_json::Value::String("".into()));
+    row.as_object_mut().unwrap().insert(
+        "evidence_quote".into(),
+        serde_json::Value::String("".into()),
+    );
     let result = compile_relationship_event_row(row, |_| {});
 
     assert_eq!(result.trace.form_rows_rejected, 1);
@@ -4605,9 +4890,10 @@ fn relationship_event_row_rejects_missing_evidence() {
 #[test]
 fn relationship_event_row_rejects_bad_entity() {
     let mut row = relationship_event_base_row();
-    row.as_object_mut()
-        .unwrap()
-        .insert("actor_entity_id".into(), serde_json::Value::String("stranger".into()));
+    row.as_object_mut().unwrap().insert(
+        "actor_entity_id".into(),
+        serde_json::Value::String("stranger".into()),
+    );
     let result = compile_relationship_event_row(row, |_| {});
 
     assert_eq!(result.trace.form_rows_rejected, 1);
@@ -4620,7 +4906,10 @@ fn relationship_event_row_rejects_bad_entity() {
 #[test]
 fn boundary_respect_decreases_boundary_pressure() {
     let result = compile_relationship_event_row(relationship_event_base_row(), |soul| {
-        soul.relationships.get_mut("user").unwrap().boundary_pressure = 40.0;
+        soul.relationships
+            .get_mut("user")
+            .unwrap()
+            .boundary_pressure = 40.0;
     });
 
     assert!(first_relationship_delta(&result).boundary_pressure.unwrap() < 0.0);
@@ -4660,7 +4949,10 @@ fn betrayal_increases_untrustworthy_bias_more_than_minor_kindness_reduces_it() {
     set_row_i64(&mut betrayal, "reliability", -5);
     set_row_i64(&mut betrayal, "intent", -4);
     let betrayal_result = compile_relationship_event_row(betrayal, |soul| {
-        soul.relationships.get_mut("user").unwrap().untrustworthy_bias = 40.0;
+        soul.relationships
+            .get_mut("user")
+            .unwrap()
+            .untrustworthy_bias = 40.0;
     });
 
     let mut kindness = relationship_event_base_row();
@@ -4669,7 +4961,10 @@ fn betrayal_increases_untrustworthy_bias_more_than_minor_kindness_reduces_it() {
     set_row_i64(&mut kindness, "salience", 20);
     set_row_i64(&mut kindness, "stakes", 10);
     let kindness_result = compile_relationship_event_row(kindness, |soul| {
-        soul.relationships.get_mut("user").unwrap().untrustworthy_bias = 40.0;
+        soul.relationships
+            .get_mut("user")
+            .unwrap()
+            .untrustworthy_bias = 40.0;
     });
 
     let betrayal_delta = first_relationship_delta(&betrayal_result)
@@ -4707,7 +5002,10 @@ fn minor_nice_event_does_not_erase_asshole_bias() {
         soul.relationships.get_mut("user").unwrap().asshole_bias = 80.0;
     });
 
-    let next = 80.0 + first_relationship_delta(&result).asshole_bias.unwrap_or(0.0);
+    let next = 80.0
+        + first_relationship_delta(&result)
+            .asshole_bias
+            .unwrap_or(0.0);
     assert!(next > 75.0);
 }
 
@@ -4785,7 +5083,10 @@ fn reappraisal_enters_under_review_at_threshold() {
         relationship.reappraisal_debt = 35.0;
     });
 
-    assert_eq!(first_relationship_delta(&result).reappraisal_state_code, Some(2));
+    assert_eq!(
+        first_relationship_delta(&result).reappraisal_state_code,
+        Some(2)
+    );
 }
 
 #[test]
@@ -4797,16 +5098,20 @@ fn reappraisal_revises_after_strong_contradiction() {
     set_row_i64(&mut row, "costliness", 100);
     set_row_i64(&mut row, "stakes", 100);
     set_row_i64(&mut row, "repetition", 100);
-    row.as_object_mut()
-        .unwrap()
-        .insert("event_flags_u64".into(), serde_json::Value::from(32_u64 | 64_u64));
+    row.as_object_mut().unwrap().insert(
+        "event_flags_u64".into(),
+        serde_json::Value::from(32_u64 | 64_u64),
+    );
     let result = compile_relationship_event_row(row, |soul| {
         let relationship = soul.relationships.get_mut("user").unwrap();
         relationship.asshole_bias = 100.0;
         relationship.reappraisal_debt = 65.0;
     });
 
-    assert_eq!(first_relationship_delta(&result).reappraisal_state_code, Some(3));
+    assert_eq!(
+        first_relationship_delta(&result).reappraisal_state_code,
+        Some(3)
+    );
 }
 
 #[test]
@@ -4848,7 +5153,10 @@ fn legacy_relationship_rows_still_compile_when_no_numeric_rows() {
 #[test]
 fn numeric_relationship_event_rows_take_priority_when_present() {
     let (mut soul, world) = soul_and_world();
-    soul.relationships.get_mut("user").unwrap().boundary_pressure = 40.0;
+    soul.relationships
+        .get_mut("user")
+        .unwrap()
+        .boundary_pressure = 40.0;
     let (spec, context) = spec_and_context(&soul, &world, "Door", "Aurora waits.");
     let response = EvalFormResponse {
         relationship_event_rows: vec![relationship_event_base_row()],
@@ -4874,9 +5182,11 @@ fn numeric_relationship_event_rows_take_priority_when_present() {
             .map(String::as_str),
         Some("numeric_event_v2")
     );
-    assert!(result.trace.evaluator_row_traces.iter().any(|row| {
-        row.compiler_result == "deduped_numeric_event_v2_priority"
-    }));
+    assert!(result
+        .trace
+        .evaluator_row_traces
+        .iter()
+        .any(|row| { row.compiler_result == "deduped_numeric_event_v2_priority" }));
 }
 
 #[test]
@@ -4961,7 +5271,10 @@ fn legacy_relationship_row_with_axis_affection_as_key_gets_rejected() {
     let result = compile_eval_form_response(&spec, &response, &context);
 
     assert_eq!(result.trace.form_rows_rejected, 1);
-    assert_eq!(result.rejected_rows[0].reason, "relationship dimension is not allowed");
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "relationship dimension is not allowed"
+    );
 }
 
 #[test]
@@ -4972,7 +5285,7 @@ fn legacy_relationship_row_rejects_missing_dimension() {
         relationship_rows: vec![RelationshipRow {
             source_soul_id: "aurora_soul".into(),
             target_entity_id: "default_player".into(),
-            dimension: None, 
+            dimension: None,
             direction: Some(RelationshipDirection::Increase),
             evidence_quote: "Aurora relaxes.".into(),
             ..RelationshipRow::default()
@@ -4982,7 +5295,10 @@ fn legacy_relationship_row_rejects_missing_dimension() {
     let result = compile_eval_form_response(&spec, &response, &context);
 
     assert_eq!(result.trace.form_rows_rejected, 1);
-    assert_eq!(result.rejected_rows[0].reason, "relationship dimension is not allowed");
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "relationship dimension is not allowed"
+    );
 }
 
 #[test]
@@ -4990,7 +5306,7 @@ fn test_regression_evaluator_form_fixes() {
     let (mut soul, world) = soul_and_world();
     soul.character_id = "aurora-uuid-12345".to_string();
     soul.character_name = "Aurora".to_string();
-    
+
     soul.memory.recent.clear();
 
     let spec = build_eval_form_spec_with_player_persona(
@@ -5002,7 +5318,7 @@ fn test_regression_evaluator_form_fixes() {
         "preset_male",
         "Jun",
     );
-    
+
     let context = EvaluatorConversionContext {
         active_soul_id: &soul.character_id,
         active_soul_ids: vec![soul.character_id.clone()],
@@ -5067,7 +5383,7 @@ fn test_regression_evaluator_form_fixes() {
 
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.trace.form_rows_accepted, 3); // event, memory, object
-    
+
     // 2. perceived_by_entity_id preset_male fails
     let raw_response_bad_perceiver = r#"{
       "relationship_event_rows": [{
@@ -5102,7 +5418,10 @@ fn test_regression_evaluator_form_fixes() {
     let response_bad = parse_eval_form_response(raw_response_bad_perceiver).unwrap();
     let result_bad = compile_eval_form_response(&spec, &response_bad, &context);
     assert_eq!(result_bad.trace.form_rows_rejected, 1);
-    assert_eq!(result_bad.rejected_rows[0].reason, "perceived_by_entity_resolution_failed");
+    assert_eq!(
+        result_bad.rejected_rows[0].reason,
+        "perceived_by_entity_resolution_failed"
+    );
 
     // 3. Malformed evidence_quote with unescaped dialogue comma is repaired and parses successfully
     let raw_response_malformed_quote = r#"{
@@ -5115,6 +5434,10 @@ fn test_regression_evaluator_form_fixes() {
         "linked_event_id": "event_latest_turn"
       }]
     }"#;
-    let parsed_repair = parse_eval_form_response(raw_response_malformed_quote).expect("repaired successfully");
-    assert_eq!(parsed_repair.memory_rows[0].evidence_quote, "I said, \"Hello,\" and walked away.");
+    let parsed_repair =
+        parse_eval_form_response(raw_response_malformed_quote).expect("repaired successfully");
+    assert_eq!(
+        parsed_repair.memory_rows[0].evidence_quote,
+        "I said, \"Hello,\" and walked away."
+    );
 }

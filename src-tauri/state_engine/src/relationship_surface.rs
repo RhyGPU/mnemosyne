@@ -26,9 +26,12 @@ pub fn relationship_surface_summary(relationship: &Relationship) -> String {
     }
 
     if relationship.boundary_pressure <= 15.0 && relationship.autonomy_respect_bias >= 35.0 {
-        lines.push("The sense of being cornered has eased because they left room to choose.".to_string());
+        lines.push(
+            "The sense of being cornered has eased because they left room to choose.".to_string(),
+        );
     } else if relationship.boundary_pressure >= 65.0 {
-        lines.push("The interaction feels cornering and boundary pressure is defining.".to_string());
+        lines
+            .push("The interaction feels cornering and boundary pressure is defining.".to_string());
     } else if relationship.boundary_pressure >= 35.0 {
         lines.push("There is noticeable pressure around boundaries.".to_string());
     }

@@ -271,6 +271,10 @@ pub struct MemoryEntry {
     pub superseded_by_memory_id: Option<String>,
     #[serde(default)]
     pub is_retconned: bool,
+    /// Evicted from the active pool by the salience cap, not invalidated.
+    /// Archived memories stay stored, queryable, and restorable.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -767,6 +771,7 @@ mod tests {
         soul.world.key_objects = vec!["old phone on couch".into()];
         soul.world.time_elapsed = "One year after the first meeting.".into();
         soul.memory.recent.push(MemoryEntry {
+            archived: false,
             id: "recent".into(),
             timestamp: 1,
             content: "Aurora warmed to the user.".into(),

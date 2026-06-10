@@ -439,7 +439,9 @@ fn build_controlled_entities_section(
     let character_name = fallback(&soul.character_name, "Unnamed Character");
     let lines = vec![
         "Narrator-controlled Souls:".into(),
-        format!("- {character_name} = engine-controlled character. The user is not {character_name}."),
+        format!(
+            "- {character_name} = engine-controlled character. The user is not {character_name}."
+        ),
         "User-controlled player persona:".into(),
         format!("- persona_id: {}", player_persona.persona_id),
         format!("- display_name: {}", player_persona.display_name),
@@ -1800,10 +1802,7 @@ fn display_entity_id(entity_id: &str) -> String {
     trimmed.to_string()
 }
 
-fn display_entity_id_for_persona(
-    entity_id: &str,
-    player_persona: &PlayerPersonaContext,
-) -> String {
+fn display_entity_id_for_persona(entity_id: &str, player_persona: &PlayerPersonaContext) -> String {
     let trimmed = entity_id.trim();
     if trimmed.eq_ignore_ascii_case("user")
         || trimmed.eq_ignore_ascii_case("default_player")
@@ -2987,6 +2986,7 @@ mod tests {
         timestamp: u64,
     ) -> MemoryEntry {
         MemoryEntry {
+            archived: false,
             id: id.into(),
             timestamp,
             content: content.into(),

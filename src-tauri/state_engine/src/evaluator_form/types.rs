@@ -245,7 +245,12 @@ pub struct ObjectRow {
     pub property_changed: String,
     #[serde(alias = "old_state", alias = "previous_status")]
     pub old_value: Option<String>,
-    #[serde(alias = "value", alias = "object_state", alias = "new_state", alias = "status")]
+    #[serde(
+        alias = "value",
+        alias = "object_state",
+        alias = "new_state",
+        alias = "status"
+    )]
     pub new_value: String,
     pub evidence_quote: String,
     pub confidence_tier: Option<ConfidenceTier>,
@@ -277,7 +282,11 @@ pub struct RelationshipRow {
     pub target_entity_id: String,
     #[serde(alias = "relationship_id", skip_serializing)]
     pub relationship_id: Option<String>,
-    #[serde(alias = "relationship_dimension", alias = "relationship_dim", alias = "relationship_metric")]
+    #[serde(
+        alias = "relationship_dimension",
+        alias = "relationship_dim",
+        alias = "relationship_metric"
+    )]
     pub dimension: Option<RelationshipDimension>,
     #[serde(alias = "change_direction", alias = "shift_direction")]
     pub direction: Option<RelationshipDirection>,
@@ -334,7 +343,11 @@ pub struct MemoryRow {
     pub owner_soul_id: String,
     #[serde(alias = "slot_id", alias = "memory_slot")]
     pub slot: Option<MemorySlot>,
-    #[serde(alias = "candidate_memory", alias = "candidate_summary", alias = "content_summary")]
+    #[serde(
+        alias = "candidate_memory",
+        alias = "candidate_summary",
+        alias = "content_summary"
+    )]
     pub content: String,
     pub evidence_quote: String,
     #[serde(alias = "salience", alias = "importance", alias = "importance_tier")]
