@@ -8135,6 +8135,11 @@ pub async fn send_api_turn(
                     &snapshot_user_text,
                     &visible_response_for_updater,
                 );
+                stamp_memory_provenance(
+                    &mut engine_patch,
+                    &conversation_id,
+                    Some(assistant_message_id),
+                );
                 let converter_trace = evaluator_converter_trace_json(&engine_patch, &conversion);
                 let form_trace = runtime_form_trace_json(&runtime);
                 evaluator_pipeline_trace = serde_json::json!({
@@ -12815,6 +12820,11 @@ async fn run_background_evaluator_job(
         &snapshot_user_text,
         &visible_response_for_updater,
     );
+    stamp_memory_provenance(
+        &mut engine_patch,
+        &job.conversation_id,
+        Some(job.assistant_message_id),
+    );
     let patch_elapsed = patch_compile_start.elapsed().as_millis() as u64;
     let mut patch_status = "success";
     if !conversion.rejected_candidates.is_empty() {
@@ -13746,6 +13756,31 @@ fn sanitize_state_updater_patch(
     }
 
     patch
+}
+
+/// Stamp creating-turn provenance onto every new memory in the patch so each
+/// memory can answer "which exchange created you?". Evaluator-provided values
+/// are kept; only missing fields are filled.
+fn stamp_memory_provenance(
+    patch: &mut EnginePatch,
+    conversation_id: &str,
+    assistant_message_id: Option<i64>,
+) {
+    let Some(soul_patch) = patch.soul_patch.as_mut() else {
+        return;
+    };
+    for memory in &mut soul_patch.new_memories {
+        if memory
+            .source_conversation_id
+            .as_deref()
+            .map_or(true, |id| id.trim().is_empty())
+        {
+            memory.source_conversation_id = Some(conversation_id.to_string());
+        }
+        if memory.source_message_id.is_none() {
+            memory.source_message_id = assistant_message_id;
+        }
+    }
 }
 
 fn apply_state_truth_boundary(patch: &mut EnginePatch, user_text: &str, narrator_response: &str) {
@@ -17468,6 +17503,32 @@ mod tests {
         assert_eq!(report.memories_added, 1);
         assert!(report.world_updated);
         assert_eq!(soul.relationships["user"].trust, 12.0);
+    }
+
+    #[test]
+    fn memory_provenance_is_stamped_without_overwriting() {
+        let mut patch = parse_engine_patch_json(
+            r#"{"schema_version":1,"soul_patch":{"new_memories":[
+                {"content":"Aurora noticed the brass key.","tag":"orientation"},
+                {"content":"Aurora recalled the old vow.","tag":"orientation","source_conversation_id":"conv_original","source_message_id":7}
+            ]}}"#,
+        )
+        .expect("patch");
+
+        stamp_memory_provenance(&mut patch, "conv_current", Some(42));
+
+        let memories = &patch.soul_patch.as_ref().expect("soul patch").new_memories;
+        assert_eq!(
+            memories[0].source_conversation_id.as_deref(),
+            Some("conv_current")
+        );
+        assert_eq!(memories[0].source_message_id, Some(42));
+        // Evaluator-provided provenance is preserved.
+        assert_eq!(
+            memories[1].source_conversation_id.as_deref(),
+            Some("conv_original")
+        );
+        assert_eq!(memories[1].source_message_id, Some(7));
     }
 
     #[test]
