@@ -322,6 +322,38 @@ struct ChatCompletionRequest {
     temperature: f32,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
+}
+
+/// How strictly the provider enforced structured output for a completion.
+/// Recorded so the pipeline trace can show whether schema enforcement was
+/// active or the call silently degraded to prompt-only compliance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuredEnforcement {
+    /// Provider validated output against the supplied JSON schema.
+    JsonSchema,
+    /// Provider guaranteed syntactically valid JSON, but not the schema.
+    JsonObject,
+    /// No provider-side enforcement; output relies on the prompt alone.
+    None,
+}
+
+impl StructuredEnforcement {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            StructuredEnforcement::JsonSchema => "json_schema",
+            StructuredEnforcement::JsonObject => "json_object",
+            StructuredEnforcement::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StructuredCompletion {
+    pub raw_text: String,
+    pub enforcement: StructuredEnforcement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,6 +448,7 @@ impl ApiProvider {
             model: model.to_string(),
             temperature: 0.85,
             stream: false,
+            response_format: None,
             messages: vec![
                 ApiRequestMessage {
                     role: "system".into(),
@@ -493,6 +526,100 @@ impl ApiProvider {
         temperature: f32,
         timeout: Option<Duration>,
     ) -> Result<String, String> {
+        self.complete_prompt_with_format(
+            settings,
+            system_prompt,
+            user_text,
+            temperature,
+            timeout,
+            None,
+        )
+        .await
+    }
+
+    /// Structured completion with provider-enforced output, degrading gracefully:
+    /// `json_schema` (schema-validated) -> `json_object` (valid JSON guaranteed)
+    /// -> no enforcement. Returns which level actually succeeded so callers can
+    /// surface it in the pipeline trace and decide whether to trust the output
+    /// syntactically.
+    pub async fn complete_structured_prompt(
+        &self,
+        settings: &ApiProviderSettings,
+        system_prompt: &str,
+        user_text: &str,
+        temperature: f32,
+        timeout: Option<Duration>,
+        schema_name: &str,
+        schema: &serde_json::Value,
+    ) -> Result<StructuredCompletion, String> {
+        let json_schema_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": true,
+                "schema": schema,
+            }
+        });
+        match self
+            .complete_prompt_with_format(
+                settings,
+                system_prompt,
+                user_text,
+                temperature,
+                timeout,
+                Some(json_schema_format),
+            )
+            .await
+        {
+            Ok(raw_text) => {
+                return Ok(StructuredCompletion {
+                    raw_text,
+                    enforcement: StructuredEnforcement::JsonSchema,
+                })
+            }
+            Err(error) if !is_response_format_rejection(&error) => return Err(error),
+            Err(_) => {}
+        }
+
+        let json_object_format = serde_json::json!({ "type": "json_object" });
+        match self
+            .complete_prompt_with_format(
+                settings,
+                system_prompt,
+                user_text,
+                temperature,
+                timeout,
+                Some(json_object_format),
+            )
+            .await
+        {
+            Ok(raw_text) => {
+                return Ok(StructuredCompletion {
+                    raw_text,
+                    enforcement: StructuredEnforcement::JsonObject,
+                })
+            }
+            Err(error) if !is_response_format_rejection(&error) => return Err(error),
+            Err(_) => {}
+        }
+
+        self.complete_prompt_with_format(settings, system_prompt, user_text, temperature, timeout, None)
+            .await
+            .map(|raw_text| StructuredCompletion {
+                raw_text,
+                enforcement: StructuredEnforcement::None,
+            })
+    }
+
+    async fn complete_prompt_with_format(
+        &self,
+        settings: &ApiProviderSettings,
+        system_prompt: &str,
+        user_text: &str,
+        temperature: f32,
+        timeout: Option<Duration>,
+        response_format: Option<serde_json::Value>,
+    ) -> Result<String, String> {
         let api_key = settings.api_key.trim();
         let model = settings.model.trim();
         let base_url = settings.base_url.trim();
@@ -510,6 +637,7 @@ impl ApiProvider {
             model: model.to_string(),
             temperature,
             stream: false,
+            response_format,
             messages: vec![
                 ApiRequestMessage {
                     role: "system".into(),
@@ -624,6 +752,7 @@ impl ApiProvider {
             model: model.to_string(),
             temperature: 0.85,
             stream: true,
+            response_format: None,
             messages,
         };
 
@@ -716,6 +845,25 @@ impl ApiProvider {
             provider_response_id,
         })
     }
+}
+
+/// Detect a provider rejecting the `response_format` parameter itself (as
+/// opposed to a real request failure). Such rejections come back as client
+/// errors whose body names the unsupported field; they mean "try a weaker
+/// enforcement level", not "give up".
+fn is_response_format_rejection(error: &str) -> bool {
+    let lowered = error.to_ascii_lowercase();
+    let client_error = lowered.contains("400")
+        || lowered.contains("404")
+        || lowered.contains("422")
+        || lowered.contains("bad request")
+        || lowered.contains("unprocessable");
+    let names_format = lowered.contains("response_format")
+        || lowered.contains("json_schema")
+        || lowered.contains("json_object")
+        || lowered.contains("structured output")
+        || lowered.contains("structured_output");
+    client_error && names_format
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1003,6 +1151,130 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
             relationship_summary.join("\n")
         },
     )
+}
+
+/// Strict-mode JSON Schema for the evaluator's engine patch. Designed for
+/// provider-enforced structured output (`response_format: json_schema` with
+/// `strict: true`): every object is closed with `additionalProperties: false`,
+/// every property is required, and optionality is expressed via nullable types.
+/// The engine still runs semantic validation after parse; this schema only
+/// guarantees shape, which is what the hand-written repair layer used to chase.
+pub fn evaluator_patch_json_schema() -> serde_json::Value {
+    let nullable_string = serde_json::json!({ "type": ["string", "null"] });
+    let nullable_number = serde_json::json!({ "type": ["number", "null"] });
+    let nullable_boolean = serde_json::json!({ "type": ["boolean", "null"] });
+
+    let relationship_delta = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from", "target", "trust", "affection", "fear", "conflict"],
+        "properties": {
+            "from": nullable_string,
+            "target": { "type": "string" },
+            "trust": nullable_number,
+            "affection": nullable_number,
+            "fear": nullable_number,
+            "conflict": nullable_number
+        }
+    });
+
+    let new_memory = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "memory_id", "content", "tag", "source_type", "truth_status",
+            "perceived_by_entity_id", "target_entity_ids", "memory_slot"
+        ],
+        "properties": {
+            "memory_id": nullable_string,
+            "content": { "type": "string" },
+            "tag": nullable_string,
+            "source_type": nullable_string,
+            "truth_status": nullable_string,
+            "perceived_by_entity_id": nullable_string,
+            "target_entity_ids": { "type": "array", "items": { "type": "string" } },
+            "memory_slot": nullable_string
+        }
+    });
+
+    let scene_state = serde_json::json!({
+        "type": ["object", "null"],
+        "additionalProperties": false,
+        "required": [
+            "scene_state_id", "current_scene", "resolved_active_plot", "focus",
+            "participants", "last_user_action", "pressure_point", "continuity_note"
+        ],
+        "properties": {
+            "scene_state_id": nullable_string,
+            "current_scene": nullable_string,
+            "resolved_active_plot": nullable_string,
+            "focus": nullable_string,
+            "participants": { "type": "array", "items": { "type": "string" } },
+            "last_user_action": nullable_string,
+            "pressure_point": nullable_string,
+            "continuity_note": nullable_string
+        }
+    });
+
+    let event_operation = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation", "recent_event_id", "target_recent_event_id", "content"],
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": [
+                    "add_recent_event", "replace_recent_event", "invalidate_recent_event",
+                    "clear_recent_event_matching", "add_correction_note", "no_op"
+                ]
+            },
+            "recent_event_id": nullable_string,
+            "target_recent_event_id": nullable_string,
+            "content": nullable_string
+        }
+    });
+
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "soul_patch", "world_patch", "body_patch"],
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "soul_patch": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": ["relationship_deltas", "new_memories"],
+                "properties": {
+                    "relationship_deltas": { "type": "array", "items": relationship_delta },
+                    "new_memories": { "type": "array", "items": new_memory }
+                }
+            },
+            "world_patch": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": [
+                    "location", "time_elapsed", "scene_state",
+                    "event_operations", "correction_note"
+                ],
+                "properties": {
+                    "location": nullable_string,
+                    "time_elapsed": nullable_string,
+                    "scene_state": scene_state,
+                    "event_operations": { "type": "array", "items": event_operation },
+                    "correction_note": nullable_string
+                }
+            },
+            "body_patch": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "required": ["activation_delta", "activation_blocked"],
+                "properties": {
+                    "activation_delta": nullable_number,
+                    "activation_blocked": nullable_boolean
+                }
+            }
+        }
+    })
 }
 
 pub fn build_evaluator_prompt(soul: &Soul, session_world: Option<&SessionWorld>) -> String {
@@ -1440,6 +1712,167 @@ fn chat_completions_url(base_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_request_omits_response_format_when_none() {
+        let request = ChatCompletionRequest {
+            model: "test-model".into(),
+            temperature: 0.2,
+            stream: false,
+            response_format: None,
+            messages: vec![ApiRequestMessage {
+                role: "user".into(),
+                content: "hello".into(),
+            }],
+        };
+        let serialized = serde_json::to_string(&request).expect("serializes");
+        assert!(!serialized.contains("response_format"));
+        assert!(!serialized.contains("stream"));
+    }
+
+    #[test]
+    fn chat_request_serializes_json_schema_response_format() {
+        let request = ChatCompletionRequest {
+            model: "test-model".into(),
+            temperature: 0.0,
+            stream: false,
+            response_format: Some(serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "evaluator_patch",
+                    "strict": true,
+                    "schema": {"type": "object"}
+                }
+            })),
+            messages: Vec::new(),
+        };
+        let serialized = serde_json::to_string(&request).expect("serializes");
+        assert!(serialized.contains("\"response_format\""));
+        assert!(serialized.contains("\"json_schema\""));
+        assert!(serialized.contains("\"strict\":true"));
+    }
+
+    /// Strict-mode structured outputs require every object schema to be closed
+    /// (additionalProperties: false) and to require every declared property.
+    fn assert_strict_object_invariants(value: &serde_json::Value, path: &str) {
+        if let Some(object) = value.as_object() {
+            let is_object_schema = object
+                .get("type")
+                .map(|kind| match kind {
+                    serde_json::Value::String(kind) => kind == "object",
+                    serde_json::Value::Array(kinds) => kinds.iter().any(|kind| kind == "object"),
+                    _ => false,
+                })
+                .unwrap_or(false);
+            if is_object_schema {
+                assert_eq!(
+                    object.get("additionalProperties"),
+                    Some(&serde_json::Value::Bool(false)),
+                    "object schema at {path} must close additionalProperties"
+                );
+                let properties = object
+                    .get("properties")
+                    .and_then(|properties| properties.as_object())
+                    .unwrap_or_else(|| panic!("object schema at {path} must declare properties"));
+                let required = object
+                    .get("required")
+                    .and_then(|required| required.as_array())
+                    .unwrap_or_else(|| panic!("object schema at {path} must declare required"));
+                for key in properties.keys() {
+                    assert!(
+                        required.iter().any(|entry| entry == key),
+                        "property {key} at {path} must be required (use nullable types for optionality)"
+                    );
+                }
+            }
+            for (key, child) in object {
+                assert_strict_object_invariants(child, &format!("{path}/{key}"));
+            }
+        } else if let Some(array) = value.as_array() {
+            for (index, child) in array.iter().enumerate() {
+                assert_strict_object_invariants(child, &format!("{path}[{index}]"));
+            }
+        }
+    }
+
+    #[test]
+    fn evaluator_patch_schema_satisfies_strict_mode() {
+        let schema = evaluator_patch_json_schema();
+        assert_strict_object_invariants(&schema, "root");
+    }
+
+    #[test]
+    fn schema_shaped_output_parses_into_engine_patch() {
+        // A maximal output a schema-enforced model could produce; it must be
+        // accepted by the engine's patch parser without repair.
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "soul_patch": {
+                "relationship_deltas": [{
+                    "from": "aurora",
+                    "target": "default_player",
+                    "trust": 1.5,
+                    "affection": null,
+                    "fear": null,
+                    "conflict": 0.0
+                }],
+                "new_memories": [{
+                    "memory_id": null,
+                    "content": "Aurora noticed the visitor's steady answer.",
+                    "tag": "observation",
+                    "source_type": "current_session",
+                    "truth_status": "scene_event",
+                    "perceived_by_entity_id": "aurora",
+                    "target_entity_ids": ["default_player"],
+                    "memory_slot": "relationship_memory"
+                }]
+            },
+            "world_patch": {
+                "location": "the apartment kitchen",
+                "time_elapsed": null,
+                "scene_state": null,
+                "event_operations": [{
+                    "operation": "add_recent_event",
+                    "recent_event_id": "evt_1",
+                    "target_recent_event_id": null,
+                    "content": "Aurora answered the visitor's question."
+                }],
+                "correction_note": null
+            },
+            "body_patch": null
+        })
+        .to_string();
+
+        let patch: state_engine::patch::EnginePatch =
+            serde_json::from_str(&raw).expect("schema-shaped output parses into EnginePatch");
+        let soul_patch = patch.soul_patch.expect("soul patch present");
+        assert_eq!(soul_patch.new_memories.len(), 1);
+        assert_eq!(soul_patch.relationship_deltas.len(), 1);
+        assert_eq!(
+            patch.world_patch.expect("world patch").location.as_deref(),
+            Some("the apartment kitchen")
+        );
+    }
+
+    #[test]
+    fn response_format_rejection_is_detected() {
+        assert!(is_response_format_rejection(
+            "API request failed with 400 Bad Request: {\"error\":\"response_format is not supported\"}"
+        ));
+        assert!(is_response_format_rejection(
+            "API request failed with 422: json_schema unsupported for this model"
+        ));
+        // Real failures must not be mistaken for format rejections.
+        assert!(!is_response_format_rejection(
+            "API request failed with 401 Unauthorized: invalid api key"
+        ));
+        assert!(!is_response_format_rejection(
+            "API request failed with 400 Bad Request: model not found"
+        ));
+        assert!(!is_response_format_rejection(
+            "API request failed with 500: internal error in json_schema validator"
+        ));
+    }
 
     const SCENE_TURN_ROUTER_ASSUMPTION: &str = "If this narrator prompt is called, the input is a scene/RP turn. Slash commands and meta/control messages have already been handled by the router.";
     const SCENE_ONLY_OUTPUT_RULE: &str = "Write visible scene narration only. Include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, implementation notes, or command/help text.";
