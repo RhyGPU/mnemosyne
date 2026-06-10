@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -512,6 +512,46 @@ fn build_memory_section(
         .filter(|memory| !is_generic_filler_memory(memory))
         .collect::<Vec<_>>();
 
+    // Assign each memory one primary slot (its best-scoring eligible slot) so the
+    // same memory cannot fill multiple prompt sections.
+    let mut primary_slots: HashMap<&str, MemorySlot> = HashMap::new();
+    for memory in &all_recent {
+        let mut best: Option<((u8, u8, f32), MemorySlot)> = None;
+        for slot in MemorySlot::all() {
+            let scored = score_memory_for_slot(
+                memory,
+                slot,
+                &query_terms,
+                &world_terms,
+                soul,
+                source_query_active,
+            );
+            let eligible = !scored.source_restricted
+                && !scored.repetitive
+                && slot_matches_memory(memory, slot, &query_terms, &world_terms, soul)
+                && scored.score >= slot_min_score(slot);
+            if !eligible {
+                continue;
+            }
+            // Rank: evaluator-assigned slot > explicit tag affinity > score; ties keep
+            // the earlier slot in MemorySlot::all() order.
+            let rank = (
+                u8::from(evaluator_slot_matches(memory, slot)),
+                u8::from(slot_tag_affinity(memory, slot)),
+                scored.score,
+            );
+            if best
+                .as_ref()
+                .is_none_or(|(best_rank, _)| rank.partial_cmp(best_rank) == Some(Ordering::Greater))
+            {
+                best = Some((rank, slot));
+            }
+        }
+        if let Some((_, slot)) = best {
+            primary_slots.insert(memory.id.as_str(), slot);
+        }
+    }
+
     for slot in MemorySlot::all() {
         let mut lines = Vec::new();
         if slot == MemorySlot::CharacterIdentity {
@@ -543,7 +583,11 @@ fn build_memory_section(
         let mut selected = 0;
         for scored in candidates {
             let reason = slot_reason(scored.memory, slot, &query_terms, &world_terms, soul);
-            let selected_for_slot = !scored.source_restricted
+            let assigned_elsewhere = primary_slots
+                .get(scored.memory.id.as_str())
+                .is_some_and(|primary| *primary != slot);
+            let selected_for_slot = !assigned_elsewhere
+                && !scored.source_restricted
                 && !scored.repetitive
                 && slot_matches_memory(scored.memory, slot, &query_terms, &world_terms, soul)
                 && scored.score >= slot_min_score(slot);
@@ -552,6 +596,8 @@ fn build_memory_section(
                 memory_id: scored.memory.id.clone(),
                 action: if selected_for_slot && selected < slot.cap() {
                     "selected".into()
+                } else if assigned_elsewhere {
+                    "deduplicated_primary_slot_elsewhere".into()
                 } else if scored.source_restricted {
                     "downranked_source".into()
                 } else if scored.repetitive {
@@ -887,6 +933,20 @@ fn evaluator_slot_matches(memory: &MemoryEntry, slot: MemorySlot) -> bool {
         return false;
     };
     memory_slot == evaluator_slot_label(slot)
+}
+
+/// Explicit tag affinity outranks generic content-keyword matches when picking a
+/// memory's primary slot. Mirrors the tag checks inside `slot_matches_memory`.
+fn slot_tag_affinity(memory: &MemoryEntry, slot: MemorySlot) -> bool {
+    let tag = memory.tag.to_ascii_lowercase();
+    match slot {
+        MemorySlot::Relationship => tag.contains("relationship"),
+        MemorySlot::CurrentPlot => tag.contains("plot"),
+        MemorySlot::CharacterIdentity => tag.contains("identity") || tag.contains("schema"),
+        MemorySlot::UnresolvedTension => tag.contains("conflict") || tag.contains("boundary"),
+        MemorySlot::WorldLocation => tag.contains("orientation"),
+        MemorySlot::RecentEmotionalState => tag.contains("emotion") || tag.contains("trauma"),
+    }
 }
 
 fn evaluator_slot_label(slot: MemorySlot) -> &'static str {
@@ -2555,9 +2615,10 @@ mod tests {
                 content: "What did the imported log say about previous Aurora?".into(),
             }],
         );
-        let referenced_memories = section_text(&referenced.text, "[UNRESOLVED TENSION]");
-        assert!(referenced_memories.contains("imported_log / not lived"));
-        assert!(referenced_memories.contains("previous Aurora argued"));
+        // Each memory now has one primary slot, so assert visibility and labeling
+        // across the whole compiled context instead of pinning a specific section.
+        assert!(referenced.text.contains("imported_log / not lived"));
+        assert!(referenced.text.contains("previous Aurora argued"));
     }
 
     #[test]
@@ -2602,9 +2663,10 @@ mod tests {
                 content: "Do you remember the cross-session bleed from before?".into(),
             }],
         );
-        let memories = section_text(&referenced.text, "[RECENT EMOTIONAL STATE]");
-        assert!(memories.contains("cross_session_bleed / not lived"));
-        assert!(memories.contains("memory-like trace"));
+        // Each memory now has one primary slot, so assert visibility and labeling
+        // across the whole compiled context instead of pinning a specific section.
+        assert!(referenced.text.contains("cross_session_bleed / not lived"));
+        assert!(referenced.text.contains("memory-like trace"));
     }
 
     #[test]
@@ -2636,6 +2698,52 @@ mod tests {
         assert!(relationship_slot.contains("building Mnemosyne"));
         assert!(!relationship_slot.contains("felt distressed"));
         assert!(emotion_slot.contains("felt distressed"));
+    }
+
+    #[test]
+    fn memory_appears_in_at_most_one_prompt_section() {
+        let mut soul = new_default_soul("Aurora");
+        // Content deliberately matches several slot keyword lists at once:
+        // "promise"/"argued" (relationship, unresolved tension), "current"/"goal"
+        // (current plot), "door" (world/location), "afraid" (emotional state).
+        let mut tangled = memory(
+            "tangled",
+            "Aurora argued about a broken promise near the current door and is afraid the goal is lost.",
+            "relationship",
+            95.0,
+            95.0,
+            1,
+        );
+        tangled.target_entity_ids = vec!["default_player".into()];
+        soul.memory.recent.push(tangled);
+
+        let preview = compile_context_for_messages(
+            &soul,
+            &[ContextMessage {
+                role: "user".into(),
+                content: "We argued about the promise at the door.".into(),
+            }],
+        );
+
+        let occurrences = preview
+            .text
+            .matches("argued about a broken promise")
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "memory must be selected into exactly one prompt section, found {occurrences}"
+        );
+        let selected_slots = preview
+            .memory_slot_debug
+            .iter()
+            .filter(|trace| trace.memory_id == "tangled" && trace.action == "selected")
+            .count();
+        assert_eq!(selected_slots, 1);
+        assert!(preview
+            .memory_slot_debug
+            .iter()
+            .any(|trace| trace.memory_id == "tangled"
+                && trace.action == "deduplicated_primary_slot_elsewhere"));
     }
 
     #[test]

@@ -82,7 +82,9 @@ Known issues and risks:
 
 ## Recommended Roadmap
 
-The near-term roadmap is State Map V1, not a full universal simulator. The milestone is practical inspection and correction: a user should be able to run a 30-turn RP session, inspect what the engine believes, correct wrong memory or state, continue the RP, and export/import the session safely.
+The roadmap rests on one architectural finding: the evaluator's fragility came from enforcing its schema contract through prompt wording instead of through the provider API. Structured outputs and tool calling (Anthropic tool use, OpenAI `json_schema` response format, grammar-constrained local sampling) force the model's output to match a schema at the decoding level, which makes most of the hand-written parse/repair layer deletable and makes evaluator models swappable.
+
+The near-term product milestone is State Map V1, not a full universal simulator: a user should be able to run a 50+ turn multi-character session, inspect what the engine believes, trace any memory to the turn that created it, correct wrong state, continue playing, and export/import the session safely.
 
 State Map V1 should expose:
 
@@ -96,14 +98,15 @@ State Map V1 should expose:
 
 The user should be able to click a character, object, location, relationship, or event and understand what the engine believes is true, where that belief came from, what changed this turn, what memories were retrieved, what relationships were updated, and what unresolved tensions remain.
 
-Immediate engineering priorities:
+Immediate engineering priorities (in order — see the roadmap doc for full detail):
 
-- Add role-specific model compatibility gates. Narrator models can be creative, evaluator models must pass strict JSON/schema contracts, and command models must be concise and instruction-following. A universal model should not silently take over all roles unless it passes each role contract.
-- Slim the evaluator prompt from tutorial prose into a compact schema card. Keep the hard fillable form, remove contradictory or deprecated wording, move relationship calibration references away from output schema instructions, and prefer machine-readable constraints where possible.
+- Move the evaluator to schema-enforced output (tool calling / structured outputs) and have it propose patch operations against a compact current-state JSON instead of filling a large text form. Keep semantic validation; delete syntactic repair once unreachable.
+- Make the evaluator cheap and conditional: run it on a small fast model, gate it on turn significance using the narrator's existing status block, and expose Fast / Balanced / Long Context modes. Add output-token and cost estimates to the pipeline trace.
+- Lift the destructive stored-memory cap (archive evicted memories instead of deleting), keep the prompt memory budget capped, and deduplicate memories across prompt sections.
+- Role-specific model compatibility gates and evaluator auto-fallback are implemented; keep them as the safety net and verify them live.
 - Add a compact authoritative `scene_continuity_summary` for current truth, not long-term memory. It should track location, participants, positions, door/room state, current misunderstanding, active object, open question, and last concrete action.
-- Clean up memory retrieval without removing prompt memory limits. Separate stored memory capacity from prompt retrieval capacity, allow more stored memories, retrieve only the best few, prevent duplicate memories across prompt sections, and show primary slot labels while hiding secondary tags until inspection.
-- Deduplicate relationship and memory context. Relationship summaries should collapse by `source_soul_id + target_entity_id` and prefer latest materialized relationship state. Memories should not repeat across current plot, character identity, world/location, unresolved tension, and recent emotional state sections.
-- Build State Map V1 UI around current scene truth, known character facts, relationship changes with evidence, object owner/location/status, timeline events, unresolved tensions, and retrieved-memory evidence.
+- Deduplicate relationship context: collapse relationship summaries by `source_soul_id + target_entity_id` and prefer latest materialized relationship state.
+- Build State Map V1 UI around current scene truth, known character facts, relationship changes with evidence, object owner/location/status, timeline events, unresolved tensions, and a Memory Inspector with full provenance (every memory traceable to the turn that created it, with pin/edit/invalidate).
 
 Longer-term priorities:
 
