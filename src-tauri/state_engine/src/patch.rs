@@ -1687,10 +1687,38 @@ fn upsert_object_state(world: &mut WorldLog, object_state: &ObjectState) -> bool
         }
         *existing = object_state.clone();
         true
+    } else if let Some(index) = unknown_owner_object_alias_index(world, object_state) {
+        if world.object_states[index] == *object_state {
+            return false;
+        }
+        world.object_states[index] = object_state.clone();
+        true
     } else {
         world.object_states.push(object_state.clone());
         true
     }
+}
+
+fn unknown_owner_object_alias_index(world: &WorldLog, object_state: &ObjectState) -> Option<usize> {
+    let new_owner = object_state.owner_entity_id.as_deref().and_then(clean_str)?;
+    if new_owner.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    let object_kind = clean_str(&object_state.object_kind)?;
+    world.object_states.iter().position(|existing| {
+        clean_str(&existing.object_kind)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case(object_kind))
+            && existing
+                .owner_entity_id
+                .as_deref()
+                .and_then(clean_str)
+                .map(|owner| owner.eq_ignore_ascii_case("unknown"))
+                .unwrap_or(true)
+            && existing
+                .object_id
+                .to_ascii_lowercase()
+                .starts_with(&format!("unknown_{}_", object_kind.to_ascii_lowercase()))
+    })
 }
 
 fn world_event_consistency_notice(

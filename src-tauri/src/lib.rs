@@ -19,6 +19,9 @@ pub fn run() {
         .setup(|app| {
             let path = connection_path(&app.handle())?;
             let conn = init_connection(&path)?;
+            if let Err(err) = db::recover_incomplete_sessions_on_startup(&conn) {
+                eprintln!("Mnemosyne startup recovery warning: {err}");
+            }
             app.manage(AppState {
                 conn: Mutex::new(conn),
             });
@@ -113,6 +116,8 @@ pub fn run() {
             commands::get_latest_evaluator_job,
             commands::cancel_evaluator_job,
             commands::retry_evaluator_job,
+            commands::run_evaluator_contract_test,
+            commands::set_active_evaluator_profile,
             commands::send_mock_turn,
             commands::send_api_turn,
             commands::compile_context,

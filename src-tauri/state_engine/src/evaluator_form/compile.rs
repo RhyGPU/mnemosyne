@@ -8,7 +8,8 @@ use crate::{
         TurnClassification, WorldChangeEvaluation, EVALUATOR_SCHEMA_VERSION,
     },
     evaluator_form::{
-        clean, slugify,
+        active_player_entity_id,
+        clean, resolve_active_entity_id, slugify,
         relationship_evaluation_has_delta, relationship_event_row_id,
         relationship_from_numeric_event_row,
         validate_event_row, validate_memory_row, validate_object_row,
@@ -16,7 +17,7 @@ use crate::{
         ConfidenceTier, EvalFormCompileResult, EvalFormResponse, EvalFormRowRejection,
         EvalFormSpec, EvalFormTrace, EvalRowTrace, EventRow, EventType, ExistingStateKind,
         ExistingStateRow, FormDedupeDecisionTrace, FormEntityOption, FormRelationshipState,
-        ImportanceTier, MagnitudeTier, MemoryRow, RelationshipDimension, RelationshipDirection,
+        ImportanceTier, MagnitudeTier, MemoryRow, ObjectRow, RelationshipDimension, RelationshipDirection,
         RelationshipEventValidation, RelationshipRow, ReviewDecision, ReviewRow,
         RELATIONSHIP_EVENT_TEMPLATE_VERSION, normalize_eval_form_response, normalize_player_id,
     },
@@ -224,6 +225,7 @@ pub fn compile_eval_form_response(
     let mut evaluator_row_traces = Vec::new();
     let mut object_row_results = HashMap::new();
     let mut memory_row_results = HashMap::new();
+    let mut object_identity_registry = ObjectIdentityRegistry::new(spec);
 
     let mut trace = EvalFormTrace {
         form_spec_event_option_count: spec.allowed_event_types.len(),
@@ -277,6 +279,7 @@ pub fn compile_eval_form_response(
     if let Some(ref baseline_id) = context.baseline_recent_event_id {
         event_ids.insert(baseline_id.as_str());
     }
+    event_ids.insert("event_latest_turn");
     let review_map = response
         .review_rows
         .iter()
@@ -326,13 +329,32 @@ pub fn compile_eval_form_response(
     }
 
     for (idx, row) in response.object_rows.iter().enumerate() {
-        let raw_row = raw_response_struct.object_rows.get(idx).cloned().unwrap_or_else(|| row.clone());
-        let valid = validate_object_row(row, spec, &event_ids, &mut rejected_rows);
-        
-        let validation_status = if valid { "accepted".to_string() } else { "rejected".to_string() };
-        let rejection_reason = if valid { None } else { rejected_rows.last().map(|r| r.reason.clone()) };
-        let compiler_result = if valid { "object_patch_created".to_string() } else { "rejected".to_string() };
-        
+        let raw_row = raw_response_struct
+            .object_rows
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| row.clone());
+        let disabled = object_row_disabled(row);
+        let valid = disabled || validate_object_row(row, spec, &event_ids, &mut rejected_rows);
+
+        let validation_status = if valid {
+            "accepted".to_string()
+        } else {
+            "rejected".to_string()
+        };
+        let rejection_reason = if valid {
+            None
+        } else {
+            rejected_rows.last().map(|r| r.reason.clone())
+        };
+        let compiler_result = if disabled {
+            "disabled_row_ignored".to_string()
+        } else if valid {
+            "object_patch_created".to_string()
+        } else {
+            "rejected".to_string()
+        };
+
         evaluator_row_traces.push(EvalRowTrace {
             row_kind: "object".to_string(),
             row_index: idx,
@@ -343,18 +365,23 @@ pub fn compile_eval_form_response(
             compiler_result: compiler_result.clone(),
         });
 
-        let object_id = row
-            .object_id
-            .as_ref()
-            .and_then(|id| clean(id).map(str::to_string))
-            .or_else(|| {
-                row.new_object_label
-                    .as_ref()
-                    .and_then(|id| clean(id).map(slugify))
-            })
-            .unwrap_or_else(|| "unknown_object".into());
-
-        if valid {
+        if disabled {
+            trace.form_rows_accepted += 1;
+            let object_id = row
+                .object_id
+                .as_ref()
+                .and_then(|id| clean(id).map(str::to_string))
+                .or_else(|| {
+                    row.new_object_label
+                        .as_ref()
+                        .and_then(|id| clean(id).map(slugify))
+                })
+                .unwrap_or_else(|| "disabled_object_row".into());
+            object_row_results.insert(object_id, "disabled_row_ignored".to_string());
+        } else if valid {
+            let object_state =
+                object_state_from_row(row, spec, context, &mut object_identity_registry);
+            let object_id = object_state.object_id.clone();
             trace.form_rows_accepted += 1;
             object_row_results.insert(object_id.clone(), "patch_created".to_string());
             output.object_changes.push(ObjectChangeEvaluation {
@@ -365,25 +392,7 @@ pub fn compile_eval_form_response(
                         row.linked_event_id, object_id, row.property_changed
                     ),
                 )),
-                object_state: ObjectState {
-                    object_id: object_id.clone(),
-                    object_kind: row
-                        .object_kind
-                        .clone()
-                        .and_then(|k| clean(&k).map(str::to_string))
-                        .unwrap_or_else(|| infer_object_kind(&object_id)),
-                    status: row.new_value.clone(),
-                    last_observed_state: format!("{}: {}", row.property_changed, row.new_value),
-                    confidence: confidence_from_confidence_tier(
-                        row.confidence_tier.unwrap_or(ConfidenceTier::Medium),
-                    ),
-                    location: row
-                        .location
-                        .clone()
-                        .and_then(|l| clean(&l).map(str::to_string))
-                        .unwrap_or_default(),
-                    ..ObjectState::default()
-                },
+                object_state,
                 evidence_quote: clean(&row.evidence_quote).map(str::to_string),
                 confidence: confidence_from_confidence_tier(
                     row.confidence_tier.unwrap_or(ConfidenceTier::Medium),
@@ -392,6 +401,16 @@ pub fn compile_eval_form_response(
             });
             output.turn_flags_u64 |= turn_flags::OBJECT_CHANGE | turn_flags::WORLD_CHANGE;
         } else {
+            let object_id = row
+                .object_id
+                .as_ref()
+                .and_then(|id| clean(id).map(str::to_string))
+                .or_else(|| {
+                    row.new_object_label
+                        .as_ref()
+                        .and_then(|id| clean(id).map(slugify))
+                })
+                .unwrap_or_else(|| "unknown_object".into());
             object_row_results.insert(object_id, "rejected".to_string());
         }
     }
@@ -639,7 +658,7 @@ pub fn compile_eval_form_response(
         trace.form_rows_accepted += 1;
         memory_row_results.insert(candidate_id.clone(), "candidate_created".to_string());
         
-        let candidate = memory_candidate_from_row(row, &candidate_id);
+        let candidate = memory_candidate_from_row(row, &candidate_id, spec);
         if row.owner_soul_id == "session_world" {
             output.world_changes.push(WorldChangeEvaluation {
                 change_id: Some(candidate_id),
@@ -765,8 +784,15 @@ fn relationship_from_row(row: &RelationshipRow) -> RelationshipEvaluation {
     relation
 }
 
-fn memory_candidate_from_row(row: &MemoryRow, candidate_id: &str) -> MemoryCandidate {
+fn memory_candidate_from_row(
+    row: &MemoryRow,
+    candidate_id: &str,
+    spec: &EvalFormSpec,
+) -> MemoryCandidate {
     let importance = row.importance_tier.unwrap_or(ImportanceTier::Medium);
+    let target_entity_ids = active_player_entity_id(spec)
+        .map(|id| vec![id])
+        .unwrap_or_else(|| vec!["default_player".into()]);
     MemoryCandidate {
         candidate_id: candidate_id.into(),
         owner_soul_id: row.owner_soul_id.clone(),
@@ -778,12 +804,381 @@ fn memory_candidate_from_row(row: &MemoryRow, candidate_id: &str) -> MemoryCandi
         salience: Some(salience_from_importance(importance)),
         retrieval_strength: Some(retrieval_from_importance(importance)),
         perceived_by_entity_id: Some(row.owner_soul_id.clone()),
-        target_entity_ids: vec!["default_player".into()],
+        target_entity_ids,
         source_type: MemorySourceType::CurrentSession,
         truth_status: TruthStatus::SceneEvent,
         relevance_tags: row.selected_tags.clone(),
         knowledge_scope: crate::evaluator::KnowledgeScope::DirectlyObserved,
     }
+}
+
+struct ObjectIdentityRegistry {
+    used_ids: HashSet<String>,
+}
+
+impl ObjectIdentityRegistry {
+    fn new(spec: &EvalFormSpec) -> Self {
+        let mut used_ids = HashSet::new();
+        for row in &spec.existing_object_observations {
+            if let Some(id) = clean(&row.existing_id) {
+                used_ids.insert(id.to_string());
+            }
+            if let Some((object_id, _)) = row.summary.split_once(':') {
+                if let Some(id) = clean(object_id) {
+                    used_ids.insert(id.to_string());
+                }
+            }
+        }
+        Self { used_ids }
+    }
+
+    fn assign(&mut self, owner_id: &str, object_type: &str, prefer_new_instance: bool) -> String {
+        let owner = slugify(owner_id).trim().to_string();
+        let object_type = slugify(object_type).trim().to_string();
+        let owner = if owner.is_empty() { "unknown".into() } else { owner };
+        let object_type = if object_type.is_empty() {
+            "object".into()
+        } else {
+            object_type
+        };
+        let prefix = format!("{owner}_{object_type}_");
+        if !prefer_new_instance {
+            if let Some(existing) = self
+                .used_ids
+                .iter()
+                .filter(|id| id.starts_with(&prefix))
+                .min_by_key(|id| object_ordinal(id, &prefix).unwrap_or(u32::MAX))
+                .cloned()
+            {
+                return existing;
+            }
+        }
+        let mut ordinal = 1;
+        loop {
+            let candidate = format!("{prefix}{ordinal}");
+            if self.used_ids.insert(candidate.clone()) {
+                return candidate;
+            }
+            ordinal += 1;
+        }
+    }
+}
+
+fn object_ordinal(object_id: &str, prefix: &str) -> Option<u32> {
+    object_id.strip_prefix(prefix)?.parse().ok()
+}
+
+fn object_state_from_row(
+    row: &ObjectRow,
+    spec: &EvalFormSpec,
+    context: &EvaluatorConversionContext<'_>,
+    registry: &mut ObjectIdentityRegistry,
+) -> ObjectState {
+    let identity_text = object_identity_text(row, context);
+    let row_text = object_row_text(row);
+    let object_type = infer_object_type(row, &identity_text);
+    let owner_id = infer_object_owner_id(row, &identity_text, &object_type, spec);
+    let prefer_new_instance = row
+        .change_type
+        .as_deref()
+        .map(|change_type| change_type.eq_ignore_ascii_case("new_object_observation"))
+        .unwrap_or(false);
+    let object_id =
+        stable_or_canonical_object_id(row, &owner_id, &object_type, registry, prefer_new_instance);
+    let status = infer_object_status(row, &row_text);
+    let location = row
+        .location
+        .as_deref()
+        .and_then(clean)
+        .map(str::to_string)
+        .or_else(|| infer_object_location(&row_text))
+        .or_else(|| infer_object_location(&identity_text))
+        .unwrap_or_default();
+    let last_observed_state = object_last_observed_state(row);
+    ObjectState {
+        object_id,
+        object_kind: object_type,
+        owner_entity_id: Some(owner_id),
+        status,
+        last_observed_state,
+        confidence: confidence_from_confidence_tier(
+            row.confidence_tier.unwrap_or(ConfidenceTier::Medium),
+        ),
+        location,
+        ..ObjectState::default()
+    }
+}
+
+fn object_identity_text(row: &ObjectRow, context: &EvaluatorConversionContext<'_>) -> String {
+    [
+        row.object_id.as_deref().unwrap_or_default(),
+        row.new_object_label.as_deref().unwrap_or_default(),
+        row.object_kind.as_deref().unwrap_or_default(),
+        row.owner_entity_id.as_deref().unwrap_or_default(),
+        row.last_observed_state.as_deref().unwrap_or_default(),
+        row.property_changed.as_str(),
+        row.new_value.as_str(),
+        row.evidence_quote.as_str(),
+        context.latest_user_message,
+        context.latest_narrator_response,
+    ]
+    .join(" ")
+}
+
+fn object_row_text(row: &ObjectRow) -> String {
+    [
+        row.object_id.as_deref().unwrap_or_default(),
+        row.new_object_label.as_deref().unwrap_or_default(),
+        row.object_kind.as_deref().unwrap_or_default(),
+        row.last_observed_state.as_deref().unwrap_or_default(),
+        row.property_changed.as_str(),
+        row.new_value.as_str(),
+        row.evidence_quote.as_str(),
+    ]
+    .join(" ")
+}
+
+fn object_last_observed_state(row: &ObjectRow) -> String {
+    if let Some(value) = row.last_observed_state.as_deref().and_then(clean) {
+        return value.to_string();
+    }
+    if !matches!(row.property_changed.as_str(), "presence" | "state") {
+        if let Some(value) = clean(&row.new_value) {
+            return format!("{}: {}", row.property_changed, value);
+        }
+    }
+    clean(&row.evidence_quote)
+        .or_else(|| clean(&row.new_value))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}: {}", row.property_changed, row.new_value))
+}
+
+fn stable_or_canonical_object_id(
+    row: &ObjectRow,
+    owner_id: &str,
+    object_type: &str,
+    registry: &mut ObjectIdentityRegistry,
+    prefer_new_instance: bool,
+) -> String {
+    if let Some(raw_id) = row.object_id.as_deref().and_then(clean) {
+        let raw_id = slugify(raw_id);
+        if !is_label_generated_object_id(&raw_id, row)
+            && !is_temporary_state_object_id(&raw_id, object_type)
+            && !is_generic_object_type_id(&raw_id, object_type)
+        {
+            registry.used_ids.insert(raw_id.clone());
+            return raw_id;
+        }
+    }
+    registry.assign(owner_id, object_type, prefer_new_instance)
+}
+
+fn is_label_generated_object_id(object_id: &str, row: &ObjectRow) -> bool {
+    row.new_object_label
+        .as_deref()
+        .and_then(clean)
+        .map(|label| slugify(label) == object_id)
+        .unwrap_or(false)
+}
+
+fn is_temporary_state_object_id(object_id: &str, object_type: &str) -> bool {
+    let normalized = slugify(object_id);
+    let object_type = slugify(object_type);
+    if normalized == object_type {
+        return false;
+    }
+    let state_words = [
+        "wet", "soaked", "damp", "dry", "broken", "shattered", "open", "closed", "locked",
+        "unlocked", "dirty", "clean", "torn", "bloodied", "empty", "full",
+    ];
+    state_words.iter().any(|word| {
+        normalized == format!("{word}_{object_type}")
+            || normalized.starts_with(&format!("{word}_"))
+            || normalized.ends_with(&format!("_{word}"))
+    })
+}
+
+fn is_generic_object_type_id(object_id: &str, object_type: &str) -> bool {
+    object_id == object_type
+        && matches!(
+            object_type,
+            "jacket"
+                | "coat"
+                | "door"
+                | "chair"
+                | "table"
+                | "glass"
+                | "cup"
+                | "mug"
+                | "phone"
+                | "window"
+                | "lock"
+                | "bag"
+                | "book"
+                | "candle"
+                | "bottle"
+                | "key"
+                | "lamp"
+        )
+}
+
+fn infer_object_type(row: &ObjectRow, text: &str) -> String {
+    if let Some(kind) = row.object_kind.as_deref().and_then(clean) {
+        let kind = strip_state_words_from_type(kind);
+        if !is_generic_object_kind(&kind) {
+            return kind;
+        }
+    }
+    if let Some(label) = row.new_object_label.as_deref().and_then(clean) {
+        return strip_state_words_from_type(label);
+    }
+    if let Some(object_id) = row.object_id.as_deref().and_then(clean) {
+        let inferred = strip_state_words_from_type(object_id);
+        if inferred != "object" {
+            return inferred;
+        }
+    }
+    infer_object_kind(text)
+}
+
+fn is_generic_object_kind(kind: &str) -> bool {
+    matches!(kind, "clothing" | "clothes" | "item" | "object" | "thing" | "unknown")
+}
+
+fn strip_state_words_from_type(value: &str) -> String {
+    let slug = slugify(value);
+    let lower = slug.replace('_', " ");
+    if lower.contains("wine glass") {
+        return "wine_glass".into();
+    }
+    for object_type in [
+        "jacket", "hoodie", "bag", "glass", "chair", "door", "coat", "cup", "mug", "phone",
+        "window", "lock", "book", "bottle", "key", "lamp",
+    ] {
+        if slug.split('_').any(|token| token == object_type) {
+            return object_type.into();
+        }
+    }
+    let tokens = slug
+        .split('_')
+        .filter(|token| {
+            !matches!(
+                *token,
+                "wet"
+                    | "soaked"
+                    | "damp"
+                    | "dry"
+                    | "broken"
+                    | "shattered"
+                    | "open"
+                    | "closed"
+                    | "locked"
+                    | "unlocked"
+                    | "dirty"
+                    | "clean"
+                    | "torn"
+                    | "bloodied"
+                    | "old"
+                    | "new"
+                    | "leather"
+                    | "wooden"
+                    | "metal"
+            )
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        "object".into()
+    } else {
+        tokens.join("_")
+    }
+}
+
+fn infer_object_owner_id(row: &ObjectRow, text: &str, object_type: &str, spec: &EvalFormSpec) -> String {
+    if let Some(owner_id) = row.owner_entity_id.as_deref().and_then(clean) {
+        let resolved = resolve_active_entity_id(owner_id, spec);
+        if spec
+            .active_entities
+            .iter()
+            .any(|entity| entity.entity_id == resolved)
+            || resolved.eq_ignore_ascii_case("unknown")
+        {
+            return resolved;
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    let object_word = object_type.replace('_', " ");
+    let player_id = active_player_entity_id(spec).unwrap_or_else(|| "default_player".into());
+    if contains_possessive_for_player(&lower, &object_word) {
+        return player_id;
+    }
+    for entity in &spec.active_entities {
+        if entity.entity_type != "soul" {
+            continue;
+        }
+        let display = entity.display_name.to_ascii_lowercase();
+        let first = display.split_whitespace().next().unwrap_or("").to_string();
+        if (!display.is_empty() && lower.contains(&format!("{display}'s")))
+            || (!first.is_empty() && lower.contains(&format!("{first}'s")))
+        {
+            return entity.entity_id.clone();
+        }
+    }
+    "unknown".into()
+}
+
+fn contains_possessive_for_player(lower: &str, object_word: &str) -> bool {
+    ["my", "your"].iter().any(|possessive| {
+        lower.contains(&format!("{possessive} {object_word}"))
+            || lower.contains(&format!("{possessive} wet {object_word}"))
+            || lower.contains(&format!("{possessive} soaked {object_word}"))
+            || lower.contains(&format!("{possessive} damp {object_word}"))
+            || lower.contains(&format!("{possessive} broken {object_word}"))
+    })
+}
+
+fn infer_object_status(row: &ObjectRow, text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let status = if lower.contains("soaked") || lower.contains("wet") || lower.contains("damp") {
+        "wet"
+    } else if lower.contains("dry") {
+        "dry"
+    } else if lower.contains("broken") || lower.contains("shattered") {
+        "broken"
+    } else if lower.contains("ajar") || lower.contains("open") {
+        "open"
+    } else if lower.contains("closed") {
+        "closed"
+    } else if lower.contains("unlocked") {
+        "unlocked"
+    } else if lower.contains("locked") {
+        "locked"
+    } else {
+        clean(&row.new_value).unwrap_or("observed")
+    };
+    status.to_string()
+}
+
+fn infer_object_location(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    [
+        "chair",
+        "table",
+        "couch",
+        "sofa",
+        "floor",
+        "door",
+        "counter",
+        "bed",
+        "desk",
+    ]
+    .iter()
+        .find(|location| lower.contains(**location))
+        .map(|location| (*location).to_string())
+}
+
+fn object_row_disabled(row: &ObjectRow) -> bool {
+    row.row_enabled == Some(0)
 }
 
 fn memory_row_disabled(row: &MemoryRow) -> bool {
@@ -1158,12 +1553,29 @@ fn decay_profile(tier: ImportanceTier) -> &'static str {
 }
 
 fn infer_object_kind(object_id: &str) -> String {
-    if object_id.contains("door") {
+    let lower = object_id.to_ascii_lowercase();
+    if lower.contains("wine glass") || lower.contains("wine_glass") {
+        "wine_glass".into()
+    } else if lower.contains("chain lock") || lower.contains("chain_lock") {
+        "chain_lock".into()
+    } else if lower.contains("jacket") {
+        "jacket".into()
+    } else if lower.contains("coat") {
+        "coat".into()
+    } else if lower.contains("chair") {
+        "chair".into()
+    } else if lower.contains("cup") {
+        "cup".into()
+    } else if lower.contains("glass") {
+        "glass".into()
+    } else if lower.contains("door") {
         "door".into()
-    } else if object_id.contains("phone") {
+    } else if lower.contains("phone") {
         "phone".into()
+    } else if lower.contains("lock") {
+        "lock".into()
     } else {
-        "unknown".into()
+        "object".into()
     }
 }
 

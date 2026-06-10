@@ -171,9 +171,36 @@ pub fn repair_unescaped_quotes_in_field(raw: &str, field_name: &str, trace: &mut
                             while next < bytes.len() && bytes[next].is_ascii_whitespace() {
                                 next += 1;
                             }
-                            if next < bytes.len() && (bytes[next] == b',' || bytes[next] == b'}' || bytes[next] == b']') {
-                                end_quote_pos = Some(i);
-                                break;
+                            if next < bytes.len() {
+                                let ch = bytes[next];
+                                if ch == b'}' || ch == b']' {
+                                    end_quote_pos = Some(i);
+                                    break;
+                                } else if ch == b',' {
+                                    let mut probe = next + 1;
+                                    while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+                                        probe += 1;
+                                    }
+                                    if probe < bytes.len() && bytes[probe] == b'"' {
+                                        let mut key_end = probe + 1;
+                                        while key_end < bytes.len() && bytes[key_end] != b'"' {
+                                            key_end += 1;
+                                        }
+                                        if key_end < bytes.len() {
+                                            let mut colon = key_end + 1;
+                                            while colon < bytes.len() && bytes[colon].is_ascii_whitespace() {
+                                                colon += 1;
+                                            }
+                                            if colon < bytes.len() && bytes[colon] == b':' {
+                                                end_quote_pos = Some(i);
+                                                break;
+                                            }
+                                        }
+                                    } else if probe < bytes.len() && (bytes[probe] == b'}' || bytes[probe] == b']') {
+                                        end_quote_pos = Some(i);
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -254,6 +281,14 @@ pub fn repair_common_json_drift(raw: &str, trace: &mut EvalFormRepairTrace) -> S
     let repaired_evidence = repair_unescaped_quotes_in_field(&repaired, "evidence_quote", trace);
     if repaired_evidence != repaired {
         repaired = repaired_evidence;
+    }
+    let repaired_summary = repair_unescaped_quotes_in_field(&repaired, "objective_summary", trace);
+    if repaired_summary != repaired {
+        repaired = repaired_summary;
+    }
+    let repaired_content = repair_unescaped_quotes_in_field(&repaired, "content", trace);
+    if repaired_content != repaired {
+        repaired = repaired_content;
     }
     repaired
 }

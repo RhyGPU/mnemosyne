@@ -138,6 +138,7 @@ pub struct ConversationSummary {
     pub last_message_preview: Option<String>,
     pub message_count: i64,
     pub archived_at: Option<i64>,
+    pub active_evaluator_profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +300,13 @@ pub struct ProviderProfile {
     pub evaluator_background_enabled: Option<bool>,
     pub anti_replay_forced_retry_enabled: Option<bool>,
     pub archived_at: Option<i64>,
+    pub narrator_compatibility_status: i32,
+    pub evaluator_compatibility_status: i32,
+    pub command_compatibility_status: i32,
+    pub evaluator_contract_version: i32,
+    pub evaluator_prompt_version: i32,
+    pub evaluator_last_tested_at: Option<i64>,
+    pub evaluator_last_failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +383,16 @@ pub struct StatePatchRecord {
     pub source_assistant_message_id: Option<i64>,
     pub source_assistant_variant_id: Option<i64>,
     pub created_by_job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StartupRecoveryReport {
+    pub branches_rebuilt: usize,
+    pub materialized_conversation_ids: Vec<String>,
+    pub running_jobs_marked_retryable: usize,
+    pub pending_job_ids: Vec<String>,
+    pub failed_job_ids: Vec<String>,
+    pub canceled_or_timed_out_job_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -907,6 +925,27 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
 
     add_column_if_missing(conn, "provider_profiles", "archived_at", "INTEGER")?;
 
+    add_column_if_missing(conn, "provider_profiles", "narrator_compatibility_status", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "provider_profiles", "evaluator_compatibility_status", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "provider_profiles", "command_compatibility_status", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "provider_profiles", "evaluator_contract_version", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "provider_profiles", "evaluator_prompt_version", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "provider_profiles", "evaluator_last_tested_at", "INTEGER")?;
+    add_column_if_missing(conn, "provider_profiles", "evaluator_last_failure_reason", "TEXT")?;
+
+    add_column_if_missing(conn, "conversations", "active_evaluator_profile_id", "TEXT")?;
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversation_evaluator_streaks (
+            conversation_id TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            empty_patch_streak INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (conversation_id, profile_id),
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_conversation_evaluator_streaks ON conversation_evaluator_streaks(conversation_id, profile_id);"
+    )?;
+
     Ok(())
 }
 
@@ -1409,6 +1448,16 @@ pub fn get_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<Soul> {
 }
 
 pub fn archive_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
+    let active_session_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM conversations WHERE soul_id = ?1 AND archived_at IS NULL",
+        [soul_id],
+        |row| row.get(0),
+    )?;
+    if active_session_count > 0 {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "Cannot archive Soul while active sessions use it; archive the session first or save a copy.".into(),
+        ));
+    }
     let affected = conn.execute(
         "UPDATE souls SET archived_at = ?1 WHERE character_id = ?2",
         params![now_ts(), soul_id],
@@ -1430,7 +1479,7 @@ pub fn list_archived_souls(conn: &Connection) -> rusqlite::Result<Vec<SoulSummar
         SELECT character_id, character_name, soul_kind, source_soul_id, source_savepoint_id,
                avatar_image_id, last_updated, recent_count, core_count, archived_at
         FROM souls
-        WHERE soul_kind != 'session_clone' AND archived_at IS NOT NULL
+        WHERE soul_kind NOT IN ('session_clone', 'checkpoint') AND archived_at IS NOT NULL
         ORDER BY archived_at DESC, character_name ASC
         ",
     )?;
@@ -1452,7 +1501,7 @@ pub fn list_archived_savepoints(conn: &Connection) -> rusqlite::Result<Vec<SoulS
         SELECT character_id, character_name, soul_kind, source_soul_id, source_savepoint_id,
                avatar_image_id, last_updated, recent_count, core_count, archived_at
         FROM souls
-        WHERE soul_kind != 'session_clone' AND archived_at IS NOT NULL
+        WHERE soul_kind = 'checkpoint' AND archived_at IS NOT NULL
         ORDER BY archived_at DESC, character_name ASC
         ",
     )?;
@@ -1461,7 +1510,10 @@ pub fn list_archived_savepoints(conn: &Connection) -> rusqlite::Result<Vec<SoulS
 }
 
 pub fn delete_soul(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
-    archive_soul(conn, soul_id)
+    let _ = (conn, soul_id);
+    Err(rusqlite::Error::InvalidParameterName(
+        "delete_soul is deprecated; use archive_soul with session safety guards.".into(),
+    ))
 }
 
 pub fn hard_delete_soul_internal(conn: &Connection, soul_id: &str) -> rusqlite::Result<bool> {
@@ -1611,7 +1663,8 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
                 FROM messages
                 WHERE conversation_id = c.id AND is_active != 0 AND message_status = 'active'
             ) AS message_count,
-            c.archived_at
+            c.archived_at,
+            c.active_evaluator_profile_id
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
         WHERE c.archived_at IS NULL
@@ -1633,6 +1686,7 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             last_message_preview: preview.map(compact_preview),
             message_count: row.get(10)?,
             archived_at: row.get(11)?,
+            active_evaluator_profile_id: row.get(12)?,
         })
     })?;
     rows.collect()
@@ -1644,7 +1698,7 @@ pub fn get_conversation_summary(
 ) -> rusqlite::Result<ConversationSummary> {
     conn.query_row(
         "
-        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL), c.world_id, c.source_setting_id, c.active_player_persona_id, c.archived_at
+        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL), c.world_id, c.source_setting_id, c.active_player_persona_id, c.archived_at, c.active_evaluator_profile_id
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
         WHERE c.id = ?1
@@ -1667,6 +1721,7 @@ pub fn get_conversation_summary(
                 last_message_preview,
                 message_count,
                 archived_at: row.get(9)?,
+                active_evaluator_profile_id: row.get(10)?,
             })
         },
     )
@@ -2537,6 +2592,50 @@ pub fn seed_initial_assistant_message_variant(
     get_assistant_variant(conn, conversation_id, conn.last_insert_rowid())
 }
 
+pub fn insert_imported_assistant_message_variant(
+    conn: &Connection,
+    variant: &AssistantMessageVariant,
+) -> rusqlite::Result<AssistantMessageVariant> {
+    let message = get_message(conn, &variant.conversation_id, variant.message_id)?;
+    if message.role != "assistant" {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    if variant.is_selected {
+        conn.execute(
+            "UPDATE assistant_message_variants SET is_selected = 0 WHERE message_id = ?1",
+            [variant.message_id],
+        )?;
+    }
+    conn.execute(
+        "
+        INSERT INTO assistant_message_variants
+            (message_id, conversation_id, content, created_at, label, source, is_selected, soul_snapshot_json, debug_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ",
+        params![
+            variant.message_id,
+            variant.conversation_id,
+            variant.content,
+            variant.created_at,
+            variant.label,
+            variant.source,
+            if variant.is_selected { 1 } else { 0 },
+            variant.soul_snapshot_json,
+            variant.debug_json
+        ],
+    )?;
+    let imported = get_assistant_variant(conn, &variant.conversation_id, conn.last_insert_rowid())?;
+    if variant.is_selected {
+        update_message_content(
+            conn,
+            &variant.conversation_id,
+            variant.message_id,
+            &variant.content,
+        )?;
+    }
+    Ok(imported)
+}
+
 pub fn select_assistant_message_variant(
     conn: &Connection,
     conversation_id: &str,
@@ -2878,7 +2977,8 @@ pub fn list_archived_sessions(conn: &Connection) -> rusqlite::Result<Vec<Convers
                 FROM messages
                 WHERE conversation_id = c.id AND is_active != 0 AND message_status = 'active'
             ) AS message_count,
-            c.archived_at
+            c.archived_at,
+            c.active_evaluator_profile_id
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
         WHERE c.archived_at IS NOT NULL
@@ -2900,6 +3000,7 @@ pub fn list_archived_sessions(conn: &Connection) -> rusqlite::Result<Vec<Convers
             last_message_preview: preview.map(compact_preview),
             message_count: row.get(10)?,
             archived_at: row.get(11)?,
+            active_evaluator_profile_id: row.get(12)?,
         })
     })?;
     rows.collect()
@@ -3766,6 +3867,22 @@ pub fn get_active_session_branch(
     )
 }
 
+pub fn list_session_branches_for_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<SessionBranch>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT branch_id, conversation_id, base_soul_json, base_session_world_json, active_turn_id, rebuild_generation, is_active, created_at, updated_at
+        FROM session_branches
+        WHERE conversation_id = ?1
+        ORDER BY is_active DESC, created_at ASC
+        ",
+    )?;
+    let rows = stmt.query_map([conversation_id], session_branch_from_row)?;
+    rows.collect()
+}
+
 pub fn has_session_branch(conn: &Connection, conversation_id: &str) -> rusqlite::Result<bool> {
     Ok(get_active_session_branch(conn, conversation_id)
         .optional()?
@@ -3797,6 +3914,128 @@ pub fn get_turn_commit_by_assistant(
         turn_commit_from_row,
     )
     .optional()
+}
+
+pub fn list_turn_commits_for_branch(
+    conn: &Connection,
+    branch_id: &str,
+) -> rusqlite::Result<Vec<TurnCommit>> {
+    let mut stmt = conn.prepare(
+        "SELECT turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant FROM turn_commits WHERE branch_id = ?1 ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map([branch_id], turn_commit_from_row)?;
+    rows.collect()
+}
+
+pub fn list_state_patches_for_branch(
+    conn: &Connection,
+    branch_id: &str,
+) -> rusqlite::Result<Vec<StatePatchRecord>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT sp.patch_id, sp.turn_id, sp.parent_state_hash, sp.patch_json, sp.inverse_patch_json,
+               sp.applied_at, sp.applies_to, sp.is_active, sp.invalidated_by_patch_id,
+               sp.supersedes_patch_id, sp.patch_kind, sp.parent_baseline_patch_id,
+               sp.source_turn_id, sp.source_assistant_message_id, sp.source_assistant_variant_id,
+               sp.created_by_job_id
+        FROM state_patches sp
+        JOIN turn_commits tc ON tc.turn_id = sp.turn_id
+        WHERE tc.branch_id = ?1
+        ORDER BY tc.created_at ASC,
+                 CASE sp.patch_kind WHEN 'baseline' THEN 0 WHEN 'enrichment' THEN 1 ELSE 2 END,
+                 sp.applied_at ASC,
+                 sp.patch_id ASC
+        ",
+    )?;
+    let rows = stmt.query_map([branch_id], state_patch_from_row)?;
+    rows.collect()
+}
+
+pub fn insert_imported_session_branch(
+    conn: &Connection,
+    branch: &SessionBranch,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE session_branches SET is_active = 0 WHERE conversation_id = ?1",
+        [branch.conversation_id.as_str()],
+    )?;
+    conn.execute(
+        "
+        INSERT INTO session_branches
+            (branch_id, conversation_id, base_soul_json, base_session_world_json, active_turn_id, rebuild_generation, is_active, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ",
+        params![
+            branch.branch_id,
+            branch.conversation_id,
+            branch.base_soul_json,
+            branch.base_session_world_json,
+            branch.active_turn_id,
+            branch.rebuild_generation,
+            if branch.is_active { 1 } else { 0 },
+            branch.created_at,
+            branch.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn insert_imported_turn_commit(conn: &Connection, commit: &TurnCommit) -> rusqlite::Result<()> {
+    conn.execute(
+        "
+        INSERT INTO turn_commits
+            (turn_id, conversation_id, branch_id, parent_turn_id, user_message_id, assistant_message_id, state_patch_id, selected_variant_id, created_at, active_variant, is_active, is_discarded, is_regenerated_variant)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ",
+        params![
+            commit.turn_id,
+            commit.conversation_id,
+            commit.branch_id,
+            commit.parent_turn_id,
+            commit.user_message_id,
+            commit.assistant_message_id,
+            commit.state_patch_id,
+            commit.selected_variant_id,
+            commit.created_at,
+            if commit.active_variant { 1 } else { 0 },
+            if commit.is_active { 1 } else { 0 },
+            if commit.is_discarded { 1 } else { 0 },
+            if commit.is_regenerated_variant { 1 } else { 0 }
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn insert_imported_state_patch(
+    conn: &Connection,
+    patch: &StatePatchRecord,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "
+        INSERT INTO state_patches
+            (patch_id, turn_id, parent_state_hash, patch_json, inverse_patch_json, applied_at, applies_to, is_active, invalidated_by_patch_id, supersedes_patch_id, patch_kind, parent_baseline_patch_id, source_turn_id, source_assistant_message_id, source_assistant_variant_id, created_by_job_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        ",
+        params![
+            patch.patch_id,
+            patch.turn_id,
+            patch.parent_state_hash,
+            patch.patch_json,
+            patch.inverse_patch_json,
+            patch.applied_at,
+            patch.applies_to,
+            if patch.is_active { 1 } else { 0 },
+            patch.invalidated_by_patch_id,
+            patch.supersedes_patch_id,
+            patch.patch_kind,
+            patch.parent_baseline_patch_id,
+            patch.source_turn_id,
+            patch.source_assistant_message_id,
+            patch.source_assistant_variant_id,
+            patch.created_by_job_id
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn record_turn_commit_with_patch(
@@ -4053,6 +4292,88 @@ pub fn rebuild_session_state_until(
     })
 }
 
+pub fn recover_incomplete_sessions_on_startup(
+    conn: &Connection,
+) -> rusqlite::Result<StartupRecoveryReport> {
+    let mut report = StartupRecoveryReport::default();
+    let branches = {
+        let mut stmt = conn.prepare(
+            "
+            SELECT branch_id, conversation_id, base_soul_json, base_session_world_json, active_turn_id, rebuild_generation, is_active, created_at, updated_at
+            FROM session_branches
+            WHERE is_active = 1
+            ORDER BY updated_at ASC
+            ",
+        )?;
+        let rows = stmt.query_map([], session_branch_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for branch in branches {
+        if rebuild_session_state(conn, &branch.conversation_id, &branch.branch_id).is_ok() {
+            report.branches_rebuilt += 1;
+            report
+                .materialized_conversation_ids
+                .push(branch.conversation_id);
+        }
+    }
+
+    let running_jobs = {
+        let mut stmt = conn.prepare(
+            "
+            SELECT evaluator_job_id
+            FROM evaluator_background_jobs
+            WHERE status = 'running'
+            ORDER BY started_at ASC
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for job_id in &running_jobs {
+        conn.execute(
+            "
+            UPDATE evaluator_background_jobs
+            SET status = 'pending',
+                error_message = COALESCE(error_message, 'Recovered after app restart; evaluator can be retried.'),
+                completed_at = NULL,
+                elapsed_ms = NULL,
+                patch_applied = 0
+            WHERE evaluator_job_id = ?1 AND status = 'running'
+            ",
+            [job_id],
+        )?;
+    }
+    report.running_jobs_marked_retryable = running_jobs.len();
+
+    report.pending_job_ids = evaluator_job_ids_by_status(conn, &["pending"])?;
+    report.failed_job_ids = evaluator_job_ids_by_status(conn, &["failed"])?;
+    report.canceled_or_timed_out_job_ids =
+        evaluator_job_ids_by_status(conn, &["canceled", "timed_out"])?;
+    Ok(report)
+}
+
+fn evaluator_job_ids_by_status(
+    conn: &Connection,
+    statuses: &[&str],
+) -> rusqlite::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for status in statuses {
+        let mut stmt = conn.prepare(
+            "
+            SELECT evaluator_job_id
+            FROM evaluator_background_jobs
+            WHERE status = ?1
+            ORDER BY started_at ASC
+            ",
+        )?;
+        let rows = stmt.query_map([*status], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            ids.push(row?);
+        }
+    }
+    Ok(ids)
+}
+
 fn session_branch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionBranch> {
     Ok(SessionBranch {
         branch_id: row.get(0)?,
@@ -4286,9 +4607,12 @@ pub fn upsert_provider_profile(
             id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
             narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
             wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
-            anti_replay_forced_retry_enabled, archived_at
+            anti_replay_forced_retry_enabled, archived_at,
+            narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
+            evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
+            evaluator_last_failure_reason
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             base_url = excluded.base_url,
@@ -4304,7 +4628,14 @@ pub fn upsert_provider_profile(
             allow_send_with_stale_state = excluded.allow_send_with_stale_state,
             evaluator_background_enabled = excluded.evaluator_background_enabled,
             anti_replay_forced_retry_enabled = excluded.anti_replay_forced_retry_enabled,
-            archived_at = excluded.archived_at
+            archived_at = excluded.archived_at,
+            narrator_compatibility_status = excluded.narrator_compatibility_status,
+            evaluator_compatibility_status = excluded.evaluator_compatibility_status,
+            command_compatibility_status = excluded.command_compatibility_status,
+            evaluator_contract_version = excluded.evaluator_contract_version,
+            evaluator_prompt_version = excluded.evaluator_prompt_version,
+            evaluator_last_tested_at = excluded.evaluator_last_tested_at,
+            evaluator_last_failure_reason = excluded.evaluator_last_failure_reason
         ",
         params![
             updated.id,
@@ -4323,7 +4654,14 @@ pub fn upsert_provider_profile(
             updated.allow_send_with_stale_state,
             updated.evaluator_background_enabled,
             updated.anti_replay_forced_retry_enabled,
-            updated.archived_at
+            updated.archived_at,
+            updated.narrator_compatibility_status,
+            updated.evaluator_compatibility_status,
+            updated.command_compatibility_status,
+            updated.evaluator_contract_version,
+            updated.evaluator_prompt_version,
+            updated.evaluator_last_tested_at,
+            updated.evaluator_last_failure_reason
         ],
     )?;
     Ok(updated)
@@ -4335,7 +4673,10 @@ pub fn list_provider_profiles(conn: &Connection) -> rusqlite::Result<Vec<Provide
         SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
                narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
-               anti_replay_forced_retry_enabled, archived_at
+               anti_replay_forced_retry_enabled, archived_at,
+               narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
+               evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
+               evaluator_last_failure_reason
         FROM provider_profiles
         WHERE archived_at IS NULL
         ORDER BY updated_at DESC, name ASC
@@ -4351,7 +4692,10 @@ pub fn get_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<Pro
         SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
                narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
-               anti_replay_forced_retry_enabled, archived_at
+               anti_replay_forced_retry_enabled, archived_at,
+               narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
+               evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
+               evaluator_last_failure_reason
         FROM provider_profiles
         WHERE id = ?1
         ",
@@ -4415,7 +4759,10 @@ pub fn list_archived_provider_profiles(
         SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
                narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
-               anti_replay_forced_retry_enabled, archived_at
+               anti_replay_forced_retry_enabled, archived_at,
+               narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
+               evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
+               evaluator_last_failure_reason
         FROM provider_profiles
         WHERE archived_at IS NOT NULL
         ORDER BY archived_at DESC, name ASC
@@ -4423,6 +4770,81 @@ pub fn list_archived_provider_profiles(
     )?;
     let rows = stmt.query_map([], provider_profile_from_row)?;
     rows.collect()
+}
+
+pub fn get_evaluator_empty_patch_streak(
+    conn: &Connection,
+    conversation_id: &str,
+    profile_id: &str,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT empty_patch_streak FROM conversation_evaluator_streaks WHERE conversation_id = ?1 AND profile_id = ?2",
+        params![conversation_id, profile_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(|opt| opt.unwrap_or(0))
+}
+
+pub fn increment_evaluator_empty_patch_streak(
+    conn: &Connection,
+    conversation_id: &str,
+    profile_id: &str,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO conversation_evaluator_streaks (conversation_id, profile_id, empty_patch_streak)
+         VALUES (?1, ?2, 1)
+         ON CONFLICT(conversation_id, profile_id) DO UPDATE SET
+             empty_patch_streak = empty_patch_streak + 1",
+        params![conversation_id, profile_id],
+    )?;
+    get_evaluator_empty_patch_streak(conn, conversation_id, profile_id)
+}
+
+pub fn reset_evaluator_empty_patch_streak(
+    conn: &Connection,
+    conversation_id: &str,
+    profile_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO conversation_evaluator_streaks (conversation_id, profile_id, empty_patch_streak)
+         VALUES (?1, ?2, 0)
+         ON CONFLICT(conversation_id, profile_id) DO UPDATE SET
+             empty_patch_streak = 0",
+        params![conversation_id, profile_id],
+    )?;
+    Ok(())
+}
+
+pub fn get_last_known_good_evaluator_profile(conn: &Connection) -> rusqlite::Result<Option<ProviderProfile>> {
+    conn.query_row(
+        "SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
+                narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
+                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
+                anti_replay_forced_retry_enabled, archived_at,
+                narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
+                evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
+                evaluator_last_failure_reason
+         FROM provider_profiles
+         WHERE archived_at IS NULL AND evaluator_compatibility_status = 1
+         ORDER BY evaluator_last_tested_at DESC, updated_at DESC
+         LIMIT 1",
+        [],
+        provider_profile_from_row,
+    )
+    .optional()
+}
+
+pub fn set_active_evaluator_profile(
+    conn: &Connection,
+    conversation_id: &str,
+    profile_id: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE conversations SET active_evaluator_profile_id = ?1 WHERE id = ?2",
+        params![profile_id, conversation_id],
+    )?;
+    Ok(())
 }
 
 fn provider_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderProfile> {
@@ -4444,6 +4866,13 @@ fn provider_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provid
         evaluator_background_enabled: row.get(14)?,
         anti_replay_forced_retry_enabled: row.get(15)?,
         archived_at: row.get(16)?,
+        narrator_compatibility_status: row.get(17)?,
+        evaluator_compatibility_status: row.get(18)?,
+        command_compatibility_status: row.get(19)?,
+        evaluator_contract_version: row.get(20)?,
+        evaluator_prompt_version: row.get(21)?,
+        evaluator_last_tested_at: row.get(22)?,
+        evaluator_last_failure_reason: row.get(23)?,
     })
 }
 
@@ -6277,6 +6706,13 @@ mod tests {
             evaluator_background_enabled: Some(false),
             anti_replay_forced_retry_enabled: Some(false),
             archived_at: None,
+            narrator_compatibility_status: 0,
+            evaluator_compatibility_status: 0,
+            command_compatibility_status: 0,
+            evaluator_contract_version: 0,
+            evaluator_prompt_version: 0,
+            evaluator_last_tested_at: None,
+            evaluator_last_failure_reason: None,
         };
 
         let saved = upsert_provider_profile(&conn, &profile).expect("upsert");
@@ -6319,6 +6755,13 @@ mod tests {
             evaluator_background_enabled: Some(false),
             anti_replay_forced_retry_enabled: Some(false),
             archived_at: None,
+            narrator_compatibility_status: 0,
+            evaluator_compatibility_status: 0,
+            command_compatibility_status: 0,
+            evaluator_contract_version: 0,
+            evaluator_prompt_version: 0,
+            evaluator_last_tested_at: None,
+            evaluator_last_failure_reason: None,
         };
         let profile2 = ProviderProfile {
             id: "anthropic".into(),
@@ -6338,6 +6781,13 @@ mod tests {
             evaluator_background_enabled: Some(true),
             anti_replay_forced_retry_enabled: Some(true),
             archived_at: None,
+            narrator_compatibility_status: 0,
+            evaluator_compatibility_status: 0,
+            command_compatibility_status: 0,
+            evaluator_contract_version: 0,
+            evaluator_prompt_version: 0,
+            evaluator_last_tested_at: None,
+            evaluator_last_failure_reason: None,
         };
 
         upsert_provider_profile(&conn, &profile1).expect("upsert1");
@@ -6418,6 +6868,13 @@ mod tests {
             evaluator_background_enabled: Some(false),
             anti_replay_forced_retry_enabled: Some(false),
             archived_at: None,
+            narrator_compatibility_status: 0,
+            evaluator_compatibility_status: 0,
+            command_compatibility_status: 0,
+            evaluator_contract_version: 0,
+            evaluator_prompt_version: 0,
+            evaluator_last_tested_at: None,
+            evaluator_last_failure_reason: None,
         };
         upsert_provider_profile(&conn, &profile).expect("upsert");
 
@@ -6450,6 +6907,13 @@ mod tests {
             evaluator_background_enabled: Some(false),
             anti_replay_forced_retry_enabled: Some(false),
             archived_at: None,
+            narrator_compatibility_status: 0,
+            evaluator_compatibility_status: 0,
+            command_compatibility_status: 0,
+            evaluator_contract_version: 0,
+            evaluator_prompt_version: 0,
+            evaluator_last_tested_at: None,
+            evaluator_last_failure_reason: None,
         };
         upsert_provider_profile(&conn, &profile).expect("upsert");
 
@@ -6483,6 +6947,13 @@ mod tests {
             evaluator_background_enabled: Some(false),
             anti_replay_forced_retry_enabled: Some(false),
             archived_at: None,
+            narrator_compatibility_status: 0,
+            evaluator_compatibility_status: 0,
+            command_compatibility_status: 0,
+            evaluator_contract_version: 0,
+            evaluator_prompt_version: 0,
+            evaluator_last_tested_at: None,
+            evaluator_last_failure_reason: None,
         };
         upsert_provider_profile(&conn, &profile).expect("upsert");
 
@@ -6516,6 +6987,13 @@ mod tests {
             evaluator_background_enabled: Some(false),
             anti_replay_forced_retry_enabled: Some(false),
             archived_at: None,
+            narrator_compatibility_status: 0,
+            evaluator_compatibility_status: 0,
+            command_compatibility_status: 0,
+            evaluator_contract_version: 0,
+            evaluator_prompt_version: 0,
+            evaluator_last_tested_at: None,
+            evaluator_last_failure_reason: None,
         };
         upsert_provider_profile(&conn, &profile).expect("upsert");
 
@@ -6930,6 +7408,100 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovery_rebuilds_active_branch_and_marks_running_jobs_retryable() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Recovery");
+        upsert_soul(&conn, &soul).expect("soul");
+        ensure_conversation(&conn, "recovery-session", &soul.character_id).expect("conversation");
+        let world = ensure_conversation_session_world(&conn, "recovery-session", &soul, None)
+            .expect("world");
+        let branch =
+            create_session_branch(&conn, "recovery-session", &soul, &world).expect("branch");
+        let assistant_id =
+            insert_message_and_get_id(&conn, "recovery-session", "assistant", "Recovered.")
+                .expect("assistant");
+        let patch = EnginePatch {
+            soul_patch: Some(SoulPatch {
+                new_memories: vec![MemoryPatch {
+                    content: "Recovery memory survived restart.".into(),
+                    ..MemoryPatch::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            world_patch: Some(WorldPatch {
+                corrected_object_states: vec![ObjectState {
+                    object_id: "recovery_object_1".into(),
+                    object_kind: "object".into(),
+                    last_observed_state: "present after recovery".into(),
+                    ..ObjectState::default()
+                }],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        let (commit, _) = record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "turn_recovery",
+            "recovery-session",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            None,
+            &patch,
+            false,
+        )
+        .expect("commit");
+        let mut stale_soul = soul.clone();
+        stale_soul.memory.recent.clear();
+        upsert_soul(&conn, &stale_soul).expect("stale soul");
+        let mut stale_world = world.clone();
+        stale_world.object_states.clear();
+        upsert_session_world(&conn, &stale_world).expect("stale world");
+        insert_evaluator_job(
+            &conn,
+            &EvaluatorJob {
+                evaluator_job_id: "job-recovery-running".into(),
+                conversation_id: "recovery-session".into(),
+                turn_id: commit.turn_id,
+                assistant_message_id: assistant_id,
+                status: "running".into(),
+                started_at: now_ts(),
+                completed_at: None,
+                elapsed_ms: None,
+                timeout_ms: Some(25_000),
+                timeout_mode: "finite".into(),
+                model: Some("model".into()),
+                provider: Some("provider".into()),
+                error_message: None,
+                patch_applied: false,
+            },
+        )
+        .expect("job");
+
+        let report = recover_incomplete_sessions_on_startup(&conn).expect("recover");
+
+        assert_eq!(report.branches_rebuilt, 1);
+        assert_eq!(report.running_jobs_marked_retryable, 1);
+        assert!(report
+            .pending_job_ids
+            .contains(&"job-recovery-running".to_string()));
+        let recovered_soul = get_soul(&conn, &soul.character_id).expect("recovered soul");
+        assert_eq!(recovered_soul.memory.recent.len(), 1);
+        let recovered_world = get_conversation_session_world(&conn, "recovery-session")
+            .expect("world")
+            .expect("linked world");
+        assert_eq!(recovered_world.object_states.len(), 1);
+        assert_eq!(
+            get_evaluator_job(&conn, "job-recovery-running")
+                .expect("job")
+                .expect("job")
+                .status,
+            "pending"
+        );
+    }
+
+    #[test]
     fn test_backups() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let db_path = temp_dir.path().join("mnemosyne.sqlite3");
@@ -7236,11 +7808,18 @@ mod tests {
             .iter()
             .any(|s| s.character_id == savepoint_c.character_id));
 
-        // 1. Archive Soul A
+        // 1. Active sessions guard Soul archive until the session is archived first.
+        let blocked = archive_soul(&conn, &soul_a.character_id).expect_err("active guard");
+        assert!(blocked
+            .to_string()
+            .contains("Cannot archive Soul while active sessions use it"));
+        assert!(archive_session(&conn, conv_id).expect("archive session first"));
+
+        // 2. Archive Soul A
         let ok = archive_soul(&conn, &soul_a.character_id).expect("archive soul");
         assert!(ok);
 
-        // 2. Verify archive_soul hides from active list
+        // 3. Verify archive_soul hides from active list
         let active_after = list_souls(&conn).expect("list");
         assert_eq!(active_after.len(), 2);
         assert!(!active_after
@@ -7254,12 +7833,12 @@ mod tests {
             .iter()
             .any(|s| s.character_id == savepoint_c.character_id));
 
-        // 3. Verify archived Soul appears in archived list
+        // 4. Verify archived Soul appears in archived list
         let archived = list_archived_souls(&conn).expect("archived");
         assert_eq!(archived.len(), 1);
         assert_eq!(archived[0].character_id, soul_a.character_id);
 
-        // 4. Verify archive does NOT delete conversations
+        // 5. Verify archive does NOT delete conversations
         let conv_exists = conn
             .query_row(
                 "SELECT COUNT(*) FROM conversations WHERE id = ?1",
@@ -7270,7 +7849,7 @@ mod tests {
             > 0;
         assert!(conv_exists);
 
-        // 5. Verify archive does NOT delete messages
+        // 6. Verify archive does NOT delete messages
         let msg_exists = conn
             .query_row(
                 "SELECT COUNT(*) FROM messages WHERE id = ?1",
@@ -7281,7 +7860,7 @@ mod tests {
             > 0;
         assert!(msg_exists);
 
-        // 6. Verify archive does NOT delete savepoints
+        // 7. Verify archive does NOT delete savepoints
         let savepoint_exists = conn
             .query_row(
                 "SELECT COUNT(*) FROM souls WHERE character_id = ?1",

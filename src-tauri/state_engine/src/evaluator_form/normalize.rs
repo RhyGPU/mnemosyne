@@ -971,6 +971,9 @@ pub fn normalize_eval_form_response(
         .or_else(|| context.baseline_recent_event_id.clone())
         .unwrap_or_else(|| "event_latest_turn".into());
 
+    for row in &mut normalized.event_rows {
+        normalize_event_participants(row, spec);
+    }
     for row in &mut normalized.relationship_rows {
         normalize_child_link(
             &mut row.linked_event_id,
@@ -1014,10 +1017,37 @@ pub fn normalize_eval_form_response(
     normalized
 }
 
+pub fn normalize_event_participants(row: &mut EventRow, spec: &EvalFormSpec) {
+    let mut participants = row
+        .participants
+        .iter()
+        .filter_map(|participant| {
+            let resolved = resolve_active_entity_id(participant, spec);
+            clean(&resolved).map(|_| normalize_player_id(&resolved))
+        })
+        .collect::<Vec<_>>();
+    participants.sort();
+    participants.dedup();
+    if participants.is_empty() {
+        participants = default_participants(spec);
+    }
+    row.participants = participants;
+}
+
 pub fn normalize_relationship_event_entities(row: &mut Value, spec: &EvalFormSpec) {
     let Some(object) = row.as_object_mut() else {
         return;
     };
+    if !object.contains_key("actor_entity_id") {
+        if let Some(val) = object.remove("source_entity_id") {
+            object.insert("actor_entity_id".into(), val);
+        }
+    }
+    if !object.contains_key("relationship_target_entity_id") {
+        if let Some(val) = object.remove("target_entity_id") {
+            object.insert("relationship_target_entity_id".into(), val);
+        }
+    }
     for key in [
         "actor_entity_id",
         "source_entity_id",
@@ -1082,18 +1112,24 @@ pub fn normalize_child_link(
     event_ids: &[String],
     main_event_id: &str,
 ) {
-    if clean(linked_event_id).is_some() {
-        return;
-    }
-    if let Some(associated) = associated_event_ids
-        .iter()
-        .find(|id| event_ids.iter().any(|event_id| event_id == *id))
-    {
-        *linked_event_id = associated.clone();
-    } else if event_ids.len() == 1 {
-        *linked_event_id = event_ids[0].clone();
-    } else {
-        *linked_event_id = main_event_id.to_string();
+    let raw = linked_event_id.trim();
+    if raw.is_empty() || raw == "event_latest_turn" {
+        if let Some(associated) = associated_event_ids
+            .iter()
+            .find(|id| *id != "event_latest_turn" && event_ids.iter().any(|event_id| event_id == *id))
+        {
+            *linked_event_id = associated.clone();
+        } else if clean(main_event_id).is_some() {
+            *linked_event_id = main_event_id.to_string();
+        } else if !event_ids.is_empty() {
+            if let Some(first_other) = event_ids.iter().find(|id| *id != "event_latest_turn") {
+                *linked_event_id = first_other.to_string();
+            } else {
+                *linked_event_id = event_ids[0].to_string();
+            }
+        } else {
+            *linked_event_id = "event_latest_turn".to_string();
+        }
     }
 }
 

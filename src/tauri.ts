@@ -177,6 +177,7 @@ export type ConversationSummary = {
   last_message_preview: string | null;
   message_count: number;
   archived_at?: number | null;
+  active_evaluator_profile_id?: string | null;
 };
 
 export type PlayerPersona = {
@@ -541,6 +542,13 @@ export type ProviderProfile = ApiProviderSettings & {
   created_at: number;
   updated_at: number;
   archived_at?: number | null;
+  narrator_compatibility_status: number;
+  evaluator_compatibility_status: number;
+  command_compatibility_status: number;
+  evaluator_contract_version: number;
+  evaluator_prompt_version: number;
+  evaluator_last_tested_at?: number | null;
+  evaluator_last_failure_reason?: string | null;
 };
 
 export type EvaluatorJobStatus =
@@ -1318,6 +1326,16 @@ export function listenPipelineTraceUpdated(
   return listen<TurnPipelineTrace>("pipeline-trace-updated", (event) => callback(event.payload));
 }
 
+export function listenEvaluatorAutoFallbackTriggered(
+  callback: (payload: { conversation_id: string; profile_id: string }) => void,
+): Promise<() => void> {
+  if (!hasTauriRuntime()) return Promise.resolve(() => undefined);
+  return listen<{ conversation_id: string; profile_id: string }>(
+    "evaluator_auto_fallback_triggered",
+    (event) => callback(event.payload),
+  );
+}
+
 
 export function listProviderProfiles(): Promise<ProviderProfile[]> {
   return invokeOrPreview("list_provider_profiles", {}, () => browserProviderProfiles);
@@ -1402,6 +1420,32 @@ export function retryEvaluatorJob(
     { conversationId, assistantMessageId, stateUpdaterSettings },
     () => undefined,
   );
+}
+
+export type EvaluatorContractTestReport = {
+  passed: boolean;
+  errors: string[];
+  raw_response: string;
+};
+
+export function runEvaluatorContractTest(profileId: string): Promise<EvaluatorContractTestReport> {
+  return invokeOrPreview("run_evaluator_contract_test", { profileId }, () => {
+    return {
+      passed: true,
+      errors: [],
+      raw_response: "{}"
+    };
+  });
+}
+
+export function setActiveEvaluatorProfile(conversationId: string, profileId: string | null): Promise<void> {
+  return invokeOrPreview("set_active_evaluator_profile", { conversationId, profileId }, () => {
+    const conv = browserConversations.find(c => c.conversation_id === conversationId);
+    if (conv) {
+      (conv as any).active_evaluator_profile_id = profileId;
+    }
+    return Promise.resolve();
+  });
 }
 
 export function listConversationMessages(conversationId: string): Promise<ChatMessage[]> {

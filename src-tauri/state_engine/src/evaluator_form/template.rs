@@ -17,7 +17,18 @@ pub fn build_hard_eval_form_template(spec: &EvalFormSpec) -> Value {
                 "evidence_quote": ""
             }],
             "event_rows": [],
-            "object_rows": [],
+            "object_rows": [{
+                "row_enabled": 0,
+                "linked_event_id": "event_latest_turn",
+                "object_id": "",
+                "object_label": "",
+                "object_type": "",
+                "owner_entity_id": target_entity_id,
+                "status": "",
+                "location": "",
+                "last_observed_state": "",
+                "evidence_quote": ""
+            }],
             "relationship_rows": [],
             "relationship_event_rows": [{
                 "row_enabled": 0,

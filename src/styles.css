@@ -678,8 +678,71 @@ h2 {
   width: 100%;
 }
 
-.persona-add-button {
-  justify-self: start;
+.persona-list-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 14px;
+  border-top: 1px solid #e5dfd1;
+  padding-top: 14px;
+}
+
+.persona-add-button,
+.persona-confirm-button,
+.persona-cancel-button,
+.persona-save-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  font-weight: 800;
+  cursor: pointer;
+  min-height: 40px;
+  padding: 0 16px;
+  transition: all 120ms ease;
+}
+
+.persona-add-button,
+.persona-cancel-button {
+  border: 1px solid #d9d3c3;
+  background: #fffdf8;
+  color: #1d5e52;
+}
+
+.persona-add-button:hover,
+.persona-cancel-button:hover {
+  background: #fbf8ef;
+  border-color: #b8b0a0;
+}
+
+.persona-cancel-button {
+  color: #5b665f;
+}
+
+.persona-confirm-button,
+.persona-save-button {
+  background: #1d5e52;
+  color: #fffdf8;
+}
+
+.persona-confirm-button:hover,
+.persona-save-button:hover {
+  background: #14433a;
+}
+
+.persona-row-actions button {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: #1d5e52;
+  background: transparent;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: all 120ms ease;
+}
+
+.persona-row-actions button:hover {
+  background: rgba(29, 94, 82, 0.08);
 }
 
 button:disabled {
@@ -878,6 +941,39 @@ button:disabled {
 
 .world-picker-list {
   max-height: 320px;
+}
+
+.archived-resource-list {
+  max-height: 220px;
+}
+
+.list-section-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 2px 0;
+}
+
+.list-section-heading strong {
+  color: #284239;
+  font-size: 0.9rem;
+}
+
+.archived-resource-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.archived-resource-row small {
+  grid-column: 1;
+}
+
+.archived-resource-row button {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  min-height: 32px;
+  padding: 6px 8px;
 }
 
 .collapsible-section {

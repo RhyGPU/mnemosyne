@@ -62,8 +62,9 @@ use crate::{
             build_command_help_prompt, build_command_ooc_prompt, build_command_setup_prompt,
             build_command_soul_edit_agent_prompt, build_command_state_edit_prompt,
             build_command_state_summary_prompt, build_evaluator_form_prompt_with_player_persona,
-            build_evaluator_prompt, build_narrator_system_prompt, ApiMessage, ApiProvider,
-            ApiProviderSettings, PreparedApiPayload,
+            build_evaluator_form_prompt_compact_with_player_persona, build_evaluator_prompt,
+            build_narrator_system_prompt, ApiMessage, ApiProvider, ApiProviderSettings,
+            PreparedApiPayload, CURRENT_EVALUATOR_CONTRACT_VERSION, CURRENT_EVALUATOR_PROMPT_VERSION,
         },
         mock::MockProvider,
     },
@@ -379,6 +380,14 @@ pub struct MneImportResult {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MneSessionLedgerExport {
+    branches: Vec<db::SessionBranch>,
+    turns: Vec<db::TurnCommit>,
+    patches: Vec<db::StatePatchRecord>,
+    variants: Vec<db::AssistantMessageVariant>,
+}
+
 #[tauri::command]
 pub fn create_default_soul(character_name: String) -> Soul {
     new_default_soul(&character_name)
@@ -671,6 +680,8 @@ pub fn export_current_session_checkpoint_mne(
     }
     let messages =
         db::list_messages(&conn, &conversation_id, 10_000).map_err(|err| err.to_string())?;
+    let session_ledger = collect_mne_session_ledger(&conn, &conversation_id, &messages)
+        .map_err(|err| err.to_string())?;
     let soul_path = format!("souls/{}.json", safe_bundle_name(&soul.character_id));
     let world_path = format!("worlds/{}.json", safe_bundle_name(&session_world.world_id));
     let conversation_path = "conversation/conversation.json".to_string();
@@ -701,6 +712,26 @@ pub fn export_current_session_checkpoint_mne(
             "conversation/payload_logs.json",
             &payload_logs,
         )?);
+    }
+    if !session_ledger.branches.is_empty() {
+        files.push(json_bundle_file(
+            "conversation/branches.json",
+            &session_ledger.branches,
+        )?);
+        files.push(json_bundle_file(
+            "conversation/turns.json",
+            &session_ledger.turns,
+        )?);
+        files.push(json_bundle_file(
+            "conversation/patches.json",
+            &session_ledger.patches,
+        )?);
+        if !session_ledger.variants.is_empty() {
+            files.push(json_bundle_file(
+                "conversation/variants.json",
+                &session_ledger.variants,
+            )?);
+        }
     }
     let result = write_mne_bundle(&app, &output_path, &manifest, files)?;
     let export_trace = mne_export_state_trace_json(
@@ -1312,6 +1343,11 @@ pub fn import_mne_as_new_inner(conn: &Connection, bytes: &[u8]) -> Result<MneImp
             Some(&title),
         )
         .map_err(|err| err.to_string())?;
+        let _ = db::set_active_player_persona(
+            conn,
+            &target_conv_id,
+            &conversation.active_player_persona_id,
+        );
 
         let messages_path = "conversation/messages.json";
         if let Some(message_bytes) = entries.get(messages_path) {
@@ -1326,6 +1362,30 @@ pub fn import_mne_as_new_inner(conn: &Connection, bytes: &[u8]) -> Result<MneImp
                     )
                     .map_err(|err| err.to_string())?;
                     msg_map.insert(message.id, new_msg_id);
+                }
+            }
+        }
+
+        let mut variant_map: HashMap<i64, i64> = HashMap::new();
+        if let Some(variant_bytes) = entries.get("conversation/variants.json") {
+            if let Ok(variants) =
+                serde_json::from_slice::<Vec<db::AssistantMessageVariant>>(variant_bytes)
+            {
+                for variant in variants {
+                    let Some(new_message_id) = msg_map.get(&variant.message_id).copied() else {
+                        continue;
+                    };
+                    let old_variant_id = variant.id;
+                    let mut imported_variant = variant;
+                    imported_variant.id = None;
+                    imported_variant.message_id = new_message_id;
+                    imported_variant.conversation_id = target_conv_id.clone();
+                    let inserted =
+                        db::insert_imported_assistant_message_variant(conn, &imported_variant)
+                            .map_err(|err| err.to_string())?;
+                    if let (Some(old_id), Some(new_id)) = (old_variant_id, inserted.id) {
+                        variant_map.insert(old_id, new_id);
+                    }
                 }
             }
         }
@@ -1367,19 +1427,30 @@ pub fn import_mne_as_new_inner(conn: &Connection, bytes: &[u8]) -> Result<MneImp
             }
         }
 
-        if let (Ok(soul), Some(world_id)) = (
-            db::get_soul(conn, &soul_id),
-            imported_session_world_id.as_deref(),
-        ) {
-            let world = db::get_session_world(conn, world_id).map_err(|err| err.to_string())?;
-            let _ = db::create_session_branch(conn, &target_conv_id, &soul, &world);
+        let ledger_restored = restore_imported_session_ledger(
+            conn,
+            &entries,
+            &target_conv_id,
+            &id_map,
+            &msg_map,
+            &variant_map,
+        )?;
+
+        if !ledger_restored {
+            if let (Ok(soul), Some(world_id)) = (
+                db::get_soul(conn, &soul_id),
+                imported_session_world_id.as_deref(),
+            ) {
+                let world = db::get_session_world(conn, world_id).map_err(|err| err.to_string())?;
+                let _ = db::create_session_branch(conn, &target_conv_id, &soul, &world);
+            }
         }
     }
 
     let warning_part = if entries.contains_key("conversation/branches.json")
         || entries.contains_key("conversation/turns.json")
     {
-        " (branch/variant structure import was skipped to protect data)"
+        " (branch/variant structure restored for imported copy)"
     } else {
         ""
     };
@@ -1395,8 +1466,226 @@ pub fn import_mne_as_new_inner(conn: &Connection, bytes: &[u8]) -> Result<MneImp
     Ok(result)
 }
 
+fn restore_imported_session_ledger(
+    conn: &Connection,
+    entries: &HashMap<String, Vec<u8>>,
+    target_conv_id: &str,
+    id_map: &HashMap<String, String>,
+    msg_map: &HashMap<i64, i64>,
+    variant_map: &HashMap<i64, i64>,
+) -> Result<bool, String> {
+    let Some(branch_bytes) = entries.get("conversation/branches.json") else {
+        return Ok(false);
+    };
+    let Some(turn_bytes) = entries.get("conversation/turns.json") else {
+        return Ok(false);
+    };
+    let Some(patch_bytes) = entries.get("conversation/patches.json") else {
+        return Ok(false);
+    };
+    let branches: Vec<db::SessionBranch> =
+        serde_json::from_slice(branch_bytes).map_err(|err| err.to_string())?;
+    let turns: Vec<db::TurnCommit> =
+        serde_json::from_slice(turn_bytes).map_err(|err| err.to_string())?;
+    let patches: Vec<db::StatePatchRecord> =
+        serde_json::from_slice(patch_bytes).map_err(|err| err.to_string())?;
+    if branches.is_empty() || turns.is_empty() || patches.is_empty() {
+        return Ok(false);
+    }
+
+    let mut branch_map = HashMap::new();
+    for branch in branches.iter().filter(|branch| branch.is_active) {
+        branch_map.insert(branch.branch_id.clone(), uuid_like_id());
+    }
+    if branch_map.is_empty() {
+        return Ok(false);
+    }
+    let mut turn_map = HashMap::new();
+    for turn in &turns {
+        if branch_map.contains_key(&turn.branch_id) {
+            turn_map.insert(turn.turn_id.clone(), uuid_like_id());
+        }
+    }
+    let mut patch_map = HashMap::new();
+    for patch in &patches {
+        if turn_map.contains_key(&patch.turn_id) {
+            patch_map.insert(patch.patch_id.clone(), uuid_like_id());
+        }
+    }
+
+    for branch in branches.into_iter().filter(|branch| branch.is_active) {
+        let Some(new_branch_id) = branch_map.get(&branch.branch_id).cloned() else {
+            continue;
+        };
+        let mut imported = branch;
+        imported.branch_id = new_branch_id;
+        imported.conversation_id = target_conv_id.to_string();
+        imported.active_turn_id = imported
+            .active_turn_id
+            .as_deref()
+            .and_then(|turn_id| turn_map.get(turn_id).cloned());
+        imported.base_soul_json = remap_json_string_ids(&imported.base_soul_json, id_map)?;
+        imported.base_session_world_json =
+            remap_json_string_ids(&imported.base_session_world_json, id_map)?;
+        db::insert_imported_session_branch(conn, &imported).map_err(|err| err.to_string())?;
+    }
+
+    for turn in turns {
+        if !branch_map.contains_key(&turn.branch_id) {
+            continue;
+        }
+        let mut imported = turn;
+        let Some(new_turn_id) = turn_map.get(&imported.turn_id).cloned() else {
+            continue;
+        };
+        imported.turn_id = new_turn_id;
+        imported.conversation_id = target_conv_id.to_string();
+        imported.branch_id = branch_map
+            .get(&imported.branch_id)
+            .cloned()
+            .unwrap_or(imported.branch_id);
+        imported.parent_turn_id = imported
+            .parent_turn_id
+            .as_deref()
+            .and_then(|turn_id| turn_map.get(turn_id).cloned());
+        imported.user_message_id = imported
+            .user_message_id
+            .and_then(|message_id| msg_map.get(&message_id).copied());
+        imported.assistant_message_id = imported
+            .assistant_message_id
+            .and_then(|message_id| msg_map.get(&message_id).copied());
+        imported.state_patch_id = imported
+            .state_patch_id
+            .as_deref()
+            .and_then(|patch_id| patch_map.get(patch_id).cloned());
+        imported.selected_variant_id = imported
+            .selected_variant_id
+            .and_then(|variant_id| variant_map.get(&variant_id).copied());
+        db::insert_imported_turn_commit(conn, &imported).map_err(|err| err.to_string())?;
+    }
+
+    for patch in patches {
+        if !turn_map.contains_key(&patch.turn_id) {
+            continue;
+        }
+        let mut imported = patch;
+        imported.patch_id = patch_map
+            .get(&imported.patch_id)
+            .cloned()
+            .unwrap_or(imported.patch_id);
+        imported.turn_id = turn_map
+            .get(&imported.turn_id)
+            .cloned()
+            .unwrap_or(imported.turn_id);
+        imported.parent_baseline_patch_id = imported
+            .parent_baseline_patch_id
+            .as_deref()
+            .and_then(|patch_id| patch_map.get(patch_id).cloned());
+        imported.source_turn_id = imported
+            .source_turn_id
+            .as_deref()
+            .and_then(|turn_id| turn_map.get(turn_id).cloned());
+        imported.source_assistant_message_id = imported
+            .source_assistant_message_id
+            .and_then(|message_id| msg_map.get(&message_id).copied());
+        imported.source_assistant_variant_id = imported
+            .source_assistant_variant_id
+            .and_then(|variant_id| variant_map.get(&variant_id).copied());
+        imported.invalidated_by_patch_id = imported
+            .invalidated_by_patch_id
+            .as_deref()
+            .and_then(|patch_id| patch_map.get(patch_id).cloned());
+        imported.supersedes_patch_id = imported
+            .supersedes_patch_id
+            .as_deref()
+            .and_then(|patch_id| patch_map.get(patch_id).cloned());
+        imported.patch_json = remap_patch_json_ids(&imported.patch_json, id_map, msg_map)?;
+        if let Some(inverse) = imported.inverse_patch_json.as_deref() {
+            imported.inverse_patch_json = Some(remap_patch_json_ids(inverse, id_map, msg_map)?);
+        }
+        db::insert_imported_state_patch(conn, &imported).map_err(|err| err.to_string())?;
+    }
+
+    let active_branch =
+        db::get_active_session_branch(conn, target_conv_id).map_err(|err| err.to_string())?;
+    db::rebuild_session_state(conn, target_conv_id, &active_branch.branch_id)
+        .map_err(|err| err.to_string())?;
+    Ok(true)
+}
+
+fn remap_json_string_ids(value: &str, id_map: &HashMap<String, String>) -> Result<String, String> {
+    let mut json: serde_json::Value = serde_json::from_str(value).map_err(|err| err.to_string())?;
+    remap_json_value_ids(&mut json, id_map);
+    serde_json::to_string(&json).map_err(|err| err.to_string())
+}
+
+fn remap_patch_json_ids(
+    value: &str,
+    id_map: &HashMap<String, String>,
+    msg_map: &HashMap<i64, i64>,
+) -> Result<String, String> {
+    let mut json: serde_json::Value = serde_json::from_str(value).map_err(|err| err.to_string())?;
+    remap_json_value_ids(&mut json, id_map);
+    remap_json_message_ids(&mut json, msg_map);
+    serde_json::to_string(&json).map_err(|err| err.to_string())
+}
+
+fn remap_json_value_ids(value: &mut serde_json::Value, id_map: &HashMap<String, String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(mapped) = id_map.get(text) {
+                *text = mapped.clone();
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remap_json_value_ids(value, id_map);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values_mut() {
+                remap_json_value_ids(value, id_map);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remap_json_message_ids(value: &mut serde_json::Value, msg_map: &HashMap<i64, i64>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remap_json_message_ids(value, msg_map);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if is_message_id_json_key(key) {
+                    if let Some(old_id) = value.as_i64() {
+                        if let Some(new_id) = msg_map.get(&old_id) {
+                            *value = serde_json::Value::Number(serde_json::Number::from(*new_id));
+                            continue;
+                        }
+                    }
+                }
+                remap_json_message_ids(value, msg_map);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_message_id_json_key(key: &str) -> bool {
+    matches!(
+        key,
+        "message_id" | "source_message_id" | "source_assistant_message_id"
+    )
+}
+
 #[tauri::command]
 pub fn import_mne_as_new(
+    app: AppHandle,
+    window: Window,
     state: State<'_, AppState>,
     file_path: String,
 ) -> Result<MneImportResult, String> {
@@ -1404,6 +1693,7 @@ pub fn import_mne_as_new(
     if path.extension().and_then(|ext| ext.to_str()) != Some("mne") {
         return Err("Mnemosyne bundle import requires a .mne file".into());
     }
+    create_safety_backup(&app, &window, "import_mne_as_new")?;
     let bytes = fs::read(&path).map_err(|err| err.to_string())?;
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     import_mne_as_new_inner(&conn, &bytes)
@@ -1411,6 +1701,8 @@ pub fn import_mne_as_new(
 
 #[tauri::command]
 pub fn import_mne_bundle(
+    app: AppHandle,
+    window: Window,
     state: State<'_, AppState>,
     file_path: String,
 ) -> Result<MneImportResult, String> {
@@ -1418,6 +1710,7 @@ pub fn import_mne_bundle(
     if path.extension().and_then(|ext| ext.to_str()) != Some("mne") {
         return Err("Mnemosyne bundle import requires a .mne file".into());
     }
+    create_safety_backup(&app, &window, "import_mne_bundle")?;
     let bytes = fs::read(&path).map_err(|err| err.to_string())?;
     let entries = read_stored_zip(&bytes)?;
     let manifest_bytes = entries
@@ -2256,13 +2549,18 @@ pub fn get_setting(state: State<'_, AppState>, setting_id: String) -> Result<Set
 }
 
 #[tauri::command]
-pub fn delete_soul(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
-    let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    db::delete_soul(&conn, &soul_id).map_err(|err| err.to_string())
+pub fn delete_soul(_state: State<'_, AppState>, _soul_id: String) -> Result<bool, String> {
+    Err("delete_soul is deprecated; use archive_soul with session safety guards.".into())
 }
 
 #[tauri::command]
-pub fn archive_soul(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
+pub fn archive_soul(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    soul_id: String,
+) -> Result<bool, String> {
+    create_safety_backup(&app, &window, "archive_soul")?;
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::archive_soul(&conn, &soul_id).map_err(|err| err.to_string())
 }
@@ -2280,7 +2578,13 @@ pub fn list_archived_souls(state: State<'_, AppState>) -> Result<Vec<db::SoulSum
 }
 
 #[tauri::command]
-pub fn archive_savepoint(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
+pub fn archive_savepoint(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    soul_id: String,
+) -> Result<bool, String> {
+    create_safety_backup(&app, &window, "archive_savepoint")?;
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::archive_savepoint(&conn, &soul_id).map_err(|err| err.to_string())
 }
@@ -2309,10 +2613,13 @@ pub fn delete_setting(_state: State<'_, AppState>, _setting_id: String) -> Resul
 
 #[tauri::command]
 pub fn archive_setting(
+    app: AppHandle,
+    window: Window,
     state: State<'_, AppState>,
     setting_id: String,
     active_or_default_ids: Vec<String>,
 ) -> Result<bool, String> {
+    create_safety_backup(&app, &window, "archive_setting")?;
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let active_refs: Vec<&str> = active_or_default_ids.iter().map(|s| s.as_str()).collect();
     db::archive_setting(&conn, &setting_id, &active_refs)
@@ -2343,11 +2650,10 @@ pub fn list_conversation_messages(
 
 #[tauri::command]
 pub fn delete_conversation(
-    state: State<'_, AppState>,
-    conversation_id: String,
+    _state: State<'_, AppState>,
+    _conversation_id: String,
 ) -> Result<bool, String> {
-    let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    db::delete_conversation(&conn, &conversation_id).map_err(|err| err.to_string())
+    Err("delete_conversation is deprecated; use archive_session.".into())
 }
 
 #[tauri::command]
@@ -2449,11 +2755,37 @@ pub fn create_backup(app: AppHandle, _state: State<'_, AppState>) -> Result<Stri
     Ok(backup_path.to_string_lossy().to_string())
 }
 
+fn create_safety_backup(
+    app: &AppHandle,
+    window: &Window,
+    operation: &str,
+) -> Result<String, String> {
+    let db_path = db::connection_path(app).map_err(|err| err.to_string())?;
+    let mut backup_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
+    backup_dir.push("backups");
+    let backup_path = db::create_backup_file(&db_path, &backup_dir)?;
+    let backup_path = backup_path.to_string_lossy().to_string();
+    emit_dev_log(
+        window,
+        "success",
+        "backup",
+        "automatic_safety_backup_created",
+        Some(serde_json::json!({
+            "operation": operation,
+            "backup_path": backup_path
+        })),
+    );
+    Ok(backup_path)
+}
+
 #[tauri::command]
 pub fn archive_session(
+    app: AppHandle,
+    window: Window,
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<bool, String> {
+    create_safety_backup(&app, &window, "archive_session")?;
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::archive_session(&conn, &conversation_id).map_err(|err| err.to_string())
 }
@@ -3103,6 +3435,8 @@ pub fn delete_provider_profile(
 
 #[tauri::command]
 pub fn archive_provider_profile(
+    app: AppHandle,
+    window: Window,
     state: State<'_, AppState>,
     profile_id: String,
     active_ids: Vec<String>,
@@ -3110,6 +3444,7 @@ pub fn archive_provider_profile(
     if active_ids.is_empty() {
         return Err("active_ids is required and cannot be empty.".into());
     }
+    create_safety_backup(&app, &window, "archive_provider_profile")?;
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let active_refs: Vec<&str> = active_ids.iter().map(|s| s.as_str()).collect();
     db::archive_provider_profile(&conn, &profile_id, &active_refs)
@@ -3163,6 +3498,150 @@ pub fn cancel_evaluator_job(state: State<'_, AppState>, job_id: String) -> Resul
         false,
     )
     .map_err(|err| err.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluatorContractTestReport {
+    pub passed: bool,
+    pub errors: Vec<String>,
+    pub raw_response: String,
+}
+
+#[tauri::command]
+pub async fn run_evaluator_contract_test(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<EvaluatorContractTestReport, String> {
+    let profile = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::get_provider_profile(&conn, &profile_id).map_err(|err| err.to_string())?
+    };
+
+    let settings = ApiProviderSettings {
+        base_url: profile.base_url.clone(),
+        api_key: profile.api_key.clone(),
+        model: profile.model.clone(),
+        system_prompt: profile.system_prompt.clone(),
+        narrator_timeout_ms: profile.narrator_timeout_ms,
+        evaluator_timeout_ms: profile.evaluator_timeout_ms,
+        evaluator_timeout_mode: profile.evaluator_timeout_mode.clone(),
+        evaluator_mode: profile.evaluator_mode.clone(),
+        wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn,
+        allow_send_with_stale_state: profile.allow_send_with_stale_state,
+        evaluator_background_enabled: profile.evaluator_background_enabled,
+        anti_replay_forced_retry_enabled: profile.anti_replay_forced_retry_enabled,
+    };
+
+    let test_user_text = "I promise to help you clean the laboratory tomorrow morning. I want you to feel comfortable trusting me.";
+    let test_narrator_text = "Aurora smiles softly, her eyes warming. 'Thank you. That means a lot to me.' She takes your hand, showing a moment of rare vulnerability.";
+
+    let mut soul = new_default_soul("Aurora");
+    soul.relationships.insert(
+        "default_player".to_string(),
+        state_engine::soul::Relationship {
+            trust: 10.0,
+            affection: 10.0,
+            intimacy: 10.0,
+            respect: 10.0,
+            comfort: 10.0,
+            ..Default::default()
+        },
+    );
+
+    let system_prompt = build_evaluator_form_prompt_compact_with_player_persona(
+        &soul,
+        None,
+        test_user_text,
+        test_narrator_text,
+        "default_player",
+        "User",
+    );
+
+    let user_message = build_evaluator_user_message(
+        test_user_text,
+        test_narrator_text,
+        &format!("User: {}\nNarrator: {}", test_user_text, test_narrator_text),
+        None,
+        None,
+        None,
+    );
+
+    let provider = ApiProvider::default();
+    let raw_response = match complete_evaluator_with_config(
+        &provider,
+        &settings,
+        &system_prompt,
+        &user_message,
+    )
+    .await {
+        Ok(res) => res,
+        Err(err) => {
+            let now = db::now_ts();
+            let mut failed_profile = profile.clone();
+            failed_profile.evaluator_compatibility_status = 2; // failed
+            failed_profile.evaluator_last_tested_at = Some(now);
+            failed_profile.evaluator_last_failure_reason = Some(format!("LLM Call Error: {}", err));
+            failed_profile.evaluator_contract_version = CURRENT_EVALUATOR_CONTRACT_VERSION;
+            failed_profile.evaluator_prompt_version = CURRENT_EVALUATOR_PROMPT_VERSION;
+
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            let _ = db::upsert_provider_profile(&conn, &failed_profile);
+
+            return Ok(EvaluatorContractTestReport {
+                passed: false,
+                errors: vec![format!("LLM Call failed: {}", err)],
+                raw_response: String::new(),
+            });
+        }
+    };
+
+    let validation_result = state_engine::evaluator_form::validate::validate_evaluator_contract(
+        &raw_response,
+        test_user_text,
+        test_narrator_text,
+    );
+
+    let now = db::now_ts();
+    let mut updated_profile = profile.clone();
+    updated_profile.evaluator_last_tested_at = Some(now);
+    updated_profile.evaluator_contract_version = CURRENT_EVALUATOR_CONTRACT_VERSION;
+    updated_profile.evaluator_prompt_version = CURRENT_EVALUATOR_PROMPT_VERSION;
+
+    let report = match validation_result {
+        Ok(_) => {
+            updated_profile.evaluator_compatibility_status = 1; // passed
+            updated_profile.evaluator_last_failure_reason = None;
+            EvaluatorContractTestReport {
+                passed: true,
+                errors: Vec::new(),
+                raw_response: raw_response.clone(),
+            }
+        }
+        Err(err) => {
+            updated_profile.evaluator_compatibility_status = 2; // failed
+            updated_profile.evaluator_last_failure_reason = Some(err.clone());
+            EvaluatorContractTestReport {
+                passed: false,
+                errors: vec![err],
+                raw_response: raw_response.clone(),
+            }
+        }
+    };
+
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let _ = db::upsert_provider_profile(&conn, &updated_profile);
+
+    Ok(report)
+}
+
+#[tauri::command]
+pub fn set_active_evaluator_profile(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    profile_id: Option<String>,
+) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::set_active_evaluator_profile(&conn, &conversation_id, profile_id.as_deref()).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -3724,6 +4203,7 @@ struct CommandTurnState {
     branch: Option<db::SessionBranch>,
     parent_turn_id: Option<String>,
     pre_turn_soul_json: String,
+    evaluator_freshness_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3985,13 +4465,35 @@ fn load_command_turn_state(
         (fallback_soul, fallback_world, None)
     };
     let pre_turn_soul_json = serde_json::to_string(&soul).map_err(|err| err.to_string())?;
+    let evaluator_freshness_warning =
+        command_state_evaluator_freshness_warning(conn, conversation_id)?;
     Ok(CommandTurnState {
         soul,
         session_world,
         branch,
         parent_turn_id,
         pre_turn_soul_json,
+        evaluator_freshness_warning,
     })
+}
+
+fn command_state_evaluator_freshness_warning(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<String>, String> {
+    let pending_jobs = db::get_pending_evaluator_jobs_for_conversation(conn, conversation_id)
+        .map_err(|err| err.to_string())?;
+    if pending_jobs.is_empty() {
+        return Ok(None);
+    }
+    let pending_job_ids = pending_jobs
+        .iter()
+        .map(|job| job.evaluator_job_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Some(format!(
+        "Evaluator update pending; status may not include the latest scene enrichment yet. Pending jobs: {pending_job_ids}."
+    )))
 }
 
 fn command_llm_mode(parsed: &ParsedChatCommand) -> Option<&'static str> {
@@ -5164,6 +5666,9 @@ fn render_state_show_response(body: &str, state: &CommandTurnState) -> String {
             relationship.fear,
             relationship.boundary_pressure
         ));
+    }
+    if let Some(warning) = state.evaluator_freshness_warning.as_deref() {
+        lines.push(warning.to_string());
     }
     lines.join("\n")
 }
@@ -7066,6 +7571,10 @@ pub async fn send_api_turn(
 
     let before_state_summary = compact_state_summary_json(&soul, &session_world);
     let evaluator_request_id = format!("eval_{request_id}");
+    let active_player_persona = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::get_active_player_persona(&conn, &conversation_id).map_err(|err| err.to_string())?
+    };
 
     let mut baseline_patch_id = None;
     let mut baseline_event_id = None;
@@ -7077,8 +7586,12 @@ pub async fn send_api_turn(
     let baseline_start = Instant::now();
     if is_normal_scene_turn && ledger_branch_id.is_some() {
         let branch_id = ledger_branch_id.as_deref().unwrap();
-        let (ev_id, baseline_patch) =
-            construct_baseline_patch(&soul, &snapshot_user_text, &visible_response_for_updater);
+        let (ev_id, baseline_patch) = construct_baseline_patch(
+            &soul,
+            &snapshot_user_text,
+            &visible_response_for_updater,
+            &active_player_persona.persona_id,
+        );
         baseline_event_id = Some(ev_id);
 
         let commit_res: Result<(db::TurnCommit, db::StatePatchRecord, db::LedgerRebuild), String> =
@@ -7304,10 +7817,6 @@ pub async fn send_api_turn(
     let updater_payload_started = Instant::now();
     let evaluator_mode = evaluator_mode(&state_updater_settings);
     let selected_evaluator_source = selected_evaluator_source(&evaluator_mode);
-    let active_player_persona = {
-        let conn = state.conn.lock().map_err(|err| err.to_string())?;
-        db::get_active_player_persona(&conn, &conversation_id).map_err(|err| err.to_string())?
-    };
     let form_spec = (selected_evaluator_source == EVALUATOR_MODE_FORM_V1).then(|| {
         build_eval_form_spec_with_player_persona(
             &pre_baseline_soul,
@@ -11172,11 +11681,12 @@ fn minimal_form_scene_runtime(
     baseline_recent_event_id: Option<String>,
 ) -> RuntimeEvaluatorOutcome {
     let summary = minimal_scene_summary(latest_user_message, latest_narrator_response);
-    let participants = minimal_scene_participants(soul);
+    let player_entity_id = form_scene_player_entity_id(&spec);
+    let participants = minimal_scene_participants(soul, &player_entity_id);
     let scene_state = SceneStatePatch {
         scene_state_id: Some(format!("scene_form_{}", uuid_like_id())),
         current_scene: Some(summary.clone()),
-        focus: Some(format!("{} and default_player", soul.character_name)),
+        focus: Some(scene_focus(soul, &player_entity_id)),
         participants: participants.clone(),
         last_user_action: clean_user_action(latest_user_message),
         continuity_note: Some(summary.clone()),
@@ -11267,6 +11777,7 @@ fn construct_baseline_patch(
     soul: &Soul,
     latest_user_message: &str,
     latest_narrator_response: &str,
+    active_player_entity_id: &str,
 ) -> (String, EnginePatch) {
     let narrator_trimmed = latest_narrator_response.trim();
     let one_sentence =
@@ -11299,11 +11810,11 @@ fn construct_baseline_patch(
     };
 
     let baseline_event_id = format!("event_baseline_{}", uuid_like_id());
-    let participants = minimal_scene_participants(soul);
+    let participants = minimal_scene_participants(soul, active_player_entity_id);
     let scene_state = SceneStatePatch {
         scene_state_id: Some(format!("scene_baseline_{}", uuid_like_id())),
         current_scene: Some(summary.clone()),
-        focus: Some(format!("{} and default_player", soul.character_name)),
+        focus: Some(scene_focus(soul, active_player_entity_id)),
         participants,
         last_user_action: clean_user_action(latest_user_message),
         continuity_note: Some(summary.clone()),
@@ -11344,8 +11855,37 @@ fn minimal_scene_summary(latest_user_message: &str, latest_narrator_response: &s
     "The current scene advanced.".into()
 }
 
-fn minimal_scene_participants(soul: &Soul) -> Vec<String> {
-    vec![soul.character_id.clone(), "default_player".into()]
+fn form_scene_player_entity_id(spec: &EvalFormSpec) -> String {
+    spec.active_entities
+        .iter()
+        .find(|entity| entity.entity_type == "player_persona")
+        .or_else(|| {
+            spec.active_entities
+                .iter()
+                .find(|entity| entity.entity_type == "user")
+        })
+        .map(|entity| entity.entity_id.clone())
+        .unwrap_or_else(|| "default_player".into())
+}
+
+fn scene_focus(soul: &Soul, active_player_entity_id: &str) -> String {
+    let player = active_player_entity_id.trim();
+    let player = if player.is_empty() {
+        "default_player"
+    } else {
+        player
+    };
+    format!("{} and {}", soul.character_name, player)
+}
+
+fn minimal_scene_participants(soul: &Soul, active_player_entity_id: &str) -> Vec<String> {
+    let player = active_player_entity_id.trim();
+    let player = if player.is_empty() {
+        "default_player"
+    } else {
+        player
+    };
+    vec![soul.character_id.clone(), player.to_string()]
 }
 
 fn clean_user_action(value: &str) -> Option<String> {
@@ -11669,6 +12209,19 @@ async fn run_background_evaluator_job(
     baseline_patch_id: Option<String>,
 ) {
     let started = Instant::now();
+    let profile_id = {
+        let state = app.state::<AppState>();
+        state.conn.lock().ok().and_then(|conn| {
+            if let Ok(conv) = db::get_conversation_summary(&conn, &job.conversation_id) {
+                if let Some(id) = conv.active_evaluator_profile_id {
+                    return Some(id);
+                }
+            }
+            let query = "SELECT id FROM provider_profiles WHERE archived_at IS NULL AND model = ?1 LIMIT 1";
+            conn.query_row(query, [&state_updater_settings.model], |row| row.get::<_, String>(0)).ok()
+        })
+    };
+
     let parent_payload_log = {
         let state = app.state::<AppState>();
         state.conn.lock().ok().and_then(|conn| {
@@ -11811,14 +12364,37 @@ async fn run_background_evaluator_job(
         )
     });
     let updater_system_prompt = if selected_evaluator_source == EVALUATOR_MODE_FORM_V1 {
-        build_evaluator_form_prompt_with_player_persona(
-            &soul,
-            Some(&session_world),
-            &snapshot_user_text,
-            &visible_response_for_updater,
-            &active_player_persona.persona_id,
-            &active_player_persona.display_name,
-        )
+        let mut is_compact = state_updater_settings.evaluator_mode.as_deref() == Some("form_v1_compact");
+        if !is_compact {
+            if let Some(ref p_id) = profile_id {
+                if let Ok(conn) = app.state::<AppState>().conn.lock() {
+                    if let Ok(profile) = db::get_provider_profile(&conn, p_id) {
+                        if profile.evaluator_mode.as_deref() == Some("form_v1_compact") {
+                            is_compact = true;
+                        }
+                    }
+                }
+            }
+        }
+        if is_compact {
+            build_evaluator_form_prompt_compact_with_player_persona(
+                &soul,
+                Some(&session_world),
+                &snapshot_user_text,
+                &visible_response_for_updater,
+                &active_player_persona.persona_id,
+                &active_player_persona.display_name,
+            )
+        } else {
+            build_evaluator_form_prompt_with_player_persona(
+                &soul,
+                Some(&session_world),
+                &snapshot_user_text,
+                &visible_response_for_updater,
+                &active_player_persona.persona_id,
+                &active_player_persona.display_name,
+            )
+        }
     } else {
         build_evaluator_prompt(&soul, Some(&session_world))
     };
@@ -12172,6 +12748,9 @@ async fn run_background_evaluator_job(
                 started,
                 false,
             );
+            if let Some(ref p_id) = profile_id {
+                handle_evaluator_streak_and_fallback(&app, &window, &job.conversation_id, p_id, false);
+            }
             return;
         }
     };
@@ -12601,6 +13180,9 @@ async fn run_background_evaluator_job(
             started,
             false,
         );
+        if let Some(ref p_id) = profile_id {
+            handle_evaluator_streak_and_fallback(&app, &window, &job.conversation_id, p_id, false);
+        }
         return;
     }
 
@@ -12808,6 +13390,52 @@ async fn run_background_evaluator_job(
         started,
         !engine_patch.is_empty() && !enrichment_stale_skipped,
     );
+
+    if !enrichment_stale_skipped {
+        if let Some(ref p_id) = profile_id {
+            let is_success_nonempty = final_job_status == "completed" && !engine_patch.is_empty();
+            handle_evaluator_streak_and_fallback(&app, &window, &job.conversation_id, p_id, is_success_nonempty);
+        }
+    }
+}
+
+fn handle_evaluator_streak_and_fallback(
+    app: &AppHandle,
+    window: &Window,
+    conversation_id: &str,
+    profile_id: &str,
+    is_success_nonempty: bool,
+) {
+    let state = app.state::<AppState>();
+    let conn_guard = match state.conn.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    let conn = &*conn_guard;
+
+    if is_success_nonempty {
+        let _ = db::reset_evaluator_empty_patch_streak(conn, conversation_id, profile_id);
+    } else {
+        if let Ok(new_streak) = db::increment_evaluator_empty_patch_streak(conn, conversation_id, profile_id) {
+            let _ = window.emit("evaluator_empty_patch_streak_incremented", serde_json::json!({
+                "conversation_id": conversation_id,
+                "profile_id": profile_id,
+                "streak": new_streak,
+            }));
+
+            if new_streak >= 2 {
+                if let Ok(Some(fallback_profile)) = db::get_last_known_good_evaluator_profile(conn) {
+                    if let Ok(_) = db::set_active_evaluator_profile(conn, conversation_id, Some(&fallback_profile.id)) {
+                        let _ = db::reset_evaluator_empty_patch_streak(conn, conversation_id, profile_id);
+                        let _ = window.emit("evaluator_auto_fallback_triggered", serde_json::json!({
+                            "conversation_id": conversation_id,
+                            "profile_id": fallback_profile.id,
+                        }));
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn update_llm_payload_pipeline_trace(
@@ -12984,6 +13612,37 @@ fn mne_export_state_trace_json(
         "conversation_id": manifest.conversation_id,
         "soul_id": manifest.soul_id,
         "world_id": manifest.world_id,
+    })
+}
+
+fn collect_mne_session_ledger(
+    conn: &Connection,
+    conversation_id: &str,
+    messages: &[ChatMessage],
+) -> rusqlite::Result<MneSessionLedgerExport> {
+    let branches = db::list_session_branches_for_conversation(conn, conversation_id)?;
+    let mut turns = Vec::new();
+    let mut patches = Vec::new();
+    for branch in &branches {
+        turns.extend(db::list_turn_commits_for_branch(conn, &branch.branch_id)?);
+        patches.extend(db::list_state_patches_for_branch(conn, &branch.branch_id)?);
+    }
+    let mut variants = Vec::new();
+    for message in messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+    {
+        variants.extend(db::list_assistant_message_variants(
+            conn,
+            conversation_id,
+            message.id,
+        )?);
+    }
+    Ok(MneSessionLedgerExport {
+        branches,
+        turns,
+        patches,
+        variants,
     })
 }
 
@@ -15002,7 +15661,7 @@ mod tests {
         context_compiler::estimate_tokens,
         evaluator_ingest::parse_evaluator_output,
         hidden_state::HiddenState,
-        patch::{EnginePatch, WorldPatch},
+        patch::{EnginePatch, MemoryPatch, RelationshipDelta, SoulPatch, WorldPatch},
         soul::{MemoryEntry, MemorySourceType, ObjectState, Relationship, TruthStatus},
     };
 
@@ -15208,6 +15867,104 @@ mod tests {
         assert_eq!(trace["command_llm_mode"], "state_summary");
         assert_eq!(trace["state_mutation_allowed"], false);
         assert_command_trace_skips_rp(&trace);
+    }
+
+    #[test]
+    fn status_after_completed_evaluator_patch_reads_materialized_counts() {
+        let (conn, soul) = command_test_setup("slash-status-fresh-enrichment");
+        let branch = db::get_active_session_branch(&conn, "slash-status-fresh-enrichment")
+            .expect("active branch");
+        let assistant_id = db::insert_message_and_get_id(
+            &conn,
+            "slash-status-fresh-enrichment",
+            "assistant",
+            "Aurora notices the wet jacket.",
+        )
+        .expect("assistant");
+        let (commit, baseline) = db::record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "turn_status_fresh_enrichment",
+            "slash-status-fresh-enrichment",
+            &branch.branch_id,
+            None,
+            None,
+            assistant_id,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("baseline commit");
+        let mut completed_job = evaluator_test_job("completed");
+        completed_job.evaluator_job_id = "job-status-fresh".into();
+        completed_job.conversation_id = "slash-status-fresh-enrichment".into();
+        completed_job.turn_id = commit.turn_id.clone();
+        completed_job.assistant_message_id = assistant_id;
+        completed_job.completed_at = Some(db::now_ts());
+        completed_job.elapsed_ms = Some(42);
+        completed_job.patch_applied = true;
+        db::insert_evaluator_job(&conn, &completed_job).expect("completed evaluator job");
+
+        let enrichment_patch = EnginePatch {
+            soul_patch: Some(SoulPatch {
+                new_memories: vec![MemoryPatch {
+                    content: "Aurora remembers preset_male arrived with a wet jacket.".into(),
+                    source_type: Some(MemorySourceType::CurrentSession),
+                    target_entity_ids: vec!["preset_male".into()],
+                    truth_status: Some(TruthStatus::SceneEvent),
+                    confidence: Some(0.9),
+                    salience: Some(0.7),
+                    ..MemoryPatch::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            world_patch: Some(WorldPatch {
+                recent_event: Some("Aurora observed preset_male's wet jacket on the chair.".into()),
+                corrected_object_states: vec![ObjectState {
+                    object_id: "preset_male_jacket_1".into(),
+                    object_kind: "jacket".into(),
+                    owner_entity_id: Some("preset_male".into()),
+                    status: "wet".into(),
+                    location: "chair".into(),
+                    last_observed_state: "wet jacket draped over chair".into(),
+                    ..ObjectState::default()
+                }],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        db::record_enrichment_patch_with_metadata(
+            &conn,
+            &commit.turn_id,
+            &enrichment_patch,
+            Some(&baseline.patch_id),
+            Some(assistant_id),
+            None,
+            Some("job-status-fresh"),
+        )
+        .expect("enrichment");
+
+        let result = run_command_turn(&conn, "slash-status-fresh-enrichment", &soul, "/status");
+
+        assert!(result
+            .visible_response
+            .contains("Recent events: 1. Memories: 1. Objects: 1."));
+        assert!(!result.visible_response.contains("Evaluator update pending"));
+    }
+
+    #[test]
+    fn status_warns_when_evaluator_patch_is_still_pending() {
+        let (conn, soul) = command_test_setup("slash-status-pending-enrichment");
+        let mut pending_job = evaluator_test_job("running");
+        pending_job.evaluator_job_id = "job-status-pending".into();
+        pending_job.conversation_id = "slash-status-pending-enrichment".into();
+        db::insert_evaluator_job(&conn, &pending_job).expect("pending evaluator job");
+
+        let result = run_command_turn(&conn, "slash-status-pending-enrichment", &soul, "/status");
+
+        assert!(result.visible_response.contains(
+            "Evaluator update pending; status may not include the latest scene enrichment yet."
+        ));
+        assert!(result.visible_response.contains("job-status-pending"));
     }
 
     #[test]
@@ -17012,6 +17769,7 @@ mod tests {
             last_message_preview: None,
             message_count: 1,
             archived_at: None,
+            active_evaluator_profile_id: None,
         };
         let messages = vec![ChatMessage {
             id: 1,
@@ -19827,14 +20585,16 @@ mod tests {
     #[test]
     fn test_baseline_patch_has_focus_participants_last_user_action() {
         let soul = new_default_soul("Aurora");
-        let (ev_id, patch) = construct_baseline_patch(&soul, "I walk in.", "The visitor enters.");
+        let (ev_id, patch) =
+            construct_baseline_patch(&soul, "I walk in.", "The visitor enters.", "preset_male");
         assert!(ev_id.starts_with("event_baseline_"));
 
         let wp = patch.world_patch.as_ref().unwrap();
         let ss = wp.scene_state.as_ref().unwrap();
-        assert_eq!(ss.focus, Some("Aurora and default_player".to_string()));
+        assert_eq!(ss.focus, Some("Aurora and preset_male".to_string()));
         assert!(ss.participants.contains(&soul.character_id));
-        assert!(ss.participants.contains(&"default_player".to_string()));
+        assert!(ss.participants.contains(&"preset_male".to_string()));
+        assert!(!ss.participants.contains(&"default_player".to_string()));
         assert_eq!(ss.last_user_action.as_deref(), Some("I walk in."));
         assert!(ss.continuity_note.is_some());
     }
@@ -20565,6 +21325,7 @@ mod tests {
             last_message_preview: None,
             message_count: 0,
             archived_at: None,
+            active_evaluator_profile_id: None,
         };
 
         let messages = vec![ChatMessage {
@@ -20661,6 +21422,7 @@ mod tests {
             message_count: 0,
             active_player_persona_id: "preset_male".into(),
             archived_at: None,
+            active_evaluator_profile_id: None,
         };
 
         let messages = vec![ChatMessage {
@@ -20736,6 +21498,282 @@ mod tests {
     }
 
     #[test]
+    fn session_checkpoint_mne_roundtrip_restores_state_ledger_variants_and_payloads() {
+        let conn = db::init_memory_connection().unwrap();
+        let mut source_soul = new_default_soul("Roundtrip Aurora");
+        source_soul.character_id = "roundtrip_soul".into();
+        db::upsert_soul(&conn, &source_soul).unwrap();
+        let mut source_world =
+            state_engine::setting::session_world_from_setting(&new_default_setting("Roundtrip"));
+        source_world.world_id = "roundtrip_world".into();
+        source_world.source_setting_id = None;
+        db::upsert_session_world(&conn, &source_world).unwrap();
+        db::ensure_conversation_with_title_and_world(
+            &conn,
+            "roundtrip_conv",
+            "roundtrip_soul",
+            Some("roundtrip_world"),
+            None,
+            Some("Roundtrip Session"),
+        )
+        .unwrap();
+        db::set_active_player_persona(&conn, "roundtrip_conv", "preset_male").unwrap();
+        let branch =
+            db::create_session_branch(&conn, "roundtrip_conv", &source_soul, &source_world)
+                .unwrap();
+        let user_id =
+            db::insert_message_and_get_id(&conn, "roundtrip_conv", "user", "I hang my wet jacket.")
+                .unwrap();
+        let assistant_id = db::insert_message_and_get_id(
+            &conn,
+            "roundtrip_conv",
+            "assistant",
+            "Aurora watches the wet jacket drip onto the chair.",
+        )
+        .unwrap();
+        let selected_variant = db::seed_initial_assistant_message_variant(
+            &conn,
+            "roundtrip_conv",
+            assistant_id,
+            "Aurora watches the wet jacket drip onto the chair.",
+            Some(OP_NORMAL_SEND),
+            None,
+            None,
+        )
+        .unwrap();
+        let baseline_patch = EnginePatch {
+            soul_patch: Some(SoulPatch {
+                new_memories: vec![MemoryPatch {
+                    content: "Aurora saw preset_male hang a wet jacket on the chair.".into(),
+                    source_type: Some(MemorySourceType::CurrentSession),
+                    source_conversation_id: Some("roundtrip_conv".into()),
+                    source_message_id: Some(user_id),
+                    target_entity_ids: vec!["preset_male".into()],
+                    truth_status: Some(TruthStatus::SceneEvent),
+                    confidence: Some(0.9),
+                    salience: Some(0.8),
+                    ..MemoryPatch::default()
+                }],
+                relationship_deltas: vec![RelationshipDelta {
+                    target: Some("preset_male".into()),
+                    trust: Some(3.0),
+                    comfort: Some(2.0),
+                    max_abs_delta: Some(5.0),
+                    ..RelationshipDelta::default()
+                }],
+                ..SoulPatch::default()
+            }),
+            world_patch: Some(WorldPatch {
+                recent_event: Some("preset_male hung a wet jacket on the chair.".into()),
+                scene_state: Some(SceneStatePatch {
+                    current_scene: Some("Aurora's apartment after the knock.".into()),
+                    focus: Some("Roundtrip Aurora and preset_male".into()),
+                    participants: vec!["roundtrip_soul".into(), "preset_male".into()],
+                    ..SceneStatePatch::default()
+                }),
+                corrected_object_states: vec![ObjectState {
+                    object_id: "preset_male_jacket_1".into(),
+                    object_kind: "jacket".into(),
+                    owner_entity_id: Some("preset_male".into()),
+                    status: "wet".into(),
+                    location: "chair".into(),
+                    last_observed_state: "wet jacket draped over chair".into(),
+                    ..ObjectState::default()
+                }],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        let (commit, baseline_record) = db::record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "roundtrip_turn",
+            "roundtrip_conv",
+            &branch.branch_id,
+            None,
+            Some(user_id),
+            assistant_id,
+            selected_variant.id,
+            &baseline_patch,
+            false,
+        )
+        .unwrap();
+        let enrichment_patch = EnginePatch {
+            world_patch: Some(WorldPatch {
+                recent_events: vec!["The wet jacket remains visible in the room.".into()],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        db::record_enrichment_patch_with_metadata(
+            &conn,
+            &commit.turn_id,
+            &enrichment_patch,
+            Some(&baseline_record.patch_id),
+            Some(assistant_id),
+            selected_variant.id,
+            Some("roundtrip_job"),
+        )
+        .unwrap();
+        db::insert_llm_payload_log(
+            &conn,
+            &LlmPayloadLog {
+                conversation_id: "roundtrip_conv".into(),
+                message_id: Some(assistant_id),
+                provider: "api".into(),
+                mode: "narrator".into(),
+                model: "roundtrip-model".into(),
+                base_url: "https://api.example.test".into(),
+                system_message: "system without raw api key".into(),
+                user_message: "I hang my wet jacket.".into(),
+                context_text: "context".into(),
+                estimated_system_tokens: 1,
+                estimated_user_tokens: 1,
+                estimated_total_tokens: 2,
+                created_at: db::now_ts(),
+                branch_id: Some(branch.branch_id.clone()),
+                active_turn_id: Some(commit.turn_id.clone()),
+                latest_assistant_variant_id: selected_variant.id,
+                turn_id: Some(commit.turn_id.clone()),
+                ..LlmPayloadLog::default()
+            },
+        )
+        .unwrap();
+
+        let rebuilt_source =
+            db::rebuild_session_state(&conn, "roundtrip_conv", &branch.branch_id).unwrap();
+        let conversation = db::get_conversation_summary(&conn, "roundtrip_conv").unwrap();
+        let messages = db::list_messages(&conn, "roundtrip_conv", 10_000).unwrap();
+        let ledger = collect_mne_session_ledger(&conn, "roundtrip_conv", &messages).unwrap();
+        let mut manifest = mne_manifest(
+            "session_checkpoint",
+            "Roundtrip Session",
+            "roundtrip",
+            vec!["souls/roundtrip_soul.json".into()],
+            vec!["worlds/roundtrip_world.json".into()],
+            Some("conversation/conversation.json".into()),
+        );
+        manifest.soul_id = Some("roundtrip_soul".into());
+        manifest.world_id = Some("roundtrip_world".into());
+        manifest.conversation_id = Some("roundtrip_conv".into());
+        let payload_logs = db::list_llm_payload_logs(&conn, "roundtrip_conv").unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "manifest.json".into(),
+            serde_json::to_vec(&manifest).unwrap(),
+        );
+        entries.insert(
+            "souls/roundtrip_soul.json".into(),
+            serde_json::to_vec(&rebuilt_source.soul).unwrap(),
+        );
+        entries.insert(
+            "worlds/roundtrip_world.json".into(),
+            serde_json::to_vec(&rebuilt_source.session_world).unwrap(),
+        );
+        entries.insert(
+            "conversation/conversation.json".into(),
+            serde_json::to_vec(&conversation).unwrap(),
+        );
+        entries.insert(
+            "conversation/messages.json".into(),
+            serde_json::to_vec(&messages).unwrap(),
+        );
+        entries.insert(
+            "conversation/payload_logs.json".into(),
+            serde_json::to_vec(&payload_logs).unwrap(),
+        );
+        entries.insert(
+            "conversation/branches.json".into(),
+            serde_json::to_vec(&ledger.branches).unwrap(),
+        );
+        entries.insert(
+            "conversation/turns.json".into(),
+            serde_json::to_vec(&ledger.turns).unwrap(),
+        );
+        entries.insert(
+            "conversation/patches.json".into(),
+            serde_json::to_vec(&ledger.patches).unwrap(),
+        );
+        entries.insert(
+            "conversation/variants.json".into(),
+            serde_json::to_vec(&ledger.variants).unwrap(),
+        );
+
+        let bytes = write_test_mne_bytes(entries);
+        let report = validate_mne_bundle_bytes(&bytes);
+        assert!(report.valid, "report errors: {:?}", report.errors);
+        assert!(!String::from_utf8_lossy(&bytes).contains("sk-live-secret"));
+
+        let result = import_mne_as_new_inner(&conn, &bytes).unwrap();
+        let imported_conv_id = result.remapped_ids.get("roundtrip_conv").unwrap();
+        let imported_soul_id = result.remapped_ids.get("roundtrip_soul").unwrap();
+        let imported_world_id = result.remapped_ids.get("roundtrip_world").unwrap();
+        assert_ne!(imported_conv_id, "roundtrip_conv");
+        assert_ne!(imported_soul_id, "roundtrip_soul");
+        assert_ne!(imported_world_id, "roundtrip_world");
+        assert_eq!(
+            db::get_soul(&conn, "roundtrip_soul")
+                .unwrap()
+                .character_name,
+            "Roundtrip Aurora"
+        );
+
+        let imported_branch = db::get_active_session_branch(&conn, imported_conv_id).unwrap();
+        let rebuilt_imported =
+            db::rebuild_session_state(&conn, imported_conv_id, &imported_branch.branch_id).unwrap();
+        assert_eq!(
+            rebuilt_imported.session_world.scene_state.focus,
+            "Roundtrip Aurora and preset_male"
+        );
+        assert_eq!(rebuilt_imported.session_world.object_states.len(), 1);
+        assert_eq!(
+            rebuilt_imported.session_world.object_states[0].object_id,
+            "preset_male_jacket_1"
+        );
+        assert_eq!(rebuilt_imported.soul.memory.recent.len(), 1);
+        assert!(rebuilt_imported
+            .soul
+            .relationships
+            .contains_key("preset_male"));
+        assert_eq!(
+            db::get_active_player_persona_id(&conn, imported_conv_id).unwrap(),
+            "preset_male"
+        );
+        assert_eq!(
+            db::list_messages(&conn, imported_conv_id, 100)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            db::list_llm_payload_logs(&conn, imported_conv_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let imported_assistant = db::list_messages(&conn, imported_conv_id, 100)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.role == "assistant")
+            .unwrap();
+        let imported_variants =
+            db::list_assistant_message_variants(&conn, imported_conv_id, imported_assistant.id)
+                .unwrap();
+        assert!(imported_variants.iter().any(|variant| variant.is_selected));
+        assert_eq!(
+            db::list_turn_commits_for_branch(&conn, &imported_branch.branch_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db::list_state_patches_for_branch(&conn, &imported_branch.branch_id)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn import_as_new_does_not_overwrite_existing_soul() {
         let conn = db::init_memory_connection().unwrap();
 
@@ -20796,6 +21834,7 @@ mod tests {
             message_count: 0,
             active_player_persona_id: "preset_male".into(),
             archived_at: None,
+            active_evaluator_profile_id: None,
         };
 
         let messages = vec![ChatMessage {

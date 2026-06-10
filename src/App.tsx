@@ -125,6 +125,9 @@ import {
   upsertProviderProfile,
   upsertSetting,
   upsertSoul,
+  runEvaluatorContractTest,
+  setActiveEvaluatorProfile,
+  listenEvaluatorAutoFallbackTriggered,
 } from "./tauri";
 
 const DEFAULT_CONVERSATION_ID = "local-mock";
@@ -483,6 +486,7 @@ export function App() {
   const [useNarratorProviderForUpdater, setUseNarratorProviderForUpdater] = useState(
     () => localStorage.getItem(USE_NARRATOR_FOR_UPDATER_STORAGE_KEY) !== "false",
   );
+  const [devOverrideActive, setDevOverrideActive] = useState(false);
   const [apiSettings, setApiSettings] = useState<ApiProviderSettings>({
     base_url: "https://api.openai.com/v1",
     api_key: "",
@@ -653,6 +657,29 @@ export function App() {
       unlisten?.();
     };
   }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listenEvaluatorAutoFallbackTriggered((payload) => {
+      void refreshConversations().then(() => {
+        if (payload.conversation_id === currentConversationIdRef.current) {
+          const profile = providerProfiles.find((p) => p.id === payload.profile_id);
+          if (profile) {
+            setSelectedStateUpdaterProfileId(profile.id);
+            applyStateUpdaterProviderProfile(profile);
+            setStatus(`Evaluator auto fallback triggered! Selected model "${profile.name}".`);
+            logDev("warn", "state_updater", `Auto fallback triggered for conversation ${payload.conversation_id}: switched evaluator to profile "${profile.name}"`);
+          }
+        }
+      });
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, [providerProfiles]);
 
   useEffect(() => {
     if (!devConsoleOpen || devConsolePaused) return;
@@ -2049,6 +2076,13 @@ export function App() {
       setMessages(session.messages);
       setContext(await compileContext(sessionSoul.character_id, nextConversationId));
       await refreshPlayerPersonas(nextConversationId);
+      if (selectedStateUpdaterProfileId) {
+        try {
+          await setActiveEvaluatorProfile(nextConversationId, selectedStateUpdaterProfileId);
+        } catch (e) {
+          console.error("Failed to set active evaluator profile on new chat", e);
+        }
+      }
       setSouls(await listSouls());
       await refreshConversations();
       setLastTurnDebug(null);
@@ -2126,6 +2160,21 @@ export function App() {
           : "Loaded persistent Soul continuity chat",
       );
       setMessages(await listConversationMessages(conversation.conversation_id));
+      if (conversation.active_evaluator_profile_id) {
+        const updaterProfile = providerProfiles.find((p) => p.id === conversation.active_evaluator_profile_id);
+        if (updaterProfile) {
+          setSelectedStateUpdaterProfileId(updaterProfile.id);
+          applyStateUpdaterProviderProfile(updaterProfile);
+        }
+      } else {
+        if (selectedStateUpdaterProfileId) {
+          try {
+            await setActiveEvaluatorProfile(conversation.conversation_id, selectedStateUpdaterProfileId);
+          } catch (e) {
+            console.error("Failed to set active evaluator profile on conversation select", e);
+          }
+        }
+      }
       await refreshPlayerPersonas(conversation.conversation_id);
       setLastTurnDebug(null);
       setView("chat");
@@ -2615,11 +2664,85 @@ export function App() {
     });
   }
 
-  async function handleSelectStateUpdaterProfile(profileId: string) {
-    setSelectedStateUpdaterProfileId(profileId);
+  async function handleRunContractTest(profileId: string) {
     const profile = providerProfiles.find((item) => item.id === profileId);
     if (!profile) return;
+    setBusy(true);
+    setStatus(`Running evaluator contract test for ${profile.name}...`);
+    try {
+      const report = await runEvaluatorContractTest(profileId);
+      if (report.passed) {
+        setStatus(`Evaluator contract test passed for ${profile.name}!`);
+        logDev("success", "state_updater", `Evaluator contract test passed for ${profile.name}`);
+      } else {
+        const errorMsg = report.errors.join("; ");
+        setStatus(`Evaluator contract test failed for ${profile.name}: ${errorMsg}`);
+        logDev("error", "error", `Evaluator contract test failed for ${profile.name}: ${errorMsg}`, {
+          errors: report.errors,
+          raw_response: report.raw_response,
+        });
+        window.alert(`Evaluator contract test failed:\n\n${errorMsg}\n\nRaw response:\n${report.raw_response}`);
+      }
+      setProviderProfiles(await listProviderProfiles());
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      setStatus(`Evaluator contract test error: ${msg}`);
+      reportError(error, "Evaluator contract test failed", "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSelectStateUpdaterProfile(profileId: string) {
+    if (!profileId) {
+      setSelectedStateUpdaterProfileId("");
+      if (currentConversationId) {
+        await setActiveEvaluatorProfile(currentConversationId, null);
+        await refreshConversations();
+      }
+      return;
+    }
+    const profile = providerProfiles.find((item) => item.id === profileId);
+    if (!profile) return;
+
+    if (profile.evaluator_compatibility_status === 2 && !devOverrideActive) {
+      window.alert(`Cannot activate profile "${profile.name}": Compatibility status is FAILED. Run contract test or enable Developer Override to proceed.`);
+      return;
+    }
+
+    const CURRENT_EVALUATOR_PROMPT_VERSION = 1;
+    const isStalePrompt = profile.evaluator_prompt_version !== CURRENT_EVALUATOR_PROMPT_VERSION;
+    if (profile.evaluator_compatibility_status === 0 || isStalePrompt) {
+      const reason = profile.evaluator_compatibility_status === 0 ? "is untested" : "has a stale prompt version";
+      const confirmRun = window.confirm(
+        `Profile "${profile.name}" ${reason}.\n\nWould you like to run the compatibility contract test now?\n\nClick Cancel to bypass and load with a developer warning.`
+      );
+      if (confirmRun) {
+        await handleRunContractTest(profileId);
+        const updatedProfiles = await listProviderProfiles();
+        setProviderProfiles(updatedProfiles);
+        const refreshedProfile = updatedProfiles.find(item => item.id === profileId);
+        if (refreshedProfile && refreshedProfile.evaluator_compatibility_status !== 1 && !devOverrideActive) {
+          window.alert("Contract test did not pass. Profile activation cancelled.");
+          return;
+        }
+      } else {
+        logDev("warn", "warning", `Bypassed compatibility gate for untested/stale profile ${profile.name}`);
+      }
+    }
+
+    setSelectedStateUpdaterProfileId(profileId);
     applyStateUpdaterProviderProfile(profile);
+
+    if (currentConversationId) {
+      try {
+        await setActiveEvaluatorProfile(currentConversationId, profileId);
+        await refreshConversations();
+      } catch (error) {
+        reportError(error, "Failed to persist active evaluator profile on conversation", "db");
+      }
+    }
+
     setStatus(`Loaded state updater profile ${profile.name}`);
     logDev("info", "app", "State updater provider profile selected", {
       profile: profile.name,
@@ -2631,6 +2754,7 @@ export function App() {
   async function handleSaveNarratorProviderProfile() {
     if (busy) return;
     const trimmedName = narratorProviderProfileName.trim() || "Narrator API";
+    const existing = providerProfiles.find(p => p.id === selectedProviderProfileId);
     const profile: ProviderProfile = {
       id: selectedProviderProfileId || crypto.randomUUID(),
       name: trimmedName,
@@ -2645,8 +2769,15 @@ export function App() {
       allow_send_with_stale_state: apiSettings.allow_send_with_stale_state ?? false,
       evaluator_background_enabled: apiSettings.evaluator_background_enabled ?? false,
       anti_replay_forced_retry_enabled: apiSettings.anti_replay_forced_retry_enabled ?? false,
-      created_at: 0,
+      created_at: existing?.created_at ?? 0,
       updated_at: 0,
+      narrator_compatibility_status: existing?.narrator_compatibility_status ?? 0,
+      evaluator_compatibility_status: existing?.evaluator_compatibility_status ?? 0,
+      command_compatibility_status: existing?.command_compatibility_status ?? 0,
+      evaluator_contract_version: existing?.evaluator_contract_version ?? 0,
+      evaluator_prompt_version: existing?.evaluator_prompt_version ?? 0,
+      evaluator_last_tested_at: existing?.evaluator_last_tested_at,
+      evaluator_last_failure_reason: existing?.evaluator_last_failure_reason,
     };
     try {
       const saved = await upsertProviderProfile(profile);
@@ -2677,6 +2808,7 @@ export function App() {
   async function handleSaveStateUpdaterProviderProfile() {
     if (busy) return;
     const trimmedName = updaterProviderProfileName.trim() || "Updater API";
+    const existing = providerProfiles.find(p => p.id === selectedStateUpdaterProfileId);
     const profile: ProviderProfile = {
       id: selectedStateUpdaterProfileId || crypto.randomUUID(),
       name: trimmedName,
@@ -2691,8 +2823,15 @@ export function App() {
       allow_send_with_stale_state: stateUpdaterSettings.allow_send_with_stale_state ?? false,
       evaluator_background_enabled: stateUpdaterSettings.evaluator_background_enabled ?? false,
       anti_replay_forced_retry_enabled: stateUpdaterSettings.anti_replay_forced_retry_enabled ?? false,
-      created_at: 0,
+      created_at: existing?.created_at ?? 0,
       updated_at: 0,
+      narrator_compatibility_status: existing?.narrator_compatibility_status ?? 0,
+      evaluator_compatibility_status: existing?.evaluator_compatibility_status ?? 0,
+      command_compatibility_status: existing?.command_compatibility_status ?? 0,
+      evaluator_contract_version: existing?.evaluator_contract_version ?? 0,
+      evaluator_prompt_version: existing?.evaluator_prompt_version ?? 0,
+      evaluator_last_tested_at: existing?.evaluator_last_tested_at,
+      evaluator_last_failure_reason: existing?.evaluator_last_failure_reason,
     };
     try {
       const saved = await upsertProviderProfile(profile);
@@ -3300,6 +3439,15 @@ export function App() {
               />
               <span>Allow send with stale state</span>
             </label>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={devOverrideActive}
+                onChange={(event) => setDevOverrideActive(event.target.checked)}
+                disabled={busy}
+              />
+              <span>Developer override (skip evaluator gates)</span>
+            </label>
             {useNarratorProviderForUpdater ? (
               <p className="provider-note">
                 Using narrator provider: {apiSettings.base_url || "No base URL"} / {apiSettings.model || "No model"}
@@ -3394,6 +3542,15 @@ export function App() {
                     <Archive size={16} />
                     <span>Archive Profile</span>
                   </button>
+                  <button
+                    type="button"
+                    className="ghost-action"
+                    onClick={() => void handleRunContractTest(selectedStateUpdaterProfileId)}
+                    disabled={busy || !selectedStateUpdaterProfileId}
+                  >
+                    <Play size={16} />
+                    <span>Run Contract Test</span>
+                  </button>
                 </div>
               </>
             )}
@@ -3430,18 +3587,42 @@ export function App() {
                         </span>
                         {isNarratorActive && <span className="provider-status-pill" style={{ marginLeft: "0.5rem", fontSize: "0.7rem", padding: "2px 6px" }}>Active Narrator</span>}
                         {isUpdaterActive && <span className="provider-status-pill" style={{ marginLeft: "0.5rem", fontSize: "0.7rem", padding: "2px 6px" }}>Active Updater</span>}
+                        <span style={{
+                          fontSize: "0.75rem",
+                          marginLeft: "0.5rem",
+                          padding: "1px 6px",
+                          borderRadius: "4px",
+                          backgroundColor: "rgba(255,255,255,0.05)",
+                          color: p.evaluator_compatibility_status === 1 ? "#4caf50" : p.evaluator_compatibility_status === 2 ? "#f44336" : "var(--text-muted, #888)",
+                          border: `1px solid ${p.evaluator_compatibility_status === 1 ? "#4caf50" : p.evaluator_compatibility_status === 2 ? "#f44336" : "#888888"}33`
+                        }}>
+                          Evaluator: {p.evaluator_compatibility_status === 1 ? "Passed" : p.evaluator_compatibility_status === 2 ? "Failed" : "Untested"}
+                        </span>
                       </div>
-                      <button
-                        type="button"
-                        className="ghost-action compact-ghost"
-                        onClick={() => handleArchiveProviderProfile(p.id)}
-                        disabled={busy || isActive}
-                        title={isActive ? "Cannot archive active profile" : "Archive profile"}
-                        style={{ fontSize: "0.8rem", padding: "2px 8px" }}
-                      >
-                        <Archive size={12} style={{ marginRight: "4px" }} />
-                        <span>Archive</span>
-                      </button>
+                      <div style={{ display: "flex", gap: "0.5rem" }}>
+                        <button
+                          type="button"
+                          className="ghost-action compact-ghost"
+                          onClick={() => void handleRunContractTest(p.id)}
+                          disabled={busy}
+                          title="Run compatibility contract test"
+                          style={{ fontSize: "0.8rem", padding: "2px 8px" }}
+                        >
+                          <Play size={12} style={{ marginRight: "4px" }} />
+                          <span>Test</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="ghost-action compact-ghost"
+                          onClick={() => handleArchiveProviderProfile(p.id)}
+                          disabled={busy || isActive}
+                          title={isActive ? "Cannot archive active profile" : "Archive profile"}
+                          style={{ fontSize: "0.8rem", padding: "2px 8px" }}
+                        >
+                          <Archive size={12} style={{ marginRight: "4px" }} />
+                          <span>Archive</span>
+                        </button>
+                      </div>
                     </div>
                   );
                 })}
@@ -5257,6 +5438,15 @@ export function App() {
                   />
                   <span>Allow send with stale state</span>
                 </label>
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={devOverrideActive}
+                    onChange={(event) => setDevOverrideActive(event.target.checked)}
+                    disabled={busy}
+                  />
+                  <span>Developer override (skip evaluator gates)</span>
+                </label>
                 {useNarratorProviderForUpdater ? (
                   <p className="provider-note">
                     Using narrator provider: {apiSettings.base_url || "No base URL"} / {apiSettings.model || "No model"}
@@ -5350,6 +5540,15 @@ export function App() {
                       >
                         <Archive size={16} />
                         <span>Archive Profile</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-action"
+                        onClick={() => void handleRunContractTest(selectedStateUpdaterProfileId)}
+                        disabled={busy || !selectedStateUpdaterProfileId}
+                      >
+                        <Play size={16} />
+                        <span>Run Contract Test</span>
                       </button>
                     </div>
                   </>

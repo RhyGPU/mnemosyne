@@ -255,3 +255,150 @@ pub fn existing_id_allowed(spec: &EvalFormSpec, id: &str) -> bool {
         .chain(spec.existing_relationship_facts.iter())
         .any(|row| row.existing_id == id)
 }
+
+pub fn validate_evaluator_contract(
+    raw_response: &str,
+    user_text: &str,
+    narrator_text: &str,
+) -> Result<(), String> {
+    let stripped = crate::evaluator_form::strip_json_fences(raw_response);
+    let extracted = crate::evaluator_form::extract_first_balanced_json_object(&stripped)
+        .unwrap_or_else(|| stripped.clone());
+
+    let root = serde_json::from_str::<serde_json::Value>(&extracted)
+        .map_err(|err| format!("Invalid JSON: {err}"))?;
+
+    let root_obj = root
+        .as_object()
+        .ok_or_else(|| "Root of response must be a JSON object".to_string())?;
+
+    if root_obj.len() != 1 || !root_obj.contains_key("evaluator_form_v1") {
+        return Err("Root JSON envelope must contain exactly one key: 'evaluator_form_v1'".to_string());
+    }
+
+    let form_v1 = &root_obj["evaluator_form_v1"];
+    let form_obj = form_v1
+        .as_object()
+        .ok_or_else(|| "'evaluator_form_v1' must be a JSON object".to_string())?;
+
+    let allowed_envelope_keys = [
+        "event_rows",
+        "object_rows",
+        "relationship_rows",
+        "relationship_event_rows",
+        "memory_rows",
+        "review_rows",
+    ];
+
+    for key in form_obj.keys() {
+        if !allowed_envelope_keys.contains(&key.as_str()) {
+            return Err(format!("Unknown key inside envelope: '{key}'"));
+        }
+    }
+
+    let mut has_rel_delta = false;
+    if let Some(rows) = form_obj.get("relationship_event_rows").and_then(|v| v.as_array()) {
+        for row in rows {
+            let row_obj = row
+                .as_object()
+                .ok_or_else(|| "relationship_event_row must be an object".to_string())?;
+            if !row_obj.contains_key("row_enabled") {
+                return Err("relationship_event_row is missing 'row_enabled'".to_string());
+            }
+
+            use crate::evaluator_form::relationship_event::{
+                FORBIDDEN_RELATIONSHIP_SURFACE_KEYS, RELATIONSHIP_EVENT_REQUIRED_KEYS,
+            };
+
+            for key in row_obj.keys() {
+                if !RELATIONSHIP_EVENT_REQUIRED_KEYS.contains(&key.as_str()) {
+                    return Err(format!("relationship_event_row contains unknown key: '{key}'"));
+                }
+                if FORBIDDEN_RELATIONSHIP_SURFACE_KEYS.contains(&key.as_str()) {
+                    return Err(format!(
+                        "relationship_event_row contains forbidden surface dimension key: '{key}'"
+                    ));
+                }
+            }
+
+            let enabled = row_obj.get("row_enabled").and_then(|v| v.as_i64()).unwrap_or(0);
+            if enabled == 1 {
+                has_rel_delta = true;
+            }
+        }
+    }
+
+    if let Some(rel_rows) = form_obj.get("relationship_rows") {
+        let arr = rel_rows
+            .as_array()
+            .ok_or_else(|| "relationship_rows must be an array".to_string())?;
+        if !arr.is_empty() {
+            return Err("relationship_rows must remain empty".to_string());
+        }
+    }
+
+    let allowed_slots = [
+        "relationship_memory",
+        "current_plot_memory",
+        "character_identity_memory",
+        "unresolved_tension",
+        "world_location_memory",
+        "recent_emotional_state",
+    ];
+    let mut has_memory_delta = false;
+    if let Some(mem_rows) = form_obj.get("memory_rows").and_then(|v| v.as_array()) {
+        for row in mem_rows {
+            let row_obj = row
+                .as_object()
+                .ok_or_else(|| "memory_row must be an object".to_string())?;
+            if let Some(slot_val) = row_obj.get("slot").and_then(|v| v.as_str()) {
+                if !allowed_slots.contains(&slot_val) {
+                    return Err(format!("memory_row contains invalid slot: '{slot_val}'"));
+                }
+            }
+
+            let enabled = row_obj.get("row_enabled").and_then(|v| v.as_i64()).unwrap_or(1);
+            if enabled == 1 {
+                has_memory_delta = true;
+            }
+        }
+    }
+
+    let evidence_text = format!("{}\n{}", user_text, narrator_text);
+    let row_fields = [
+        "event_rows",
+        "object_rows",
+        "relationship_rows",
+        "relationship_event_rows",
+        "memory_rows",
+        "review_rows",
+    ];
+
+    for field in &row_fields {
+        if let Some(rows) = form_obj.get(*field).and_then(|v| v.as_array()) {
+            for row in rows {
+                if let Some(row_obj) = row.as_object() {
+                    let enabled = row_obj.get("row_enabled").and_then(|v| v.as_i64()).unwrap_or(1);
+                    if enabled == 0 {
+                        continue;
+                    }
+                    if let Some(quote_val) = row_obj.get("evidence_quote").and_then(|v| v.as_str()) {
+                        if !quote_val.trim().is_empty()
+                            && !crate::evaluator::claim_has_evidence(Some(quote_val), &evidence_text)
+                        {
+                            return Err(format!(
+                                "evidence_quote not found in scene context: '{quote_val}'"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !has_rel_delta && !has_memory_delta {
+        return Err("Nontrivial test scene did not produce any memory or relationship delta".to_string());
+    }
+
+    Ok(())
+}

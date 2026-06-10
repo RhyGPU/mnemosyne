@@ -1233,8 +1233,135 @@ pub fn build_evaluator_form_prompt_with_player_persona(
     );
     let hard_form_template = build_hard_eval_form_template(&spec);
     format!(
-        "{}\n\nYou are filling a provided JSON evaluation sheet. Do not invent keys. Do not rename keys. Do not remove required keys. Do not add alternate row shapes. For rows with no evidence, leave row_enabled as 0 and keep numeric fields at 0. For rows with evidence, set row_enabled to 1 and fill every numeric field with an integer in the required range.\n\nThe output must use the exact keys from the provided form. Unknown keys are invalid. Missing keys are invalid.\n\nNever output axis_trust, axis_fear, axis_comfort, axis_boundary_pressure, modifier_trust, modifier_fear, modifier_comfort, or modifier_boundary_pressure.\n\nReturn valid evaluator_form_v1 JSON only. Return the same top-level evaluator_form_v1 object from the provided sheet, with values filled in. Do not output final EnginePatch JSON. Every enabled row requires evidence_quote. Unknown entity ids are invalid unless an object row uses new_object_label. For relationship_event_rows, every axis field must be an integer from -5 to +5. Every modifier field must be an integer from 0 to 100. The required numeric bitmask field is event_flags_u64. If no evidence exists for a field, use 0, not null or a string. Do not decide final relationship deltas. Only score observable event evidence.\n\n[LATEST EXCHANGE]\nUser: {}\nNarrator: {}\n\n[FORM SPEC]\n{}\n\n[HARD FILLABLE FORM TEMPLATE]\n{}",
+        "{}\n\
+        \n\
+        You are filling a provided JSON evaluation sheet. Do not invent keys. Do not rename keys. Do not remove required keys. Do not add alternate row shapes. For rows with no evidence, leave row_enabled as 0 and keep numeric fields at 0. For rows with evidence, set row_enabled to 1 and fill every numeric field with an integer in the required range.\n\
+        \n\
+        The output must use the exact keys from the provided form. Unknown keys are invalid. Missing keys are invalid.\n\
+        \n\
+        ### SCHEMA & FIELD TAXONOMY RULES:\n\
+        1. **relationship_event_rows**:\n\
+           - **row_enabled**: integer, either 0 (no evidence) or 1 (evidence exists).\n\
+           - **Identifier fields** (must be nonempty strings if enabled):\n\
+             - `event_id`: the event identifier (e.g. \"event_latest_turn\").\n\
+             - `actor_entity_id`: the entity ID of the character taking action.\n\
+             - `relationship_source_soul_id`: the soul ID whose perspective/relationship updates.\n\
+             - `relationship_target_entity_id`: the target entity of the relationship.\n\
+             - `perceived_by_entity_id`: the soul ID perceiving this event.\n\
+             - `evidence_quote`: exact substring from the latest exchange.\n\
+           - **Axis fields** (must be an integer from -5 to +5 inclusive):\n\
+             Axis point standards: -5 = severe negative event; -3 = meaningful negative event; -1 = slight negative cue; 0 = no evidence / neutral; +1 = slight positive cue; +3 = meaningful positive event; +5 = major positive event.\n\
+             - `intent`: benign/helpful intent (+5) vs malicious/harming intent (-5).\n\
+             - `honesty`: truthfulness (+5) vs deceit/dishonesty (-5).\n\
+             - `reliability`: dependable/consistent (+5) vs flaky/unreliable (-5).\n\
+             - `boundary_treatment`: respecting boundaries (+5) vs violating/pushing boundaries (-5).\n\
+             - `responsiveness`: supportive/warm responsiveness (+5) vs ignoring/avoidance (-5).\n\
+             - `power_use`: fair/collaborative power (+5) vs coercive/abusive power (-5).\n\
+             - `evaluation_tone`: warm/approving (+5) vs harsh/critical (-5).\n\
+             - `competence`: skillful/capable action (+5) vs harmful/incompetent (-5).\n\
+             - `disclosure`: vulnerability/openness (+5) vs secrecy/withholding (-5).\n\
+             - `reciprocity`: balanced give-and-take (+5) vs exploitation/taking (-5).\n\
+             - `repair`: building repair/de-escalation (+5) vs escalating conflict (-5).\n\
+             - `predictability`: stable/predictable (+5) vs erratic/volatile (-5). Predictability is an axis field, -5..+5, never 0..100.\n\
+           - **Modifier fields** (must be an integer from 0 to 100 inclusive):\n\
+             - `salience`: how noticeable/salient the event is.\n\
+             - `certainty`: confidence in interpretation.\n\
+             - `directness`: how direct the action was.\n\
+             - `costliness`: self-sacrifice/effort required.\n\
+             - `stakes`: severity/importance of the situation.\n\
+             - `repetition`: history of repeated similar action.\n\
+           - **Bitmask field** (must be an integer):\n\
+             - `event_flags_u64`: turn flags bitmask.\n\
+           - **Forbidden in relationship_event_rows**: Never output trust, comfort, intimacy, respect, fear, conflict, or boundary_pressure inside relationship_event_rows.\n\
+             The evaluator scores only observable event axes on -5..+5 plus modifiers. The engine translates those event scores into bounded 0-100 relationship deltas. Do not output final relationship point totals.\n\
+        \n\
+        2. **relationship_rows**:\n\
+           - **DEPRECATED**: Do not populate this array. Always output \"relationship_rows\": []. All relationship changes must be scored via relationship_event_rows only. Do not create relationship_rows.\n\
+        \n\
+        3. **Relationship Surface Standards Reference Only**:\n\
+           These 0-100 bands describe engine-owned relationship surfaces for calibration only. They are not output fields and must not appear inside relationship_event_rows.\n\
+           - trust: 0 total distrust, 25 guarded skepticism, 50 uncertain/limited trust, 75 reliable trust, 100 complete earned trust.\n\
+           - comfort: 0 unsafe/tense, 25 uneasy, 50 tolerable, 75 relaxed, 100 fully at ease.\n\
+           - intimacy: 0 no closeness, 25 distant familiarity, 50 guarded closeness, 75 emotionally close, 100 profound intimacy.\n\
+           - respect: 0 contempt, 25 low regard, 50 neutral regard, 75 clear respect, 100 deep admiration.\n\
+           - fear: 0 no fear, 25 mild wariness, 50 active fear, 75 strong fear, 100 terror/panic.\n\
+           - conflict: 0 no conflict, 25 friction, 50 open tension, 75 active opposition, 100 rupture/hostility.\n\
+           - boundary_pressure: 0 no pressure, 25 mild pressure, 50 guarded/strained boundary, 75 cornered, 100 overwhelmed/coerced.\n\
+        \n\
+        4. **Relationship Dimension Naming Constraint**:\n\
+           - Do not prefix relationship dimensions with 'axis_' or 'modifier_' (e.g. use plain 'trust', 'comfort', 'affection', 'fear', 'respect' as dimensions, never 'axis_trust' or 'modifier_comfort').\n\
+        \n\
+        5. **object_rows**:\n\
+           Use object rows only for durable object state. Do not use condition-based object_id values like wet_jacket, broken_cup, or open_door. Prefer object_label/object_type/owner_entity_id/status/location/last_observed_state and let the compiler assign a stable owner_type_ordinal id.\n\
+        \n\
+        6. **evidence_quote Strict Rules**:\n\
+           - Must be a single, continuous, exact substring from the latest exchange.\n\
+           - Do not paraphrase or modify any words.\n\
+           - Do not stitch multiple separate quotes together (e.g. do not write '\"quote A\" and \"quote B\"').\n\
+           - Avoid ellipses ('...').\n\
+           - If using ellipses ('...'), the quote will be split, and each split fragment must be at least 24 characters long. Otherwise, the quote will be rejected. Prefer a single continuous exact quote of at least 4 characters.\n\
+           - Prefer evidence_quote substrings that do not contain dialogue quotes (nested double quotes). If dialogue quotes are present, you must escape them (use \\\" for nested quotes) or select a substring that avoids them.\n\
+        \n\
+        Return valid evaluator_form_v1 JSON only. Return the same top-level evaluator_form_v1 object from the provided sheet, with values filled in. Do not output final EnginePatch JSON. If no evidence exists for a field, use 0 (not null or a string). Do not decide final relationship deltas. Only score observable event evidence.\n\
+        \n\
+        [LATEST EXCHANGE]\nUser: {}\nNarrator: {}\n\n[FORM SPEC]\n{}\n\n[HARD FILLABLE FORM TEMPLATE]\n{}",
         EVALUATOR_SYSTEM_PROMPT,
+        latest_user_message,
+        latest_narrator_response,
+        serde_json::to_string_pretty(&spec).unwrap_or_default(),
+        serde_json::to_string_pretty(&hard_form_template).unwrap_or_default(),
+    )
+}
+
+pub const CURRENT_EVALUATOR_CONTRACT_VERSION: i32 = 1;
+pub const CURRENT_EVALUATOR_PROMPT_VERSION: i32 = 1;
+
+pub fn build_evaluator_form_prompt_compact_with_player_persona(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    latest_user_message: &str,
+    latest_narrator_response: &str,
+    player_persona_id: &str,
+    player_persona_display_name: &str,
+) -> String {
+    let spec = build_eval_form_spec_with_player_persona(
+        soul,
+        session_world,
+        latest_user_message,
+        latest_narrator_response,
+        8,
+        player_persona_id,
+        player_persona_display_name,
+    );
+    let hard_form_template = build_hard_eval_form_template(&spec);
+    format!(
+        "# SYSTEM: Mnemosyne Compact Evaluator V1\n\
+        You are filling a provided JSON evaluation sheet based on the latest exchange.\n\
+        \n\
+        ### GENERAL RULES:\n\
+        1. Return valid evaluator_form_v1 JSON only. Unknown keys are invalid.\n\
+        2. Keep relationship_rows empty: \"relationship_rows\": [].\n\
+        3. Do not invent keys or alternate shapes. Do not rename keys.\n\
+        4. For rows with no evidence, leave row_enabled as 0 and keep numeric fields at 0.\n\
+        5. For rows with evidence, set row_enabled to 1 and fill every numeric field.\n\
+        \n\
+        ### SCHEMA & FIELD TAXONOMY RULES:\n\
+        - **relationship_event_rows**:\n\
+          - **row_enabled**: 0 or 1.\n\
+          - **Identifier fields** (must be nonempty strings if enabled): `event_id`, `actor_entity_id`, `relationship_source_soul_id`, `relationship_target_entity_id`, `perceived_by_entity_id`, `evidence_quote`.\n\
+          - **Axis fields** (must be an integer from -5 to +5): `intent`, `honesty`, `reliability`, `boundary_treatment`, `responsiveness`, `power_use`, `evaluation_tone`, `competence`, `disclosure`, `reciprocity`, `repair`, `predictability`. Predictability is -5..+5, never 0..100.\n\
+          - **Modifier fields** (must be an integer from 0 to 100): `salience`, `certainty`, `directness`, `costliness`, `stakes`, `repetition`.\n\
+          - **Bitmask field**: `event_flags_u64`.\n\
+          - **Forbidden keys**: Do not output trust, comfort, intimacy, respect, fear, conflict, or boundary_pressure inside relationship_event_rows.\n\
+        - **memory_rows**:\n\
+          - Fill out memory candidates only for durable shifts/events. Verify memory slots are valid.\n\
+        \n\
+        ### evidence_quote STRICT RULES:\n\
+        - Must be a single, continuous, exact substring from the latest exchange. No ellipses.\n\
+        - Do not paraphrase or modify any words. Must be at least 4 characters.\n\
+        - Escape nested double quotes or select a substring that avoids them.\n\
+        \n\
+        [LATEST EXCHANGE]\nUser: {}\nNarrator: {}\n\n[FORM SPEC]\n{}\n\n[HARD FILLABLE FORM TEMPLATE]\n{}",
         latest_user_message,
         latest_narrator_response,
         serde_json::to_string_pretty(&spec).unwrap_or_default(),
@@ -1451,9 +1578,38 @@ mod tests {
         assert!(prompt.contains("You are filling a provided JSON evaluation sheet"));
         assert!(prompt.contains("Unknown keys are invalid. Missing keys are invalid."));
         assert!(prompt.contains("event_flags_u64"));
-        assert!(prompt.contains("Never output axis_trust"));
+        assert!(prompt.contains("SCHEMA & FIELD TAXONOMY RULES:"));
+        assert!(prompt.contains("-5 = severe negative event"));
+        assert!(prompt.contains("+5 = major positive event"));
+        assert!(prompt
+            .contains("`intent`: benign/helpful intent (+5) vs malicious/harming intent (-5)"));
+        assert!(prompt.contains("`salience`: how noticeable/salient the event is"));
+        assert!(prompt.contains("trust: 0 total distrust"));
+        assert!(prompt.contains("boundary_pressure: 0 no pressure"));
+        assert!(prompt.contains("Predictability is an axis field, -5..+5, never 0..100"));
+        assert!(prompt.contains("Never output trust, comfort, intimacy, respect, fear, conflict, or boundary_pressure inside relationship_event_rows"));
+        assert!(prompt.contains("Relationship Surface Standards Reference Only"));
+        assert!(prompt.contains(
+            "The engine translates those event scores into bounded 0-100 relationship deltas"
+        ));
+        assert!(prompt.contains("Do not output final relationship point totals"));
+        assert!(prompt.contains("Always output \"relationship_rows\": []"));
+        assert!(
+            prompt.contains("Do not prefix relationship dimensions with 'axis_' or 'modifier_'")
+        );
+        assert!(prompt.contains("evidence_quote Strict Rules"));
+        assert!(prompt.contains("Must be a single, continuous, exact substring"));
+        assert!(prompt.contains("Do not stitch multiple separate quotes together"));
         assert!(prompt.contains("relationship_event_rows"));
         assert!(prompt.contains("review_rows"));
+
+        let relationship_event_schema = prompt
+            .split("1. **relationship_event_rows**:")
+            .nth(1)
+            .and_then(|tail| tail.split("2. **relationship_rows**:").next())
+            .expect("relationship event schema section");
+        assert!(!relationship_event_schema.contains("- trust: 0 total distrust"));
+        assert!(!relationship_event_schema.contains("- comfort: 0 unsafe/tense"));
     }
 
     #[test]
@@ -1474,6 +1630,12 @@ mod tests {
         assert!(prompt.contains("\"intent\": 0"));
         assert!(prompt.contains("\"salience\": 0"));
         assert!(prompt.contains("\"event_flags_u64\": 0"));
+        assert!(prompt.contains("\"object_rows\""));
+        assert!(prompt.contains("\"object_label\": \"\""));
+        assert!(prompt.contains("\"object_type\": \"\""));
+        assert!(prompt.contains("\"owner_entity_id\": \"default_player\""));
+        assert!(prompt.contains("\"status\": \"\""));
+        assert!(prompt.contains("\"last_observed_state\": \"\""));
         assert!(prompt.contains("\"new_character_rows\""));
         assert!(prompt.contains("\"scene_participants\""));
         assert!(!prompt.contains("\"axis_trust\""));

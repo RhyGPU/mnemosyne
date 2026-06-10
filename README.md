@@ -1,10 +1,14 @@
 # Mnemosyne
 
-Mnemosyne is an AGPL-licensed local desktop client for persistent AI roleplay and long-form story creation. It combines a React/Tauri UI with a Rust state engine that manages character Souls, world continuity, memory scoring, context compilation, and state updates outside the LLM.
+Mnemosyne is an AGPL-licensed local-first campaign brain for persistent AI roleplay and long-form story creation. It is not meant to be only a better chat frontend, JanitorAI clone, or SillyTavern alternative. The product goal is a universal RP state map: a living graph of characters, relationships, objects, locations, events, factions, secrets, unresolved tensions, and continuity facts that can support many styles of roleplay through one underlying architecture.
+
+Mnemosyne combines a React/Tauri UI with a Rust state engine that manages character Souls, world continuity, memory scoring, context compilation, evaluator patches, and state updates outside the LLM.
 
 The core design principle is simple:
 
-> The narrator writes. The Soul remembers.
+> The narrator writes. The state map remembers.
+
+That state map should eventually support character RP, relationship RP, D&D-style party adventures, multi-user campaigns, political intrigue, survival/base-building stories, and alternate-history war games without rebuilding the engine around each genre.
 
 Mnemosyne is currently a working alpha. The main narrator, memory, state, and persistence pipeline exists, but the project is not yet a polished public release.
 
@@ -32,6 +36,7 @@ Implemented:
 - Debug logs, performance logs, context preview, LLM payload preview, and payload history export
 - Visible chat log export
 - Soul and setting JSON import/export
+- Portable `.mne` bundle validation and session checkpoint import/export
 - Image attachment import and local image asset storage
 - Browser preview fallback for development when Tauri runtime is unavailable
 
@@ -43,7 +48,6 @@ Supported provider path:
 
 Not implemented yet:
 
-- Portable `.mne` bundle import/export
 - Native embedded local model runtime inside Mnemosyne
 - Browser/subscription connector for external web chat services
 - Full production packaging, installer polish, and broad end-user documentation
@@ -78,26 +82,37 @@ Known issues and risks:
 
 ## Recommended Roadmap
 
-Short-term priorities:
+The near-term roadmap is State Map V1, not a full universal simulator. The milestone is practical inspection and correction: a user should be able to run a 30-turn RP session, inspect what the engine believes, correct wrong memory or state, continue the RP, and export/import the session safely.
 
-- Add stronger entity and speaker registry support for multi-actor scenes.
-- Store relationship, trust, conflict, affection, fear, comfort, dependency, and curiosity per entity rather than only against a generic player target.
-- Add fixed memory retrieval slots, such as relationship memories, current-plot memories, identity memories, unresolved-tension memories, and world/location memories.
-- Improve memory hygiene by rejecting or deprioritizing generic memories, repeated body-language notes, routine emotional reactions, and vague observations.
-- Add an import-log mode that routes pasted logs to a summarizer/state-updater pipeline instead of sending large logs directly to the narrator.
-- Add stronger anti-replay checks that compare a new narrator response against recent assistant responses and reject or regenerate near-duplicates.
-- Add plot lifecycle management: dominant current plot, background plots, resolved plots, and stale plot decay.
-- Make the state updater non-blocking where possible: stream the narrator response first, then run the updater in the background and apply the patch before the next turn.
-- Add dev timing metrics: context compile time, time to first narrator token, narrator completion time, updater completion time, DB save time, and total turn time.
-- Add user-facing speed presets: Fast, Balanced, and Literary, with different output-length targets.
+State Map V1 should expose:
+
+- Scene State panel
+- Characters panel
+- Relationships panel
+- Objects panel
+- Timeline panel
+- Open Tensions panel
+- Debug/Memory Inspector panel
+
+The user should be able to click a character, object, location, relationship, or event and understand what the engine believes is true, where that belief came from, what changed this turn, what memories were retrieved, what relationships were updated, and what unresolved tensions remain.
+
+Immediate engineering priorities:
+
+- Add role-specific model compatibility gates. Narrator models can be creative, evaluator models must pass strict JSON/schema contracts, and command models must be concise and instruction-following. A universal model should not silently take over all roles unless it passes each role contract.
+- Slim the evaluator prompt from tutorial prose into a compact schema card. Keep the hard fillable form, remove contradictory or deprecated wording, move relationship calibration references away from output schema instructions, and prefer machine-readable constraints where possible.
+- Add a compact authoritative `scene_continuity_summary` for current truth, not long-term memory. It should track location, participants, positions, door/room state, current misunderstanding, active object, open question, and last concrete action.
+- Clean up memory retrieval without removing prompt memory limits. Separate stored memory capacity from prompt retrieval capacity, allow more stored memories, retrieve only the best few, prevent duplicate memories across prompt sections, and show primary slot labels while hiding secondary tags until inspection.
+- Deduplicate relationship and memory context. Relationship summaries should collapse by `source_soul_id + target_entity_id` and prefer latest materialized relationship state. Memories should not repeat across current plot, character identity, world/location, unresolved tension, and recent emotional state sections.
+- Build State Map V1 UI around current scene truth, known character facts, relationship changes with evidence, object owner/location/status, timeline events, unresolved tensions, and retrieved-memory evidence.
 
 Longer-term priorities:
 
-- Portable `.mne` packages for sharing a complete Soul, memories, world links, metadata, and assets as one file.
-- Native local model runtime support, separate from OpenAI-compatible external local servers.
-- Better schema versioning, migration tooling, and import/export validation.
-- Optional paid fallback model for state updating when a free updater model fails JSON validation or rate limits.
-- More complete documentation for testers, including safe testing guidance, recommended models, and known failure modes.
+- Generalize the state graph across entities, edges, events, secrets, knowledge scopes, faction state, resources, morale, danger, timers, and delayed consequences.
+- Support richer multi-character and multi-user campaign workflows on top of the same state map.
+- Add native local model runtime support, separate from OpenAI-compatible external local servers.
+- Continue improving schema versioning, migration tooling, import/export validation, and tester documentation.
+
+See [State Map Roadmap](docs/state-map-roadmap.md) for the fuller product direction.
 
 ## Alpha Warning
 

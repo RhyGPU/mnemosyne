@@ -233,6 +233,7 @@ pub struct EventRow {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ObjectRow {
+    pub row_enabled: Option<u8>,
     #[serde(alias = "event_id")]
     pub linked_event_id: String,
     pub object_id: Option<String>,
@@ -250,8 +251,10 @@ pub struct ObjectRow {
     pub confidence_tier: Option<ConfidenceTier>,
     #[serde(alias = "object_type", alias = "object_kind")]
     pub object_kind: Option<String>,
+    pub owner_entity_id: Option<String>,
     #[serde(alias = "location_observed")]
     pub location: Option<String>,
+    pub last_observed_state: Option<String>,
     #[serde(skip_serializing)]
     pub summary: Option<String>,
     #[serde(skip_serializing)]

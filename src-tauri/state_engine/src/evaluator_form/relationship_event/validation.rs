@@ -8,7 +8,7 @@ use crate::evaluator_form::{
 
 pub const RELATIONSHIP_EVENT_TEMPLATE_VERSION: &str = "relationship_event_v2b_hard_template";
 
-const RELATIONSHIP_EVENT_REQUIRED_KEYS: [&str; 26] = [
+pub const RELATIONSHIP_EVENT_REQUIRED_KEYS: [&str; 26] = [
     "row_enabled",
     "event_id",
     "actor_entity_id",
@@ -55,6 +55,16 @@ const FORBIDDEN_LEGACY_NUMERIC_KEYS: [&str; 8] = [
     "modifier_fear",
     "modifier_comfort",
     "modifier_boundary_pressure",
+];
+
+pub const FORBIDDEN_RELATIONSHIP_SURFACE_KEYS: [&str; 7] = [
+    "trust",
+    "comfort",
+    "intimacy",
+    "respect",
+    "fear",
+    "conflict",
+    "boundary_pressure",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,18 +155,54 @@ pub fn validate_relationship_event_row(
     let perceived_by_entity_id =
         required_nonempty_string(object, "perceived_by_entity_id").unwrap_or_default();
 
-    if event_id.is_empty()
-        || !event_ids.contains(event_id.as_str())
-        || actor_entity_id.is_empty()
-        || relationship_source_soul_id.is_empty()
-        || relationship_target_entity_id.is_empty()
-        || perceived_by_entity_id.is_empty()
-        || !allowed_entities.contains(actor_entity_id.as_str())
+    if event_id.is_empty() || !event_ids.contains(event_id.as_str()) {
+        reject_row(
+            rejected,
+            "relationship_event",
+            &row_id,
+            "event_id_resolution_failed",
+        );
+        return None;
+    }
+
+    if actor_entity_id.is_empty() || !allowed_entities.contains(actor_entity_id.as_str()) {
+        reject_row(
+            rejected,
+            "relationship_event",
+            &row_id,
+            "actor_entity_resolution_failed",
+        );
+        return None;
+    }
+
+    if relationship_target_entity_id.is_empty()
         || !allowed_entities.contains(relationship_target_entity_id.as_str())
+    {
+        reject_row(
+            rejected,
+            "relationship_event",
+            &row_id,
+            "relationship_target_entity_resolution_failed",
+        );
+        return None;
+    }
+
+    if relationship_source_soul_id.is_empty()
         || !spec
             .active_soul_ids
             .iter()
             .any(|id| id == &relationship_source_soul_id)
+    {
+        reject_row(
+            rejected,
+            "relationship_event",
+            &row_id,
+            "relationship_source_soul_resolution_failed",
+        );
+        return None;
+    }
+
+    if perceived_by_entity_id.is_empty()
         || !spec
             .active_soul_ids
             .iter()
@@ -166,7 +212,7 @@ pub fn validate_relationship_event_row(
             rejected,
             "relationship_event",
             &row_id,
-            "entity_resolution_failed",
+            "perceived_by_entity_resolution_failed",
         );
         return None;
     }
@@ -226,6 +272,16 @@ fn validate_relationship_event_keys(
                 "relationship_event",
                 row_id,
                 &format!("relationship_event_unknown_key:{key}"),
+            );
+        }
+    }
+    for key in FORBIDDEN_RELATIONSHIP_SURFACE_KEYS {
+        if object.contains_key(key) {
+            return reject_row(
+                rejected,
+                "relationship_event",
+                row_id,
+                &format!("relationship_event_forbidden_surface_field:{key}"),
             );
         }
     }

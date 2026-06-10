@@ -1,10 +1,10 @@
 # Mnemosyne Multi-Character Settings Architecture
 
-This is a future-facing architecture note. The MVP remains a single-character desktop client.
+This is a future-facing architecture note. It now sits under the broader State Map roadmap: Mnemosyne is moving toward a universal RP state map, while implementation should still ship in practical, inspectable milestones.
 
-## Current MVP Boundary
+## Current Boundary
 
-The MVP stores one character Soul with one embedded `WorldLog`. This supports 1-on-1 RP and keeps the first client shippable.
+The original MVP stored one character Soul with one embedded `WorldLog`. That shape still matters for compatibility, but State Map V1 should treat world/session state as part of an inspectable graph rather than as a permanent single-character limitation.
 
 The important compatibility rule is that world state must stay structurally separate from character-specific fields. In code, `WorldLog` remains its own serializable struct and `Soul.world` is defaultable during deserialization. That means future character-only Soul files can omit embedded world state while old Soul files with embedded world state still load.
 
@@ -113,7 +113,7 @@ For MVP, do not implement schema relevance filtering. Later, filter by:
 
 ## Phase Gate
 
-Do not build this in the MVP. Implementation belongs after the single-character client is stable:
+Do not chase the full multi-user campaign simulator before State Map V1 is legible and correctable. Implementation belongs after the core state map can show scene truth, entities, relationships, objects, timeline events, unresolved tensions, retrieved memories, and evidence:
 
 1. Extract `WorldLog` into a standalone setting file.
 2. Add `Setting` persistence and Setting Manager UI.

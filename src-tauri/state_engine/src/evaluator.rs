@@ -628,7 +628,7 @@ fn reject(
         });
 }
 
-fn claim_has_evidence(quote: Option<&str>, evidence_text: &str) -> bool {
+pub(crate) fn claim_has_evidence(quote: Option<&str>, evidence_text: &str) -> bool {
     let Some(quote) = quote.map(str::trim).filter(|quote| !quote.is_empty()) else {
         return false;
     };
@@ -683,7 +683,8 @@ fn evidence_contains_quote(evidence_lower: &str, quote_lower: &str) -> bool {
 }
 
 fn normalize_evidence_quote(text: &str) -> String {
-    let mut cleaned = text
+    let normalized = normalize_common_mojibake(text);
+    let mut cleaned = normalized
         .trim()
         .replace("\\\"", "\"")
         .replace(['“', '”'], "\"")
@@ -703,11 +704,21 @@ fn normalize_evidence_quote(text: &str) -> String {
 }
 
 fn normalize_evidence(text: &str) -> String {
-    strip_status_block_lines(text)
+    normalize_common_mojibake(&strip_status_block_lines(text))
         .to_ascii_lowercase()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn normalize_common_mojibake(text: &str) -> String {
+    text.replace("â", "—")
+        .replace("â", "–")
+        .replace("â", "’")
+        .replace("â", "“")
+        .replace("â", "”")
+        .replace(['“', '”'], "\"")
+        .replace(['‘', '’'], "'")
 }
 
 fn strip_status_block_lines(text: &str) -> String {
@@ -1392,5 +1403,33 @@ mod tests {
             .rejected_candidates
             .iter()
             .any(|rejection| rejection.reason == "duplicate candidate id"));
+    }
+
+    #[test]
+    fn stitched_evidence_quote_fails_validation() {
+        let evidence = "Aurora hears it: Don't mind the chain. Knock knock. Come in.";
+        // This quote is split by "..." into "don't mind the chain" (len 20) and "knock knock" (len 11)
+        // Since neither part is >= 24 characters, it fails validation.
+        assert!(!claim_has_evidence(
+            Some("\"Don't mind the chain...\" and \"Knock knock...\""),
+            evidence
+        ));
+    }
+
+    #[test]
+    fn single_continuous_exact_quote_passes_validation() {
+        let evidence = "Aurora hears it: Don't mind the chain. Knock knock. Come in.";
+        assert!(claim_has_evidence(
+            Some("Don't mind the chain"),
+            evidence
+        ));
+    }
+
+    #[test]
+    fn mojibake_em_dash_evidence_quote_validates_after_normalization() {
+        assert!(claim_has_evidence(
+            Some("cologneâsomething"),
+            "The air carries cologne—something sharp and familiar."
+        ));
     }
 }

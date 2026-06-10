@@ -2015,8 +2015,13 @@ fn live_object_state_new_object_label_compiles_to_object_patch() {
     ).expect("parse should succeed");
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.output.object_changes.len(), 1);
-    assert_eq!(result.output.object_changes[0].object_state.object_id, "wet_jacket");
-    assert_eq!(result.output.object_changes[0].object_state.status, "placed on chair");
+    assert_eq!(
+        result.output.object_changes[0].object_state.object_id,
+        "unknown_jacket_1"
+    );
+    assert_eq!(result.output.object_changes[0].object_state.object_kind, "jacket");
+    assert_eq!(result.output.object_changes[0].object_state.status, "wet");
+    assert_eq!(result.output.object_changes[0].object_state.location, "chair");
 }
 
 #[test]
@@ -2273,10 +2278,16 @@ fn live_payload8_object_rows_compile() {
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.object_changes.len(), 2);
-    assert_eq!(result.output.object_changes[0].object_state.object_id, "wet_jacket");
-    assert_eq!(result.output.object_changes[0].object_state.status, "placed_on_chair");
-    assert_eq!(result.output.object_changes[1].object_state.object_id, "chair");
-    assert_eq!(result.output.object_changes[1].object_state.status, "wet_from_jacket_drip");
+    assert_eq!(
+        result.output.object_changes[0].object_state.object_id,
+        "unknown_jacket_1"
+    );
+    assert_eq!(result.output.object_changes[0].object_state.status, "wet");
+    assert_eq!(
+        result.output.object_changes[1].object_state.object_id,
+        "unknown_chair_1"
+    );
+    assert_eq!(result.output.object_changes[1].object_state.status, "wet");
 }
 
 #[test]
@@ -2363,8 +2374,19 @@ fn live_payload11_wet_jacket_new_object_observation_compiles() {
     let result = compile_eval_form_response(&spec, &response, &context);
     assert_eq!(result.trace.form_rows_rejected, 0);
     assert_eq!(result.output.object_changes.len(), 1);
-    assert_eq!(result.output.object_changes[0].object_state.object_id, "wet_jacket");
-    assert_eq!(result.output.object_changes[0].object_state.status, "wet_jacket");
+    assert_eq!(
+        result.output.object_changes[0].object_state.object_id,
+        "default_player_jacket_1"
+    );
+    assert_eq!(result.output.object_changes[0].object_state.object_kind, "jacket");
+    assert_eq!(
+        result.output.object_changes[0]
+            .object_state
+            .owner_entity_id
+            .as_deref(),
+        Some("default_player")
+    );
+    assert_eq!(result.output.object_changes[0].object_state.status, "wet");
 }
 
 #[test]
@@ -2500,7 +2522,13 @@ fn live_exact_object_row_reaches_exported_object_state() {
     let mut soul_mut = soul;
     report.patch.apply_to_session(&mut soul_mut, Some(&mut world)).expect("apply to session succeeds");
 
-    let found = world.object_states.iter().find(|obj| obj.object_id == "wet_jacket").expect("wet_jacket should exist in world");
+    let found = world
+        .object_states
+        .iter()
+        .find(|obj| obj.object_id == "default_player_jacket_1")
+        .expect("stable player jacket should exist in world");
+    assert_eq!(found.object_kind, "jacket");
+    assert_eq!(found.status, "wet");
     assert!(found.last_observed_state.contains("nearest the couch"));
 }
 
@@ -2745,7 +2773,7 @@ fn object_row_empty_new_value_derives_from_evidence_quote() {
     assert_eq!(result.output.object_changes.len(), 1);
     assert_eq!(
         result.output.object_changes[0].object_state.object_id,
-        "wet_jacket"
+        "unknown_jacket_1"
     );
     // compiler_result in row trace must be object_patch_created
     let obj_trace = result
@@ -3381,6 +3409,12 @@ fn hard_form_template_uses_active_player_persona_id() {
     }));
     assert!(template_text.contains("\"actor_entity_id\":\"persona_jun\""));
     assert!(template_text.contains("\"relationship_target_entity_id\":\"persona_jun\""));
+    assert!(template_text.contains("\"object_rows\""));
+    assert!(template_text.contains("\"row_enabled\":0"));
+    assert!(template_text.contains("\"owner_entity_id\":\"persona_jun\""));
+    assert!(template_text.contains("\"object_label\":\"\""));
+    assert!(template_text.contains("\"object_type\":\"\""));
+    assert!(template_text.contains("\"last_observed_state\":\"\""));
     assert!(!template_text.contains("\"actor_entity_id\":\"default_player\""));
     assert!(!template_text.contains("\"relationship_target_entity_id\":\"default_player\""));
 }
@@ -3426,6 +3460,552 @@ fn relationship_rows_default_to_active_player_persona() {
     assert_eq!(
         result.normalized_response.relationship_rows[0].target_entity_id,
         "persona_jun"
+    );
+}
+
+#[test]
+fn normal_rp_i_maps_scene_participants_to_active_persona() {
+    let (soul, world) = soul_and_world();
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "I knock once.",
+        "Aurora hears the knock.",
+        8,
+        "preset_male",
+        "Male Persona",
+    );
+    let context = EvaluatorConversionContext {
+        active_soul_id: &soul.character_id,
+        active_soul_ids: vec![soul.character_id.clone()],
+        latest_user_message: "I knock once.",
+        latest_narrator_response: "Aurora hears the knock.",
+        session_world: Some(&world),
+        baseline_recent_event_id: None,
+    };
+    let response = EvalFormResponse::default();
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    let scene_state = result.output.world_changes[0]
+        .scene_state
+        .as_ref()
+        .expect("scene state");
+    assert!(scene_state.participants.contains(&"preset_male".to_string()));
+    assert!(!scene_state
+        .participants
+        .contains(&"default_player".to_string()));
+    assert!(scene_state.focus.as_deref().unwrap_or("").contains("preset_male"));
+    assert!(!scene_state
+        .focus
+        .as_deref()
+        .unwrap_or("")
+        .contains("default_player"));
+}
+
+#[test]
+fn normal_rp_memory_targets_active_persona_not_default_player() {
+    let (soul, world) = soul_and_world();
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "I knock once.",
+        "Aurora remembers the visitor's knock.",
+        8,
+        "preset_male",
+        "Male Persona",
+    );
+    let context = EvaluatorConversionContext {
+        active_soul_id: &soul.character_id,
+        active_soul_ids: vec![soul.character_id.clone()],
+        latest_user_message: "I knock once.",
+        latest_narrator_response: "Aurora remembers the visitor's knock.",
+        session_world: Some(&world),
+        baseline_recent_event_id: None,
+    };
+    let response = parse_eval_form_response(
+        r#"{
+          "memory_rows": [{
+            "owner_soul_id": "aurora_soul",
+            "slot_id": "current_plot_memory",
+            "content": "Aurora remembers the visitor's knock.",
+            "evidence_quote": "Aurora remembers the visitor's knock.",
+            "tags": ["current_plot"]
+          }]
+        }"#,
+    )
+    .expect("memory response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(
+        result.output.memory_candidates[0].target_entity_ids,
+        vec!["preset_male".to_string()]
+    );
+    assert_ne!(
+        result.output.memory_candidates[0].target_entity_ids,
+        vec!["default_player".to_string()]
+    );
+}
+
+#[test]
+fn wet_jacket_creates_stable_unknown_jacket_identity() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "A wet jacket is on the chair.",
+        "A wet jacket is draped over the chair.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "change_type": "new_object_observation",
+            "new_object_label": "wet_jacket",
+            "evidence_quote": "A wet jacket is draped over the chair."
+          }]
+        }"#,
+    )
+    .expect("object response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    let object = &result.output.object_changes[0].object_state;
+
+    assert_eq!(object.object_id, "unknown_jacket_1");
+    assert_ne!(object.object_id, "wet_jacket");
+    assert_eq!(object.object_kind, "jacket");
+    assert_eq!(object.owner_entity_id.as_deref(), Some("unknown"));
+    assert_eq!(object.status, "wet");
+    assert_eq!(object.location, "chair");
+    assert!(object.last_observed_state.contains("wet jacket"));
+}
+
+#[test]
+fn my_wet_jacket_uses_active_persona_owner() {
+    let (soul, world) = soul_and_world();
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "I hang my wet jacket on the chair.",
+        "Aurora watches the jacket drip onto the chair.",
+        8,
+        "preset_male",
+        "Male Persona",
+    );
+    let context = EvaluatorConversionContext {
+        active_soul_id: &soul.character_id,
+        active_soul_ids: vec![soul.character_id.clone()],
+        latest_user_message: "I hang my wet jacket on the chair.",
+        latest_narrator_response: "Aurora watches the jacket drip onto the chair.",
+        session_world: Some(&world),
+        baseline_recent_event_id: None,
+    };
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "change_type": "new_object_observation",
+            "new_object_label": "wet_jacket",
+            "evidence_quote": "I hang my wet jacket on the chair."
+          }]
+        }"#,
+    )
+    .expect("object response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    let object = &result.output.object_changes[0].object_state;
+
+    assert_eq!(object.object_id, "preset_male_jacket_1");
+    assert_eq!(object.owner_entity_id.as_deref(), Some("preset_male"));
+    assert_eq!(object.object_kind, "jacket");
+    assert_eq!(object.status, "wet");
+}
+
+#[test]
+fn hard_object_row_shape_compiles_my_wet_jacket_to_stable_identity() {
+    let (soul, world) = soul_and_world();
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "I drape my wet jacket over the chair.",
+        "The wet jacket is draped over the chair.",
+        8,
+        "preset_male",
+        "Male Persona",
+    );
+    let context = EvaluatorConversionContext {
+        active_soul_id: &soul.character_id,
+        active_soul_ids: vec![soul.character_id.clone()],
+        latest_user_message: "I drape my wet jacket over the chair.",
+        latest_narrator_response: "The wet jacket is draped over the chair.",
+        session_world: Some(&world),
+        baseline_recent_event_id: None,
+    };
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "row_enabled": 1,
+            "linked_event_id": "event_latest_turn",
+            "object_id": "",
+            "object_label": "my wet jacket",
+            "object_type": "jacket",
+            "owner_entity_id": "preset_male",
+            "status": "wet",
+            "location": "chair",
+            "last_observed_state": "wet jacket draped over chair",
+            "evidence_quote": "my wet jacket over the chair"
+          }]
+        }"#,
+    )
+    .expect("object response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    let object = &result.output.object_changes[0].object_state;
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(object.object_id, "preset_male_jacket_1");
+    assert_eq!(object.owner_entity_id.as_deref(), Some("preset_male"));
+    assert_eq!(object.object_kind, "jacket");
+    assert_eq!(object.status, "wet");
+    assert_eq!(object.location, "chair");
+    assert_eq!(object.last_observed_state, "wet jacket draped over chair");
+}
+
+#[test]
+fn generic_clothing_kind_uses_specific_object_label_type_and_reuses_identity() {
+    let (soul, mut world) = soul_and_world();
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "I drape my wet jacket over the chair.",
+        "The wet jacket is draped over the chair.",
+        8,
+        "preset_male",
+        "Male Persona",
+    );
+    let context = EvaluatorConversionContext {
+        active_soul_id: &soul.character_id,
+        active_soul_ids: vec![soul.character_id.clone()],
+        latest_user_message: "I drape my wet jacket over the chair.",
+        latest_narrator_response: "The wet jacket is draped over the chair.",
+        session_world: Some(&world),
+        baseline_recent_event_id: None,
+    };
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "row_enabled": 1,
+            "linked_event_id": "event_latest_turn",
+            "object_label": "wet jacket",
+            "object_type": "clothing",
+            "owner_entity_id": "preset_male",
+            "status": "wet",
+            "location": "chair",
+            "last_observed_state": "wet jacket draped over chair",
+            "evidence_quote": "my wet jacket over the chair"
+          }]
+        }"#,
+    )
+    .expect("object response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    let object = &result.output.object_changes[0].object_state;
+    assert_eq!(object.object_kind, "jacket");
+    assert_eq!(object.object_id, "preset_male_jacket_1");
+    assert_eq!(object.status, "wet");
+    assert_eq!(object.location, "chair");
+
+    world.object_states.push(object.clone());
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "I move my wet jacket near the door.",
+        "The wet jacket is near the door.",
+        8,
+        "preset_male",
+        "Male Persona",
+    );
+    let context = EvaluatorConversionContext {
+        active_soul_id: &soul.character_id,
+        active_soul_ids: vec![soul.character_id.clone()],
+        latest_user_message: "I move my wet jacket near the door.",
+        latest_narrator_response: "The wet jacket is near the door.",
+        session_world: Some(&world),
+        baseline_recent_event_id: None,
+    };
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "row_enabled": 1,
+            "linked_event_id": "event_latest_turn",
+            "object_label": "wet jacket",
+            "object_type": "clothing",
+            "owner_entity_id": "preset_male",
+            "status": "wet",
+            "location": "near door",
+            "last_observed_state": "wet jacket moved near door",
+            "evidence_quote": "my wet jacket near the door"
+          }]
+        }"#,
+    )
+    .expect("object response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    let object = &result.output.object_changes[0].object_state;
+    assert_eq!(object.object_kind, "jacket");
+    assert_eq!(object.object_id, "preset_male_jacket_1");
+    assert_eq!(object.location, "near door");
+}
+
+#[test]
+fn disabled_hard_object_row_is_ignored_without_rejection() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "I wait.",
+        "Aurora waits behind the door.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "row_enabled": 0,
+            "linked_event_id": "event_latest_turn",
+            "object_id": "",
+            "object_label": "",
+            "object_type": "",
+            "owner_entity_id": "default_player",
+            "status": "",
+            "location": "",
+            "last_observed_state": "",
+            "evidence_quote": ""
+          }]
+        }"#,
+    )
+    .expect("disabled object row response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert!(result.output.object_changes.is_empty());
+    assert!(result.trace.evaluator_row_traces.iter().any(|row| {
+        row.row_kind == "object"
+            && row.validation_status == "accepted"
+            && row.compiler_result == "disabled_row_ignored"
+    }));
+}
+
+#[test]
+fn auroras_jacket_uses_aurora_owner() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(
+        &soul,
+        &world,
+        "I point at it.",
+        "Aurora's jacket hangs from the chair.",
+    );
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "change_type": "new_object_observation",
+            "new_object_label": "jacket",
+            "evidence_quote": "Aurora's jacket hangs from the chair."
+          }]
+        }"#,
+    )
+    .expect("object response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    let object = &result.output.object_changes[0].object_state;
+
+    assert_eq!(object.object_id, "aurora_soul_jacket_1");
+    assert_eq!(object.owner_entity_id.as_deref(), Some("aurora_soul"));
+    assert_eq!(object.object_kind, "jacket");
+}
+
+#[test]
+fn multiple_jackets_owned_by_same_entity_increment_ordinals() {
+    let (soul, world) = soul_and_world();
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "I set my wet jacket and my dry jacket on two chairs.",
+        "Two jackets rest on separate chairs.",
+        8,
+        "preset_male",
+        "Male Persona",
+    );
+    let context = EvaluatorConversionContext {
+        active_soul_id: &soul.character_id,
+        active_soul_ids: vec![soul.character_id.clone()],
+        latest_user_message: "I set my wet jacket and my dry jacket on two chairs.",
+        latest_narrator_response: "Two jackets rest on separate chairs.",
+        session_world: Some(&world),
+        baseline_recent_event_id: None,
+    };
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [
+            {
+              "change_type": "new_object_observation",
+              "new_object_label": "wet_jacket",
+              "evidence_quote": "I set my wet jacket on the first chair."
+            },
+            {
+              "change_type": "new_object_observation",
+              "new_object_label": "dry_jacket",
+              "evidence_quote": "I set my dry jacket on the second chair."
+            }
+          ]
+        }"#,
+    )
+    .expect("object response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+    let ids = result
+        .output
+        .object_changes
+        .iter()
+        .map(|change| change.object_state.object_id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec!["preset_male_jacket_1", "preset_male_jacket_2"]);
+}
+
+#[test]
+fn object_state_update_reuses_existing_matching_object() {
+    let (soul, mut world) = soul_and_world();
+    world.object_states.push(ObjectState {
+        object_id: "preset_male_jacket_1".into(),
+        object_kind: "jacket".into(),
+        owner_entity_id: Some("preset_male".into()),
+        status: "wet".into(),
+        location: "chair".into(),
+        last_observed_state: "wet jacket on chair".into(),
+        ..ObjectState::default()
+    });
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "My jacket is still wet on the chair.",
+        "The jacket remains wet.",
+        8,
+        "preset_male",
+        "Male Persona",
+    );
+    let context = EvaluatorConversionContext {
+        active_soul_id: &soul.character_id,
+        active_soul_ids: vec![soul.character_id.clone()],
+        latest_user_message: "My jacket is still wet on the chair.",
+        latest_narrator_response: "The jacket remains wet.",
+        session_world: Some(&world),
+        baseline_recent_event_id: None,
+    };
+    let response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "change_type": "state_change",
+            "evidence_quote": "My jacket is still wet on the chair."
+          }]
+        }"#,
+    )
+    .expect("object response");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(
+        result.output.object_changes[0].object_state.object_id,
+        "preset_male_jacket_1"
+    );
+    assert_eq!(result.output.object_changes[0].object_state.status, "wet");
+
+    let before_count = world.object_states.len();
+    let report = evaluator_output_to_engine_patch(&result.output, &context);
+    let mut soul_mut = soul;
+    report
+        .patch
+        .apply_to_session(&mut soul_mut, Some(&mut world))
+        .expect("object patch applies");
+    assert_eq!(world.object_states.len(), before_count);
+    assert_eq!(
+        world
+            .object_states
+            .iter()
+            .filter(|object| object.object_id == "preset_male_jacket_1")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn unknown_owned_jacket_merges_when_owner_becomes_known() {
+    let (soul, mut world) = soul_and_world();
+    let (unknown_spec, unknown_context) = spec_and_context(
+        &soul,
+        &world,
+        "A wet jacket lies on the chair.",
+        "A wet jacket lies on the chair.",
+    );
+    let unknown_response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "change_type": "new_object_observation",
+            "new_object_label": "wet_jacket",
+            "evidence_quote": "A wet jacket lies on the chair."
+          }]
+        }"#,
+    )
+    .expect("unknown object response");
+    let unknown_result =
+        compile_eval_form_response(&unknown_spec, &unknown_response, &unknown_context);
+    let unknown_report = evaluator_output_to_engine_patch(&unknown_result.output, &unknown_context);
+    let mut soul_mut = soul;
+    unknown_report
+        .patch
+        .apply_to_session(&mut soul_mut, Some(&mut world))
+        .expect("unknown object patch applies");
+    assert!(world
+        .object_states
+        .iter()
+        .any(|object| object.object_id == "unknown_jacket_1"));
+
+    let known_spec = build_eval_form_spec_with_player_persona(
+        &soul_mut,
+        Some(&world),
+        "I pick up my wet jacket.",
+        "The jacket is clearly his now.",
+        8,
+        "preset_male",
+        "Male Persona",
+    );
+    let known_context = EvaluatorConversionContext {
+        active_soul_id: &soul_mut.character_id,
+        active_soul_ids: vec![soul_mut.character_id.clone()],
+        latest_user_message: "I pick up my wet jacket.",
+        latest_narrator_response: "The jacket is clearly his now.",
+        session_world: Some(&world),
+        baseline_recent_event_id: None,
+    };
+    let known_response = parse_eval_form_response(
+        r#"{
+          "object_rows": [{
+            "change_type": "state_change",
+            "evidence_quote": "I pick up my wet jacket."
+          }]
+        }"#,
+    )
+    .expect("known object response");
+    let known_result = compile_eval_form_response(&known_spec, &known_response, &known_context);
+    assert_eq!(
+        known_result.output.object_changes[0].object_state.object_id,
+        "preset_male_jacket_1"
+    );
+
+    let known_report = evaluator_output_to_engine_patch(&known_result.output, &known_context);
+    known_report
+        .patch
+        .apply_to_session(&mut soul_mut, Some(&mut world))
+        .expect("known object patch applies");
+    assert!(!world
+        .object_states
+        .iter()
+        .any(|object| object.object_id == "unknown_jacket_1"));
+    assert_eq!(
+        world
+            .object_states
+            .iter()
+            .filter(|object| object.object_id == "preset_male_jacket_1")
+            .count(),
+        1
     );
 }
 
@@ -3527,6 +4107,81 @@ fn set_row_i64(row: &mut serde_json::Value, key: &str, value: i64) {
         .insert(key.into(), serde_json::Value::from(value));
 }
 
+fn calibrated_positive_relationship_row(
+    axis_score: i64,
+    salience: i64,
+    stakes: i64,
+) -> serde_json::Value {
+    let mut row = relationship_event_base_row();
+    for key in [
+        "intent",
+        "honesty",
+        "reliability",
+        "boundary_treatment",
+        "responsiveness",
+        "power_use",
+        "evaluation_tone",
+        "competence",
+        "disclosure",
+        "reciprocity",
+        "repair",
+        "predictability",
+    ] {
+        set_row_i64(&mut row, key, axis_score);
+    }
+    set_row_i64(&mut row, "salience", salience);
+    set_row_i64(&mut row, "certainty", 90);
+    set_row_i64(&mut row, "directness", 90);
+    set_row_i64(&mut row, "costliness", 0);
+    set_row_i64(&mut row, "stakes", stakes);
+    set_row_i64(&mut row, "repetition", 0);
+    row.as_object_mut()
+        .expect("row object")
+        .insert("event_flags_u64".into(), serde_json::Value::from(0_u64));
+    row
+}
+
+fn calibrated_negative_relationship_row(
+    axis_score: i64,
+    salience: i64,
+    stakes: i64,
+) -> serde_json::Value {
+    calibrated_positive_relationship_row(-axis_score.abs(), salience, stakes)
+}
+
+fn relationship_comfort_delta(result: &EvalFormCompileResult) -> f32 {
+    first_relationship_delta(result)
+        .comfort
+        .expect("comfort delta")
+}
+
+fn apply_relationship_event_row_to_state(
+    soul: &mut Soul,
+    world: &mut SessionWorld,
+    row: serde_json::Value,
+) {
+    let (spec, context) = spec_and_context(
+        soul,
+        world,
+        "I stay outside the threshold.",
+        "Aurora watches from behind the door chain.",
+    );
+    let result = compile_eval_form_response(
+        &spec,
+        &EvalFormResponse {
+            relationship_event_rows: vec![row],
+            ..EvalFormResponse::default()
+        },
+        &context,
+    );
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    let report = evaluator_output_to_engine_patch(&result.output, &context);
+    report
+        .patch
+        .apply_to_session(soul, Some(world))
+        .expect("relationship event patch applies");
+}
+
 #[test]
 fn hard_relationship_event_template_accepts_exact_keys() {
     let result = compile_relationship_event_row(relationship_event_base_row(), |_| {});
@@ -3571,6 +4226,31 @@ fn hard_relationship_event_template_rejects_unknown_modifier_trust() {
         result.rejected_rows[0].reason,
         "relationship_event_unknown_key:modifier_trust"
     );
+}
+
+#[test]
+fn relationship_event_row_rejects_surface_fields_inside_numeric_event() {
+    let mut row = relationship_event_base_row();
+    let object = row.as_object_mut().unwrap();
+    object.insert("trust".into(), serde_json::Value::from(75));
+    object.insert("comfort".into(), serde_json::Value::from(60));
+    object.insert("boundary_pressure".into(), serde_json::Value::from(20));
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "relationship_event_forbidden_surface_field:trust"
+    );
+    assert!(result.trace.evaluator_row_traces.iter().any(|row| {
+        row.row_kind == "relationship_event"
+            && row.validation_status == "rejected"
+            && row
+                .rejection_reason
+                .as_deref()
+                .is_some_and(|reason| reason
+                    == "relationship_event_forbidden_surface_field:trust")
+    }));
 }
 
 #[test]
@@ -3624,6 +4304,98 @@ fn hard_relationship_event_template_compiles_enabled_row() {
         .relationship_delta_source
         .values()
         .any(|source| source == "numeric_event_v2"));
+}
+
+#[test]
+fn relationship_calibration_plus_one_low_salience_creates_small_delta() {
+    let result =
+        compile_relationship_event_row(calibrated_positive_relationship_row(1, 20, 20), |_| {});
+    let comfort = relationship_comfort_delta(&result);
+
+    assert!(comfort > 0.0);
+    assert!(comfort <= 3.0, "low-salience +1 delta was {comfort}");
+}
+
+#[test]
+fn relationship_calibration_plus_three_medium_salience_creates_moderate_delta() {
+    let result =
+        compile_relationship_event_row(calibrated_positive_relationship_row(3, 55, 55), |_| {});
+    let comfort = relationship_comfort_delta(&result);
+
+    assert!(comfort > 3.0, "medium-salience +3 delta was {comfort}");
+    assert!(comfort <= 10.0, "medium-salience +3 delta was {comfort}");
+}
+
+#[test]
+fn relationship_calibration_plus_five_high_salience_creates_large_bounded_delta() {
+    let result =
+        compile_relationship_event_row(calibrated_positive_relationship_row(5, 90, 90), |_| {});
+    let comfort = relationship_comfort_delta(&result);
+
+    assert!(comfort > 8.0, "high-salience +5 delta was {comfort}");
+    assert!(comfort <= 20.0, "high-salience +5 delta was {comfort}");
+    assert!(
+        first_relationship_delta(&result)
+            .max_abs_delta
+            .unwrap_or_default()
+            <= 20.0
+    );
+}
+
+#[test]
+fn relationship_calibration_repeated_minor_events_do_not_explode_values() {
+    let (mut soul, mut world) = soul_and_world();
+    let starting_comfort = soul.relationships["user"].comfort;
+
+    for _ in 0..20 {
+        apply_relationship_event_row_to_state(
+            &mut soul,
+            &mut world,
+            calibrated_positive_relationship_row(1, 20, 20),
+        );
+    }
+
+    let relationship = &soul.relationships["user"];
+    assert!(relationship.comfort > starting_comfort);
+    assert!(
+        relationship.comfort < 45.0,
+        "repeated low-salience +1 events raised comfort to {}",
+        relationship.comfort
+    );
+    assert!(relationship.trust <= 100.0);
+}
+
+#[test]
+fn relationship_calibration_clamps_values_to_valid_ranges() {
+    let (mut soul, mut world) = soul_and_world();
+    {
+        let relationship = soul.relationships.get_mut("user").expect("user relation");
+        relationship.comfort = 99.0;
+        relationship.boundary_pressure = 1.0;
+    }
+    apply_relationship_event_row_to_state(
+        &mut soul,
+        &mut world,
+        calibrated_positive_relationship_row(5, 100, 100),
+    );
+    let relationship = &soul.relationships["user"];
+    assert!((0.0..=100.0).contains(&relationship.comfort));
+    assert!((0.0..=100.0).contains(&relationship.boundary_pressure));
+
+    let (mut soul, mut world) = soul_and_world();
+    {
+        let relationship = soul.relationships.get_mut("user").expect("user relation");
+        relationship.conflict = 99.0;
+        relationship.boundary_pressure = 99.0;
+    }
+    apply_relationship_event_row_to_state(
+        &mut soul,
+        &mut world,
+        calibrated_negative_relationship_row(5, 100, 100),
+    );
+    let relationship = &soul.relationships["user"];
+    assert!((0.0..=100.0).contains(&relationship.conflict));
+    assert!((0.0..=100.0).contains(&relationship.boundary_pressure));
 }
 
 #[test]
@@ -3796,6 +4568,19 @@ fn relationship_event_row_rejects_axis_out_of_range() {
 }
 
 #[test]
+fn relationship_event_row_rejects_predictability_as_modifier_scale() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "predictability", 40);
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "axis_out_of_range:predictability"
+    );
+}
+
+#[test]
 fn relationship_event_row_rejects_modifier_out_of_range() {
     let mut row = relationship_event_base_row();
     set_row_i64(&mut row, "salience", 101);
@@ -3826,7 +4611,10 @@ fn relationship_event_row_rejects_bad_entity() {
     let result = compile_relationship_event_row(row, |_| {});
 
     assert_eq!(result.trace.form_rows_rejected, 1);
-    assert_eq!(result.rejected_rows[0].reason, "entity_resolution_failed");
+    assert_eq!(
+        result.rejected_rows[0].reason,
+        "actor_entity_resolution_failed"
+    );
 }
 
 #[test]
@@ -4143,4 +4931,190 @@ fn door_chain_numeric_event_compiles_without_direction() {
         .relationship_delta_source
         .values()
         .any(|source| source == "numeric_event_v2"));
+}
+
+#[test]
+fn relationship_event_row_rejects_intent_seventy() {
+    let mut row = relationship_event_base_row();
+    set_row_i64(&mut row, "intent", 70);
+    let result = compile_relationship_event_row(row, |_| {});
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "axis_out_of_range:intent");
+}
+
+#[test]
+fn legacy_relationship_row_with_axis_affection_as_key_gets_rejected() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Hi", "Aurora relaxes.");
+    let response = parse_eval_form_response(
+        r#"{
+          "relationship_rows": [{
+            "axis_affection": 3,
+            "direction": "increase",
+            "evidence_quote": "Aurora relaxes.",
+            "tags": ["relationship"]
+          }]
+        }"#,
+    )
+    .expect("parsed");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "relationship dimension is not allowed");
+}
+
+#[test]
+fn legacy_relationship_row_rejects_missing_dimension() {
+    let (soul, world) = soul_and_world();
+    let (spec, context) = spec_and_context(&soul, &world, "Hi", "Aurora relaxes.");
+    let response = EvalFormResponse {
+        relationship_rows: vec![RelationshipRow {
+            source_soul_id: "aurora_soul".into(),
+            target_entity_id: "default_player".into(),
+            dimension: None, 
+            direction: Some(RelationshipDirection::Increase),
+            evidence_quote: "Aurora relaxes.".into(),
+            ..RelationshipRow::default()
+        }],
+        ..EvalFormResponse::default()
+    };
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 1);
+    assert_eq!(result.rejected_rows[0].reason, "relationship dimension is not allowed");
+}
+
+#[test]
+fn test_regression_evaluator_form_fixes() {
+    let (mut soul, world) = soul_and_world();
+    soul.character_id = "aurora-uuid-12345".to_string();
+    soul.character_name = "Aurora".to_string();
+    
+    soul.memory.recent.clear();
+
+    let spec = build_eval_form_spec_with_player_persona(
+        &soul,
+        Some(&world),
+        "I stay outside.",
+        "Aurora watches.",
+        8,
+        "preset_male",
+        "Jun",
+    );
+    
+    let context = EvaluatorConversionContext {
+        active_soul_id: &soul.character_id,
+        active_soul_ids: vec![soul.character_id.clone()],
+        latest_user_message: "I stay outside.",
+        latest_narrator_response: "Aurora watches.",
+        session_world: Some(&world),
+        baseline_recent_event_id: Some("event_baseline_abc".to_string()),
+    };
+
+    // 1. Compile relationship_event source soul UUID + target preset_male
+    // Also tests actor_entity_id preset_male compiles
+    // And memory linked_event_id event_latest_turn compiles without event_rows
+    // And object row linked to event_latest_turn compiles
+    let raw_response = r#"{
+      "relationship_event_rows": [{
+        "row_enabled": 1,
+        "event_id": "event_latest_turn",
+        "actor_entity_id": "preset_male",
+        "relationship_source_soul_id": "aurora-uuid-12345",
+        "relationship_target_entity_id": "preset_male",
+        "perceived_by_entity_id": "aurora-uuid-12345",
+        "evidence_quote": "Aurora watches.",
+        "intent": 3,
+        "honesty": 1,
+        "reliability": 1,
+        "boundary_treatment": 5,
+        "responsiveness": 3,
+        "power_use": 1,
+        "evaluation_tone": 1,
+        "competence": 0,
+        "disclosure": 0,
+        "reciprocity": 1,
+        "repair": 0,
+        "predictability": 2,
+        "salience": 65,
+        "certainty": 95,
+        "directness": 90,
+        "costliness": 25,
+        "stakes": 50,
+        "repetition": 20,
+        "event_flags_u64": 35
+      }],
+      "memory_rows": [{
+        "row_enabled": 1,
+        "owner_soul_id": "aurora-uuid-12345",
+        "slot": "relationship_memory",
+        "content": "Aurora remembers that Jun stayed outside.",
+        "evidence_quote": "Aurora watches.",
+        "linked_event_id": "event_latest_turn"
+      }],
+      "object_rows": [{
+        "linked_event_id": "event_latest_turn",
+        "object_id": "apartment_door",
+        "property_changed": "status",
+        "new_value": "closed",
+        "evidence_quote": "Aurora watches."
+      }]
+    }"#;
+
+    let response = parse_eval_form_response(raw_response).expect("parsed successfully");
+    let result = compile_eval_form_response(&spec, &response, &context);
+
+    assert_eq!(result.trace.form_rows_rejected, 0);
+    assert_eq!(result.trace.form_rows_accepted, 3); // event, memory, object
+    
+    // 2. perceived_by_entity_id preset_male fails
+    let raw_response_bad_perceiver = r#"{
+      "relationship_event_rows": [{
+        "row_enabled": 1,
+        "event_id": "event_latest_turn",
+        "actor_entity_id": "preset_male",
+        "relationship_source_soul_id": "aurora-uuid-12345",
+        "relationship_target_entity_id": "preset_male",
+        "perceived_by_entity_id": "preset_male",
+        "evidence_quote": "Aurora watches.",
+        "intent": 3,
+        "honesty": 1,
+        "reliability": 1,
+        "boundary_treatment": 5,
+        "responsiveness": 3,
+        "power_use": 1,
+        "evaluation_tone": 1,
+        "competence": 0,
+        "disclosure": 0,
+        "reciprocity": 1,
+        "repair": 0,
+        "predictability": 2,
+        "salience": 65,
+        "certainty": 95,
+        "directness": 90,
+        "costliness": 25,
+        "stakes": 50,
+        "repetition": 20,
+        "event_flags_u64": 35
+      }]
+    }"#;
+    let response_bad = parse_eval_form_response(raw_response_bad_perceiver).unwrap();
+    let result_bad = compile_eval_form_response(&spec, &response_bad, &context);
+    assert_eq!(result_bad.trace.form_rows_rejected, 1);
+    assert_eq!(result_bad.rejected_rows[0].reason, "perceived_by_entity_resolution_failed");
+
+    // 3. Malformed evidence_quote with unescaped dialogue comma is repaired and parses successfully
+    let raw_response_malformed_quote = r#"{
+      "memory_rows": [{
+        "row_enabled": 1,
+        "owner_soul_id": "aurora-uuid-12345",
+        "slot": "relationship_memory",
+        "content": "Aurora remembers what was said.",
+        "evidence_quote": "I said, "Hello," and walked away.",
+        "linked_event_id": "event_latest_turn"
+      }]
+    }"#;
+    let parsed_repair = parse_eval_form_response(raw_response_malformed_quote).expect("repaired successfully");
+    assert_eq!(parsed_repair.memory_rows[0].evidence_quote, "I said, \"Hello,\" and walked away.");
 }
