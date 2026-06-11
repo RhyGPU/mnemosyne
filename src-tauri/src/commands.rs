@@ -61,10 +61,13 @@ use crate::{
         api::{
             build_command_help_prompt, build_command_ooc_prompt, build_command_setup_prompt,
             build_command_soul_edit_agent_prompt, build_command_state_edit_prompt,
-            build_command_state_summary_prompt, build_evaluator_form_prompt_with_player_persona,
-            build_evaluator_form_prompt_compact_with_player_persona, build_evaluator_prompt,
-            build_narrator_system_prompt, ApiMessage, ApiProvider, ApiProviderSettings,
-            PreparedApiPayload, CURRENT_EVALUATOR_CONTRACT_VERSION, CURRENT_EVALUATOR_PROMPT_VERSION,
+            build_command_state_summary_prompt,
+            build_evaluator_form_prompt_compact_with_player_persona,
+            build_evaluator_form_prompt_with_player_persona, build_evaluator_prompt,
+            build_narrator_system_prompt, build_structured_evaluator_prompt,
+            evaluator_patch_json_schema, ApiMessage, ApiProvider, ApiProviderSettings,
+            PreparedApiPayload, StructuredEnforcement, CURRENT_EVALUATOR_CONTRACT_VERSION,
+            CURRENT_EVALUATOR_PROMPT_VERSION,
         },
         mock::MockProvider,
     },
@@ -87,6 +90,7 @@ const NEXT_TURN_GATE_FALLBACK_MAX_MS: u64 = 120_000;
 const ANTI_REPLAY_FORCED_RETRY_ENABLED_DEFAULT: bool = false;
 const EVALUATOR_MODE_V1: &str = "evaluator_v1";
 const EVALUATOR_MODE_FORM_V1: &str = "evaluator_form_v1";
+const EVALUATOR_MODE_STRUCTURED_V1: &str = "evaluator_structured_v1";
 const EVALUATOR_MODE_DUAL_COMPARE: &str = "dual_compare";
 const OP_NORMAL_SEND: &str = "normal_send";
 const OP_REGENERATE: &str = "regenerate";
@@ -3525,7 +3529,10 @@ pub async fn run_evaluator_contract_test(
         narrator_timeout_ms: profile.narrator_timeout_ms,
         evaluator_timeout_ms: profile.evaluator_timeout_ms,
         evaluator_timeout_mode: profile.evaluator_timeout_mode.clone(),
-        evaluator_mode: profile.evaluator_mode.clone(),
+        // The contract test always exercises the FORM contract (form prompt +
+        // form validation), so the call must not route through the structured
+        // path even when the profile selects evaluator_structured_v1.
+        evaluator_mode: Some(EVALUATOR_MODE_FORM_V1.into()),
         wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn,
         allow_send_with_stale_state: profile.allow_send_with_stale_state,
         evaluator_background_enabled: profile.evaluator_background_enabled,
@@ -3567,33 +3574,31 @@ pub async fn run_evaluator_contract_test(
     );
 
     let provider = ApiProvider::default();
-    let raw_response = match complete_evaluator_with_config(
-        &provider,
-        &settings,
-        &system_prompt,
-        &user_message,
-    )
-    .await {
-        Ok(res) => res,
-        Err(err) => {
-            let now = db::now_ts();
-            let mut failed_profile = profile.clone();
-            failed_profile.evaluator_compatibility_status = 2; // failed
-            failed_profile.evaluator_last_tested_at = Some(now);
-            failed_profile.evaluator_last_failure_reason = Some(format!("LLM Call Error: {}", err));
-            failed_profile.evaluator_contract_version = CURRENT_EVALUATOR_CONTRACT_VERSION;
-            failed_profile.evaluator_prompt_version = CURRENT_EVALUATOR_PROMPT_VERSION;
+    let raw_response =
+        match complete_evaluator_with_config(&provider, &settings, &system_prompt, &user_message)
+            .await
+        {
+            Ok(res) => res.raw_text,
+            Err(err) => {
+                let now = db::now_ts();
+                let mut failed_profile = profile.clone();
+                failed_profile.evaluator_compatibility_status = 2; // failed
+                failed_profile.evaluator_last_tested_at = Some(now);
+                failed_profile.evaluator_last_failure_reason =
+                    Some(format!("LLM Call Error: {}", err));
+                failed_profile.evaluator_contract_version = CURRENT_EVALUATOR_CONTRACT_VERSION;
+                failed_profile.evaluator_prompt_version = CURRENT_EVALUATOR_PROMPT_VERSION;
 
-            let conn = state.conn.lock().map_err(|err| err.to_string())?;
-            let _ = db::upsert_provider_profile(&conn, &failed_profile);
+                let conn = state.conn.lock().map_err(|err| err.to_string())?;
+                let _ = db::upsert_provider_profile(&conn, &failed_profile);
 
-            return Ok(EvaluatorContractTestReport {
-                passed: false,
-                errors: vec![format!("LLM Call failed: {}", err)],
-                raw_response: String::new(),
-            });
-        }
-    };
+                return Ok(EvaluatorContractTestReport {
+                    passed: false,
+                    errors: vec![format!("LLM Call failed: {}", err)],
+                    raw_response: String::new(),
+                });
+            }
+        };
 
     let validation_result = state_engine::evaluator_form::validate::validate_evaluator_contract(
         &raw_response,
@@ -3641,7 +3646,8 @@ pub fn set_active_evaluator_profile(
     profile_id: Option<String>,
 ) -> Result<(), String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    db::set_active_evaluator_profile(&conn, &conversation_id, profile_id.as_deref()).map_err(|err| err.to_string())
+    db::set_active_evaluator_profile(&conn, &conversation_id, profile_id.as_deref())
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -7837,6 +7843,8 @@ pub async fn send_api_turn(
             &active_player_persona.persona_id,
             &active_player_persona.display_name,
         )
+    } else if selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1 {
+        build_structured_evaluator_prompt(&pre_baseline_soul, Some(&pre_baseline_session_world))
     } else {
         build_evaluator_prompt(&pre_baseline_soul, Some(&pre_baseline_session_world))
     };
@@ -7976,10 +7984,18 @@ pub async fn send_api_turn(
         updater_call_elapsed,
     );
     let parse_started = Instant::now();
-    let raw_updater_response = updater_response_result.as_ref().ok().cloned();
+    let raw_updater_response = updater_response_result
+        .as_ref()
+        .ok()
+        .map(|completion| completion.raw_text.clone());
+    let structured_enforcement = updater_response_result
+        .as_ref()
+        .ok()
+        .and_then(|completion| completion.structured_enforcement);
     let mut evaluator_pipeline_trace: serde_json::Value;
     let updater_result = match updater_response_result {
-        Ok(updater_response) => {
+        Ok(updater_completion) => {
+            let updater_response = updater_completion.raw_text;
             emit_dev_log(
                 &window,
                 "info",
@@ -8013,6 +8029,7 @@ pub async fn send_api_turn(
                 &evaluator_mode,
                 form_spec.clone(),
                 &updater_response,
+                updater_completion.structured_enforcement,
                 &pre_baseline_soul,
                 &pre_baseline_session_world,
                 &snapshot_user_text,
@@ -8044,6 +8061,8 @@ pub async fn send_api_turn(
         &conversation_id,
         if selected_evaluator_source == EVALUATOR_MODE_FORM_V1 {
             "parse evaluator_form_v1"
+        } else if selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1 {
+            "parse structured EnginePatch"
         } else {
             "parse EvaluatorOutputV1"
         },
@@ -8151,6 +8170,7 @@ pub async fn send_api_turn(
                         "model": state_updater_settings.model.trim(),
                         "evaluator_mode": evaluator_mode.as_str(),
                         "selected_evaluator_source": selected_evaluator_source,
+                        "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label),
                         "raw_evaluator_response": raw_updater_response.as_deref().unwrap_or_default(),
                         "normalized_evaluator_response": runtime.normalized_json.as_str(),
                         "parsed_evaluator_json": &evaluator_output,
@@ -8174,6 +8194,7 @@ pub async fn send_api_turn(
                     },
                     "evaluator_mode": evaluator_mode.as_str(),
                     "selected_evaluator_source": selected_evaluator_source,
+                    "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label),
                     "evaluator_raw_response": raw_updater_response.as_deref().unwrap_or_default(),
                     "evaluator_parsed_json": &evaluator_output,
                     "evaluator_json_normalized": runtime.normalized,
@@ -8359,6 +8380,7 @@ pub async fn send_api_turn(
                         "model": state_updater_settings.model.trim(),
                         "evaluator_mode": evaluator_mode.as_str(),
                         "selected_evaluator_source": selected_evaluator_source,
+                        "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label),
                         "raw_evaluator_response": raw_updater_response.as_deref().unwrap_or_default(),
                         "normalized_evaluator_response": raw_updater_response.as_deref().unwrap_or_default(),
                         "parsed_evaluator_json": serde_json::Value::Null,
@@ -11320,7 +11342,6 @@ fn build_compact_updater_payload_for_test(
     )
 }
 
-#[cfg(test)]
 fn parse_engine_patch_json(raw: &str) -> Result<EnginePatch, String> {
     let trimmed = raw.trim();
     let json = if let Some(stripped) = trimmed.strip_prefix("```json") {
@@ -11353,6 +11374,7 @@ fn evaluator_mode(settings: &ApiProviderSettings) -> String {
     match settings.evaluator_mode.as_deref() {
         Some(EVALUATOR_MODE_V1) => EVALUATOR_MODE_V1.into(),
         Some(EVALUATOR_MODE_FORM_V1) => EVALUATOR_MODE_FORM_V1.into(),
+        Some(EVALUATOR_MODE_STRUCTURED_V1) => EVALUATOR_MODE_STRUCTURED_V1.into(),
         Some(EVALUATOR_MODE_DUAL_COMPARE) => EVALUATOR_MODE_DUAL_COMPARE.into(),
         _ => EVALUATOR_MODE_FORM_V1.into(),
     }
@@ -11361,6 +11383,8 @@ fn evaluator_mode(settings: &ApiProviderSettings) -> String {
 fn selected_evaluator_source(mode: &str) -> &'static str {
     if mode == EVALUATOR_MODE_FORM_V1 || mode == EVALUATOR_MODE_DUAL_COMPARE {
         EVALUATOR_MODE_FORM_V1
+    } else if mode == EVALUATOR_MODE_STRUCTURED_V1 {
+        EVALUATOR_MODE_STRUCTURED_V1
     } else {
         EVALUATOR_MODE_V1
     }
@@ -11504,17 +11528,20 @@ fn insert_json_object_fields(target: &mut serde_json::Value, fields: &serde_json
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_selected_evaluator_runtime(
     evaluator_mode: &str,
     form_spec: Option<EvalFormSpec>,
     raw_response: &str,
+    structured_enforcement: Option<StructuredEnforcement>,
     soul: &Soul,
     session_world: &SessionWorld,
     latest_user_message: &str,
     latest_narrator_response: &str,
     baseline_recent_event_id: Option<String>,
 ) -> Result<RuntimeEvaluatorOutcome, String> {
-    if selected_evaluator_source(evaluator_mode) == EVALUATOR_MODE_FORM_V1 {
+    let source = selected_evaluator_source(evaluator_mode);
+    if source == EVALUATOR_MODE_FORM_V1 {
         let spec = form_spec.ok_or_else(|| {
             "Evaluator form runtime selected but EvalFormSpec was not generated".to_string()
         })?;
@@ -11527,6 +11554,8 @@ fn compile_selected_evaluator_runtime(
             latest_narrator_response,
             baseline_recent_event_id,
         )
+    } else if source == EVALUATOR_MODE_STRUCTURED_V1 {
+        compile_evaluator_structured_runtime(raw_response, structured_enforcement)
     } else {
         compile_evaluator_v1_runtime(
             raw_response,
@@ -11537,6 +11566,59 @@ fn compile_selected_evaluator_runtime(
             baseline_recent_event_id,
         )
     }
+}
+
+/// Runtime for `evaluator_structured_v1`: the model returns EnginePatch JSON
+/// directly under provider enforcement, so there is no EvaluatorOutputV1
+/// stage and no conversion layer — the patch parses with serde alone. With
+/// `json_schema` enforcement a strict-parse failure is a contract break, not
+/// formatting drift, so NO syntactic repair is attempted. At weaker
+/// enforcement levels the legacy code-fence stripping remains as fallback.
+fn compile_evaluator_structured_runtime(
+    raw_response: &str,
+    structured_enforcement: Option<StructuredEnforcement>,
+) -> Result<RuntimeEvaluatorOutcome, String> {
+    let strict_parse = serde_json::from_str::<EnginePatch>(raw_response.trim());
+    let (patch, normalized, warnings) = match strict_parse {
+        Ok(patch) => (patch, false, Vec::new()),
+        Err(err) if structured_enforcement == Some(StructuredEnforcement::JsonSchema) => {
+            return Err(format!(
+                "Structured evaluator returned schema-enforced output that failed strict parse: {err}"
+            ));
+        }
+        Err(_) => {
+            let patch = parse_engine_patch_json(raw_response)?;
+            (
+                patch,
+                true,
+                vec!["structured evaluator output required code-fence stripping".to_string()],
+            )
+        }
+    };
+    let normalized_json = serde_json::to_string(&patch)
+        .map_err(|err| format!("Structured evaluator patch serialization failed: {err}"))?;
+    let no_op = patch.is_empty();
+    Ok(RuntimeEvaluatorOutcome {
+        output: EvaluatorOutputV1::default(),
+        draft: state_engine::evaluator_ingest::NormalizedEvaluationDraft::default(),
+        normalized_json,
+        normalized,
+        warnings,
+        conversion: EvaluatorConversionReport {
+            patch,
+            accepted_candidate_ids: Vec::new(),
+            rejected_candidates: Vec::new(),
+            evidence_validations: Vec::new(),
+            no_op,
+        },
+        form_spec: None,
+        form_trace: None,
+        form_rejected_rows: Vec::new(),
+        form_response_parse_status: None,
+        comparison_trace: None,
+        partial_success: false,
+        partial_success_reason: None,
+    })
 }
 
 fn compile_evaluator_v1_runtime(
@@ -11961,27 +12043,52 @@ fn evaluator_timed_out(err: &str, elapsed: Duration, settings: &ApiProviderSetti
             .is_some_and(|timeout_ms| elapsed >= Duration::from_millis(timeout_ms))
 }
 
+/// Evaluator completion plus how strictly the provider enforced output shape.
+/// `structured_enforcement` is `Some` only for `evaluator_structured_v1`.
+#[derive(Debug, Clone)]
+struct EvaluatorCompletion {
+    raw_text: String,
+    structured_enforcement: Option<StructuredEnforcement>,
+}
+
 async fn complete_evaluator_with_config(
     provider: &ApiProvider,
     settings: &ApiProviderSettings,
     system_prompt: &str,
     user_message: &str,
-) -> Result<String, String> {
-    if let Some(timeout_ms) = effective_evaluator_timeout_ms(settings) {
-        provider
-            .complete_prompt_with_timeout(
+) -> Result<EvaluatorCompletion, String> {
+    let timeout = effective_evaluator_timeout_ms(settings).map(Duration::from_millis);
+    if selected_evaluator_source(&evaluator_mode(settings)) == EVALUATOR_MODE_STRUCTURED_V1 {
+        let schema = evaluator_patch_json_schema();
+        let completion = provider
+            .complete_structured_prompt(
                 settings,
                 system_prompt,
                 user_message,
                 0.0,
-                Duration::from_millis(timeout_ms),
+                timeout,
+                "engine_patch",
+                &schema,
             )
-            .await
+            .await?;
+        return Ok(EvaluatorCompletion {
+            raw_text: completion.raw_text,
+            structured_enforcement: Some(completion.enforcement),
+        });
+    }
+    let raw_text = if let Some(timeout) = timeout {
+        provider
+            .complete_prompt_with_timeout(settings, system_prompt, user_message, 0.0, timeout)
+            .await?
     } else {
         provider
             .complete_prompt(settings, system_prompt, user_message, 0.0)
-            .await
-    }
+            .await?
+    };
+    Ok(EvaluatorCompletion {
+        raw_text,
+        structured_enforcement: None,
+    })
 }
 
 fn gate_pending_evaluator_jobs(
@@ -12222,8 +12329,12 @@ async fn run_background_evaluator_job(
                     return Some(id);
                 }
             }
-            let query = "SELECT id FROM provider_profiles WHERE archived_at IS NULL AND model = ?1 LIMIT 1";
-            conn.query_row(query, [&state_updater_settings.model], |row| row.get::<_, String>(0)).ok()
+            let query =
+                "SELECT id FROM provider_profiles WHERE archived_at IS NULL AND model = ?1 LIMIT 1";
+            conn.query_row(query, [&state_updater_settings.model], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok()
         })
     };
 
@@ -12369,7 +12480,8 @@ async fn run_background_evaluator_job(
         )
     });
     let updater_system_prompt = if selected_evaluator_source == EVALUATOR_MODE_FORM_V1 {
-        let mut is_compact = state_updater_settings.evaluator_mode.as_deref() == Some("form_v1_compact");
+        let mut is_compact =
+            state_updater_settings.evaluator_mode.as_deref() == Some("form_v1_compact");
         if !is_compact {
             if let Some(ref p_id) = profile_id {
                 if let Ok(conn) = app.state::<AppState>().conn.lock() {
@@ -12400,6 +12512,8 @@ async fn run_background_evaluator_job(
                 &active_player_persona.display_name,
             )
         }
+    } else if selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1 {
+        build_structured_evaluator_prompt(&soul, Some(&session_world))
     } else {
         build_evaluator_prompt(&soul, Some(&session_world))
     };
@@ -12488,7 +12602,14 @@ async fn run_background_evaluator_job(
     )
     .await;
     let call_elapsed = call_started.elapsed();
-    let raw_response = response_result.as_ref().ok().cloned();
+    let raw_response = response_result
+        .as_ref()
+        .ok()
+        .map(|completion| completion.raw_text.clone());
+    let structured_enforcement = response_result
+        .as_ref()
+        .ok()
+        .and_then(|completion| completion.structured_enforcement);
 
     let received_elapsed = call_elapsed.as_millis() as u64;
     match &response_result {
@@ -12498,7 +12619,13 @@ async fn run_background_evaluator_job(
                 "success",
                 received_elapsed,
                 None,
-                Some("Evaluator response received".to_string()),
+                Some(match structured_enforcement {
+                    Some(enforcement) => format!(
+                        "Evaluator response received (structured enforcement: {})",
+                        enforcement.as_label()
+                    ),
+                    None => "Evaluator response received".to_string(),
+                }),
             );
             window.emit("pipeline-trace-updated", &pipeline_trace).ok();
             if let Some(n_id) = narrator_log_id {
@@ -12528,15 +12655,15 @@ async fn run_background_evaluator_job(
             }
         }
     }
-    if let (Some(log_id), Ok(response)) = (updater_log_id, response_result.as_ref()) {
+    if let (Some(log_id), Ok(completion)) = (updater_log_id, response_result.as_ref()) {
         let state = app.state::<AppState>();
         if let Ok(conn) = state.conn.lock() {
             let _ = db::update_llm_payload_log_response(
                 &conn,
                 log_id,
                 &db::LlmPayloadResponseUpdate {
-                    raw_provider_response: Some(response.clone()),
-                    normalized_response: Some(response.clone()),
+                    raw_provider_response: Some(completion.raw_text.clone()),
+                    normalized_response: Some(completion.raw_text.clone()),
                     ..Default::default()
                 },
             );
@@ -12555,11 +12682,12 @@ async fn run_background_evaluator_job(
         return;
     }
 
-    let runtime = match response_result.and_then(|response| {
+    let runtime = match response_result.and_then(|completion| {
         compile_selected_evaluator_runtime(
             &evaluator_mode,
             form_spec.clone(),
-            &response,
+            &completion.raw_text,
+            completion.structured_enforcement,
             &soul,
             &session_world,
             &snapshot_user_text,
@@ -12694,6 +12822,7 @@ async fn run_background_evaluator_job(
                     "model": state_updater_settings.model.trim(),
                     "evaluator_mode": evaluator_mode.as_str(),
                     "selected_evaluator_source": selected_evaluator_source,
+                    "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label),
                     "raw_evaluator_response": raw_response.as_deref().unwrap_or_default(),
                     "normalized_evaluator_response": raw_response.as_deref().unwrap_or_default(),
                     "parsed_evaluator_json": serde_json::Value::Null,
@@ -12754,7 +12883,13 @@ async fn run_background_evaluator_job(
                 false,
             );
             if let Some(ref p_id) = profile_id {
-                handle_evaluator_streak_and_fallback(&app, &window, &job.conversation_id, p_id, false);
+                handle_evaluator_streak_and_fallback(
+                    &app,
+                    &window,
+                    &job.conversation_id,
+                    p_id,
+                    false,
+                );
             }
             return;
         }
@@ -13118,6 +13253,7 @@ async fn run_background_evaluator_job(
                 "model": state_updater_settings.model.trim(),
                 "evaluator_mode": evaluator_mode.as_str(),
                 "selected_evaluator_source": selected_evaluator_source,
+                "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label),
                 "raw_evaluator_response": raw_response.as_deref().unwrap_or_default(),
                 "normalized_evaluator_response": runtime.normalized_json.as_str(),
                 "parsed_evaluator_json": &evaluator_output,
@@ -13141,6 +13277,7 @@ async fn run_background_evaluator_job(
             },
             "evaluator_mode": evaluator_mode.as_str(),
             "selected_evaluator_source": selected_evaluator_source,
+            "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label),
             "evaluator_raw_response": raw_response.as_deref().unwrap_or_default(),
             "evaluator_parsed_json": &evaluator_output,
             "evaluator_json_normalized": runtime.normalized,
@@ -13295,6 +13432,7 @@ async fn run_background_evaluator_job(
             "model": state_updater_settings.model.trim(),
             "evaluator_mode": evaluator_mode.as_str(),
             "selected_evaluator_source": selected_evaluator_source,
+            "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label),
             "raw_evaluator_response": raw_response.as_deref().unwrap_or_default(),
             "normalized_evaluator_response": runtime.normalized_json.as_str(),
             "parsed_evaluator_json": &evaluator_output,
@@ -13325,6 +13463,7 @@ async fn run_background_evaluator_job(
         },
         "evaluator_mode": evaluator_mode.as_str(),
         "selected_evaluator_source": selected_evaluator_source,
+        "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label),
         "evaluator_raw_response": raw_response.as_deref().unwrap_or_default(),
         "evaluator_parsed_json": &evaluator_output,
         "evaluator_json_normalized": runtime.normalized,
@@ -13404,7 +13543,13 @@ async fn run_background_evaluator_job(
     if !enrichment_stale_skipped {
         if let Some(ref p_id) = profile_id {
             let is_success_nonempty = final_job_status == "completed" && !engine_patch.is_empty();
-            handle_evaluator_streak_and_fallback(&app, &window, &job.conversation_id, p_id, is_success_nonempty);
+            handle_evaluator_streak_and_fallback(
+                &app,
+                &window,
+                &job.conversation_id,
+                p_id,
+                is_success_nonempty,
+            );
         }
     }
 }
@@ -13426,21 +13571,38 @@ fn handle_evaluator_streak_and_fallback(
     if is_success_nonempty {
         let _ = db::reset_evaluator_empty_patch_streak(conn, conversation_id, profile_id);
     } else {
-        if let Ok(new_streak) = db::increment_evaluator_empty_patch_streak(conn, conversation_id, profile_id) {
-            let _ = window.emit("evaluator_empty_patch_streak_incremented", serde_json::json!({
-                "conversation_id": conversation_id,
-                "profile_id": profile_id,
-                "streak": new_streak,
-            }));
+        if let Ok(new_streak) =
+            db::increment_evaluator_empty_patch_streak(conn, conversation_id, profile_id)
+        {
+            let _ = window.emit(
+                "evaluator_empty_patch_streak_incremented",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "profile_id": profile_id,
+                    "streak": new_streak,
+                }),
+            );
 
             if new_streak >= 2 {
-                if let Ok(Some(fallback_profile)) = db::get_last_known_good_evaluator_profile(conn) {
-                    if let Ok(_) = db::set_active_evaluator_profile(conn, conversation_id, Some(&fallback_profile.id)) {
-                        let _ = db::reset_evaluator_empty_patch_streak(conn, conversation_id, profile_id);
-                        let _ = window.emit("evaluator_auto_fallback_triggered", serde_json::json!({
-                            "conversation_id": conversation_id,
-                            "profile_id": fallback_profile.id,
-                        }));
+                if let Ok(Some(fallback_profile)) = db::get_last_known_good_evaluator_profile(conn)
+                {
+                    if let Ok(_) = db::set_active_evaluator_profile(
+                        conn,
+                        conversation_id,
+                        Some(&fallback_profile.id),
+                    ) {
+                        let _ = db::reset_evaluator_empty_patch_streak(
+                            conn,
+                            conversation_id,
+                            profile_id,
+                        );
+                        let _ = window.emit(
+                            "evaluator_auto_fallback_triggered",
+                            serde_json::json!({
+                                "conversation_id": conversation_id,
+                                "profile_id": fallback_profile.id,
+                            }),
+                        );
                     }
                 }
             }
@@ -19455,6 +19617,7 @@ mod tests {
             EVALUATOR_MODE_FORM_V1,
             Some(spec),
             &door_entry_form_response_json(&soul.character_id),
+            None,
             &soul,
             &world,
             &user,
@@ -19464,6 +19627,93 @@ mod tests {
         .expect("compile selected form");
 
         assert!(!outcome.conversion.patch.is_empty());
+        assert!(outcome.conversion.patch.world_patch.is_some());
+    }
+
+    #[test]
+    fn structured_mode_selection_and_labels() {
+        let mut settings = evaluator_test_settings();
+        settings.evaluator_mode = Some(EVALUATOR_MODE_STRUCTURED_V1.into());
+
+        assert_eq!(evaluator_mode(&settings), EVALUATOR_MODE_STRUCTURED_V1);
+        assert_eq!(
+            selected_evaluator_source(EVALUATOR_MODE_STRUCTURED_V1),
+            EVALUATOR_MODE_STRUCTURED_V1
+        );
+        assert_eq!(
+            evaluator_provider_label(EVALUATOR_MODE_STRUCTURED_V1, true),
+            "evaluator_structured_v1_background"
+        );
+    }
+
+    #[test]
+    fn structured_prompt_omits_embedded_patch_schema() {
+        let soul = new_default_soul("Aurora");
+        let structured = build_structured_evaluator_prompt(&soul, None);
+
+        assert!(!structured.contains("Patch schema:"));
+        assert!(structured.contains("[CURRENT STATE]"));
+
+        // The legacy prose-schema prompt is unchanged by the refactor.
+        let legacy = crate::providers::api::build_state_updater_prompt(&soul, None);
+        assert!(legacy.contains("Patch schema:"));
+        assert!(legacy.contains("[CURRENT STATE]"));
+    }
+
+    #[test]
+    fn structured_runtime_parses_engine_patch_without_conversion_layer() {
+        let raw = r#"{"schema_version":1,"soul_patch":{"new_memories":[{"content":"Aurora noticed the visitor's steady answer.","tag":"observation"}]},"world_patch":{"recent_event":"Aurora let the visitor in."}}"#;
+
+        let outcome =
+            compile_evaluator_structured_runtime(raw, Some(StructuredEnforcement::JsonSchema))
+                .expect("structured runtime");
+
+        assert!(!outcome.conversion.patch.is_empty());
+        assert!(!outcome.conversion.no_op);
+        assert!(!outcome.normalized);
+        assert!(outcome.warnings.is_empty());
+        assert!(outcome.form_spec.is_none());
+    }
+
+    #[test]
+    fn structured_runtime_skips_repair_under_schema_enforcement() {
+        let fenced = "```json\n{\"schema_version\":1}\n```";
+
+        // Schema-enforced output must parse with serde alone — a fence means
+        // the provider broke the contract, so no salvage is attempted.
+        assert!(compile_evaluator_structured_runtime(
+            fenced,
+            Some(StructuredEnforcement::JsonSchema)
+        )
+        .is_err());
+
+        // At weaker enforcement levels the fence-stripping fallback applies.
+        let outcome =
+            compile_evaluator_structured_runtime(fenced, Some(StructuredEnforcement::JsonObject))
+                .expect("salvaged");
+        assert!(outcome.normalized);
+        assert!(!outcome.warnings.is_empty());
+        assert!(outcome.conversion.no_op);
+    }
+
+    #[test]
+    fn structured_runtime_routes_through_selected_compile() {
+        let (soul, world, user, narrator, _) = form_runtime_fixture();
+        let raw = r#"{"schema_version":1,"world_patch":{"recent_event":"The visitor entered the apartment."}}"#;
+
+        let outcome = compile_selected_evaluator_runtime(
+            EVALUATOR_MODE_STRUCTURED_V1,
+            None,
+            raw,
+            Some(StructuredEnforcement::JsonSchema),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect("structured selected");
+
         assert!(outcome.conversion.patch.world_patch.is_some());
     }
 
@@ -19523,6 +19773,7 @@ mod tests {
             &evaluator_mode(&settings),
             None,
             &evaluator_output_json_with_candidate(valid_evaluator_candidate()),
+            None,
             &soul,
             &world,
             &user,
@@ -19613,6 +19864,7 @@ mod tests {
             EVALUATOR_MODE_FORM_V1,
             Some(spec),
             "not json",
+            None,
             &soul,
             &world,
             &user,

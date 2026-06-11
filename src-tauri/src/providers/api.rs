@@ -603,12 +603,19 @@ impl ApiProvider {
             Err(_) => {}
         }
 
-        self.complete_prompt_with_format(settings, system_prompt, user_text, temperature, timeout, None)
-            .await
-            .map(|raw_text| StructuredCompletion {
-                raw_text,
-                enforcement: StructuredEnforcement::None,
-            })
+        self.complete_prompt_with_format(
+            settings,
+            system_prompt,
+            user_text,
+            temperature,
+            timeout,
+            None,
+        )
+        .await
+        .map(|raw_text| StructuredCompletion {
+            raw_text,
+            enforcement: StructuredEnforcement::None,
+        })
     }
 
     async fn complete_prompt_with_format(
@@ -1021,7 +1028,7 @@ pub fn build_command_help_prompt() -> &'static str {
     COMMAND_HELP_PROMPT
 }
 
-pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWorld>) -> String {
+fn state_updater_current_state_block(soul: &Soul, session_world: Option<&SessionWorld>) -> String {
     let world = session_world
         .map(SessionWorld::world_log)
         .unwrap_or_else(|| soul.world.clone());
@@ -1061,6 +1068,24 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
             )
         })
         .collect::<Vec<_>>();
+    format!(
+        "[CURRENT STATE]\nCharacter: {}\nActive Soul ID: {}\nLocation: {}\nTime: {}\nActive plot: {}\nRecent event: {}\nRelationships:\n{}",
+        soul.character_name,
+        active_soul_id,
+        clean_summary_value(&world.location, "Unspecified"),
+        normalize_updater_time(&world.time_elapsed),
+        active_plot,
+        recent_event,
+        if relationship_summary.is_empty() {
+            "None".into()
+        } else {
+            relationship_summary.join("\n")
+        },
+    )
+}
+
+pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWorld>) -> String {
+    let active_soul_id = clean_summary_value(&soul.character_id, "active_soul");
     let patch_schema = serde_json::json!({
         "schema_version": 1,
         "soul_patch": {
@@ -1138,18 +1163,22 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
     });
     let patch_schema = serde_json::to_string(&patch_schema).unwrap_or_default();
     format!(
-        "{STATE_UPDATER_SYSTEM_PROMPT}\n\nPatch schema:\n{patch_schema}\n\n[CURRENT STATE]\nCharacter: {}\nActive Soul ID: {}\nLocation: {}\nTime: {}\nActive plot: {}\nRecent event: {}\nRelationships:\n{}",
-        soul.character_name,
-        active_soul_id,
-        clean_summary_value(&world.location, "Unspecified"),
-        normalize_updater_time(&world.time_elapsed),
-        active_plot,
-        recent_event,
-        if relationship_summary.is_empty() {
-            "None".into()
-        } else {
-            relationship_summary.join("\n")
-        },
+        "{STATE_UPDATER_SYSTEM_PROMPT}\n\nPatch schema:\n{patch_schema}\n\n{}",
+        state_updater_current_state_block(soul, session_world),
+    )
+}
+
+/// System prompt for `evaluator_structured_v1`: the state-updater rules plus
+/// current state WITHOUT the embedded example patch JSON. The patch shape is
+/// supplied to the provider as an enforced JSON schema (`response_format:
+/// json_schema`), so describing it again in prose only burns prompt tokens.
+pub fn build_structured_evaluator_prompt(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+) -> String {
+    format!(
+        "{STATE_UPDATER_SYSTEM_PROMPT}\n\n{}",
+        state_updater_current_state_block(soul, session_world),
     )
 }
 

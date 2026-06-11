@@ -527,7 +527,13 @@ export type ApiProviderSettings = {
   narrator_timeout_ms?: number | null;
   evaluator_timeout_ms?: number | null;
   evaluator_timeout_mode?: "finite" | "no_app_timeout" | string | null;
-  evaluator_mode?: "evaluator_v1" | "evaluator_form_v1" | "dual_compare" | string | null;
+  evaluator_mode?:
+    | "evaluator_v1"
+    | "evaluator_form_v1"
+    | "evaluator_structured_v1"
+    | "dual_compare"
+    | string
+    | null;
   wait_for_evaluator_before_next_turn?: boolean | null;
   allow_send_with_stale_state?: boolean | null;
   evaluator_background_enabled?: boolean | null;
