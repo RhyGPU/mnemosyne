@@ -7876,6 +7876,11 @@ pub async fn send_api_turn(
         });
     }
     let updater_payload_started = Instant::now();
+    let mut state_updater_settings = state_updater_settings;
+    if let Ok(conn) = state.conn.lock() {
+        state_updater_settings.evaluator_mode =
+            resolve_evaluator_mode_setting(&conn, &conversation_id, &state_updater_settings);
+    }
     let evaluator_mode = evaluator_mode(&state_updater_settings);
     let selected_evaluator_source = selected_evaluator_source(&evaluator_mode);
     let form_spec = (selected_evaluator_source == EVALUATOR_MODE_FORM_V1).then(|| {
@@ -11445,6 +11450,55 @@ fn selected_evaluator_source(mode: &str) -> &'static str {
     }
 }
 
+/// Active evaluator profile for a conversation: the explicitly selected one,
+/// falling back to the first unarchived profile matching the settings model
+/// (mirrors the background job's profile_id resolution).
+fn active_evaluator_profile_for_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+    settings: &ApiProviderSettings,
+) -> Option<db::ProviderProfile> {
+    if let Ok(conv) = db::get_conversation_summary(conn, conversation_id) {
+        if let Some(id) = conv.active_evaluator_profile_id {
+            if let Ok(profile) = db::get_provider_profile(conn, &id) {
+                return Some(profile);
+            }
+        }
+    }
+    let id = conn
+        .query_row(
+            "SELECT id FROM provider_profiles WHERE archived_at IS NULL AND model = ?1 LIMIT 1",
+            [&settings.model],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()?;
+    db::get_provider_profile(conn, &id).ok()
+}
+
+/// Resolve the raw evaluator-mode setting for this turn. Explicit settings
+/// win; otherwise the active profile's stored mode (kept raw so values like
+/// "form_v1_compact" survive for the compact-prompt check); otherwise a
+/// profile that probed json_schema-level structured support defaults to
+/// evaluator_structured_v1. Returns None when nothing overrides the built-in
+/// form_v1 default.
+fn resolve_evaluator_mode_setting(
+    conn: &Connection,
+    conversation_id: &str,
+    settings: &ApiProviderSettings,
+) -> Option<String> {
+    if settings.evaluator_mode.is_some() {
+        return settings.evaluator_mode.clone();
+    }
+    let profile = active_evaluator_profile_for_conversation(conn, conversation_id, settings)?;
+    if profile.evaluator_mode.is_some() {
+        return profile.evaluator_mode;
+    }
+    if profile.structured_output_support == STRUCTURED_SUPPORT_JSON_SCHEMA {
+        return Some(EVALUATOR_MODE_STRUCTURED_V1.into());
+    }
+    None
+}
+
 fn evaluator_provider_label(mode: &str, background: bool) -> String {
     let source = selected_evaluator_source(mode);
     if background {
@@ -12251,7 +12305,16 @@ fn start_background_evaluator_job(
 ) -> Result<db::EvaluatorJob, String> {
     let timeout_ms = effective_evaluator_timeout_ms(&state_updater_settings);
     let timeout_mode = evaluator_timeout_mode(&state_updater_settings);
-    let mode = evaluator_mode(&state_updater_settings);
+    let mode = {
+        let state = app.state::<AppState>();
+        let resolved = state.conn.lock().ok().and_then(|conn| {
+            resolve_evaluator_mode_setting(&conn, &conversation_id, &state_updater_settings)
+        });
+        evaluator_mode(&ApiProviderSettings {
+            evaluator_mode: resolved.or_else(|| state_updater_settings.evaluator_mode.clone()),
+            ..state_updater_settings.clone()
+        })
+    };
     let job = db::EvaluatorJob {
         evaluator_job_id: format!("eval_job_{}", uuid_like_id()),
         conversation_id: conversation_id.clone(),
@@ -12507,6 +12570,16 @@ async fn run_background_evaluator_job(
         };
     }
 
+    let mut state_updater_settings = state_updater_settings;
+    let resolved_evaluator_mode = {
+        let state = app.state::<AppState>();
+        state.conn.lock().ok().and_then(|conn| {
+            resolve_evaluator_mode_setting(&conn, &job.conversation_id, &state_updater_settings)
+        })
+    };
+    if let Some(mode) = resolved_evaluator_mode {
+        state_updater_settings.evaluator_mode = Some(mode);
+    }
     let evaluator_mode = evaluator_mode(&state_updater_settings);
     let selected_evaluator_source = selected_evaluator_source(&evaluator_mode);
     let active_player_persona = {
@@ -19769,6 +19842,79 @@ mod tests {
         assert_eq!(
             structured_support_level(StructuredEnforcement::JsonSchema, false),
             STRUCTURED_SUPPORT_UNTESTED
+        );
+    }
+
+    #[test]
+    fn evaluator_mode_defaults_to_structured_for_json_schema_profiles() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        db::upsert_soul(&conn, &soul).expect("soul");
+        db::ensure_conversation(&conn, "conv-structured", &soul.character_id)
+            .expect("conversation");
+        let mut profile = ProviderProfile {
+            id: "prof-structured".into(),
+            name: "Structured".into(),
+            base_url: "https://api.example/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            narrator_timeout_ms: None,
+            evaluator_timeout_ms: None,
+            evaluator_timeout_mode: None,
+            evaluator_mode: None,
+            wait_for_evaluator_before_next_turn: None,
+            allow_send_with_stale_state: None,
+            evaluator_background_enabled: None,
+            anti_replay_forced_retry_enabled: None,
+            archived_at: None,
+            narrator_compatibility_status: 0,
+            evaluator_compatibility_status: 1,
+            command_compatibility_status: 0,
+            evaluator_contract_version: 0,
+            evaluator_prompt_version: 0,
+            evaluator_last_tested_at: None,
+            evaluator_last_failure_reason: None,
+            structured_output_support: STRUCTURED_SUPPORT_JSON_SCHEMA,
+        };
+        db::upsert_provider_profile(&conn, &profile).expect("profile");
+        db::set_active_evaluator_profile(&conn, "conv-structured", Some("prof-structured"))
+            .expect("set active profile");
+
+        let mut settings = evaluator_test_settings();
+        settings.evaluator_mode = None;
+
+        // Probed json_schema support upgrades the unset default to structured.
+        assert_eq!(
+            resolve_evaluator_mode_setting(&conn, "conv-structured", &settings).as_deref(),
+            Some(EVALUATOR_MODE_STRUCTURED_V1)
+        );
+
+        // Explicit settings always win.
+        settings.evaluator_mode = Some(EVALUATOR_MODE_V1.into());
+        assert_eq!(
+            resolve_evaluator_mode_setting(&conn, "conv-structured", &settings).as_deref(),
+            Some(EVALUATOR_MODE_V1)
+        );
+
+        // An explicit profile mode beats the auto-default.
+        settings.evaluator_mode = None;
+        profile.evaluator_mode = Some(EVALUATOR_MODE_FORM_V1.into());
+        db::upsert_provider_profile(&conn, &profile).expect("profile update");
+        assert_eq!(
+            resolve_evaluator_mode_setting(&conn, "conv-structured", &settings).as_deref(),
+            Some(EVALUATOR_MODE_FORM_V1)
+        );
+
+        // Below json_schema level nothing overrides the built-in default.
+        profile.evaluator_mode = None;
+        profile.structured_output_support = STRUCTURED_SUPPORT_JSON_OBJECT;
+        db::upsert_provider_profile(&conn, &profile).expect("profile downgrade");
+        assert_eq!(
+            resolve_evaluator_mode_setting(&conn, "conv-structured", &settings),
+            None
         );
     }
 
