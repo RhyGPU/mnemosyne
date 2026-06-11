@@ -17,7 +17,6 @@ use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 use state_engine::{
     consolidation::consolidate_soul,
-    memory::{restore_archived_memory, set_memory_pinned},
     context_compiler::{
         compile_context_for_session,
         compile_context_for_session_separate_user_message_with_player_persona_pending,
@@ -35,6 +34,7 @@ use state_engine::{
     },
     evaluator_ingest::{parse_evaluator_output_with_context, EvaluatorDraftContext},
     hidden_state::{parse_hidden_state, HiddenState},
+    memory::{restore_archived_memory, set_memory_pinned},
     patch::{
         is_premature_user_turn_event, is_retcon_or_correction_text,
         purge_premature_recent_events_from_world, EnginePatch, MemoryApplyAction, MemoryPatch,
@@ -57,7 +57,7 @@ use crate::{
         LlmPayloadLog, PlayerPersona, ProviderProfile, RestoreInactiveMessagesResult,
         SettingSummary, SoulSummary,
     },
-    pipeline_trace::{PipelineErrorCode, TurnPipelineTrace},
+    pipeline_trace::{PipelineErrorCode, TurnPipelineTrace, TurnTokenUsage},
     providers::{
         api::{
             build_command_help_prompt, build_command_ooc_prompt, build_command_setup_prompt,
@@ -67,8 +67,8 @@ use crate::{
             build_evaluator_form_prompt_with_player_persona, build_evaluator_prompt,
             build_narrator_system_prompt, build_structured_evaluator_prompt,
             evaluator_patch_json_schema, ApiMessage, ApiProvider, ApiProviderSettings,
-            PreparedApiPayload, StructuredEnforcement, CURRENT_EVALUATOR_CONTRACT_VERSION,
-            CURRENT_EVALUATOR_PROMPT_VERSION,
+            PreparedApiPayload, StructuredEnforcement, TokenUsage,
+            CURRENT_EVALUATOR_CONTRACT_VERSION, CURRENT_EVALUATOR_PROMPT_VERSION,
         },
         mock::MockProvider,
     },
@@ -7551,6 +7551,22 @@ pub async fn send_api_turn(
         }
     }
 
+    {
+        let reported = active_provider_completion.token_usage;
+        let reported_prompt = reported.and_then(|usage| usage.prompt_tokens);
+        let reported_completion = reported.and_then(|usage| usage.completion_tokens);
+        pipeline_trace.token_usage = Some(TurnTokenUsage {
+            narrator_prompt_tokens: Some(reported_prompt.unwrap_or(narrator_token_estimate as u64)),
+            narrator_completion_tokens: Some(
+                reported_completion.unwrap_or_else(|| {
+                    estimate_tokens(&active_provider_completion.raw_text) as u64
+                }),
+            ),
+            narrator_estimated: reported_prompt.is_none() || reported_completion.is_none(),
+            ..TurnTokenUsage::default()
+        });
+    }
+
     let narrator_pipeline_trace = serde_json::json!({
         "narrator_trace": {
             "request_id": request_id.as_str(),
@@ -8170,6 +8186,23 @@ pub async fn send_api_turn(
         .as_ref()
         .ok()
         .and_then(|completion| completion.structured_enforcement);
+    {
+        let (prompt_tokens, completion_tokens, estimated) = evaluator_token_usage_for_trace(
+            updater_response_result
+                .as_ref()
+                .ok()
+                .and_then(|completion| completion.token_usage),
+            &updater_system_prompt,
+            &updater_user_message,
+            raw_updater_response.as_deref(),
+        );
+        let usage = pipeline_trace
+            .token_usage
+            .get_or_insert_with(TurnTokenUsage::default);
+        usage.evaluator_prompt_tokens = prompt_tokens;
+        usage.evaluator_completion_tokens = completion_tokens;
+        usage.evaluator_estimated = estimated;
+    }
     let mut evaluator_pipeline_trace: serde_json::Value;
     let updater_result = match updater_response_result {
         Ok(updater_completion) => {
@@ -12276,6 +12309,7 @@ fn evaluator_timed_out(err: &str, elapsed: Duration, settings: &ApiProviderSetti
 struct EvaluatorCompletion {
     raw_text: String,
     structured_enforcement: Option<StructuredEnforcement>,
+    token_usage: Option<TokenUsage>,
 }
 
 async fn complete_evaluator_with_config(
@@ -12301,21 +12335,35 @@ async fn complete_evaluator_with_config(
         return Ok(EvaluatorCompletion {
             raw_text: completion.raw_text,
             structured_enforcement: Some(completion.enforcement),
+            token_usage: completion.token_usage,
         });
     }
-    let raw_text = if let Some(timeout) = timeout {
-        provider
-            .complete_prompt_with_timeout(settings, system_prompt, user_message, 0.0, timeout)
-            .await?
-    } else {
-        provider
-            .complete_prompt(settings, system_prompt, user_message, 0.0)
-            .await?
-    };
+    let completion = provider
+        .complete_prompt_with_usage(settings, system_prompt, user_message, 0.0, timeout)
+        .await?;
     Ok(EvaluatorCompletion {
-        raw_text,
+        raw_text: completion.raw_text,
         structured_enforcement: None,
+        token_usage: completion.token_usage,
     })
+}
+
+/// Fill the evaluator side of the trace's token accounting, falling back to
+/// character-based estimates when the provider reported no usage.
+fn evaluator_token_usage_for_trace(
+    token_usage: Option<TokenUsage>,
+    system_prompt: &str,
+    user_message: &str,
+    raw_response: Option<&str>,
+) -> (Option<u64>, Option<u64>, bool) {
+    let reported_prompt = token_usage.and_then(|usage| usage.prompt_tokens);
+    let reported_completion = token_usage.and_then(|usage| usage.completion_tokens);
+    let estimated = reported_prompt.is_none() || reported_completion.is_none();
+    let prompt_tokens = reported_prompt
+        .unwrap_or_else(|| (estimate_tokens(system_prompt) + estimate_tokens(user_message)) as u64);
+    let completion_tokens =
+        reported_completion.or_else(|| raw_response.map(|text| estimate_tokens(text) as u64));
+    (Some(prompt_tokens), completion_tokens, estimated)
 }
 
 fn gate_pending_evaluator_jobs(
@@ -12856,6 +12904,23 @@ async fn run_background_evaluator_job(
         .as_ref()
         .ok()
         .and_then(|completion| completion.structured_enforcement);
+    {
+        let (prompt_tokens, completion_tokens, estimated) = evaluator_token_usage_for_trace(
+            response_result
+                .as_ref()
+                .ok()
+                .and_then(|completion| completion.token_usage),
+            &updater_system_prompt,
+            &updater_user_message,
+            raw_response.as_deref(),
+        );
+        let usage = pipeline_trace
+            .token_usage
+            .get_or_insert_with(TurnTokenUsage::default);
+        usage.evaluator_prompt_tokens = prompt_tokens;
+        usage.evaluator_completion_tokens = completion_tokens;
+        usage.evaluator_estimated = estimated;
+    }
 
     let received_elapsed = call_elapsed.as_millis() as u64;
     match &response_result {
@@ -19384,6 +19449,7 @@ mod tests {
                     artifact_ref: None,
                 },
             ],
+            token_usage: None,
             evaluator_row_traces: vec![],
         };
 
@@ -19409,6 +19475,7 @@ mod tests {
             failing_stage: Some("evaluator_response_validated".to_string()),
             suggested_debug_action: Some("Fix constraints".to_string()),
             stages: vec![],
+            token_usage: None,
             evaluator_row_traces: vec![state_engine::evaluator_form::EvalRowTrace {
                 row_kind: "object".to_string(),
                 row_index: 0,
@@ -19990,8 +20057,8 @@ mod tests {
 
         // The pin must be reproduced by replaying the ledger, not by a
         // direct soul mutation that a rebuild would lose.
-        let rebuilt = db::rebuild_session_state(&conn, "conv-curation", &result.branch_id)
-            .expect("rebuild");
+        let rebuilt =
+            db::rebuild_session_state(&conn, "conv-curation", &result.branch_id).expect("rebuild");
         let replayed = rebuilt
             .soul
             .memory
@@ -20009,14 +20076,16 @@ mod tests {
             "unpin",
         )
         .expect("unpin through ledger");
-        assert!(!unpinned
-            .soul
-            .memory
-            .recent
-            .iter()
-            .find(|memory| memory.id == "existing-memory-1")
-            .expect("memory present")
-            .is_pinned);
+        assert!(
+            !unpinned
+                .soul
+                .memory
+                .recent
+                .iter()
+                .find(|memory| memory.id == "existing-memory-1")
+                .expect("memory present")
+                .is_pinned
+        );
 
         // Ineffective operations fail BEFORE anything reaches the ledger.
         assert!(curate_memory_with_conn(
@@ -20043,6 +20112,44 @@ mod tests {
             "delete",
         )
         .is_err());
+    }
+
+    #[test]
+    fn evaluator_token_usage_prefers_provider_report_over_estimates() {
+        let reported = evaluator_token_usage_for_trace(
+            Some(TokenUsage {
+                prompt_tokens: Some(500),
+                completion_tokens: Some(120),
+            }),
+            "system prompt",
+            "user message",
+            Some("raw response"),
+        );
+        assert_eq!(reported, (Some(500), Some(120), false));
+
+        let (prompt, completion, estimated) =
+            evaluator_token_usage_for_trace(None, "system prompt", "user message", Some("raw"));
+        assert!(estimated);
+        assert!(prompt.unwrap() > 0);
+        assert!(completion.is_some());
+
+        // A failed call has no response text: completion side stays unknown.
+        let (_, completion, estimated) =
+            evaluator_token_usage_for_trace(None, "system prompt", "user message", None);
+        assert!(estimated);
+        assert_eq!(completion, None);
+    }
+
+    #[test]
+    fn pipeline_trace_without_token_usage_still_deserializes() {
+        // Background jobs restore the narrator's persisted trace; traces
+        // written before token_usage existed must keep loading.
+        let trace = TurnPipelineTrace::new("req".into(), None, "conv".into(), 0);
+        let mut value = serde_json::to_value(&trace).expect("serializes");
+        value.as_object_mut().expect("object").remove("token_usage");
+        let restored: TurnPipelineTrace =
+            serde_json::from_value(value).expect("legacy trace deserializes");
+        assert_eq!(restored.token_usage, None);
     }
 
     #[test]
@@ -20940,12 +21047,14 @@ mod tests {
             finish_reason: Some("length".into()),
             provider_request_id: Some("req-initial".into()),
             provider_response_id: Some("resp-initial".into()),
+            token_usage: None,
         };
         let retry = ProviderCompletion {
             raw_text: "retry raw body".into(),
             finish_reason: Some("stop".into()),
             provider_request_id: Some("req-retry".into()),
             provider_response_id: Some("resp-retry".into()),
+            token_usage: None,
         };
         let update =
             llm_payload_response_update_from_completion(&retry, "Retry visible narration.");
@@ -21550,6 +21659,7 @@ mod tests {
             failing_stage: Some("evaluator_response_validated".to_string()),
             suggested_debug_action: None,
             stages: vec![],
+            token_usage: None,
             evaluator_row_traces: vec![state_engine::evaluator_form::EvalRowTrace {
                 row_kind: "object".to_string(),
                 row_index: 1,
@@ -21582,6 +21692,7 @@ mod tests {
             failing_stage: Some("evaluator_response_validated".to_string()),
             suggested_debug_action: None,
             stages: vec![],
+            token_usage: None,
             evaluator_row_traces: vec![state_engine::evaluator_form::EvalRowTrace {
                 row_kind: "relationship".to_string(),
                 row_index: 2,
@@ -21614,6 +21725,7 @@ mod tests {
             failing_stage: None,
             suggested_debug_action: None,
             stages: vec![],
+            token_usage: None,
             evaluator_row_traces: vec![state_engine::evaluator_form::EvalRowTrace {
                 row_kind: "event".to_string(),
                 row_index: 0,
@@ -21645,6 +21757,7 @@ mod tests {
             failing_stage: None,
             suggested_debug_action: None,
             stages: vec![],
+            token_usage: None,
             evaluator_row_traces: vec![
                 state_engine::evaluator_form::EvalRowTrace {
                     row_kind: "event".to_string(),

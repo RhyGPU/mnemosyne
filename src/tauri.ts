@@ -1315,6 +1315,15 @@ export type PipelineStageTrace = {
   artifact_ref?: string | null;
 };
 
+export type TurnTokenUsage = {
+  narrator_prompt_tokens?: number | null;
+  narrator_completion_tokens?: number | null;
+  narrator_estimated: boolean;
+  evaluator_prompt_tokens?: number | null;
+  evaluator_completion_tokens?: number | null;
+  evaluator_estimated: boolean;
+};
+
 export type TurnPipelineTrace = {
   request_id: string;
   turn_id?: string | null;
@@ -1325,6 +1334,7 @@ export type TurnPipelineTrace = {
   failing_stage?: string | null;
   suggested_debug_action?: string | null;
   stages: PipelineStageTrace[];
+  token_usage?: TurnTokenUsage | null;
 };
 
 export function listenPipelineTraceUpdated(

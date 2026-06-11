@@ -14,6 +14,30 @@ pub struct TurnPipelineTrace {
     pub stages: Vec<PipelineStageTrace>,
     #[serde(default)]
     pub evaluator_row_traces: Vec<EvalRowTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TurnTokenUsage>,
+}
+
+/// Per-turn token accounting for the trace panel. Counts come from the
+/// provider's `usage` block when reported; otherwise they are character-based
+/// estimates and the matching `*_estimated` flag is true.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TurnTokenUsage {
+    pub narrator_prompt_tokens: Option<u64>,
+    pub narrator_completion_tokens: Option<u64>,
+    pub narrator_estimated: bool,
+    pub evaluator_prompt_tokens: Option<u64>,
+    pub evaluator_completion_tokens: Option<u64>,
+    pub evaluator_estimated: bool,
+}
+
+impl TurnTokenUsage {
+    pub fn total_tokens(&self) -> u64 {
+        self.narrator_prompt_tokens.unwrap_or(0)
+            + self.narrator_completion_tokens.unwrap_or(0)
+            + self.evaluator_prompt_tokens.unwrap_or(0)
+            + self.evaluator_completion_tokens.unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -67,6 +91,7 @@ impl TurnPipelineTrace {
             suggested_debug_action: None,
             stages: Vec::new(),
             evaluator_row_traces: Vec::new(),
+            token_usage: None,
         }
     }
 

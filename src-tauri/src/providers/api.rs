@@ -350,10 +350,27 @@ impl StructuredEnforcement {
     }
 }
 
+/// Token counts reported by the provider for one completion. `None` fields
+/// mean the provider did not report that side; callers fall back to
+/// `estimate_tokens` so the pipeline trace always has a number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StructuredCompletion {
     pub raw_text: String,
     pub enforcement: StructuredEnforcement,
+    pub token_usage: Option<TokenUsage>,
+}
+
+/// A plain prompt completion that retains provider-reported token usage.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptCompletion {
+    pub raw_text: String,
+    pub token_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,6 +416,7 @@ pub struct ProviderCompletion {
     pub finish_reason: Option<String>,
     pub provider_request_id: Option<String>,
     pub provider_response_id: Option<String>,
+    pub token_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -410,6 +428,7 @@ struct ApiRequestMessage {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
+    usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -535,6 +554,28 @@ impl ApiProvider {
             None,
         )
         .await
+        .map(|completion| completion.raw_text)
+    }
+
+    /// Like `complete_prompt_with_timeout` but keeps the provider-reported
+    /// token usage for cost/trace reporting.
+    pub async fn complete_prompt_with_usage(
+        &self,
+        settings: &ApiProviderSettings,
+        system_prompt: &str,
+        user_text: &str,
+        temperature: f32,
+        timeout: Option<Duration>,
+    ) -> Result<PromptCompletion, String> {
+        self.complete_prompt_with_format(
+            settings,
+            system_prompt,
+            user_text,
+            temperature,
+            timeout,
+            None,
+        )
+        .await
     }
 
     /// Structured completion with provider-enforced output, degrading gracefully:
@@ -571,10 +612,11 @@ impl ApiProvider {
             )
             .await
         {
-            Ok(raw_text) => {
+            Ok(completion) => {
                 return Ok(StructuredCompletion {
-                    raw_text,
+                    raw_text: completion.raw_text,
                     enforcement: StructuredEnforcement::JsonSchema,
+                    token_usage: completion.token_usage,
                 })
             }
             Err(error) if !is_response_format_rejection(&error) => return Err(error),
@@ -593,10 +635,11 @@ impl ApiProvider {
             )
             .await
         {
-            Ok(raw_text) => {
+            Ok(completion) => {
                 return Ok(StructuredCompletion {
-                    raw_text,
+                    raw_text: completion.raw_text,
                     enforcement: StructuredEnforcement::JsonObject,
+                    token_usage: completion.token_usage,
                 })
             }
             Err(error) if !is_response_format_rejection(&error) => return Err(error),
@@ -612,9 +655,10 @@ impl ApiProvider {
             None,
         )
         .await
-        .map(|raw_text| StructuredCompletion {
-            raw_text,
+        .map(|completion| StructuredCompletion {
+            raw_text: completion.raw_text,
             enforcement: StructuredEnforcement::None,
+            token_usage: completion.token_usage,
         })
     }
 
@@ -626,7 +670,7 @@ impl ApiProvider {
         temperature: f32,
         timeout: Option<Duration>,
         response_format: Option<serde_json::Value>,
-    ) -> Result<String, String> {
+    ) -> Result<PromptCompletion, String> {
         let api_key = settings.api_key.trim();
         let model = settings.model.trim();
         let base_url = settings.base_url.trim();
@@ -682,11 +726,16 @@ impl ApiProvider {
             .await
             .map_err(|err| format!("API response parse failed: {err}"))?;
 
+        let token_usage = body.usage;
         body.choices
             .into_iter()
             .find_map(|choice| choice.message.content)
             .map(|content| content.trim().to_string())
             .filter(|content| !content.is_empty())
+            .map(|raw_text| PromptCompletion {
+                raw_text,
+                token_usage,
+            })
             .ok_or_else(|| "API response did not include assistant content".into())
     }
 
@@ -788,6 +837,7 @@ impl ApiProvider {
         let mut emitted_visible_len = 0;
         let mut provider_response_id = None;
         let mut finish_reason = None;
+        let mut token_usage = None;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|err| format!("API stream failed: {err}"))?;
@@ -802,6 +852,9 @@ impl ApiProvider {
                     }
                     if meta.finish_reason.is_some() {
                         finish_reason = meta.finish_reason;
+                    }
+                    if meta.usage.is_some() {
+                        token_usage = meta.usage;
                     }
                 }
                 if let Some(delta) = parse_sse_delta(&line)? {
@@ -827,6 +880,9 @@ impl ApiProvider {
                 if meta.finish_reason.is_some() {
                     finish_reason = meta.finish_reason;
                 }
+                if meta.usage.is_some() {
+                    token_usage = meta.usage;
+                }
             }
             if let Some(delta) = parse_sse_delta(pending.trim())? {
                 full_text.push_str(&delta);
@@ -850,6 +906,7 @@ impl ApiProvider {
             finish_reason,
             provider_request_id: None,
             provider_response_id,
+            token_usage,
         })
     }
 }
@@ -877,6 +934,7 @@ fn is_response_format_rejection(error: &str) -> bool {
 struct SseStreamMetadata {
     response_id: Option<String>,
     finish_reason: Option<String>,
+    usage: Option<TokenUsage>,
 }
 
 fn parse_sse_metadata(line: &str) -> Option<SseStreamMetadata> {
@@ -896,12 +954,19 @@ fn parse_sse_metadata(line: &str) -> Option<SseStreamMetadata> {
         .and_then(|reason| reason.as_str())
         .filter(|reason| !reason.is_empty())
         .map(str::to_string);
-    if response_id.is_none() && finish_reason.is_none() {
+    // Some providers attach usage to the final stream chunk; capture it when
+    // present so streaming completions get real counts instead of estimates.
+    let usage = value
+        .get("usage")
+        .and_then(|usage| serde_json::from_value::<TokenUsage>(usage.clone()).ok())
+        .filter(|usage| usage.prompt_tokens.is_some() || usage.completion_tokens.is_some());
+    if response_id.is_none() && finish_reason.is_none() && usage.is_none() {
         return None;
     }
     Some(SseStreamMetadata {
         response_id,
         finish_reason,
+        usage,
     })
 }
 
@@ -1779,6 +1844,53 @@ mod tests {
         assert!(serialized.contains("\"response_format\""));
         assert!(serialized.contains("\"json_schema\""));
         assert!(serialized.contains("\"strict\":true"));
+    }
+
+    #[test]
+    fn chat_response_captures_token_usage_when_reported() {
+        let body: ChatCompletionResponse = serde_json::from_str(
+            r#"{
+                "choices": [{"message": {"content": "hi"}}],
+                "usage": {"prompt_tokens": 120, "completion_tokens": 45, "total_tokens": 165}
+            }"#,
+        )
+        .expect("deserializes");
+        assert_eq!(
+            body.usage,
+            Some(TokenUsage {
+                prompt_tokens: Some(120),
+                completion_tokens: Some(45),
+            })
+        );
+
+        let without: ChatCompletionResponse =
+            serde_json::from_str(r#"{"choices": [{"message": {"content": "hi"}}]}"#)
+                .expect("deserializes");
+        assert_eq!(without.usage, None);
+    }
+
+    #[test]
+    fn sse_metadata_captures_usage_from_final_chunk() {
+        let meta = parse_sse_metadata(
+            r#"data: {"id":"resp-1","choices":[],"usage":{"prompt_tokens":80,"completion_tokens":33}}"#,
+        )
+        .expect("metadata parsed");
+        assert_eq!(
+            meta.usage,
+            Some(TokenUsage {
+                prompt_tokens: Some(80),
+                completion_tokens: Some(33),
+            })
+        );
+
+        // A usage-only chunk (no id, no finish_reason) must still be surfaced.
+        let usage_only =
+            parse_sse_metadata(r#"data: {"usage":{"prompt_tokens":10,"completion_tokens":2}}"#)
+                .expect("usage-only chunk parsed");
+        assert!(usage_only.usage.is_some());
+
+        // An empty usage object is not a report.
+        assert!(parse_sse_metadata(r#"data: {"usage":{}}"#).is_none());
     }
 
     /// Strict-mode structured outputs require every object schema to be closed

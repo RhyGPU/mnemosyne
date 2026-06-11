@@ -3949,6 +3949,26 @@ export function App() {
               <div style={{ color: "#f87171", fontWeight: "bold" }}>Failing Stage: {latestPipelineTrace.failing_stage}</div>
             )}
           </div>
+          {latestPipelineTrace.token_usage && (
+            <div style={{ display: "flex", gap: "12px", marginBottom: "8px", fontSize: "11px", color: "#9ca3af" }}>
+              <div>
+                Narrator tokens:{" "}
+                <span style={{ color: "#f3f4f6" }}>
+                  {latestPipelineTrace.token_usage.narrator_prompt_tokens ?? "?"} in /{" "}
+                  {latestPipelineTrace.token_usage.narrator_completion_tokens ?? "?"} out
+                  {latestPipelineTrace.token_usage.narrator_estimated ? " (est.)" : ""}
+                </span>
+              </div>
+              <div>
+                Evaluator tokens:{" "}
+                <span style={{ color: "#f3f4f6" }}>
+                  {latestPipelineTrace.token_usage.evaluator_prompt_tokens ?? "—"} in /{" "}
+                  {latestPipelineTrace.token_usage.evaluator_completion_tokens ?? "—"} out
+                  {latestPipelineTrace.token_usage.evaluator_estimated ? " (est.)" : ""}
+                </span>
+              </div>
+            </div>
+          )}
           {latestPipelineTrace.suggested_debug_action && (
             <div style={{ padding: "6px 8px", backgroundColor: "#7f1d1d", color: "#fca5a5", borderRadius: "4px", marginBottom: "8px", fontSize: "11px" }}>
               <strong>Debug Suggestion:</strong> {latestPipelineTrace.suggested_debug_action}
