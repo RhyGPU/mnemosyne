@@ -300,6 +300,10 @@ pub struct ApiProviderSettings {
     pub allow_send_with_stale_state: Option<bool>,
     pub evaluator_background_enabled: Option<bool>,
     pub anti_replay_forced_retry_enabled: Option<bool>,
+    /// "fast" | "balanced" | "long_context"; missing/unknown means balanced.
+    /// Only "fast" changes behavior today: dialogue-only turns skip the
+    /// evaluator and are caught up on the next significant turn.
+    pub evaluator_execution_mode: Option<String>,
 }
 
 #[derive(Debug)]

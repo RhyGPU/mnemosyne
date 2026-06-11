@@ -141,6 +141,7 @@ const SETTINGS_DRAWER_TAB_STORAGE_KEY = "mnemosyne:settings_drawer_tab";
 const SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY = "mnemosyne:settings_first_launch_seen_v1";
 const CHAT_START_MODE_STORAGE_KEY = "mnemosyne:chat_start_mode";
 const SHOW_ARCHIVED_SESSIONS_STORAGE_KEY = "mnemosyne:show_archived_sessions";
+const EVALUATOR_EXECUTION_MODE_STORAGE_KEY = "mnemosyne:evaluator_execution_mode";
 const SESSIONS_PER_PAGE = 10;
 const DEV_CONSOLE_PAUSED_STORAGE_KEY = "mnemosyne:dev_console_paused";
 const DEV_LOG_LEVEL_FILTER_STORAGE_KEY = "mnemosyne:dev_log_level_filter";
@@ -513,6 +514,13 @@ export function App() {
     evaluator_background_enabled: false,
     anti_replay_forced_retry_enabled: false,
   });
+  const [evaluatorExecutionMode, setEvaluatorExecutionMode] = useState<string>(
+    () => localStorage.getItem(EVALUATOR_EXECUTION_MODE_STORAGE_KEY) ?? "balanced",
+  );
+  const updateEvaluatorExecutionMode = (mode: string) => {
+    setEvaluatorExecutionMode(mode);
+    localStorage.setItem(EVALUATOR_EXECUTION_MODE_STORAGE_KEY, mode);
+  };
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
   const [view, setView] = useState<AppView>("library");
   const [chatStartMode, setChatStartMode] = useState<ChatStartMode>(loadStoredChatStartMode);
@@ -1514,7 +1522,10 @@ export function App() {
               text,
               mode,
               apiSettings,
-              useNarratorProviderForUpdater ? apiSettings : stateUpdaterSettings,
+              {
+                ...(useNarratorProviderForUpdater ? apiSettings : stateUpdaterSettings),
+                evaluator_execution_mode: evaluatorExecutionMode,
+              },
               contextMode,
               abortController.signal,
               replacementAssistantId,
@@ -3399,6 +3410,18 @@ export function App() {
                 >
                   <option value="finite">Finite app timeout</option>
                   <option value="no_app_timeout">No app timeout</option>
+                </select>
+              </label>
+              <label className="field">
+                <span>Execution Mode</span>
+                <select
+                  value={evaluatorExecutionMode}
+                  onChange={(event) => updateEvaluatorExecutionMode(event.target.value)}
+                  disabled={busy}
+                >
+                  <option value="balanced">Balanced — evaluate every turn</option>
+                  <option value="fast">Fast — skip dialogue-only turns, catch up later</option>
+                  <option value="long_context">Long Context — evaluate every turn</option>
                 </select>
               </label>
             </div>

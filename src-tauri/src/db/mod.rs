@@ -991,6 +991,22 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_conversation_evaluator_streaks ON conversation_evaluator_streaks(conversation_id, profile_id);"
     )?;
 
+    // Dialogue-only exchanges skipped by the fast-mode evaluator gate; drained
+    // into the next evaluator run as a catch-up block.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS evaluator_catchup_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            user_message_id INTEGER,
+            assistant_message_id INTEGER NOT NULL,
+            user_text TEXT NOT NULL,
+            assistant_text TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_evaluator_catchup_queue_conversation ON evaluator_catchup_queue(conversation_id);"
+    )?;
+
     Ok(())
 }
 
@@ -5058,6 +5074,82 @@ pub fn get_pending_evaluator_jobs_for_conversation(
     )?;
     let rows = stmt.query_map([conversation_id], evaluator_job_from_row)?;
     rows.collect()
+}
+
+/// One dialogue-only exchange the fast-mode gate skipped; held until the next
+/// evaluator run folds it in as catch-up context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluatorCatchupEntry {
+    pub id: i64,
+    pub conversation_id: String,
+    pub user_message_id: Option<i64>,
+    pub assistant_message_id: i64,
+    pub user_text: String,
+    pub assistant_text: String,
+    pub created_at: i64,
+}
+
+pub fn insert_evaluator_catchup_entry(
+    conn: &Connection,
+    conversation_id: &str,
+    user_message_id: Option<i64>,
+    assistant_message_id: i64,
+    user_text: &str,
+    assistant_text: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO evaluator_catchup_queue
+            (conversation_id, user_message_id, assistant_message_id, user_text, assistant_text, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            conversation_id,
+            user_message_id,
+            assistant_message_id,
+            user_text,
+            assistant_text,
+            now_ts()
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn list_evaluator_catchup_entries(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<Vec<EvaluatorCatchupEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, conversation_id, user_message_id, assistant_message_id,
+                user_text, assistant_text, created_at
+         FROM evaluator_catchup_queue
+         WHERE conversation_id = ?1
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([conversation_id], |row| {
+        Ok(EvaluatorCatchupEntry {
+            id: row.get(0)?,
+            conversation_id: row.get(1)?,
+            user_message_id: row.get(2)?,
+            assistant_message_id: row.get(3)?,
+            user_text: row.get(4)?,
+            assistant_text: row.get(5)?,
+            created_at: row.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn delete_evaluator_catchup_entries(
+    conn: &Connection,
+    conversation_id: &str,
+    ids: &[i64],
+) -> rusqlite::Result<()> {
+    for id in ids {
+        conn.execute(
+            "DELETE FROM evaluator_catchup_queue WHERE conversation_id = ?1 AND id = ?2",
+            rusqlite::params![conversation_id, id],
+        )?;
+    }
+    Ok(())
 }
 
 fn evaluator_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvaluatorJob> {

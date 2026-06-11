@@ -538,6 +538,8 @@ export type ApiProviderSettings = {
   allow_send_with_stale_state?: boolean | null;
   evaluator_background_enabled?: boolean | null;
   anti_replay_forced_retry_enabled?: boolean | null;
+  /** "fast" skips the evaluator on dialogue-only turns (catch-up later); missing/unknown = "balanced". */
+  evaluator_execution_mode?: "fast" | "balanced" | "long_context" | string | null;
 };
 
 export type ContextMode = "brief" | "full_chat";

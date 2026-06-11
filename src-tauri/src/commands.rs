@@ -3561,6 +3561,7 @@ pub async fn run_evaluator_contract_test(
         allow_send_with_stale_state: profile.allow_send_with_stale_state,
         evaluator_background_enabled: profile.evaluator_background_enabled,
         anti_replay_forced_retry_enabled: profile.anti_replay_forced_retry_enabled,
+        evaluator_execution_mode: None,
     };
 
     let test_user_text = "I promise to help you clean the laboratory tomorrow morning. I want you to feel comfortable trusting me.";
@@ -7884,6 +7885,128 @@ pub async fn send_api_turn(
         window.emit("pipeline-trace-updated", &pipeline_trace).ok();
     }
 
+    // Fast-mode evaluator gate (Pillar 2 Lever B): dialogue-only turns skip
+    // the evaluator entirely; the exchange is queued and folded into the next
+    // evaluator run as catch-up. Requires a committed baseline so the
+    // exchange itself is never lost.
+    if evaluator_execution_mode(&state_updater_settings) == EVALUATOR_EXECUTION_MODE_FAST
+        && is_normal_scene_turn
+        && baseline_patch_id.is_some()
+    {
+        let previous_status = state.conn.lock().ok().and_then(|conn| {
+            previous_assistant_status_block(&conn, &conversation_id, assistant_message_id)
+        });
+        let current_status = first_valid_status_block(&visible_response_for_updater);
+        let (significance, gate_reason) = classify_turn_for_evaluator_gate(
+            &snapshot_user_text,
+            current_status.as_deref(),
+            previous_status.as_deref(),
+        );
+        emit_dev_log(
+            &window,
+            "info",
+            "evaluator",
+            "evaluator_gate_classified",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "assistant_message_id": assistant_message_id,
+                "significance": significance,
+                "reason": gate_reason
+            })),
+        );
+        if significance == TurnSignificance::DialogueOnly {
+            {
+                let conn = state.conn.lock().map_err(|err| err.to_string())?;
+                db::insert_evaluator_catchup_entry(
+                    &conn,
+                    &conversation_id,
+                    ledger_user_message_id,
+                    assistant_message_id,
+                    &snapshot_user_text,
+                    &visible_response_for_updater,
+                )
+                .map_err(|err| err.to_string())?;
+            }
+            pipeline_trace.record_stage(
+                "evaluator_job_started",
+                "skipped",
+                0,
+                Some(format!("gate: {gate_reason}")),
+                Some(
+                    "Evaluator skipped: dialogue-only turn (fast mode); exchange queued for catch-up"
+                        .to_string(),
+                ),
+            );
+            pipeline_trace.final_status = "success".into();
+            pipeline_trace.total_elapsed_ms = turn_started.elapsed().as_millis() as u64;
+            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+            if let Ok(conn) = state.conn.lock() {
+                let mut trace_val = narrator_pipeline_trace.clone();
+                trace_val["pipeline_trace"] =
+                    serde_json::to_value(&pipeline_trace).unwrap_or_default();
+                let _ = update_llm_payload_pipeline_trace(&conn, payload_log_id, &trace_val);
+            }
+            let mut debug = pre_save_debug;
+            debug.assistant_message_id = Some(assistant_message_id);
+            debug.selected_variant_id = selected_variant_id;
+            debug.state_updater_status = "skipped_dialogue_only".into();
+            debug.output_contract_warning = output_contract_warning;
+            debug.request_id = Some(request_id.clone());
+            debug.turn_id = turn_trace.turn_id.clone();
+            debug.baseline_patch_id = baseline_patch_id;
+            if let Some(variant_id) = selected_variant_id {
+                if let Ok(debug_json) = serde_json::to_string(&debug) {
+                    let _ = state
+                        .conn
+                        .lock()
+                        .map_err(|err| err.to_string())
+                        .and_then(|conn| {
+                            db::update_assistant_variant_debug_json(&conn, variant_id, &debug_json)
+                                .map_err(|err| err.to_string())
+                        });
+                }
+            }
+            let (messages, context_preview) = {
+                let conn = state.conn.lock().map_err(|err| err.to_string())?;
+                let messages = db::list_messages(&conn, &conversation_id, 100)
+                    .map_err(|err| err.to_string())?;
+                let context_preview = compile_context_for_session(
+                    &soul,
+                    Some(&session_world),
+                    &messages_to_context(messages.clone()),
+                );
+                (messages, context_preview)
+            };
+            emit_dev_log(
+                &window,
+                "info",
+                "evaluator",
+                "evaluator_skipped_dialogue_only",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id.as_str(),
+                    "assistant_message_id": assistant_message_id,
+                    "gate_reason": gate_reason,
+                    "baseline_patch_id": debug.baseline_patch_id.as_deref()
+                })),
+            );
+            emit_perf_log(
+                &window,
+                &conversation_id,
+                "total turn time",
+                turn_started.elapsed(),
+            );
+            return Ok(TurnResult {
+                conversation_id,
+                soul,
+                visible_response: visible_response_for_updater,
+                context_preview,
+                messages,
+                consolidation_ran: false,
+                debug,
+            });
+        }
+    }
+
     let job_start = Instant::now();
     if evaluator_background_enabled(&state_updater_settings) {
         let entity_updater_context =
@@ -8052,6 +8175,17 @@ pub async fn send_api_turn(
         Some(&entity_updater_context),
         Some(&memory_debug_nonce),
     );
+    // Fold in exchanges the fast-mode gate skipped; they are deleted only
+    // after this evaluator run parses successfully, so failures retry them.
+    let catchup_entries = state
+        .conn
+        .lock()
+        .ok()
+        .map(|conn| db::list_evaluator_catchup_entries(&conn, &conversation_id).unwrap_or_default())
+        .unwrap_or_default();
+    let drained_catchup_ids: Vec<i64> = catchup_entries.iter().map(|entry| entry.id).collect();
+    let updater_user_message =
+        append_evaluator_catchup_block(updater_user_message, &catchup_entries);
     let updater_token_estimate =
         estimate_tokens(&updater_system_prompt) + estimate_tokens(&updater_user_message);
     emit_perf_log(
@@ -8282,6 +8416,15 @@ pub async fn send_api_turn(
     let (hidden_state, engine_patch, state_updater_status, hidden_state_found) =
         match updater_result {
             Ok(runtime) => {
+                if !drained_catchup_ids.is_empty() {
+                    if let Ok(conn) = state.conn.lock() {
+                        let _ = db::delete_evaluator_catchup_entries(
+                            &conn,
+                            &conversation_id,
+                            &drained_catchup_ids,
+                        );
+                    }
+                }
                 let evaluator_output = runtime.output.clone();
                 let conversion = runtime.conversion.clone();
                 emit_dev_log(
@@ -9981,6 +10124,205 @@ fn normalize_status_block(status_block: &str) -> String {
         body
     };
     format!("```status\n{}\n```", body.trim())
+}
+
+/// Significance of a finished exchange for the evaluator gate (Pillar 2
+/// Lever B). The narrator's ```status``` block is the primary signal; every
+/// missing or unparseable signal degrades to `SceneRelevant` so the gate can
+/// only ever skip turns it positively identified as dialogue-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnSignificance {
+    /// Pure back-and-forth dialogue; state did not move. Skippable.
+    DialogueOnly,
+    /// State may have moved; the evaluator must run.
+    SceneRelevant,
+    /// The scene itself changed; run the evaluator including catch-up for
+    /// any previously skipped dialogue turns.
+    SceneBoundary,
+}
+
+/// The status-block fields the gate compares across turns. Atmosphere is
+/// deliberately excluded: mood drift alone does not justify an evaluator run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusGateSignature {
+    focus: String,
+    physical_state: String,
+}
+
+fn status_gate_signature(status_block: &str) -> Option<StatusGateSignature> {
+    let mut focus = None;
+    let mut physical_state = None;
+    for line in status_block.lines() {
+        let trimmed = line.trim().trim_matches('`');
+        // Both pipe-joined ("Scene | Focus: X | Physical state: Y") and
+        // one-field-per-line blocks occur in narrator output.
+        for segment in trimmed.split('|') {
+            let segment = segment.trim();
+            let lower = segment.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("focus:") {
+                focus = Some(normalize_status_gate_value(value));
+            } else if let Some(value) = lower.strip_prefix("physical state:") {
+                physical_state = Some(normalize_status_gate_value(value));
+            }
+        }
+    }
+    Some(StatusGateSignature {
+        focus: focus?,
+        physical_state: physical_state?,
+    })
+}
+
+fn normalize_status_gate_value(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(['.', ',', ';'])
+        .to_string()
+}
+
+/// Fraction of non-whitespace characters inside quote pairs. Recognizes
+/// straight, curly, and CJK quotes.
+fn dialogue_quoted_fraction(text: &str) -> f32 {
+    let mut quoted = 0usize;
+    let mut total = 0usize;
+    let mut expected_closer: Option<char> = None;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        total += 1;
+        match expected_closer {
+            Some(closer) => {
+                quoted += 1;
+                if ch == closer {
+                    expected_closer = None;
+                }
+            }
+            None => {
+                expected_closer = match ch {
+                    '"' => Some('"'),
+                    '\u{201C}' => Some('\u{201D}'), // “ ”
+                    '\u{300C}' => Some('\u{300D}'), // 「 」
+                    '\u{300E}' => Some('\u{300F}'), // 『 』
+                    _ => None,
+                };
+                if expected_closer.is_some() {
+                    quoted += 1;
+                }
+            }
+        }
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    quoted as f32 / total as f32
+}
+
+/// A user message is dialogue-like when it is predominantly quoted speech and
+/// contains no `*action*` markup. Unquoted prose is treated as action: "I
+/// draw my sword" must not be skipped.
+fn user_text_is_dialogue_like(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('*') {
+        return false;
+    }
+    dialogue_quoted_fraction(trimmed) >= 0.5
+}
+
+/// Classify a finished exchange for the conditional evaluator. Returns the
+/// significance plus a reason label for the pipeline trace.
+fn classify_turn_for_evaluator_gate(
+    user_text: &str,
+    current_status_block: Option<&str>,
+    previous_status_block: Option<&str>,
+) -> (TurnSignificance, &'static str) {
+    let Some(current) = current_status_block.and_then(status_gate_signature) else {
+        return (TurnSignificance::SceneRelevant, "no_current_status_signal");
+    };
+    let Some(previous) = previous_status_block.and_then(status_gate_signature) else {
+        return (TurnSignificance::SceneRelevant, "no_previous_status_signal");
+    };
+    if current.focus != previous.focus {
+        return (TurnSignificance::SceneBoundary, "focus_changed");
+    }
+    if current.physical_state != previous.physical_state {
+        return (TurnSignificance::SceneRelevant, "physical_state_changed");
+    }
+    if user_text_has_correction_keywords(user_text) {
+        return (TurnSignificance::SceneRelevant, "correction_keywords");
+    }
+    if !user_text_is_dialogue_like(user_text) {
+        return (
+            TurnSignificance::SceneRelevant,
+            "user_text_not_dialogue_like",
+        );
+    }
+    (TurnSignificance::DialogueOnly, "dialogue_only_turn")
+}
+
+const EVALUATOR_EXECUTION_MODE_FAST: &str = "fast";
+const EVALUATOR_EXECUTION_MODE_BALANCED: &str = "balanced";
+const EVALUATOR_EXECUTION_MODE_LONG_CONTEXT: &str = "long_context";
+
+fn evaluator_execution_mode(settings: &ApiProviderSettings) -> &'static str {
+    match settings.evaluator_execution_mode.as_deref() {
+        Some(EVALUATOR_EXECUTION_MODE_FAST) => EVALUATOR_EXECUTION_MODE_FAST,
+        Some(EVALUATOR_EXECUTION_MODE_LONG_CONTEXT) => EVALUATOR_EXECUTION_MODE_LONG_CONTEXT,
+        _ => EVALUATOR_EXECUTION_MODE_BALANCED,
+    }
+}
+
+fn first_valid_status_block(content: &str) -> Option<String> {
+    let (_, status_blocks, _) = remove_status_blocks(content);
+    status_blocks
+        .into_iter()
+        .find(|block| status_block_has_valid_line(block))
+}
+
+/// Status block of the narrator message immediately before `before_message_id`
+/// on the RP channel — the previous-turn signal for the evaluator gate.
+fn previous_assistant_status_block(
+    conn: &Connection,
+    conversation_id: &str,
+    before_message_id: i64,
+) -> Option<String> {
+    let messages =
+        db::list_messages_before_id(conn, conversation_id, before_message_id, 30).ok()?;
+    messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == "assistant" && message.channel == db::MESSAGE_CHANNEL_RP_SCENE
+        })
+        .and_then(|message| first_valid_status_block(&message.content))
+}
+
+/// Render gate-skipped exchanges as a catch-up block appended to the
+/// evaluator user message, so one evaluator run can fold in the state implied
+/// by dialogue turns it never saw.
+fn append_evaluator_catchup_block(
+    user_message: String,
+    entries: &[db::EvaluatorCatchupEntry],
+) -> String {
+    if entries.is_empty() {
+        return user_message;
+    }
+    let mut block = String::from(
+        "\n\n[CATCH-UP]\nThe following earlier exchanges were dialogue-only and were not \
+         evaluated at the time. Fold any state changes they imply (relationships, memories, \
+         small world details) into THIS update as well:\n",
+    );
+    for (index, entry) in entries.iter().enumerate() {
+        block.push_str(&format!(
+            "\nExchange {}:\nUser: {}\nNarrator: {}\n",
+            index + 1,
+            entry.user_text.trim(),
+            entry.assistant_text.trim()
+        ));
+    }
+    format!("{user_message}{block}")
 }
 
 fn strip_engine_patch_payloads(content: &str) -> (String, bool) {
@@ -12819,6 +13161,18 @@ async fn run_background_evaluator_job(
         Some(&entity_updater_context),
         Some(&memory_debug_nonce),
     );
+    // Fold in exchanges the fast-mode gate skipped; deleted only after this
+    // run parses successfully, so failed/retried jobs see them again.
+    let catchup_entries = {
+        let state = app.state::<AppState>();
+        let entries = state.conn.lock().ok().map(|conn| {
+            db::list_evaluator_catchup_entries(&conn, &job.conversation_id).unwrap_or_default()
+        });
+        entries.unwrap_or_default()
+    };
+    let drained_catchup_ids: Vec<i64> = catchup_entries.iter().map(|entry| entry.id).collect();
+    let updater_user_message =
+        append_evaluator_catchup_block(updater_user_message, &catchup_entries);
     let updater_token_estimate =
         estimate_tokens(&updater_system_prompt) + estimate_tokens(&updater_user_message);
     let updater_log_id = {
@@ -13007,6 +13361,18 @@ async fn run_background_evaluator_job(
         )
     }) {
         Ok(mut output) => {
+            if !drained_catchup_ids.is_empty() {
+                let state = app.state::<AppState>();
+                let conn = state.conn.lock();
+                if let Ok(conn) = conn.as_deref() {
+                    let _ = db::delete_evaluator_catchup_entries(
+                        conn,
+                        &job.conversation_id,
+                        &drained_catchup_ids,
+                    );
+                }
+                drop(conn);
+            }
             if let Some(comparison_trace) =
                 dual_compare_deferred_trace(&evaluator_mode, call_elapsed.as_millis(), false)
             {
@@ -20112,6 +20478,201 @@ mod tests {
             "delete",
         )
         .is_err());
+    }
+
+    #[test]
+    fn evaluator_gate_classifies_dialogue_scene_and_boundary() {
+        let previous = "```status\nScene | Focus: Negotiating with the merchant | Physical state: Standing at the stall | Atmosphere: Tense\n```";
+        let same_scene = "```status\nScene | Focus: Negotiating with the merchant | Physical state: Standing at the stall | Atmosphere: Lighter now\n```";
+        let moved = "```status\nScene | Focus: Negotiating with the merchant | Physical state: Seated inside the tent | Atmosphere: Tense\n```";
+        let new_focus = "```status\nScene | Focus: Fleeing through the alleys | Physical state: Running | Atmosphere: Panicked\n```";
+
+        // Pure quoted dialogue, status stable (atmosphere drift ignored): skip.
+        assert_eq!(
+            classify_turn_for_evaluator_gate(
+                "\"Three silvers, and that is my final offer.\"",
+                Some(same_scene),
+                Some(previous),
+            ),
+            (TurnSignificance::DialogueOnly, "dialogue_only_turn")
+        );
+
+        // Physical state moved: evaluator must run.
+        assert_eq!(
+            classify_turn_for_evaluator_gate("\"Fine.\"", Some(moved), Some(previous)).0,
+            TurnSignificance::SceneRelevant
+        );
+
+        // Focus changed: scene boundary (catch-up trigger).
+        assert_eq!(
+            classify_turn_for_evaluator_gate("\"Run!\"", Some(new_focus), Some(previous)).0,
+            TurnSignificance::SceneBoundary
+        );
+
+        // Unquoted prose is action, not dialogue.
+        assert_eq!(
+            classify_turn_for_evaluator_gate(
+                "I draw my sword and lunge.",
+                Some(same_scene),
+                Some(previous),
+            ),
+            (
+                TurnSignificance::SceneRelevant,
+                "user_text_not_dialogue_like"
+            )
+        );
+
+        // Asterisk action markup disqualifies even quoted text.
+        assert_eq!(
+            classify_turn_for_evaluator_gate(
+                "*hands over the coin pouch* \"Take it all.\"",
+                Some(same_scene),
+                Some(previous),
+            )
+            .0,
+            TurnSignificance::SceneRelevant
+        );
+
+        // Correction keywords always run the evaluator.
+        assert_eq!(
+            classify_turn_for_evaluator_gate(
+                "\"Wait, fix that — she already paid.\"",
+                Some(same_scene),
+                Some(previous),
+            ),
+            (TurnSignificance::SceneRelevant, "correction_keywords")
+        );
+
+        // Missing either status signal degrades to scene-relevant.
+        assert_eq!(
+            classify_turn_for_evaluator_gate("\"Hello.\"", None, Some(previous)),
+            (TurnSignificance::SceneRelevant, "no_current_status_signal")
+        );
+        assert_eq!(
+            classify_turn_for_evaluator_gate("\"Hello.\"", Some(same_scene), None),
+            (TurnSignificance::SceneRelevant, "no_previous_status_signal")
+        );
+    }
+
+    #[test]
+    fn evaluator_gate_parses_per_line_and_cjk_dialogue() {
+        let per_line_previous =
+            "```status\nFocus: Sharing tea\nPhysical state: Kneeling at the low table\nAtmosphere: Calm\n```";
+        let per_line_current =
+            "```status\nFocus: Sharing tea\nPhysical state: Kneeling at the low table\nAtmosphere: Warm\n```";
+        assert_eq!(
+            classify_turn_for_evaluator_gate(
+                "「お茶、おいしいですね」",
+                Some(per_line_current),
+                Some(per_line_previous),
+            ),
+            (TurnSignificance::DialogueOnly, "dialogue_only_turn")
+        );
+
+        // Status blocks lacking the gate fields produce no signature.
+        assert!(status_gate_signature("```status\nAtmosphere: Calm\n```").is_none());
+    }
+
+    #[test]
+    fn evaluator_execution_mode_defaults_to_balanced() {
+        let mut settings = ApiProviderSettings::default();
+        assert_eq!(evaluator_execution_mode(&settings), "balanced");
+        settings.evaluator_execution_mode = Some("fast".into());
+        assert_eq!(evaluator_execution_mode(&settings), "fast");
+        settings.evaluator_execution_mode = Some("long_context".into());
+        assert_eq!(evaluator_execution_mode(&settings), "long_context");
+        settings.evaluator_execution_mode = Some("warp_speed".into());
+        assert_eq!(evaluator_execution_mode(&settings), "balanced");
+    }
+
+    #[test]
+    fn evaluator_catchup_queue_round_trips_and_renders() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = soul_with_existing_memory();
+        db::upsert_soul(&conn, &soul).expect("soul");
+        db::ensure_conversation(&conn, "conv-catchup", &soul.character_id).expect("conversation");
+
+        db::insert_evaluator_catchup_entry(
+            &conn,
+            "conv-catchup",
+            Some(11),
+            12,
+            "\"How was the market?\"",
+            "\"Crowded as always.\"",
+        )
+        .expect("insert");
+        db::insert_evaluator_catchup_entry(
+            &conn,
+            "conv-catchup",
+            None,
+            14,
+            "\"Did you sleep well?\"",
+            "\"Barely.\"",
+        )
+        .expect("insert");
+
+        let entries = db::list_evaluator_catchup_entries(&conn, "conv-catchup").expect("list");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].assistant_message_id, 12);
+
+        let rendered = append_evaluator_catchup_block("BASE MESSAGE".to_string(), &entries);
+        assert!(rendered.starts_with("BASE MESSAGE"));
+        assert!(rendered.contains("[CATCH-UP]"));
+        assert!(rendered.contains("Exchange 1:"));
+        assert!(rendered.contains("How was the market?"));
+        assert!(rendered.contains("Exchange 2:"));
+
+        // Empty queue leaves the message untouched.
+        assert_eq!(
+            append_evaluator_catchup_block("BASE MESSAGE".to_string(), &[]),
+            "BASE MESSAGE"
+        );
+
+        let ids: Vec<i64> = entries.iter().map(|entry| entry.id).collect();
+        db::delete_evaluator_catchup_entries(&conn, "conv-catchup", &ids).expect("delete");
+        assert!(db::list_evaluator_catchup_entries(&conn, "conv-catchup")
+            .expect("list")
+            .is_empty());
+    }
+
+    #[test]
+    fn previous_assistant_status_block_reads_last_rp_scene_message() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = soul_with_existing_memory();
+        db::upsert_soul(&conn, &soul).expect("soul");
+        db::ensure_conversation(&conn, "conv-status", &soul.character_id).expect("conversation");
+
+        let earlier = "She nods.\n```status\nScene | Focus: Tea ceremony | Physical state: Kneeling | Atmosphere: Calm\n```";
+        db::insert_message_with_channel_and_get_id(
+            &conn,
+            "conv-status",
+            "assistant",
+            earlier,
+            db::MESSAGE_CHANNEL_RP_SCENE,
+        )
+        .expect("assistant message");
+        // A later command-channel message must not shadow the RP signal.
+        db::insert_message_with_channel_and_get_id(
+            &conn,
+            "conv-status",
+            "assistant",
+            "State updated.",
+            db::MESSAGE_CHANNEL_COMMAND_STATE,
+        )
+        .expect("command message");
+        let current_id = db::insert_message_with_channel_and_get_id(
+            &conn,
+            "conv-status",
+            "assistant",
+            "current turn",
+            db::MESSAGE_CHANNEL_RP_SCENE,
+        )
+        .expect("current message");
+
+        let block = previous_assistant_status_block(&conn, "conv-status", current_id)
+            .expect("status block found");
+        assert!(block.contains("Tea ceremony"));
+        assert!(status_gate_signature(&block).is_some());
     }
 
     #[test]
