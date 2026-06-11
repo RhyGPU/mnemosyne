@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 use state_engine::{
     consolidation::consolidate_soul,
+    memory::{restore_archived_memory, set_memory_pinned},
     context_compiler::{
         compile_context_for_session,
         compile_context_for_session_separate_user_message_with_player_persona_pending,
@@ -36,8 +37,8 @@ use state_engine::{
     hidden_state::{parse_hidden_state, HiddenState},
     patch::{
         is_premature_user_turn_event, is_retcon_or_correction_text,
-        purge_premature_recent_events_from_world, EnginePatch, MemoryApplyAction, SceneStatePatch,
-        WorldPatch,
+        purge_premature_recent_events_from_world, EnginePatch, MemoryApplyAction, MemoryPatch,
+        SceneStatePatch, SoulPatch, WorldPatch, PATCH_PROTOCOL_VERSION,
     },
     setting::{new_default_setting, SessionWorld, SettingSoul},
     soul::{
@@ -3703,6 +3704,123 @@ pub fn set_active_evaluator_profile(
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::set_active_evaluator_profile(&conn, &conversation_id, profile_id.as_deref())
         .map_err(|err| err.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryCurationResult {
+    pub patch_id: String,
+    pub turn_id: String,
+    pub branch_id: String,
+    pub memory_id: String,
+    pub operation: String,
+    pub soul: Soul,
+}
+
+/// Memory curation (pin / unpin / restore_archived) for the Memory Inspector.
+/// IMPORTANT: curation is committed as a patch through the ledger, never as a
+/// direct soul mutation — the materialized soul is rebuilt by replaying the
+/// patch ledger, so direct mutation would be silently lost on rebuild.
+fn curate_memory_with_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    soul_id: &str,
+    memory_id: &str,
+    operation: &str,
+) -> Result<MemoryCurationResult, String> {
+    if !matches!(operation, "pin" | "unpin" | "restore_archived") {
+        return Err(format!(
+            "Unsupported memory curation operation '{operation}'; expected pin, unpin, or restore_archived"
+        ));
+    }
+    let mut turn_state = load_command_turn_state(conn, conversation_id, soul_id)?;
+
+    // Dry-run the engine helper on a clone so an ineffective operation fails
+    // before anything is committed to the ledger.
+    let mut probe = turn_state.soul.clone();
+    let effective = match operation {
+        "pin" | "unpin" => set_memory_pinned(&mut probe, memory_id, operation == "pin"),
+        _ => restore_archived_memory(&mut probe, memory_id),
+    };
+    if !effective {
+        return Err(format!(
+            "Memory curation '{operation}' had no effect on memory '{memory_id}' (missing, invalidated, or not archived)"
+        ));
+    }
+
+    let patch = EnginePatch {
+        schema_version: Some(PATCH_PROTOCOL_VERSION),
+        soul_patch: Some(SoulPatch {
+            memory_operations: vec![MemoryPatch {
+                operation: Some(operation.to_string()),
+                target_memory_id: Some(memory_id.to_string()),
+                ..MemoryPatch::default()
+            }],
+            ..SoulPatch::default()
+        }),
+        ..EnginePatch::default()
+    };
+
+    let summary_label = match operation {
+        "pin" => "Pinned memory",
+        "unpin" => "Unpinned memory",
+        _ => "Restored archived memory",
+    };
+    let assistant_message_id = db::insert_message_with_channel_and_get_id(
+        conn,
+        conversation_id,
+        "assistant",
+        &format!("{summary_label} {memory_id}."),
+        db::MESSAGE_CHANNEL_COMMAND_STATE,
+    )
+    .map_err(|err| err.to_string())?;
+    let turn_id = format!("turn_{}", uuid_like_id());
+    let outcome = apply_command_patch_to_ledger(
+        conn,
+        conversation_id,
+        &turn_id,
+        None,
+        assistant_message_id,
+        &mut turn_state,
+        &patch,
+    )?;
+    Ok(MemoryCurationResult {
+        patch_id: outcome.patch_id,
+        turn_id: outcome.turn_id,
+        branch_id: outcome.branch_id,
+        memory_id: memory_id.to_string(),
+        operation: operation.to_string(),
+        soul: turn_state.soul,
+    })
+}
+
+#[tauri::command]
+pub fn curate_memory(
+    window: Window,
+    state: State<'_, AppState>,
+    conversation_id: String,
+    soul_id: String,
+    memory_id: String,
+    operation: String,
+) -> Result<MemoryCurationResult, String> {
+    let result = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        curate_memory_with_conn(&conn, &conversation_id, &soul_id, &memory_id, &operation)?
+    };
+    emit_dev_log(
+        &window,
+        "info",
+        "memory",
+        "memory_curation_applied",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "memory_id": result.memory_id.as_str(),
+            "operation": result.operation.as_str(),
+            "patch_id": result.patch_id.as_str(),
+            "turn_id": result.turn_id.as_str(),
+            "branch_id": result.branch_id.as_str()
+        })),
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -19843,6 +19961,88 @@ mod tests {
             structured_support_level(StructuredEnforcement::JsonSchema, false),
             STRUCTURED_SUPPORT_UNTESTED
         );
+    }
+
+    #[test]
+    fn memory_curation_commits_through_ledger_and_survives_rebuild() {
+        let conn = db::init_memory_connection().expect("db");
+        let soul = soul_with_existing_memory();
+        db::upsert_soul(&conn, &soul).expect("soul");
+        db::ensure_conversation(&conn, "conv-curation", &soul.character_id).expect("conversation");
+
+        let result = curate_memory_with_conn(
+            &conn,
+            "conv-curation",
+            &soul.character_id,
+            "existing-memory-1",
+            "pin",
+        )
+        .expect("pin through ledger");
+        assert!(!result.patch_id.is_empty());
+        let pinned = result
+            .soul
+            .memory
+            .recent
+            .iter()
+            .find(|memory| memory.id == "existing-memory-1")
+            .expect("memory present");
+        assert!(pinned.is_pinned);
+
+        // The pin must be reproduced by replaying the ledger, not by a
+        // direct soul mutation that a rebuild would lose.
+        let rebuilt = db::rebuild_session_state(&conn, "conv-curation", &result.branch_id)
+            .expect("rebuild");
+        let replayed = rebuilt
+            .soul
+            .memory
+            .recent
+            .iter()
+            .find(|memory| memory.id == "existing-memory-1")
+            .expect("memory survives rebuild");
+        assert!(replayed.is_pinned);
+
+        let unpinned = curate_memory_with_conn(
+            &conn,
+            "conv-curation",
+            &soul.character_id,
+            "existing-memory-1",
+            "unpin",
+        )
+        .expect("unpin through ledger");
+        assert!(!unpinned
+            .soul
+            .memory
+            .recent
+            .iter()
+            .find(|memory| memory.id == "existing-memory-1")
+            .expect("memory present")
+            .is_pinned);
+
+        // Ineffective operations fail BEFORE anything reaches the ledger.
+        assert!(curate_memory_with_conn(
+            &conn,
+            "conv-curation",
+            &soul.character_id,
+            "existing-memory-1",
+            "restore_archived",
+        )
+        .is_err());
+        assert!(curate_memory_with_conn(
+            &conn,
+            "conv-curation",
+            &soul.character_id,
+            "missing-memory",
+            "pin",
+        )
+        .is_err());
+        assert!(curate_memory_with_conn(
+            &conn,
+            "conv-curation",
+            &soul.character_id,
+            "existing-memory-1",
+            "delete",
+        )
+        .is_err());
     }
 
     #[test]

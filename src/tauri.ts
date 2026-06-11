@@ -1449,6 +1449,38 @@ export function runEvaluatorContractTest(profileId: string): Promise<EvaluatorCo
   });
 }
 
+export type MemoryCurationOperation = "pin" | "unpin" | "restore_archived";
+
+export type MemoryCurationResult = {
+  patch_id: string;
+  turn_id: string;
+  branch_id: string;
+  memory_id: string;
+  operation: MemoryCurationOperation | string;
+  soul: Soul;
+};
+
+/** Pin/unpin/restore a memory as a ledger patch (replay-safe curation). */
+export function curateMemory(
+  conversationId: string,
+  soulId: string,
+  memoryId: string,
+  operation: MemoryCurationOperation
+): Promise<MemoryCurationResult> {
+  return invokeOrPreview("curate_memory", { conversationId, soulId, memoryId, operation }, () => {
+    const soul = browserSouls.find((item) => item.character_id === soulId);
+    if (!soul) throw new Error("Soul not found");
+    return Promise.resolve({
+      patch_id: "preview-patch",
+      turn_id: "preview-turn",
+      branch_id: "preview-branch",
+      memory_id: memoryId,
+      operation,
+      soul,
+    });
+  });
+}
+
 export function setActiveEvaluatorProfile(conversationId: string, profileId: string | null): Promise<void> {
   return invokeOrPreview("set_active_evaluator_profile", { conversationId, profileId }, () => {
     const conv = browserConversations.find(c => c.conversation_id === conversationId);

@@ -118,6 +118,7 @@ pub fn run() {
             commands::retry_evaluator_job,
             commands::run_evaluator_contract_test,
             commands::set_active_evaluator_profile,
+            commands::curate_memory,
             commands::send_mock_turn,
             commands::send_api_turn,
             commands::compile_context,
