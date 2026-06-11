@@ -307,6 +307,10 @@ pub struct ProviderProfile {
     pub evaluator_prompt_version: i32,
     pub evaluator_last_tested_at: Option<i64>,
     pub evaluator_last_failure_reason: Option<String>,
+    /// Structured-output level the provider achieved during the last contract
+    /// test probe: 0 untested/failed, 1 prompt-only, 2 json_object, 3 json_schema.
+    #[serde(default)]
+    pub structured_output_support: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -925,13 +929,54 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
 
     add_column_if_missing(conn, "provider_profiles", "archived_at", "INTEGER")?;
 
-    add_column_if_missing(conn, "provider_profiles", "narrator_compatibility_status", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "provider_profiles", "evaluator_compatibility_status", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "provider_profiles", "command_compatibility_status", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "provider_profiles", "evaluator_contract_version", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "provider_profiles", "evaluator_prompt_version", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "provider_profiles", "evaluator_last_tested_at", "INTEGER")?;
-    add_column_if_missing(conn, "provider_profiles", "evaluator_last_failure_reason", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "narrator_compatibility_status",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "evaluator_compatibility_status",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "command_compatibility_status",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "evaluator_contract_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "evaluator_prompt_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "evaluator_last_tested_at",
+        "INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "evaluator_last_failure_reason",
+        "TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "structured_output_support",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     add_column_if_missing(conn, "conversations", "active_evaluator_profile_id", "TEXT")?;
 
@@ -4610,9 +4655,9 @@ pub fn upsert_provider_profile(
             anti_replay_forced_retry_enabled, archived_at,
             narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
             evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
-            evaluator_last_failure_reason
+            evaluator_last_failure_reason, structured_output_support
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             base_url = excluded.base_url,
@@ -4635,7 +4680,8 @@ pub fn upsert_provider_profile(
             evaluator_contract_version = excluded.evaluator_contract_version,
             evaluator_prompt_version = excluded.evaluator_prompt_version,
             evaluator_last_tested_at = excluded.evaluator_last_tested_at,
-            evaluator_last_failure_reason = excluded.evaluator_last_failure_reason
+            evaluator_last_failure_reason = excluded.evaluator_last_failure_reason,
+            structured_output_support = excluded.structured_output_support
         ",
         params![
             updated.id,
@@ -4661,7 +4707,8 @@ pub fn upsert_provider_profile(
             updated.evaluator_contract_version,
             updated.evaluator_prompt_version,
             updated.evaluator_last_tested_at,
-            updated.evaluator_last_failure_reason
+            updated.evaluator_last_failure_reason,
+            updated.structured_output_support
         ],
     )?;
     Ok(updated)
@@ -4676,7 +4723,7 @@ pub fn list_provider_profiles(conn: &Connection) -> rusqlite::Result<Vec<Provide
                anti_replay_forced_retry_enabled, archived_at,
                narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
                evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
-               evaluator_last_failure_reason
+               evaluator_last_failure_reason, structured_output_support
         FROM provider_profiles
         WHERE archived_at IS NULL
         ORDER BY updated_at DESC, name ASC
@@ -4695,7 +4742,7 @@ pub fn get_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<Pro
                anti_replay_forced_retry_enabled, archived_at,
                narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
                evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
-               evaluator_last_failure_reason
+               evaluator_last_failure_reason, structured_output_support
         FROM provider_profiles
         WHERE id = ?1
         ",
@@ -4762,7 +4809,7 @@ pub fn list_archived_provider_profiles(
                anti_replay_forced_retry_enabled, archived_at,
                narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
                evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
-               evaluator_last_failure_reason
+               evaluator_last_failure_reason, structured_output_support
         FROM provider_profiles
         WHERE archived_at IS NOT NULL
         ORDER BY archived_at DESC, name ASC
@@ -4816,7 +4863,9 @@ pub fn reset_evaluator_empty_patch_streak(
     Ok(())
 }
 
-pub fn get_last_known_good_evaluator_profile(conn: &Connection) -> rusqlite::Result<Option<ProviderProfile>> {
+pub fn get_last_known_good_evaluator_profile(
+    conn: &Connection,
+) -> rusqlite::Result<Option<ProviderProfile>> {
     conn.query_row(
         "SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
                 narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
@@ -4824,7 +4873,7 @@ pub fn get_last_known_good_evaluator_profile(conn: &Connection) -> rusqlite::Res
                 anti_replay_forced_retry_enabled, archived_at,
                 narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
                 evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
-                evaluator_last_failure_reason
+                evaluator_last_failure_reason, structured_output_support
          FROM provider_profiles
          WHERE archived_at IS NULL AND evaluator_compatibility_status = 1
          ORDER BY evaluator_last_tested_at DESC, updated_at DESC
@@ -4873,6 +4922,7 @@ fn provider_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provid
         evaluator_prompt_version: row.get(21)?,
         evaluator_last_tested_at: row.get(22)?,
         evaluator_last_failure_reason: row.get(23)?,
+        structured_output_support: row.get(24)?,
     })
 }
 
@@ -6713,6 +6763,7 @@ mod tests {
             evaluator_prompt_version: 0,
             evaluator_last_tested_at: None,
             evaluator_last_failure_reason: None,
+            structured_output_support: 0,
         };
 
         let saved = upsert_provider_profile(&conn, &profile).expect("upsert");
@@ -6732,6 +6783,51 @@ mod tests {
         assert!(delete_provider_profile(&conn, "openai").is_err());
         assert!(delete_provider_profile_internal(&conn, "openai").expect("delete"));
         assert!(list_provider_profiles(&conn).expect("list").is_empty());
+    }
+
+    #[test]
+    fn provider_profile_persists_structured_output_support() {
+        let conn = init_memory_connection().expect("db");
+        let profile = ProviderProfile {
+            id: "structured".into(),
+            name: "Structured".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "gpt".into(),
+            system_prompt: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            narrator_timeout_ms: None,
+            evaluator_timeout_ms: None,
+            evaluator_timeout_mode: None,
+            evaluator_mode: Some("evaluator_structured_v1".into()),
+            wait_for_evaluator_before_next_turn: None,
+            allow_send_with_stale_state: None,
+            evaluator_background_enabled: None,
+            anti_replay_forced_retry_enabled: None,
+            archived_at: None,
+            narrator_compatibility_status: 0,
+            evaluator_compatibility_status: 0,
+            command_compatibility_status: 0,
+            evaluator_contract_version: 0,
+            evaluator_prompt_version: 0,
+            evaluator_last_tested_at: None,
+            evaluator_last_failure_reason: None,
+            structured_output_support: 3,
+        };
+
+        upsert_provider_profile(&conn, &profile).expect("upsert");
+        let retrieved = get_provider_profile(&conn, "structured").expect("get");
+        assert_eq!(retrieved.structured_output_support, 3);
+
+        // Round-trips through a profile update without being reset.
+        upsert_provider_profile(&conn, &retrieved).expect("re-upsert");
+        assert_eq!(
+            get_provider_profile(&conn, "structured")
+                .expect("get")
+                .structured_output_support,
+            3
+        );
     }
 
     #[test]
@@ -6762,6 +6858,7 @@ mod tests {
             evaluator_prompt_version: 0,
             evaluator_last_tested_at: None,
             evaluator_last_failure_reason: None,
+            structured_output_support: 0,
         };
         let profile2 = ProviderProfile {
             id: "anthropic".into(),
@@ -6788,6 +6885,7 @@ mod tests {
             evaluator_prompt_version: 0,
             evaluator_last_tested_at: None,
             evaluator_last_failure_reason: None,
+            structured_output_support: 0,
         };
 
         upsert_provider_profile(&conn, &profile1).expect("upsert1");
@@ -6875,6 +6973,7 @@ mod tests {
             evaluator_prompt_version: 0,
             evaluator_last_tested_at: None,
             evaluator_last_failure_reason: None,
+            structured_output_support: 0,
         };
         upsert_provider_profile(&conn, &profile).expect("upsert");
 
@@ -6914,6 +7013,7 @@ mod tests {
             evaluator_prompt_version: 0,
             evaluator_last_tested_at: None,
             evaluator_last_failure_reason: None,
+            structured_output_support: 0,
         };
         upsert_provider_profile(&conn, &profile).expect("upsert");
 
@@ -6954,6 +7054,7 @@ mod tests {
             evaluator_prompt_version: 0,
             evaluator_last_tested_at: None,
             evaluator_last_failure_reason: None,
+            structured_output_support: 0,
         };
         upsert_provider_profile(&conn, &profile).expect("upsert");
 
@@ -6994,6 +7095,7 @@ mod tests {
             evaluator_prompt_version: 0,
             evaluator_last_tested_at: None,
             evaluator_last_failure_reason: None,
+            structured_output_support: 0,
         };
         upsert_provider_profile(&conn, &profile).expect("upsert");
 

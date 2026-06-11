@@ -92,6 +92,11 @@ const EVALUATOR_MODE_V1: &str = "evaluator_v1";
 const EVALUATOR_MODE_FORM_V1: &str = "evaluator_form_v1";
 const EVALUATOR_MODE_STRUCTURED_V1: &str = "evaluator_structured_v1";
 const EVALUATOR_MODE_DUAL_COMPARE: &str = "dual_compare";
+// provider_profiles.structured_output_support levels (contract-test probe).
+const STRUCTURED_SUPPORT_UNTESTED: i32 = 0;
+const STRUCTURED_SUPPORT_PROMPT_ONLY: i32 = 1;
+const STRUCTURED_SUPPORT_JSON_OBJECT: i32 = 2;
+const STRUCTURED_SUPPORT_JSON_SCHEMA: i32 = 3;
 const OP_NORMAL_SEND: &str = "normal_send";
 const OP_REGENERATE: &str = "regenerate";
 const OP_FIX_RESPONSE: &str = "fix_response";
@@ -3509,6 +3514,24 @@ pub struct EvaluatorContractTestReport {
     pub passed: bool,
     pub errors: Vec<String>,
     pub raw_response: String,
+    /// Structured-output level achieved by the probe (see STRUCTURED_SUPPORT_*).
+    #[serde(default)]
+    pub structured_output_support: i32,
+}
+
+/// Map the probe outcome to the persisted `structured_output_support` level.
+/// The achieved enforcement only counts if the returned text actually parsed
+/// into an EnginePatch — a provider that accepts `response_format` but returns
+/// garbage is recorded as unsupported.
+fn structured_support_level(enforcement: StructuredEnforcement, parsed_ok: bool) -> i32 {
+    if !parsed_ok {
+        return STRUCTURED_SUPPORT_UNTESTED;
+    }
+    match enforcement {
+        StructuredEnforcement::JsonSchema => STRUCTURED_SUPPORT_JSON_SCHEMA,
+        StructuredEnforcement::JsonObject => STRUCTURED_SUPPORT_JSON_OBJECT,
+        StructuredEnforcement::None => STRUCTURED_SUPPORT_PROMPT_ONLY,
+    }
 }
 
 #[tauri::command]
@@ -3596,6 +3619,7 @@ pub async fn run_evaluator_contract_test(
                     passed: false,
                     errors: vec![format!("LLM Call failed: {}", err)],
                     raw_response: String::new(),
+                    structured_output_support: failed_profile.structured_output_support,
                 });
             }
         };
@@ -3606,11 +3630,40 @@ pub async fn run_evaluator_contract_test(
         test_narrator_text,
     );
 
+    // Probe how strictly this provider can enforce structured output, so
+    // evaluator_structured_v1 eligibility is known per profile. Informational
+    // only: the probe never flips the form-contract pass/fail.
+    let structured_probe_prompt = build_structured_evaluator_prompt(&soul, None);
+    let structured_output_support = match provider
+        .complete_structured_prompt(
+            &settings,
+            &structured_probe_prompt,
+            &user_message,
+            0.0,
+            effective_evaluator_timeout_ms(&settings).map(Duration::from_millis),
+            "engine_patch",
+            &evaluator_patch_json_schema(),
+        )
+        .await
+    {
+        Ok(completion) => {
+            let parsed_ok = match completion.enforcement {
+                StructuredEnforcement::JsonSchema => {
+                    serde_json::from_str::<EnginePatch>(completion.raw_text.trim()).is_ok()
+                }
+                _ => parse_engine_patch_json(&completion.raw_text).is_ok(),
+            };
+            structured_support_level(completion.enforcement, parsed_ok)
+        }
+        Err(_) => STRUCTURED_SUPPORT_UNTESTED,
+    };
+
     let now = db::now_ts();
     let mut updated_profile = profile.clone();
     updated_profile.evaluator_last_tested_at = Some(now);
     updated_profile.evaluator_contract_version = CURRENT_EVALUATOR_CONTRACT_VERSION;
     updated_profile.evaluator_prompt_version = CURRENT_EVALUATOR_PROMPT_VERSION;
+    updated_profile.structured_output_support = structured_output_support;
 
     let report = match validation_result {
         Ok(_) => {
@@ -3620,6 +3673,7 @@ pub async fn run_evaluator_contract_test(
                 passed: true,
                 errors: Vec::new(),
                 raw_response: raw_response.clone(),
+                structured_output_support,
             }
         }
         Err(err) => {
@@ -3629,6 +3683,7 @@ pub async fn run_evaluator_contract_test(
                 passed: false,
                 errors: vec![err],
                 raw_response: raw_response.clone(),
+                structured_output_support,
             }
         }
     };
@@ -19694,6 +19749,27 @@ mod tests {
         assert!(outcome.normalized);
         assert!(!outcome.warnings.is_empty());
         assert!(outcome.conversion.no_op);
+    }
+
+    #[test]
+    fn structured_support_level_requires_parseable_output() {
+        assert_eq!(
+            structured_support_level(StructuredEnforcement::JsonSchema, true),
+            STRUCTURED_SUPPORT_JSON_SCHEMA
+        );
+        assert_eq!(
+            structured_support_level(StructuredEnforcement::JsonObject, true),
+            STRUCTURED_SUPPORT_JSON_OBJECT
+        );
+        assert_eq!(
+            structured_support_level(StructuredEnforcement::None, true),
+            STRUCTURED_SUPPORT_PROMPT_ONLY
+        );
+        // Accepted response_format but unparseable output counts as unsupported.
+        assert_eq!(
+            structured_support_level(StructuredEnforcement::JsonSchema, false),
+            STRUCTURED_SUPPORT_UNTESTED
+        );
     }
 
     #[test]

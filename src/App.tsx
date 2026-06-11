@@ -2778,6 +2778,7 @@ export function App() {
       evaluator_prompt_version: existing?.evaluator_prompt_version ?? 0,
       evaluator_last_tested_at: existing?.evaluator_last_tested_at,
       evaluator_last_failure_reason: existing?.evaluator_last_failure_reason,
+      structured_output_support: existing?.structured_output_support ?? 0,
     };
     try {
       const saved = await upsertProviderProfile(profile);
@@ -2832,6 +2833,7 @@ export function App() {
       evaluator_prompt_version: existing?.evaluator_prompt_version ?? 0,
       evaluator_last_tested_at: existing?.evaluator_last_tested_at,
       evaluator_last_failure_reason: existing?.evaluator_last_failure_reason,
+      structured_output_support: existing?.structured_output_support ?? 0,
     };
     try {
       const saved = await upsertProviderProfile(profile);

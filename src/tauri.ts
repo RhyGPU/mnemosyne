@@ -555,6 +555,8 @@ export type ProviderProfile = ApiProviderSettings & {
   evaluator_prompt_version: number;
   evaluator_last_tested_at?: number | null;
   evaluator_last_failure_reason?: string | null;
+  /** 0 untested/failed, 1 prompt-only, 2 json_object, 3 json_schema. */
+  structured_output_support?: number;
 };
 
 export type EvaluatorJobStatus =
@@ -1432,6 +1434,8 @@ export type EvaluatorContractTestReport = {
   passed: boolean;
   errors: string[];
   raw_response: string;
+  /** 0 untested/failed, 1 prompt-only, 2 json_object, 3 json_schema. */
+  structured_output_support?: number;
 };
 
 export function runEvaluatorContractTest(profileId: string): Promise<EvaluatorContractTestReport> {
@@ -1439,7 +1443,8 @@ export function runEvaluatorContractTest(profileId: string): Promise<EvaluatorCo
     return {
       passed: true,
       errors: [],
-      raw_response: "{}"
+      raw_response: "{}",
+      structured_output_support: 0
     };
   });
 }
