@@ -3,7 +3,8 @@
 Session scope: start executing the roadmap (docs/state-map-roadmap.md) in
 priority order — dev-speed/quality fixes first, then the structured-output
 foundation for Pillar 1. All work is committed on `main`, one commit per fix.
-Full workspace test suite is green after every commit (318 app + 286 engine).
+Full workspace test suite is green after every commit (325 app + 290 engine
+as of item 7).
 
 ## Done this session
 
@@ -99,31 +100,60 @@ Pillar 3 / Memory Inspector prerequisite.
   reproduces pin state), `pinned_memory_is_exempt_from_archival_eviction`,
   plus helper tests in memory.rs.
 
+### 6. New evaluator mode `evaluator_structured_v1` (commit "Add evaluator_structured_v1 mode…")
+
+Pillar 1 payoff, steps 1–4 of the original wiring plan.
+
+- `EVALUATOR_MODE_STRUCTURED_V1 = "evaluator_structured_v1"` selectable per
+  profile; `selected_evaluator_source` now three-way (form / structured / v1).
+- `complete_evaluator_with_config` returns `EvaluatorCompletion { raw_text,
+  structured_enforcement }` and routes structured mode through
+  `complete_structured_prompt` + `evaluator_patch_json_schema()`.
+- System prompt: `build_structured_evaluator_prompt` = state-updater rules +
+  `[CURRENT STATE]` WITHOUT the embedded example patch JSON (refactored out
+  of `build_state_updater_prompt` as `state_updater_current_state_block`).
+- `compile_evaluator_structured_runtime`: serde-only parse straight into
+  `EnginePatch`, no EvaluatorOutputV1 stage, no conversion layer. Under
+  `json_schema` enforcement ALL syntactic repair is skipped (strict-parse
+  failure = contract break, hard error); at weaker levels the code-fence
+  stripping of `parse_engine_patch_json` (now a runtime fn, no longer
+  cfg(test)) remains as fallback. Sanitize / strip-premature-events /
+  provenance stamping still run on the parsed patch in both paths.
+- `structured_enforcement` label recorded in all four evaluator trace builds
+  (sync+background × success+failure) and the background
+  `evaluator_response_received` stage output.
+- Contract test pins its LLM call to form mode — it exercises the FORM
+  contract and must not route through the structured path.
+- Tests: mode selection/labels, prompt omits embedded schema, strict parse
+  without conversion, repair-skip under json_schema vs salvage under
+  json_object, routing through `compile_selected_evaluator_runtime`.
+
+### 7. Contract test probes structured support (commit "Probe structured-output support…")
+
+Step 5 of the wiring plan.
+
+- `run_evaluator_contract_test` additionally probes
+  `complete_structured_prompt` and persists the achieved level on the
+  profile: `structured_output_support` — 0 untested/failed, 1 prompt-only,
+  2 json_object, 3 json_schema. Level counts only if the probe output parsed
+  into `EnginePatch`. Informational; never flips form-contract pass/fail.
+- New `provider_profiles.structured_output_support INTEGER NOT NULL DEFAULT
+  0` via `add_column_if_missing`; `#[serde(default)]` on the struct field.
+- IMPORTANT: frontend profile saves (App.tsx, both narrator + updater save
+  handlers) must carry `structured_output_support` forward from the existing
+  profile — an omitted field deserializes to 0 and would silently wipe the
+  probed value on every settings edit. Both handlers do this now; any new
+  profile-save path must too.
+
 ## Next steps, in order (the wiring plan)
 
-### A. New evaluator mode `evaluator_structured_v1` (the Pillar 1 payoff)
+### A. Remaining structured-evaluator work (Pillar 1)
 
-All evaluator LLM calls already funnel through ONE function:
-`complete_evaluator_with_config` (commands.rs ~11964). Plan:
-
-1. Add mode constant `EVALUATOR_MODE_STRUCTURED_V1` next to the existing
-   `EVALUATOR_MODE_V1` / `EVALUATOR_MODE_FORM_V1` (commands.rs ~88).
-2. When this mode is selected, call `complete_structured_prompt` with
-   `evaluator_patch_json_schema()` instead of `complete_prompt_*`. System
-   prompt: a slimmed `build_state_updater_prompt` (the schema no longer needs
-   to be described in prose — strip the embedded example JSON).
-3. Parse with `parse_engine_patch_json` directly. On `enforcement ==
-   JsonSchema`, skip ALL syntactic repair. On `JsonObject`/`None`, keep the
-   existing repair path as fallback.
-4. Record `enforcement.as_label()` in the pipeline trace stage so the Dev
-   Console shows whether enforcement was active.
-5. Extend `run_evaluator_contract_test` to also probe structured support and
-   persist the achieved level on the provider profile (suggested column:
-   `structured_output_support INTEGER DEFAULT 0`, use `add_column_if_missing`
-   like the compatibility columns, db/mod.rs ~929).
-6. Once stable, make `evaluator_structured_v1` the default for profiles that
-   probe at `json_schema` level; form_v1 remains the fallback for the rest.
-   Long-term: schema grows to cover object_observation_operations and the
+1. Once stable, make `evaluator_structured_v1` the default for profiles that
+   probe at `json_schema` level (`structured_output_support == 3`); form_v1
+   remains the fallback for the rest. There is no UI for selecting the mode
+   or showing the probed level yet — only the TS types know about it.
+2. Long-term: schema grows to cover object_observation_operations and the
    remaining world fields, then the form layer (~10k lines in
    evaluator_form/) shrinks to semantic validation only.
 
