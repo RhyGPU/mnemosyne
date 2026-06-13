@@ -295,6 +295,8 @@ pub struct ProviderProfile {
     pub evaluator_timeout_ms: Option<u64>,
     pub evaluator_timeout_mode: Option<String>,
     pub evaluator_mode: Option<String>,
+    #[serde(default)]
+    pub structured_evaluator_policy: Option<String>,
     pub wait_for_evaluator_before_next_turn: Option<bool>,
     pub allow_send_with_stale_state: Option<bool>,
     pub evaluator_background_enabled: Option<bool>,
@@ -873,6 +875,12 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "provider_profiles", "evaluator_timeout_ms", "INTEGER")?;
     add_column_if_missing(conn, "provider_profiles", "evaluator_timeout_mode", "TEXT")?;
     add_column_if_missing(conn, "provider_profiles", "evaluator_mode", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "provider_profiles",
+        "structured_evaluator_policy",
+        "TEXT",
+    )?;
     add_column_if_missing(
         conn,
         "provider_profiles",
@@ -4666,14 +4674,14 @@ pub fn upsert_provider_profile(
         "
         INSERT INTO provider_profiles (
             id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
-            narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
+            narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode, structured_evaluator_policy,
             wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
             anti_replay_forced_retry_enabled, archived_at,
             narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
             evaluator_contract_version, evaluator_prompt_version, evaluator_last_tested_at,
             evaluator_last_failure_reason, structured_output_support
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             base_url = excluded.base_url,
@@ -4685,6 +4693,7 @@ pub fn upsert_provider_profile(
             evaluator_timeout_ms = excluded.evaluator_timeout_ms,
             evaluator_timeout_mode = excluded.evaluator_timeout_mode,
             evaluator_mode = excluded.evaluator_mode,
+            structured_evaluator_policy = excluded.structured_evaluator_policy,
             wait_for_evaluator_before_next_turn = excluded.wait_for_evaluator_before_next_turn,
             allow_send_with_stale_state = excluded.allow_send_with_stale_state,
             evaluator_background_enabled = excluded.evaluator_background_enabled,
@@ -4712,6 +4721,7 @@ pub fn upsert_provider_profile(
             updated.evaluator_timeout_ms,
             updated.evaluator_timeout_mode,
             updated.evaluator_mode,
+            updated.structured_evaluator_policy,
             updated.wait_for_evaluator_before_next_turn,
             updated.allow_send_with_stale_state,
             updated.evaluator_background_enabled,
@@ -4734,7 +4744,7 @@ pub fn list_provider_profiles(conn: &Connection) -> rusqlite::Result<Vec<Provide
     let mut stmt = conn.prepare(
         "
         SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
-               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
+               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode, structured_evaluator_policy,
                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
                anti_replay_forced_retry_enabled, archived_at,
                narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
@@ -4753,7 +4763,7 @@ pub fn get_provider_profile(conn: &Connection, id: &str) -> rusqlite::Result<Pro
     conn.query_row(
         "
         SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
-               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
+               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode, structured_evaluator_policy,
                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
                anti_replay_forced_retry_enabled, archived_at,
                narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
@@ -4820,7 +4830,7 @@ pub fn list_archived_provider_profiles(
     let mut stmt = conn.prepare(
         "
         SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
-               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
+               narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode, structured_evaluator_policy,
                wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
                anti_replay_forced_retry_enabled, archived_at,
                narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
@@ -4884,7 +4894,7 @@ pub fn get_last_known_good_evaluator_profile(
 ) -> rusqlite::Result<Option<ProviderProfile>> {
     conn.query_row(
         "SELECT id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
-                narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode,
+                narrator_timeout_ms, evaluator_timeout_ms, evaluator_timeout_mode, evaluator_mode, structured_evaluator_policy,
                 wait_for_evaluator_before_next_turn, allow_send_with_stale_state, evaluator_background_enabled,
                 anti_replay_forced_retry_enabled, archived_at,
                 narrator_compatibility_status, evaluator_compatibility_status, command_compatibility_status,
@@ -4926,19 +4936,20 @@ fn provider_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provid
         evaluator_timeout_ms: row.get(9)?,
         evaluator_timeout_mode: row.get(10)?,
         evaluator_mode: row.get(11)?,
-        wait_for_evaluator_before_next_turn: row.get(12)?,
-        allow_send_with_stale_state: row.get(13)?,
-        evaluator_background_enabled: row.get(14)?,
-        anti_replay_forced_retry_enabled: row.get(15)?,
-        archived_at: row.get(16)?,
-        narrator_compatibility_status: row.get(17)?,
-        evaluator_compatibility_status: row.get(18)?,
-        command_compatibility_status: row.get(19)?,
-        evaluator_contract_version: row.get(20)?,
-        evaluator_prompt_version: row.get(21)?,
-        evaluator_last_tested_at: row.get(22)?,
-        evaluator_last_failure_reason: row.get(23)?,
-        structured_output_support: row.get(24)?,
+        structured_evaluator_policy: row.get(12)?,
+        wait_for_evaluator_before_next_turn: row.get(13)?,
+        allow_send_with_stale_state: row.get(14)?,
+        evaluator_background_enabled: row.get(15)?,
+        anti_replay_forced_retry_enabled: row.get(16)?,
+        archived_at: row.get(17)?,
+        narrator_compatibility_status: row.get(18)?,
+        evaluator_compatibility_status: row.get(19)?,
+        command_compatibility_status: row.get(20)?,
+        evaluator_contract_version: row.get(21)?,
+        evaluator_prompt_version: row.get(22)?,
+        evaluator_last_tested_at: row.get(23)?,
+        evaluator_last_failure_reason: row.get(24)?,
+        structured_output_support: row.get(25)?,
     })
 }
 
@@ -6843,6 +6854,7 @@ mod tests {
             evaluator_timeout_ms: Some(25_000),
             evaluator_timeout_mode: Some("finite".into()),
             evaluator_mode: Some("evaluator_form_v1".into()),
+            structured_evaluator_policy: Some("allow_fallback".into()),
             wait_for_evaluator_before_next_turn: Some(true),
             allow_send_with_stale_state: Some(false),
             evaluator_background_enabled: Some(false),
@@ -6872,6 +6884,13 @@ mod tests {
                 .as_deref(),
             Some("evaluator_form_v1")
         );
+        assert_eq!(
+            get_provider_profile(&conn, "openai")
+                .expect("get")
+                .structured_evaluator_policy
+                .as_deref(),
+            Some("allow_fallback")
+        );
         assert!(delete_provider_profile(&conn, "openai").is_err());
         assert!(delete_provider_profile_internal(&conn, "openai").expect("delete"));
         assert!(list_provider_profiles(&conn).expect("list").is_empty());
@@ -6893,6 +6912,7 @@ mod tests {
             evaluator_timeout_ms: None,
             evaluator_timeout_mode: None,
             evaluator_mode: Some("evaluator_structured_v1".into()),
+            structured_evaluator_policy: Some("required".into()),
             wait_for_evaluator_before_next_turn: None,
             allow_send_with_stale_state: None,
             evaluator_background_enabled: None,
@@ -6911,6 +6931,10 @@ mod tests {
         upsert_provider_profile(&conn, &profile).expect("upsert");
         let retrieved = get_provider_profile(&conn, "structured").expect("get");
         assert_eq!(retrieved.structured_output_support, 3);
+        assert_eq!(
+            retrieved.structured_evaluator_policy.as_deref(),
+            Some("required")
+        );
 
         // Round-trips through a profile update without being reset.
         upsert_provider_profile(&conn, &retrieved).expect("re-upsert");
@@ -6938,6 +6962,7 @@ mod tests {
             evaluator_timeout_ms: Some(25_000),
             evaluator_timeout_mode: Some("finite".into()),
             evaluator_mode: Some("evaluator_form_v1".into()),
+            structured_evaluator_policy: Some("prefer".into()),
             wait_for_evaluator_before_next_turn: Some(true),
             allow_send_with_stale_state: Some(false),
             evaluator_background_enabled: Some(false),
@@ -6965,6 +6990,7 @@ mod tests {
             evaluator_timeout_ms: Some(35_000),
             evaluator_timeout_mode: Some("finite".into()),
             evaluator_mode: Some("evaluator_form_v1".into()),
+            structured_evaluator_policy: Some("prefer".into()),
             wait_for_evaluator_before_next_turn: Some(false),
             allow_send_with_stale_state: Some(true),
             evaluator_background_enabled: Some(true),
@@ -7053,6 +7079,7 @@ mod tests {
             evaluator_timeout_ms: Some(25_000),
             evaluator_timeout_mode: Some("finite".into()),
             evaluator_mode: Some("evaluator_form_v1".into()),
+            structured_evaluator_policy: Some("prefer".into()),
             wait_for_evaluator_before_next_turn: Some(true),
             allow_send_with_stale_state: Some(false),
             evaluator_background_enabled: Some(false),
@@ -7093,6 +7120,7 @@ mod tests {
             evaluator_timeout_ms: Some(25_000),
             evaluator_timeout_mode: Some("finite".into()),
             evaluator_mode: Some("evaluator_form_v1".into()),
+            structured_evaluator_policy: Some("prefer".into()),
             wait_for_evaluator_before_next_turn: Some(true),
             allow_send_with_stale_state: Some(false),
             evaluator_background_enabled: Some(false),
@@ -7134,6 +7162,7 @@ mod tests {
             evaluator_timeout_ms: Some(25_000),
             evaluator_timeout_mode: Some("finite".into()),
             evaluator_mode: Some("evaluator_form_v1".into()),
+            structured_evaluator_policy: Some("prefer".into()),
             wait_for_evaluator_before_next_turn: Some(true),
             allow_send_with_stale_state: Some(false),
             evaluator_background_enabled: Some(false),
@@ -7175,6 +7204,7 @@ mod tests {
             evaluator_timeout_ms: Some(25_000),
             evaluator_timeout_mode: Some("finite".into()),
             evaluator_mode: Some("evaluator_form_v1".into()),
+            structured_evaluator_policy: Some("prefer".into()),
             wait_for_evaluator_before_next_turn: Some(true),
             allow_send_with_stale_state: Some(false),
             evaluator_background_enabled: Some(false),

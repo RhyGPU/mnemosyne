@@ -33,6 +33,10 @@ use state_engine::{
         parse_eval_form_response_with_trace, EvalFormRowRejection, EvalFormSpec, EvalFormTrace,
     },
     evaluator_ingest::{parse_evaluator_output_with_context, EvaluatorDraftContext},
+    evaluator_structured::{
+        compile_evaluator_ops_to_engine_patch, evaluator_ops_json_schema,
+        EvaluatorStructuredOutputV1, EVALUATOR_OPS_SCHEMA_NAME,
+    },
     hidden_state::{parse_hidden_state, HiddenState},
     memory::{restore_archived_memory, set_memory_pinned},
     patch::{
@@ -66,8 +70,8 @@ use crate::{
             build_evaluator_form_prompt_compact_with_player_persona,
             build_evaluator_form_prompt_with_player_persona, build_evaluator_prompt,
             build_narrator_system_prompt, build_structured_evaluator_prompt,
-            evaluator_patch_json_schema, ApiMessage, ApiProvider, ApiProviderSettings,
-            PreparedApiPayload, StructuredEnforcement, TokenUsage,
+            build_structured_evaluator_prompt_with_player_persona, ApiMessage, ApiProvider,
+            ApiProviderSettings, PreparedApiPayload, StructuredEnforcement, TokenUsage,
             CURRENT_EVALUATOR_CONTRACT_VERSION, CURRENT_EVALUATOR_PROMPT_VERSION,
         },
         mock::MockProvider,
@@ -98,6 +102,12 @@ const STRUCTURED_SUPPORT_UNTESTED: i32 = 0;
 const STRUCTURED_SUPPORT_PROMPT_ONLY: i32 = 1;
 const STRUCTURED_SUPPORT_JSON_OBJECT: i32 = 2;
 const STRUCTURED_SUPPORT_JSON_SCHEMA: i32 = 3;
+const EVALUATOR_COMPAT_UNTESTED: i32 = 0;
+const EVALUATOR_COMPAT_PASSED_SCHEMA_ENFORCED: i32 = 1;
+const EVALUATOR_COMPAT_FAILED: i32 = 2;
+const EVALUATOR_COMPAT_PASSED_JSON_OBJECT_ONLY: i32 = 3;
+const EVALUATOR_COMPAT_STALE_PROMPT_VERSION: i32 = 4;
+const EVALUATOR_COMPAT_FAILED_SCHEMA_ENFORCED: i32 = 5;
 const OP_NORMAL_SEND: &str = "normal_send";
 const OP_REGENERATE: &str = "regenerate";
 const OP_FIX_RESPONSE: &str = "fix_response";
@@ -380,6 +390,68 @@ pub struct MneExportResult {
     pub manifest: MneBundleManifest,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredEvaluatorDiagnosticRun {
+    pub turn_index: usize,
+    pub user_message: String,
+    pub narrator_response: String,
+    pub evaluator_mode: String,
+    pub enforcement_level: String,
+    pub structured_enforcement_requested: String,
+    pub structured_enforcement_validated: bool,
+    pub structured_schema_validation_status: String,
+    pub structured_schema_validation_error: Option<String>,
+    pub fallback_path: Vec<String>,
+    pub failure_reasons: Vec<String>,
+    pub ops_count: usize,
+    pub compiled_patch_summary: serde_json::Value,
+    pub syntactic_repair_used: bool,
+    pub memory_ops_count: usize,
+    pub relationship_event_ops_count: usize,
+    pub object_update_ops_count: usize,
+    pub scene_update_ops_count: usize,
+    pub state_patch_id: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredEvaluatorDiagnosticSummary {
+    pub conversation_id: String,
+    pub provider_profile_id: String,
+    pub provider_model: String,
+    pub base_url_redacted: String,
+    pub structured_mode_requested: String,
+    pub structured_mode_resolved: String,
+    pub resolved_evaluator_source: String,
+    pub structured_policy: String,
+    pub structured_evaluator_policy: String,
+    pub evaluator_mode: String,
+    pub structured_schema_version: u32,
+    pub runs: Vec<StructuredEvaluatorDiagnosticRun>,
+    pub enforcement_levels: Vec<String>,
+    pub evaluator_mode_per_run: Vec<String>,
+    pub structured_enforcement_per_run: Vec<String>,
+    pub structured_enforcement_requested_per_run: Vec<String>,
+    pub structured_enforcement_validated_per_run: Vec<bool>,
+    pub structured_schema_validation_status_per_run: Vec<String>,
+    pub failure_reasons: Vec<String>,
+    pub fallback_paths: Vec<Vec<String>>,
+    pub ops_counts: Vec<usize>,
+    pub memory_ops_count: usize,
+    pub relationship_event_ops_count: usize,
+    pub object_update_ops_count: usize,
+    pub scene_update_ops_count: usize,
+    pub syntactic_repair_used: bool,
+    pub final_memory_count: usize,
+    pub final_relationship_target_ids: Vec<String>,
+    pub final_object_states: Vec<serde_json::Value>,
+    pub final_scene_participants: Vec<String>,
+    pub default_player_leaked_into_normal_rp_state: bool,
+    pub payload_history_path: String,
+    pub mne_checkpoint_path: String,
+    pub summary_json_path: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MneImportResult {
     pub bundle_id: String,
@@ -649,19 +721,35 @@ pub fn export_current_session_checkpoint_mne(
     output_path: String,
 ) -> Result<MneExportResult, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    export_current_session_checkpoint_mne_inner(
+        &app,
+        &window,
+        &conn,
+        &conversation_id,
+        &output_path,
+    )
+}
+
+fn export_current_session_checkpoint_mne_inner(
+    app: &AppHandle,
+    window: &Window,
+    conn: &Connection,
+    conversation_id: &str,
+    output_path: &str,
+) -> Result<MneExportResult, String> {
     let conversation =
-        db::get_conversation_summary(&conn, &conversation_id).map_err(|err| err.to_string())?;
+        db::get_conversation_summary(conn, conversation_id).map_err(|err| err.to_string())?;
     let (soul, session_world, rebuilt_state_used) =
-        if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
-            let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+        if let Ok(branch) = db::get_active_session_branch(conn, conversation_id) {
+            let rebuilt = db::rebuild_session_state(conn, conversation_id, &branch.branch_id)
                 .map_err(|err| err.to_string())?;
             emit_dev_log(
-                &window,
+                window,
                 "success",
                 "ledger",
                 "mne_export_rebuilt_state_used",
                 Some(serde_json::json!({
-                    "conversation_id": conversation_id.as_str(),
+                    "conversation_id": conversation_id,
                     "branch_id": rebuilt.debug.branch_id,
                     "active_turn_id": rebuilt.debug.active_turn_id,
                     "rebuild_generation": rebuilt.debug.rebuild_generation
@@ -669,28 +757,28 @@ pub fn export_current_session_checkpoint_mne(
             );
             (rebuilt.soul, rebuilt.session_world, true)
         } else {
-            let soul = db::get_soul(&conn, &conversation.soul_id).map_err(|err| err.to_string())?;
-            let session_world = db::get_conversation_session_world(&conn, &conversation_id)
+            let soul = db::get_soul(conn, &conversation.soul_id).map_err(|err| err.to_string())?;
+            let session_world = db::get_conversation_session_world(conn, conversation_id)
                 .map_err(|err| err.to_string())?
                 .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
             (soul, session_world, false)
         };
     if !rebuilt_state_used {
         emit_dev_log(
-            &window,
+            window,
             "info",
             "ledger",
             "mne_export_rebuilt_state_used",
             Some(serde_json::json!({
-                "conversation_id": conversation_id.as_str(),
+                "conversation_id": conversation_id,
                 "rebuilt": false,
                 "reason": "no_active_session_branch"
             })),
         );
     }
     let messages =
-        db::list_messages(&conn, &conversation_id, 10_000).map_err(|err| err.to_string())?;
-    let session_ledger = collect_mne_session_ledger(&conn, &conversation_id, &messages)
+        db::list_messages(conn, conversation_id, 10_000).map_err(|err| err.to_string())?;
+    let session_ledger = collect_mne_session_ledger(conn, conversation_id, &messages)
         .map_err(|err| err.to_string())?;
     let soul_path = format!("souls/{}.json", safe_bundle_name(&soul.character_id));
     let world_path = format!("worlds/{}.json", safe_bundle_name(&session_world.world_id));
@@ -709,7 +797,7 @@ pub fn export_current_session_checkpoint_mne(
     manifest.world_id = Some(session_world.world_id.clone());
     manifest.source_savepoint_id = soul.source_savepoint_id.clone();
     manifest.source_setting_id = session_world.source_setting_id.clone();
-    let payload_logs = db::list_llm_payload_logs(&conn, &conversation_id).unwrap_or_default();
+    let payload_logs = db::list_llm_payload_logs(conn, conversation_id).unwrap_or_default();
     let mut files = vec![
         json_bundle_file("manifest.json", &manifest)?,
         json_bundle_file(&soul_path, &soul)?,
@@ -743,26 +831,26 @@ pub fn export_current_session_checkpoint_mne(
             )?);
         }
     }
-    let result = write_mne_bundle(&app, &output_path, &manifest, files)?;
+    let result = write_mne_bundle(app, output_path, &manifest, files)?;
     let export_trace = mne_export_state_trace_json(
         &manifest,
-        &conversation_id,
+        conversation_id,
         &soul,
         &session_world,
         rebuilt_state_used,
         &result.path,
     );
     emit_dev_log(
-        &window,
+        window,
         "success",
         "export",
         "mne_export_state_trace",
         Some(export_trace.clone()),
     );
     let _ = db::insert_llm_payload_log(
-        &conn,
+        conn,
         &LlmPayloadLog {
-            conversation_id: conversation_id.clone(),
+            conversation_id: conversation_id.to_string(),
             provider: "mne_export_trace".into(),
             mode: "mne_export".into(),
             context_mode: "export".into(),
@@ -3518,6 +3606,10 @@ pub struct EvaluatorContractTestReport {
     /// Structured-output level achieved by the probe (see STRUCTURED_SUPPORT_*).
     #[serde(default)]
     pub structured_output_support: i32,
+    #[serde(default)]
+    pub evaluator_compatibility_status: i32,
+    #[serde(default)]
+    pub evaluator_compatibility_status_label: String,
 }
 
 /// Map the probe outcome to the persisted `structured_output_support` level.
@@ -3530,8 +3622,37 @@ fn structured_support_level(enforcement: StructuredEnforcement, parsed_ok: bool)
     }
     match enforcement {
         StructuredEnforcement::JsonSchema => STRUCTURED_SUPPORT_JSON_SCHEMA,
+        StructuredEnforcement::ToolCall | StructuredEnforcement::Grammar => {
+            STRUCTURED_SUPPORT_JSON_SCHEMA
+        }
         StructuredEnforcement::JsonObject => STRUCTURED_SUPPORT_JSON_OBJECT,
         StructuredEnforcement::None => STRUCTURED_SUPPORT_PROMPT_ONLY,
+    }
+}
+
+fn evaluator_compatibility_status_for_structured_support(
+    structured_output_support: i32,
+    form_contract_passed: bool,
+) -> i32 {
+    if !form_contract_passed {
+        return EVALUATOR_COMPAT_FAILED;
+    }
+    match structured_output_support {
+        STRUCTURED_SUPPORT_JSON_SCHEMA => EVALUATOR_COMPAT_PASSED_SCHEMA_ENFORCED,
+        STRUCTURED_SUPPORT_JSON_OBJECT => EVALUATOR_COMPAT_PASSED_JSON_OBJECT_ONLY,
+        STRUCTURED_SUPPORT_UNTESTED => EVALUATOR_COMPAT_UNTESTED,
+        _ => EVALUATOR_COMPAT_FAILED,
+    }
+}
+
+fn evaluator_compatibility_status_label(status: i32) -> &'static str {
+    match status {
+        EVALUATOR_COMPAT_PASSED_SCHEMA_ENFORCED => "passed_schema_enforced",
+        EVALUATOR_COMPAT_PASSED_JSON_OBJECT_ONLY => "passed_json_object_only",
+        EVALUATOR_COMPAT_FAILED => "failed",
+        EVALUATOR_COMPAT_STALE_PROMPT_VERSION => "stale_prompt_version",
+        EVALUATOR_COMPAT_FAILED_SCHEMA_ENFORCED => "failed_schema_enforced",
+        _ => "untested",
     }
 }
 
@@ -3551,12 +3672,20 @@ pub async fn run_evaluator_contract_test(
         model: profile.model.clone(),
         system_prompt: profile.system_prompt.clone(),
         narrator_timeout_ms: profile.narrator_timeout_ms,
-        evaluator_timeout_ms: profile.evaluator_timeout_ms,
-        evaluator_timeout_mode: profile.evaluator_timeout_mode.clone(),
+        evaluator_timeout_ms: Some(
+            profile
+                .evaluator_timeout_ms
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_EVALUATOR_TIMEOUT_MS)
+                .min(DEFAULT_EVALUATOR_TIMEOUT_MS),
+        ),
+        evaluator_timeout_mode: Some("finite".into()),
         // The contract test always exercises the FORM contract (form prompt +
         // form validation), so the call must not route through the structured
         // path even when the profile selects evaluator_structured_v1.
         evaluator_mode: Some(EVALUATOR_MODE_FORM_V1.into()),
+        structured_evaluator_policy: Some("prefer".into()),
+        structured_evaluator_transport: None,
         wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn,
         allow_send_with_stale_state: profile.allow_send_with_stale_state,
         evaluator_background_enabled: profile.evaluator_background_enabled,
@@ -3607,7 +3736,7 @@ pub async fn run_evaluator_contract_test(
             Err(err) => {
                 let now = db::now_ts();
                 let mut failed_profile = profile.clone();
-                failed_profile.evaluator_compatibility_status = 2; // failed
+                failed_profile.evaluator_compatibility_status = EVALUATOR_COMPAT_FAILED;
                 failed_profile.evaluator_last_tested_at = Some(now);
                 failed_profile.evaluator_last_failure_reason =
                     Some(format!("LLM Call Error: {}", err));
@@ -3622,6 +3751,11 @@ pub async fn run_evaluator_contract_test(
                     errors: vec![format!("LLM Call failed: {}", err)],
                     raw_response: String::new(),
                     structured_output_support: failed_profile.structured_output_support,
+                    evaluator_compatibility_status: failed_profile.evaluator_compatibility_status,
+                    evaluator_compatibility_status_label: evaluator_compatibility_status_label(
+                        failed_profile.evaluator_compatibility_status,
+                    )
+                    .into(),
                 });
             }
         };
@@ -3636,6 +3770,7 @@ pub async fn run_evaluator_contract_test(
     // evaluator_structured_v1 eligibility is known per profile. Informational
     // only: the probe never flips the form-contract pass/fail.
     let structured_probe_prompt = build_structured_evaluator_prompt(&soul, None);
+    let mut structured_schema_claim_failed = false;
     let structured_output_support = match provider
         .complete_structured_prompt(
             &settings,
@@ -3643,17 +3778,27 @@ pub async fn run_evaluator_contract_test(
             &user_message,
             0.0,
             effective_evaluator_timeout_ms(&settings).map(Duration::from_millis),
-            "engine_patch",
-            &evaluator_patch_json_schema(),
+            EVALUATOR_OPS_SCHEMA_NAME,
+            &evaluator_ops_json_schema(),
         )
         .await
     {
         Ok(completion) => {
             let parsed_ok = match completion.enforcement {
                 StructuredEnforcement::JsonSchema => {
-                    serde_json::from_str::<EnginePatch>(completion.raw_text.trim()).is_ok()
+                    let parsed = serde_json::from_str::<EvaluatorStructuredOutputV1>(
+                        completion.raw_text.trim(),
+                    )
+                    .is_ok();
+                    if !parsed {
+                        structured_schema_claim_failed = true;
+                    }
+                    parsed
                 }
-                _ => parse_engine_patch_json(&completion.raw_text).is_ok(),
+                _ => {
+                    serde_json::from_str::<EvaluatorStructuredOutputV1>(completion.raw_text.trim())
+                        .is_ok()
+                }
             };
             structured_support_level(completion.enforcement, parsed_ok)
         }
@@ -3669,23 +3814,52 @@ pub async fn run_evaluator_contract_test(
 
     let report = match validation_result {
         Ok(_) => {
-            updated_profile.evaluator_compatibility_status = 1; // passed
-            updated_profile.evaluator_last_failure_reason = None;
+            if structured_schema_claim_failed {
+                updated_profile.evaluator_compatibility_status =
+                    EVALUATOR_COMPAT_FAILED_SCHEMA_ENFORCED;
+                updated_profile.evaluator_last_failure_reason = Some(
+                    "structured_schema_claim_failed: json_schema response did not parse as evaluator_structured_v1".into(),
+                );
+            } else {
+                updated_profile.evaluator_compatibility_status =
+                    evaluator_compatibility_status_for_structured_support(
+                        structured_output_support,
+                        true,
+                    );
+                updated_profile.evaluator_last_failure_reason = None;
+            }
             EvaluatorContractTestReport {
-                passed: true,
-                errors: Vec::new(),
+                passed: !structured_schema_claim_failed,
+                errors: if structured_schema_claim_failed {
+                    vec![
+                        "structured_schema_claim_failed: json_schema response did not parse as evaluator_structured_v1"
+                            .into(),
+                    ]
+                } else {
+                    Vec::new()
+                },
                 raw_response: raw_response.clone(),
                 structured_output_support,
+                evaluator_compatibility_status: updated_profile.evaluator_compatibility_status,
+                evaluator_compatibility_status_label: evaluator_compatibility_status_label(
+                    updated_profile.evaluator_compatibility_status,
+                )
+                .into(),
             }
         }
         Err(err) => {
-            updated_profile.evaluator_compatibility_status = 2; // failed
+            updated_profile.evaluator_compatibility_status = EVALUATOR_COMPAT_FAILED;
             updated_profile.evaluator_last_failure_reason = Some(err.clone());
             EvaluatorContractTestReport {
                 passed: false,
                 errors: vec![err],
                 raw_response: raw_response.clone(),
                 structured_output_support,
+                evaluator_compatibility_status: updated_profile.evaluator_compatibility_status,
+                evaluator_compatibility_status_label: evaluator_compatibility_status_label(
+                    updated_profile.evaluator_compatibility_status,
+                )
+                .into(),
             }
         }
     };
@@ -3694,6 +3868,874 @@ pub async fn run_evaluator_contract_test(
     let _ = db::upsert_provider_profile(&conn, &updated_profile);
 
     Ok(report)
+}
+
+#[tauri::command]
+pub async fn run_structured_evaluator_diagnostic(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    profile_id: Option<String>,
+) -> Result<StructuredEvaluatorDiagnosticSummary, String> {
+    let profile = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        if let Some(profile_id) = profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            db::get_provider_profile(&conn, profile_id).map_err(|err| err.to_string())?
+        } else {
+            db::list_provider_profiles(&conn)
+                .map_err(|err| err.to_string())?
+                .into_iter()
+                .find(|profile| {
+                    !profile.model.trim().is_empty()
+                        && !profile.base_url.trim().is_empty()
+                        && !profile.api_key.trim().is_empty()
+                })
+                .ok_or_else(|| {
+                    "No configured provider profile with base_url, model, and API key found."
+                        .to_string()
+                })?
+        }
+    };
+    let structured_policy = profile
+        .structured_evaluator_policy
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("prefer")
+        .to_string();
+    let settings = diagnostic_structured_settings_from_profile(&profile, &structured_policy);
+    let structured_mode_requested = EVALUATOR_MODE_STRUCTURED_V1.to_string();
+    let provider = ApiProvider::default();
+    let conversation_id = format!("structured-diagnostic-{}", uuid_like_id());
+    let mut soul = new_default_soul("Aurora Diagnostic");
+    soul.soul_kind = "session_clone".into();
+    soul.created_from_name = Some("Structured Evaluator Diagnostic".into());
+    let mut session_world = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::upsert_soul(&conn, &soul).map_err(|err| err.to_string())?;
+        db::ensure_conversation_with_title_and_world(
+            &conn,
+            &conversation_id,
+            &soul.character_id,
+            None,
+            None,
+            Some("Structured Evaluator Diagnostic"),
+        )
+        .map_err(|err| err.to_string())?;
+        let world = db::ensure_conversation_session_world(&conn, &conversation_id, &soul, None)
+            .map_err(|err| err.to_string())?;
+        db::set_active_player_persona(&conn, &conversation_id, "preset_male")
+            .map_err(|err| err.to_string())?;
+        db::set_active_evaluator_profile(&conn, &conversation_id, Some(&profile.id))
+            .map_err(|err| err.to_string())?;
+        db::create_session_branch(&conn, &conversation_id, &soul, &world)
+            .map_err(|err| err.to_string())?;
+        world
+    };
+    let (structured_mode_resolved, resolved_evaluator_source) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let resolved_setting = resolve_evaluator_mode_setting(&conn, &conversation_id, &settings)
+            .or_else(|| settings.evaluator_mode.clone());
+        let resolved_mode = evaluator_mode(&ApiProviderSettings {
+            evaluator_mode: resolved_setting,
+            ..settings.clone()
+        });
+        let resolved_source = selected_evaluator_source(&resolved_mode).to_string();
+        if resolved_source != EVALUATOR_MODE_STRUCTURED_V1 {
+            return Err(format!(
+                "Structured diagnostic refused to run: requested {structured_mode_requested}, resolved mode {resolved_mode}, selected source {resolved_source}"
+            ));
+        }
+        (resolved_mode, resolved_source)
+    };
+
+    emit_dev_log(
+        &window,
+        "info",
+        "evaluator",
+        "structured_evaluator_diagnostic_started",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "profile_id": profile.id.as_str(),
+            "model": profile.model.trim(),
+            "base_url": redact_base_url(&profile.base_url),
+            "structured_mode_requested": structured_mode_requested.as_str(),
+            "structured_mode_resolved": structured_mode_resolved.as_str(),
+            "resolved_evaluator_source": resolved_evaluator_source.as_str(),
+            "structured_policy": structured_policy.as_str()
+        })),
+    );
+
+    let turns = structured_diagnostic_turns();
+    let mut runs = Vec::new();
+    let mut total_memory_ops = 0usize;
+    let mut total_relationship_ops = 0usize;
+    let mut total_object_ops = 0usize;
+    let mut total_scene_ops = 0usize;
+    let mut syntactic_repair_used = false;
+
+    for (index, (user_text, narrator_text)) in turns.iter().enumerate() {
+        let (user_message_id, assistant_message_id, branch_id, parent_turn_id, recent_excerpt) = {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            let user_id = db::insert_message_and_get_id(&conn, &conversation_id, "user", user_text)
+                .map_err(|err| err.to_string())?;
+            let assistant_id =
+                db::insert_message_and_get_id(&conn, &conversation_id, "assistant", narrator_text)
+                    .map_err(|err| err.to_string())?;
+            let branch = db::get_active_session_branch(&conn, &conversation_id)
+                .map_err(|err| err.to_string())?;
+            let messages =
+                db::list_messages(&conn, &conversation_id, 50).map_err(|err| err.to_string())?;
+            let excerpt = messages
+                .iter()
+                .map(|message| format!("{}: {}", message.role, message.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (
+                user_id,
+                assistant_id,
+                branch.branch_id,
+                branch.active_turn_id,
+                excerpt,
+            )
+        };
+
+        let form_spec = build_eval_form_spec_with_player_persona(
+            &soul,
+            Some(&session_world),
+            user_text,
+            narrator_text,
+            8,
+            "preset_male",
+            "Male Persona",
+        );
+        let fallback_form_system_prompt = build_evaluator_form_prompt_with_player_persona(
+            &soul,
+            Some(&session_world),
+            user_text,
+            narrator_text,
+            "preset_male",
+            "Male Persona",
+        );
+        let updater_system_prompt = build_structured_evaluator_prompt_with_player_persona(
+            &soul,
+            Some(&session_world),
+            "preset_male",
+            "Male Persona",
+        );
+        let prompt_has_default_player = updater_system_prompt.contains("default_player");
+        let updater_user_message = build_evaluator_user_message(
+            user_text,
+            narrator_text,
+            &recent_excerpt,
+            Some(&session_world),
+            Some("Latest normal RP speaker entity_id: preset_male\nActive player persona: preset_male"),
+            None,
+        );
+        let token_estimate =
+            estimate_tokens(&updater_system_prompt) + estimate_tokens(&updater_user_message);
+        let request_id = format!("structured_diag_{}_{}", index + 1, uuid_like_id());
+        let updater_log_id = {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            db::insert_llm_payload_log(
+                &conn,
+                &LlmPayloadLog {
+                    conversation_id: conversation_id.clone(),
+                    message_id: Some(assistant_message_id),
+                    provider: evaluator_provider_label(EVALUATOR_MODE_STRUCTURED_V1, false),
+                    mode: structured_mode_resolved.clone(),
+                    context_mode: "structured_diagnostic".into(),
+                    model: settings.model.trim().to_string(),
+                    base_url: redact_base_url(&settings.base_url),
+                    system_message: updater_system_prompt.clone(),
+                    user_message: updater_user_message.clone(),
+                    context_text: updater_system_prompt.clone(),
+                    estimated_system_tokens: estimate_tokens(&updater_system_prompt),
+                    estimated_user_tokens: estimate_tokens(&updater_user_message),
+                    estimated_total_tokens: token_estimate,
+                    truncated: false,
+                    created_at: db::now_ts(),
+                    branch_id: Some(branch_id.clone()),
+                    active_turn_id: parent_turn_id.clone(),
+                    parent_turn_id: parent_turn_id.clone(),
+                    request_id: Some(request_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| err.to_string())?
+        };
+
+        emit_dev_log(
+            &window,
+            "info",
+            "evaluator",
+            "evaluator_called",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id.as_str(),
+                "assistant_message_id": assistant_message_id,
+                "model": settings.model.trim(),
+                "base_url": redact_base_url(&settings.base_url),
+                "evaluator_mode": EVALUATOR_MODE_STRUCTURED_V1,
+                "structured_mode_requested": structured_mode_requested.as_str(),
+                "structured_mode_resolved": structured_mode_resolved.as_str(),
+                "resolved_evaluator_source": resolved_evaluator_source.as_str(),
+                "structured_policy": structured_policy.as_str(),
+                "selected_evaluator_source": EVALUATOR_MODE_STRUCTURED_V1,
+                "diagnostic_turn_index": index + 1
+            })),
+        );
+
+        let completion = complete_evaluator_with_config(
+            &provider,
+            &settings,
+            &updater_system_prompt,
+            &updater_user_message,
+        )
+        .await;
+        let (raw_response, structured_enforcement) = match completion.as_ref() {
+            Ok(completion) => (
+                Some(completion.raw_text.clone()),
+                completion.structured_enforcement,
+            ),
+            Err(_) => (None, None),
+        };
+        let structured_enforcement_requested = structured_enforcement
+            .map(StructuredEnforcement::as_label)
+            .unwrap_or("none")
+            .to_string();
+        let mut run_failure_reasons = Vec::<String>::new();
+        if prompt_has_default_player {
+            run_failure_reasons.push("default_player_in_structured_prompt".into());
+        }
+        if let Some(raw) = raw_response.as_ref() {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            let _ = db::update_llm_payload_log_response(
+                &conn,
+                updater_log_id,
+                &db::LlmPayloadResponseUpdate {
+                    raw_provider_response: Some(raw.clone()),
+                    normalized_response: Some(raw.clone()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let structured_step = structured_fallback_step(structured_enforcement).to_string();
+        let outcome_result = match completion {
+            Ok(completion) => match compile_selected_evaluator_runtime(
+                EVALUATOR_MODE_STRUCTURED_V1,
+                Some(form_spec.clone()),
+                &completion.raw_text,
+                completion.structured_enforcement,
+                &soul,
+                &session_world,
+                user_text,
+                narrator_text,
+                None,
+            ) {
+                Ok(outcome) => Ok(outcome),
+                Err(err) => {
+                    if err.contains("malformed_schema_output") {
+                        run_failure_reasons.push("malformed_schema_output".into());
+                    }
+                    if err.contains("zero_ops_on_durable_turn") {
+                        run_failure_reasons.push("zero_ops_on_durable_turn".into());
+                    }
+                    if completion.structured_enforcement == Some(StructuredEnforcement::JsonSchema)
+                    {
+                        run_failure_reasons.push("schema_claim_not_validated".into());
+                        emit_dev_log(
+                            &window,
+                            "warn",
+                            "evaluator",
+                            "structured_schema_claim_failed",
+                            Some(serde_json::json!({
+                                "conversation_id": conversation_id.as_str(),
+                                "assistant_message_id": assistant_message_id,
+                                "structured_enforcement_requested": StructuredEnforcement::JsonSchema.as_label(),
+                                "structured_schema_validation_status": structured_validation_status_from_error(&err),
+                                "structured_schema_validation_error": err.as_str()
+                            })),
+                        );
+                    }
+                    emit_dev_log(
+                        &window,
+                        "error",
+                        "evaluator",
+                        "structured_evaluator_failed",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "assistant_message_id": assistant_message_id,
+                            "error": err.as_str(),
+                            "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label)
+                        })),
+                    );
+                    diagnostic_form_fallback(
+                        &window,
+                        &provider,
+                        &settings,
+                        &fallback_form_system_prompt,
+                        &updater_user_message,
+                        &form_spec,
+                        &soul,
+                        &session_world,
+                        user_text,
+                        narrator_text,
+                        &conversation_id,
+                        assistant_message_id,
+                        vec![structured_step.clone()],
+                        err,
+                    )
+                    .await
+                }
+            },
+            Err(err) => {
+                if structured_enforcement == Some(StructuredEnforcement::JsonSchema) {
+                    run_failure_reasons.push("schema_claim_not_validated".into());
+                    emit_dev_log(
+                        &window,
+                        "warn",
+                        "evaluator",
+                        "structured_schema_claim_failed",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "assistant_message_id": assistant_message_id,
+                            "structured_enforcement_requested": StructuredEnforcement::JsonSchema.as_label(),
+                            "structured_schema_validation_status": structured_validation_status_from_error(&err),
+                            "structured_schema_validation_error": err.as_str()
+                        })),
+                    );
+                }
+                emit_dev_log(
+                    &window,
+                    "error",
+                    "evaluator",
+                    "structured_evaluator_failed",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "error": err.as_str(),
+                        "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label)
+                    })),
+                );
+                diagnostic_form_fallback(
+                    &window,
+                    &provider,
+                    &settings,
+                    &fallback_form_system_prompt,
+                    &updater_user_message,
+                    &form_spec,
+                    &soul,
+                    &session_world,
+                    user_text,
+                    narrator_text,
+                    &conversation_id,
+                    assistant_message_id,
+                    vec![structured_step.clone()],
+                    err,
+                )
+                .await
+            }
+        };
+
+        let mut error = None;
+        let mut outcome = match outcome_result {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                error = Some(err.clone());
+                evaluator_noop_after_all_fallbacks(
+                    vec![structured_step.clone()],
+                    "structured diagnostic evaluator call failed".into(),
+                    err,
+                )
+            }
+        };
+        let durable_kind = durable_change_required(user_text, narrator_text);
+        let mut patch = outcome.conversion.patch.clone();
+        let pre_guarantee_counts = diagnostic_patch_counts(&patch);
+        if durable_kind == Some(DurableChangeKind::Object)
+            && pre_guarantee_counts.object_update_ops_count == 0
+        {
+            if outcome
+                .fallback_path
+                .iter()
+                .any(|step| step == EVALUATOR_MODE_FORM_V1)
+            {
+                run_failure_reasons.push("fallback_form_empty".into());
+            }
+            merge_world_guarantee_patch(
+                &mut patch,
+                diagnostic_object_scene_guarantee_patch(&soul, user_text, narrator_text),
+            );
+            outcome.conversion.patch = patch.clone();
+        }
+        if durable_kind.is_some() && diagnostic_total_patch_ops(&patch) == 0 {
+            run_failure_reasons.push("zero_ops_on_durable_turn".into());
+        }
+        run_failure_reasons.sort();
+        run_failure_reasons.dedup();
+        let patch_counts = diagnostic_patch_counts(&patch);
+        total_memory_ops += patch_counts.memory_ops_count;
+        total_relationship_ops += patch_counts.relationship_event_ops_count;
+        total_object_ops += patch_counts.object_update_ops_count;
+        total_scene_ops += patch_counts.scene_update_ops_count;
+        syntactic_repair_used |= outcome.syntactic_repair_used;
+
+        let state_patch_id = {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            let turn_id = format!("structured_diag_turn_{}_{}", index + 1, uuid_like_id());
+            let (_commit, patch_record) = db::record_turn_commit_with_patch_for_turn_id(
+                &conn,
+                &turn_id,
+                &conversation_id,
+                &branch_id,
+                parent_turn_id.as_deref(),
+                Some(user_message_id),
+                assistant_message_id,
+                None,
+                &patch,
+                false,
+            )
+            .map_err(|err| err.to_string())?;
+            let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch_id)
+                .map_err(|err| err.to_string())?;
+            soul = rebuilt.soul;
+            session_world = rebuilt.session_world;
+            let _ = db::set_llm_payload_log_ledger_metadata(
+                &conn,
+                updater_log_id,
+                &rebuilt.debug,
+                parent_turn_id.as_deref(),
+                None,
+            );
+            let trace = serde_json::json!({
+                "diagnostic": true,
+                "evaluator_mode": EVALUATOR_MODE_STRUCTURED_V1,
+                "structured_mode_requested": structured_mode_requested.as_str(),
+                "structured_mode_resolved": structured_mode_resolved.as_str(),
+                "resolved_evaluator_source": resolved_evaluator_source.as_str(),
+                "structured_policy": structured_policy.as_str(),
+                "structured_schema_version": state_engine::evaluator_structured::EVALUATOR_STRUCTURED_SCHEMA_VERSION,
+                "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label).unwrap_or("none"),
+                "structured_enforcement_requested": structured_enforcement_requested.as_str(),
+                "structured_enforcement_validated": outcome.structured_enforcement_validated,
+                "structured_schema_validation_status": outcome.structured_schema_validation_status.as_str(),
+                "structured_schema_validation_error": outcome.structured_schema_validation_error.as_deref(),
+                "fallback_path": &outcome.fallback_path,
+                "failure_reasons": &run_failure_reasons,
+                "ops_count": outcome.structured_ops_count.unwrap_or_else(|| diagnostic_total_patch_ops(&patch)),
+                "compiled_patch_summary": engine_patch_summary(&patch),
+                "syntactic_repair_used": outcome.syntactic_repair_used,
+                "ledger_apply_trace": {
+                    "state_patch_id": patch_record.patch_id,
+                    "turn_commit_id": turn_id,
+                    "branch_id": branch_id,
+                    "patch_stored": true,
+                    "patch_applied": !patch.is_empty(),
+                    "branch_rebuilt": true,
+                    "applied_patch_count": rebuilt.debug.applied_patches.len(),
+                    "skipped_patch_count": rebuilt.debug.skipped_discarded_patches.len(),
+                    "invalidated_patch_count": rebuilt.debug.invalidated_patches.len()
+                },
+                "before_after_state_summary": {
+                    "after": compact_state_summary_json(&soul, &session_world)
+                }
+            });
+            let _ = update_llm_payload_pipeline_trace(&conn, updater_log_id, &trace);
+            patch_record.patch_id
+        };
+
+        runs.push(StructuredEvaluatorDiagnosticRun {
+            turn_index: index + 1,
+            user_message: (*user_text).to_string(),
+            narrator_response: (*narrator_text).to_string(),
+            evaluator_mode: structured_mode_resolved.clone(),
+            enforcement_level: structured_enforcement
+                .map(StructuredEnforcement::as_label)
+                .unwrap_or("none")
+                .to_string(),
+            structured_enforcement_requested,
+            structured_enforcement_validated: outcome.structured_enforcement_validated,
+            structured_schema_validation_status: outcome
+                .structured_schema_validation_status
+                .clone(),
+            structured_schema_validation_error: outcome.structured_schema_validation_error.clone(),
+            fallback_path: outcome.fallback_path.clone(),
+            failure_reasons: run_failure_reasons,
+            ops_count: outcome
+                .structured_ops_count
+                .unwrap_or_else(|| diagnostic_total_patch_ops(&patch)),
+            compiled_patch_summary: engine_patch_summary(&patch),
+            syntactic_repair_used: outcome.syntactic_repair_used,
+            memory_ops_count: patch_counts.memory_ops_count,
+            relationship_event_ops_count: patch_counts.relationship_event_ops_count,
+            object_update_ops_count: patch_counts.object_update_ops_count,
+            scene_update_ops_count: patch_counts.scene_update_ops_count,
+            state_patch_id: Some(state_patch_id),
+            error,
+        });
+    }
+
+    let payload_logs = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::list_llm_payload_logs(&conn, &conversation_id).map_err(|err| err.to_string())?
+    };
+    let payload_history = render_llm_payload_history(&payload_logs);
+    let payload_history_path = write_export_file(
+        &app,
+        &conversation_id,
+        "structured-diagnostic-payload-history",
+        &payload_history,
+    )?
+    .display()
+    .to_string();
+    let mne_checkpoint = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        export_current_session_checkpoint_mne_inner(&app, &window, &conn, &conversation_id, "")?
+    };
+    let final_relationship_target_ids = {
+        let mut ids = soul.relationships.keys().cloned().collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    let final_object_states = session_world
+        .object_states
+        .iter()
+        .map(|object| serde_json::to_value(object).unwrap_or_default())
+        .collect::<Vec<_>>();
+    let final_scene_participants = session_world.scene_state.participants.clone();
+    let default_player_leaked_into_normal_rp_state = serde_json::to_string(&serde_json::json!({
+        "relationships": &soul.relationships,
+        "memories": &soul.memory,
+        "objects": &session_world.object_states,
+        "scene_state": &session_world.scene_state
+    }))
+    .unwrap_or_default()
+    .contains("default_player");
+    let mut summary = StructuredEvaluatorDiagnosticSummary {
+        conversation_id: conversation_id.clone(),
+        provider_profile_id: profile.id.clone(),
+        provider_model: profile.model.trim().to_string(),
+        base_url_redacted: redact_base_url(&profile.base_url),
+        structured_mode_requested,
+        structured_mode_resolved: structured_mode_resolved.clone(),
+        resolved_evaluator_source,
+        structured_policy: structured_policy.clone(),
+        structured_evaluator_policy: structured_policy,
+        evaluator_mode: structured_mode_resolved,
+        structured_schema_version:
+            state_engine::evaluator_structured::EVALUATOR_STRUCTURED_SCHEMA_VERSION,
+        enforcement_levels: runs
+            .iter()
+            .map(|run| run.enforcement_level.clone())
+            .collect(),
+        evaluator_mode_per_run: runs.iter().map(|run| run.evaluator_mode.clone()).collect(),
+        structured_enforcement_per_run: runs
+            .iter()
+            .map(|run| run.enforcement_level.clone())
+            .collect(),
+        structured_enforcement_requested_per_run: runs
+            .iter()
+            .map(|run| run.structured_enforcement_requested.clone())
+            .collect(),
+        structured_enforcement_validated_per_run: runs
+            .iter()
+            .map(|run| run.structured_enforcement_validated)
+            .collect(),
+        structured_schema_validation_status_per_run: runs
+            .iter()
+            .map(|run| run.structured_schema_validation_status.clone())
+            .collect(),
+        failure_reasons: {
+            let mut reasons = runs
+                .iter()
+                .flat_map(|run| run.failure_reasons.iter().cloned())
+                .collect::<Vec<_>>();
+            reasons.sort();
+            reasons.dedup();
+            reasons
+        },
+        fallback_paths: runs.iter().map(|run| run.fallback_path.clone()).collect(),
+        ops_counts: runs.iter().map(|run| run.ops_count).collect(),
+        memory_ops_count: total_memory_ops,
+        relationship_event_ops_count: total_relationship_ops,
+        object_update_ops_count: total_object_ops,
+        scene_update_ops_count: total_scene_ops,
+        syntactic_repair_used,
+        final_memory_count: soul.memory.core.len()
+            + soul.memory.recent.len()
+            + soul.memory.schemas.len(),
+        final_relationship_target_ids,
+        final_object_states,
+        final_scene_participants,
+        default_player_leaked_into_normal_rp_state,
+        payload_history_path,
+        mne_checkpoint_path: mne_checkpoint.path.clone(),
+        summary_json_path: String::new(),
+        runs,
+    };
+    summary.summary_json_path = write_diagnostic_json_file(
+        &app,
+        &conversation_id,
+        "structured-evaluator-diagnostic-summary",
+        &summary,
+    )?
+    .display()
+    .to_string();
+
+    emit_dev_log(
+        &window,
+        "success",
+        "evaluator",
+        "structured_evaluator_diagnostic_completed",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id.as_str(),
+            "summary_json_path": summary.summary_json_path,
+            "payload_history_path": summary.payload_history_path,
+            "mne_checkpoint_path": summary.mne_checkpoint_path
+        })),
+    );
+
+    Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn diagnostic_form_fallback(
+    window: &Window,
+    provider: &ApiProvider,
+    settings: &ApiProviderSettings,
+    fallback_form_system_prompt: &str,
+    updater_user_message: &str,
+    form_spec: &EvalFormSpec,
+    soul: &Soul,
+    session_world: &SessionWorld,
+    user_text: &str,
+    narrator_text: &str,
+    conversation_id: &str,
+    assistant_message_id: i64,
+    prior_path: Vec<String>,
+    structured_failure: String,
+) -> Result<RuntimeEvaluatorOutcome, String> {
+    emit_dev_log(
+        window,
+        "warn",
+        "evaluator",
+        "structured_evaluator_fallback_to_form_started",
+        Some(serde_json::json!({
+            "conversation_id": conversation_id,
+            "assistant_message_id": assistant_message_id
+        })),
+    );
+    let (fallback_result, _fallback_raw) = complete_form_fallback_runtime(
+        provider,
+        settings,
+        fallback_form_system_prompt,
+        updater_user_message,
+        Some(form_spec.clone()),
+        soul,
+        session_world,
+        user_text,
+        narrator_text,
+        None,
+        prior_path.clone(),
+        structured_failure.clone(),
+    )
+    .await;
+    match fallback_result {
+        Ok(outcome) => {
+            emit_dev_log(
+                window,
+                "success",
+                "evaluator",
+                "structured_evaluator_fallback_to_form_succeeded",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "assistant_message_id": assistant_message_id,
+                    "fallback_path": outcome.fallback_path
+                })),
+            );
+            Ok(outcome)
+        }
+        Err(form_err) => {
+            emit_dev_log(
+                window,
+                "error",
+                "evaluator",
+                "structured_evaluator_fallback_to_form_failed",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "assistant_message_id": assistant_message_id,
+                    "error": form_err.as_str()
+                })),
+            );
+            emit_dev_log(
+                window,
+                "warn",
+                "evaluator",
+                "evaluator_noop_after_all_fallbacks",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "assistant_message_id": assistant_message_id
+                })),
+            );
+            Ok(evaluator_noop_after_all_fallbacks(
+                prior_path,
+                structured_failure,
+                form_err,
+            ))
+        }
+    }
+}
+
+fn diagnostic_structured_settings_from_profile(
+    profile: &ProviderProfile,
+    structured_policy: &str,
+) -> ApiProviderSettings {
+    ApiProviderSettings {
+        base_url: profile.base_url.clone(),
+        api_key: profile.api_key.clone(),
+        model: profile.model.clone(),
+        system_prompt: profile.system_prompt.clone(),
+        narrator_timeout_ms: profile.narrator_timeout_ms,
+        evaluator_timeout_ms: profile.evaluator_timeout_ms,
+        evaluator_timeout_mode: profile.evaluator_timeout_mode.clone(),
+        evaluator_mode: Some(EVALUATOR_MODE_STRUCTURED_V1.into()),
+        structured_evaluator_policy: Some(structured_policy.to_string()),
+        // Auto: the diagnostic tries real tool-calling first, then degrades,
+        // and reports the achieved enforcement.
+        structured_evaluator_transport: None,
+        wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn,
+        allow_send_with_stale_state: profile.allow_send_with_stale_state,
+        evaluator_background_enabled: Some(false),
+        anti_replay_forced_retry_enabled: profile.anti_replay_forced_retry_enabled,
+        evaluator_execution_mode: None,
+    }
+}
+
+fn structured_diagnostic_turns() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "Set the scene: I stand outside Aurora's apartment during a cold rain.",
+            "Aurora's apartment is warm beyond the door while preset_male waits in the hallway, rain ticking against the stairwell window.",
+        ),
+        (
+            "I knock at the door.",
+            "Aurora hears the knock and pauses near the entry, recognizing preset_male's familiar cadence through the door.",
+        ),
+        (
+            "When Aurora opens it, I step inside and greet her.",
+            "Aurora lets preset_male into the apartment, watching him shake rainwater from his hair as the hallway chill follows him in.",
+        ),
+        (
+            "I slip off my wet jacket and drape it over the chair.",
+            "preset_male removes his wet jacket and lays it over the wooden chair near the kitchen table, leaving dark damp marks on the fabric.",
+        ),
+        (
+            "I move the jacket from the chair to a hook near the door.",
+            "preset_male picks up the same wet jacket from the chair and hangs it on the hook beside the apartment door so it can drip onto the mat.",
+        ),
+    ]
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DiagnosticPatchCounts {
+    memory_ops_count: usize,
+    relationship_event_ops_count: usize,
+    object_update_ops_count: usize,
+    scene_update_ops_count: usize,
+}
+
+fn diagnostic_patch_counts(patch: &EnginePatch) -> DiagnosticPatchCounts {
+    DiagnosticPatchCounts {
+        memory_ops_count: patch
+            .soul_patch
+            .as_ref()
+            .map(|soul| soul.new_memories.len() + soul.memory_operations.len())
+            .unwrap_or(0),
+        relationship_event_ops_count: patch
+            .soul_patch
+            .as_ref()
+            .map(|soul| {
+                soul.relationship_deltas.len()
+                    + usize::from(soul.relationship_delta.as_ref().is_some())
+            })
+            .unwrap_or(0),
+        object_update_ops_count: patch
+            .world_patch
+            .as_ref()
+            .map(|world| {
+                world.object_observation_operations.len() + world.corrected_object_states.len()
+            })
+            .unwrap_or(0),
+        scene_update_ops_count: patch
+            .world_patch
+            .as_ref()
+            .and_then(|world| world.scene_state.as_ref())
+            .map(|scene| usize::from(!scene.is_empty()))
+            .unwrap_or(0),
+    }
+}
+
+fn diagnostic_total_patch_ops(patch: &EnginePatch) -> usize {
+    let counts = diagnostic_patch_counts(patch);
+    counts.memory_ops_count
+        + counts.relationship_event_ops_count
+        + counts.object_update_ops_count
+        + counts.scene_update_ops_count
+        + patch
+            .world_patch
+            .as_ref()
+            .map(|world| world.event_operations.len())
+            .unwrap_or(0)
+}
+
+fn redact_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    let (scheme, authority_and_path) = without_query
+        .split_once("://")
+        .map(|(scheme, rest)| (format!("{scheme}://"), rest))
+        .unwrap_or_else(|| (String::new(), without_query));
+    let without_credentials = authority_and_path
+        .rsplit('@')
+        .next()
+        .unwrap_or(authority_and_path);
+    format!("{scheme}{without_credentials}")
+}
+
+fn write_diagnostic_json_file<T: Serialize>(
+    app: &AppHandle,
+    conversation_id: &str,
+    label: &str,
+    value: &T,
+) -> Result<PathBuf, String> {
+    let mut dir = app
+        .path()
+        .download_dir()
+        .or_else(|_| std::env::current_dir())
+        .map_err(|err| err.to_string())?;
+    dir.push("mnemosyne-exports");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let safe_conversation = safe_filename(conversation_id);
+    let filename = format!(
+        "mnemosyne-{safe_conversation}-{label}-{}.json",
+        db::now_ts()
+    );
+    dir.push(filename);
+    let json = serde_json::to_string_pretty(value).map_err(|err| err.to_string())?;
+    fs::write(&dir, json).map_err(|err| err.to_string())?;
+    Ok(dir)
 }
 
 #[tauri::command]
@@ -8137,10 +9179,20 @@ pub async fn send_api_turn(
     if let Ok(conn) = state.conn.lock() {
         state_updater_settings.evaluator_mode =
             resolve_evaluator_mode_setting(&conn, &conversation_id, &state_updater_settings);
+        state_updater_settings.structured_evaluator_policy =
+            resolve_structured_evaluator_policy_setting(
+                &conn,
+                &conversation_id,
+                &state_updater_settings,
+            );
     }
     let evaluator_mode = evaluator_mode(&state_updater_settings);
     let selected_evaluator_source = selected_evaluator_source(&evaluator_mode);
-    let form_spec = (selected_evaluator_source == EVALUATOR_MODE_FORM_V1).then(|| {
+    let form_spec = matches!(
+        selected_evaluator_source,
+        EVALUATOR_MODE_FORM_V1 | EVALUATOR_MODE_STRUCTURED_V1
+    )
+    .then(|| {
         build_eval_form_spec_with_player_persona(
             &pre_baseline_soul,
             Some(&pre_baseline_session_world),
@@ -8151,6 +9203,17 @@ pub async fn send_api_turn(
             &active_player_persona.display_name,
         )
     });
+    let fallback_form_system_prompt = (selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1)
+        .then(|| {
+            build_evaluator_form_prompt_with_player_persona(
+                &pre_baseline_soul,
+                Some(&pre_baseline_session_world),
+                &snapshot_user_text,
+                &visible_response_for_updater,
+                &active_player_persona.persona_id,
+                &active_player_persona.display_name,
+            )
+        });
     let updater_system_prompt = if selected_evaluator_source == EVALUATOR_MODE_FORM_V1 {
         build_evaluator_form_prompt_with_player_persona(
             &pre_baseline_soul,
@@ -8370,7 +9433,9 @@ pub async fn send_api_turn(
                         .map_err(|err| err.to_string())
                     });
             }
-            let mut outcome = compile_selected_evaluator_runtime(
+            let structured_step =
+                structured_fallback_step(updater_completion.structured_enforcement);
+            match compile_selected_evaluator_runtime(
                 &evaluator_mode,
                 form_spec.clone(),
                 &updater_response,
@@ -8380,18 +9445,232 @@ pub async fn send_api_turn(
                 &snapshot_user_text,
                 &visible_response_for_updater,
                 baseline_event_id.clone(),
-            )?;
-            if let Some(comparison_trace) = dual_compare_deferred_trace(
-                &evaluator_mode,
-                parse_started.elapsed().as_millis(),
-                false,
             ) {
-                outcome.comparison_trace = Some(comparison_trace);
+                Ok(mut outcome) => {
+                    if let Some(comparison_trace) = dual_compare_deferred_trace(
+                        &evaluator_mode,
+                        parse_started.elapsed().as_millis(),
+                        false,
+                    ) {
+                        outcome.comparison_trace = Some(comparison_trace);
+                    }
+                    Ok(outcome)
+                }
+                Err(err) if selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1 => {
+                    if updater_completion.structured_enforcement
+                        == Some(StructuredEnforcement::JsonSchema)
+                    {
+                        emit_dev_log(
+                            &window,
+                            "warn",
+                            "evaluator",
+                            "structured_schema_claim_failed",
+                            Some(serde_json::json!({
+                                "conversation_id": conversation_id.as_str(),
+                                "assistant_message_id": assistant_message_id,
+                                "structured_enforcement_requested": StructuredEnforcement::JsonSchema.as_label(),
+                                "structured_schema_validation_status": structured_validation_status_from_error(&err),
+                                "structured_schema_validation_error": err.as_str()
+                            })),
+                        );
+                    }
+                    emit_dev_log(
+                        &window,
+                        "error",
+                        "evaluator",
+                        "structured_evaluator_failed",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "assistant_message_id": assistant_message_id,
+                            "error": err.as_str(),
+                            "structured_enforcement": updater_completion.structured_enforcement.map(StructuredEnforcement::as_label)
+                        })),
+                    );
+                    emit_dev_log(
+                        &window,
+                        "warn",
+                        "evaluator",
+                        "structured_evaluator_fallback_to_form_started",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "assistant_message_id": assistant_message_id,
+                        })),
+                    );
+                    let (fallback_result, _fallback_raw) = complete_form_fallback_runtime(
+                        &provider,
+                        &state_updater_settings,
+                        fallback_form_system_prompt
+                            .as_deref()
+                            .unwrap_or(&updater_system_prompt),
+                        &updater_user_message,
+                        form_spec.clone(),
+                        &pre_baseline_soul,
+                        &pre_baseline_session_world,
+                        &snapshot_user_text,
+                        &visible_response_for_updater,
+                        baseline_event_id.clone(),
+                        vec![structured_step.to_string()],
+                        err.clone(),
+                    )
+                    .await;
+                    match fallback_result {
+                        Ok(outcome) => {
+                            emit_dev_log(
+                                &window,
+                                "success",
+                                "evaluator",
+                                "structured_evaluator_fallback_to_form_succeeded",
+                                Some(serde_json::json!({
+                                    "conversation_id": conversation_id.as_str(),
+                                    "assistant_message_id": assistant_message_id,
+                                    "fallback_path": outcome.fallback_path
+                                })),
+                            );
+                            Ok(outcome)
+                        }
+                        Err(form_err) => {
+                            emit_dev_log(
+                                &window,
+                                "error",
+                                "evaluator",
+                                "structured_evaluator_fallback_to_form_failed",
+                                Some(serde_json::json!({
+                                    "conversation_id": conversation_id.as_str(),
+                                    "assistant_message_id": assistant_message_id,
+                                    "error": form_err.as_str()
+                                })),
+                            );
+                            emit_dev_log(
+                                &window,
+                                "warn",
+                                "evaluator",
+                                "evaluator_noop_after_all_fallbacks",
+                                Some(serde_json::json!({
+                                    "conversation_id": conversation_id.as_str(),
+                                    "assistant_message_id": assistant_message_id,
+                                })),
+                            );
+                            Ok(evaluator_noop_after_all_fallbacks(
+                                vec![structured_step.to_string()],
+                                err,
+                                form_err,
+                            ))
+                        }
+                    }
+                }
+                Err(err) => Err(err),
             }
-            Ok(outcome)
         }
         Err(err) => {
-            if evaluator_timed_out(&err, updater_call_elapsed, &state_updater_settings) {
+            if selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1 {
+                if structured_enforcement == Some(StructuredEnforcement::JsonSchema) {
+                    emit_dev_log(
+                        &window,
+                        "warn",
+                        "evaluator",
+                        "structured_schema_claim_failed",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "assistant_message_id": assistant_message_id,
+                            "structured_enforcement_requested": StructuredEnforcement::JsonSchema.as_label(),
+                            "structured_schema_validation_status": structured_validation_status_from_error(&err),
+                            "structured_schema_validation_error": err.as_str()
+                        })),
+                    );
+                }
+                emit_dev_log(
+                    &window,
+                    "error",
+                    "evaluator",
+                    "structured_evaluator_failed",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                        "error": err.as_str(),
+                        "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label)
+                    })),
+                );
+                emit_dev_log(
+                    &window,
+                    "warn",
+                    "evaluator",
+                    "structured_evaluator_fallback_to_form_started",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "assistant_message_id": assistant_message_id,
+                    })),
+                );
+                let structured_failure =
+                    if evaluator_timed_out(&err, updater_call_elapsed, &state_updater_settings) {
+                        format!(
+                            "Evaluator timed out after {}ms; narration saved without state update",
+                            evaluator_timeout_ms.unwrap_or(DEFAULT_EVALUATOR_TIMEOUT_MS)
+                        )
+                    } else {
+                        err
+                    };
+                let (fallback_result, _fallback_raw) = complete_form_fallback_runtime(
+                    &provider,
+                    &state_updater_settings,
+                    fallback_form_system_prompt
+                        .as_deref()
+                        .unwrap_or(&updater_system_prompt),
+                    &updater_user_message,
+                    form_spec.clone(),
+                    &pre_baseline_soul,
+                    &pre_baseline_session_world,
+                    &snapshot_user_text,
+                    &visible_response_for_updater,
+                    baseline_event_id.clone(),
+                    vec![structured_fallback_step(structured_enforcement).to_string()],
+                    structured_failure.clone(),
+                )
+                .await;
+                match fallback_result {
+                    Ok(outcome) => {
+                        emit_dev_log(
+                            &window,
+                            "success",
+                            "evaluator",
+                            "structured_evaluator_fallback_to_form_succeeded",
+                            Some(serde_json::json!({
+                                "conversation_id": conversation_id.as_str(),
+                                "assistant_message_id": assistant_message_id,
+                                "fallback_path": outcome.fallback_path
+                            })),
+                        );
+                        Ok(outcome)
+                    }
+                    Err(form_err) => {
+                        emit_dev_log(
+                            &window,
+                            "error",
+                            "evaluator",
+                            "structured_evaluator_fallback_to_form_failed",
+                            Some(serde_json::json!({
+                                "conversation_id": conversation_id.as_str(),
+                                "assistant_message_id": assistant_message_id,
+                                "error": form_err.as_str()
+                            })),
+                        );
+                        emit_dev_log(
+                            &window,
+                            "warn",
+                            "evaluator",
+                            "evaluator_noop_after_all_fallbacks",
+                            Some(serde_json::json!({
+                                "conversation_id": conversation_id.as_str(),
+                                "assistant_message_id": assistant_message_id,
+                            })),
+                        );
+                        Ok(evaluator_noop_after_all_fallbacks(
+                            vec![structured_fallback_step(structured_enforcement).to_string()],
+                            structured_failure,
+                            form_err,
+                        ))
+                    }
+                }
+            } else if evaluator_timed_out(&err, updater_call_elapsed, &state_updater_settings) {
                 Err(format!(
                     "Evaluator timed out after {}ms; narration saved without state update",
                     evaluator_timeout_ms.unwrap_or(DEFAULT_EVALUATOR_TIMEOUT_MS)
@@ -8407,7 +9686,7 @@ pub async fn send_api_turn(
         if selected_evaluator_source == EVALUATOR_MODE_FORM_V1 {
             "parse evaluator_form_v1"
         } else if selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1 {
-            "parse structured EnginePatch"
+            "parse structured evaluator ops"
         } else {
             "parse EvaluatorOutputV1"
         },
@@ -8515,6 +9794,7 @@ pub async fn send_api_turn(
                 );
                 let converter_trace = evaluator_converter_trace_json(&engine_patch, &conversion);
                 let form_trace = runtime_form_trace_json(&runtime);
+                let fallback_trace = evaluator_runtime_fallback_json(&runtime);
                 evaluator_pipeline_trace = serde_json::json!({
                     "evaluator_trace": {
                         "evaluator_request_id": evaluator_request_id.as_str(),
@@ -8544,7 +9824,8 @@ pub async fn send_api_turn(
                         "comparison_trace": runtime.comparison_trace.as_ref(),
                         "evaluator_flags_u64": evaluator_output.turn_flags_u64,
                         "turn_classification": &evaluator_output.turn_classification,
-                        "no_op_reason": evaluator_output.no_op_reason.as_deref()
+                        "no_op_reason": evaluator_output.no_op_reason.as_deref(),
+                        "compiled_patch_summary": engine_patch_summary(&engine_patch)
                     },
                     "evaluator_mode": evaluator_mode.as_str(),
                     "selected_evaluator_source": selected_evaluator_source,
@@ -8565,6 +9846,7 @@ pub async fn send_api_turn(
                     "comparison_trace": runtime.comparison_trace.as_ref(),
                     "evaluator_candidate_trace": candidate_trace,
                     "converted_engine_patch": converter_trace,
+                    "compiled_patch_summary": engine_patch_summary(&engine_patch),
                     "before_after_state_summary": {
                         "before": before_state_summary.clone(),
                         "after": serde_json::Value::Null
@@ -8572,8 +9854,10 @@ pub async fn send_api_turn(
                 });
                 if let Some(trace) = evaluator_pipeline_trace.get_mut("evaluator_trace") {
                     insert_json_object_fields(trace, &form_trace);
+                    insert_json_object_fields(trace, &fallback_trace);
                 }
                 insert_json_object_fields(&mut evaluator_pipeline_trace, &form_trace);
+                insert_json_object_fields(&mut evaluator_pipeline_trace, &fallback_trace);
                 if let Some(updater_log_id) = updater_log_id {
                     if let Ok(conn) = state.conn.lock() {
                         let _ = update_llm_payload_pipeline_trace(
@@ -11309,18 +12593,26 @@ fn resolve_speaker_for_turn(
     let label = extract_latest_speaker_label(user_text);
     let mut entities = db::list_entities(conn, conversation_id)?;
     let speaker = match label {
-        None => default_speaker_resolution(),
+        None => default_speaker_resolution(conn, conversation_id),
         Some(label) => resolve_speaker_label(conn, conversation_id, &mut entities, &label)?,
     };
     entities = db::list_entities(conn, conversation_id)?;
     Ok(EntityTurnContext { entities, speaker })
 }
 
-fn default_speaker_resolution() -> SpeakerResolution {
+/// Speaker for an unlabeled user turn. Defaults to the active player persona
+/// (e.g. `preset_male`) so the evaluator's user message attributes the turn to
+/// the same entity the system prompt and relationship context use — not the
+/// generic `default_player`, which leaked a conflicting attribution.
+fn default_speaker_resolution(conn: &Connection, conversation_id: &str) -> SpeakerResolution {
+    let (entity_id, display_name) = db::get_active_player_persona(conn, conversation_id)
+        .ok()
+        .map(|persona| (persona.persona_id, persona.display_name))
+        .unwrap_or_else(|| ("default_player".into(), "User".into()));
     SpeakerResolution {
         label: None,
-        entity_id: "default_player".into(),
-        display_name: "User".into(),
+        entity_id,
+        display_name,
         status: SpeakerResolutionStatus::NoLabel,
         candidates: Vec::new(),
     }
@@ -11698,10 +12990,10 @@ fn relationship_for_entity<'a>(
 impl SpeakerResolution {
     fn summary_line(&self) -> String {
         match self.status {
-            SpeakerResolutionStatus::NoLabel => {
-                "No explicit speaker label; defaulting latest speaker to default_player (User)."
-                    .into()
-            }
+            SpeakerResolutionStatus::NoLabel => format!(
+                "No explicit speaker label; defaulting latest speaker to {} ({}).",
+                self.entity_id, self.display_name
+            ),
             SpeakerResolutionStatus::Exact => format!(
                 "Label {:?} resolved to {} ({}).",
                 self.label.as_deref().unwrap_or(""),
@@ -11895,6 +13187,7 @@ fn build_compact_updater_payload_for_test(
     )
 }
 
+#[cfg(test)]
 fn parse_engine_patch_json(raw: &str) -> Result<EnginePatch, String> {
     let trimmed = raw.trim();
     let json = if let Some(stripped) = trimmed.strip_prefix("```json") {
@@ -11992,6 +13285,18 @@ fn resolve_evaluator_mode_setting(
     None
 }
 
+fn resolve_structured_evaluator_policy_setting(
+    conn: &Connection,
+    conversation_id: &str,
+    settings: &ApiProviderSettings,
+) -> Option<String> {
+    if settings.structured_evaluator_policy.is_some() {
+        return settings.structured_evaluator_policy.clone();
+    }
+    active_evaluator_profile_for_conversation(conn, conversation_id, settings)?
+        .structured_evaluator_policy
+}
+
 fn evaluator_provider_label(mode: &str, background: bool) -> String {
     let source = selected_evaluator_source(mode);
     if background {
@@ -12016,6 +13321,14 @@ struct RuntimeEvaluatorOutcome {
     comparison_trace: Option<serde_json::Value>,
     partial_success: bool,
     partial_success_reason: Option<String>,
+    fallback_path: Vec<String>,
+    fallback_warning: Option<String>,
+    structured_ops_count: Option<usize>,
+    syntactic_repair_used: bool,
+    structured_enforcement_requested: Option<String>,
+    structured_enforcement_validated: bool,
+    structured_schema_validation_status: String,
+    structured_schema_validation_error: Option<String>,
 }
 
 fn runtime_form_trace_json(outcome: &RuntimeEvaluatorOutcome) -> serde_json::Value {
@@ -12130,6 +13443,46 @@ fn insert_json_object_fields(target: &mut serde_json::Value, fields: &serde_json
     }
 }
 
+fn structured_fallback_step(enforcement: Option<StructuredEnforcement>) -> &'static str {
+    match enforcement {
+        Some(StructuredEnforcement::JsonSchema) => "structured_json_schema",
+        Some(StructuredEnforcement::JsonObject) => "structured_json_object",
+        Some(StructuredEnforcement::ToolCall) => "structured_tool_call",
+        Some(StructuredEnforcement::Grammar) => "structured_grammar",
+        Some(StructuredEnforcement::None) | None => "structured_none",
+    }
+}
+
+fn structured_validation_status_from_error(error: &str) -> &'static str {
+    if error.contains("malformed_schema_output") {
+        "malformed_schema_output"
+    } else if error.contains("zero_ops_on_durable_turn") {
+        "zero_ops_on_durable_turn"
+    } else if error.contains("semantic validation failed") {
+        "semantic_validation_failed"
+    } else if error.to_ascii_lowercase().contains("timed out")
+        || error.to_ascii_lowercase().contains("timeout")
+    {
+        "timeout"
+    } else {
+        "not_validated"
+    }
+}
+
+fn evaluator_runtime_fallback_json(outcome: &RuntimeEvaluatorOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "fallback_path": outcome.fallback_path,
+        "fallback_warning": outcome.fallback_warning.as_deref(),
+        "structured_schema_version": state_engine::evaluator_structured::EVALUATOR_STRUCTURED_SCHEMA_VERSION,
+        "ops_count": outcome.structured_ops_count.unwrap_or(0),
+        "syntactic_repair_used": outcome.syntactic_repair_used,
+        "structured_enforcement_requested": outcome.structured_enforcement_requested.as_deref().unwrap_or("none"),
+        "structured_enforcement_validated": outcome.structured_enforcement_validated,
+        "structured_schema_validation_status": outcome.structured_schema_validation_status.as_str(),
+        "structured_schema_validation_error": outcome.structured_schema_validation_error.as_deref()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_selected_evaluator_runtime(
     evaluator_mode: &str,
@@ -12157,7 +13510,15 @@ fn compile_selected_evaluator_runtime(
             baseline_recent_event_id,
         )
     } else if source == EVALUATOR_MODE_STRUCTURED_V1 {
-        compile_evaluator_structured_runtime(raw_response, structured_enforcement)
+        compile_evaluator_structured_runtime(
+            raw_response,
+            structured_enforcement,
+            soul,
+            session_world,
+            latest_user_message,
+            latest_narrator_response,
+            baseline_recent_event_id,
+        )
     } else {
         compile_evaluator_v1_runtime(
             raw_response,
@@ -12170,49 +13531,235 @@ fn compile_selected_evaluator_runtime(
     }
 }
 
-/// Runtime for `evaluator_structured_v1`: the model returns EnginePatch JSON
-/// directly under provider enforcement, so there is no EvaluatorOutputV1
-/// stage and no conversion layer — the patch parses with serde alone. With
-/// `json_schema` enforcement a strict-parse failure is a contract break, not
-/// formatting drift, so NO syntactic repair is attempted. At weaker
-/// enforcement levels the legacy code-fence stripping remains as fallback.
+#[allow(clippy::too_many_arguments)]
+async fn complete_form_fallback_runtime(
+    provider: &ApiProvider,
+    settings: &ApiProviderSettings,
+    form_system_prompt: &str,
+    user_message: &str,
+    form_spec: Option<EvalFormSpec>,
+    soul: &Soul,
+    session_world: &SessionWorld,
+    latest_user_message: &str,
+    latest_narrator_response: &str,
+    baseline_recent_event_id: Option<String>,
+    prior_path: Vec<String>,
+    structured_failure: String,
+) -> (Result<RuntimeEvaluatorOutcome, String>, Option<String>) {
+    let Some(spec) = form_spec else {
+        return (
+            Err("Evaluator form fallback requested but EvalFormSpec was not generated".into()),
+            None,
+        );
+    };
+    let timeout = effective_evaluator_timeout_ms(settings).map(Duration::from_millis);
+    let completion = match provider
+        .complete_prompt_with_usage(settings, form_system_prompt, user_message, 0.0, timeout)
+        .await
+    {
+        Ok(completion) => completion,
+        Err(err) => return (Err(err), None),
+    };
+    let raw_response = completion.raw_text.clone();
+    let outcome = compile_evaluator_form_runtime_strict(
+        &completion.raw_text,
+        spec,
+        soul,
+        session_world,
+        latest_user_message,
+        latest_narrator_response,
+        baseline_recent_event_id,
+    )
+    .map(|mut outcome| {
+        outcome.fallback_path = {
+            let mut path = prior_path;
+            path.push(EVALUATOR_MODE_FORM_V1.to_string());
+            path
+        };
+        outcome.fallback_warning = Some(format!(
+            "structured evaluator failed; evaluator_form_v1 fallback used: {structured_failure}"
+        ));
+        outcome
+    });
+    (outcome, Some(raw_response))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_evaluator_form_runtime_strict(
+    raw_response: &str,
+    spec: EvalFormSpec,
+    soul: &Soul,
+    session_world: &SessionWorld,
+    latest_user_message: &str,
+    latest_narrator_response: &str,
+    baseline_recent_event_id: Option<String>,
+) -> Result<RuntimeEvaluatorOutcome, String> {
+    let (form_response, repair_trace) = parse_eval_form_response_with_trace(raw_response)?;
+    let compiled = compile_eval_form_response(
+        &spec,
+        &form_response,
+        &EvaluatorConversionContext {
+            active_soul_id: soul.character_id.as_str(),
+            active_soul_ids: active_souls_for_v1(soul),
+            latest_user_message,
+            latest_narrator_response,
+            session_world: Some(session_world),
+            baseline_recent_event_id,
+        },
+    );
+    let mut form_trace = compiled.trace;
+    form_trace.raw_form_repair_applied = repair_trace.raw_form_repair_applied;
+    form_trace.raw_form_repair_warnings = repair_trace.raw_form_repair_warnings;
+    form_trace.json_extract_status = repair_trace.json_extract_status;
+    form_trace.strict_parse_failed_but_salvage_attempted =
+        repair_trace.strict_parse_failed_but_salvage_attempted;
+    form_trace.salvage_success = repair_trace.salvage_success;
+    let syntactic_repair_used = form_trace.raw_form_repair_applied;
+    let normalized_json = serde_json::to_string(&compiled.output)
+        .map_err(|err| format!("Evaluator form compiled output serialization failed: {err}"))?;
+    Ok(RuntimeEvaluatorOutcome {
+        output: compiled.output,
+        draft: compiled.draft,
+        normalized_json,
+        normalized: true,
+        warnings: compiled
+            .rejected_rows
+            .iter()
+            .map(|row| format!("{} {} rejected: {}", row.row_kind, row.row_id, row.reason))
+            .collect(),
+        conversion: compiled.conversion,
+        form_spec: Some(spec),
+        form_trace: Some(form_trace),
+        form_rejected_rows: compiled.rejected_rows,
+        form_response_parse_status: Some("success".into()),
+        comparison_trace: None,
+        partial_success: false,
+        partial_success_reason: None,
+        fallback_path: vec![EVALUATOR_MODE_FORM_V1.to_string()],
+        fallback_warning: None,
+        structured_ops_count: None,
+        syntactic_repair_used,
+        structured_enforcement_requested: None,
+        structured_enforcement_validated: false,
+        structured_schema_validation_status: "not_applicable".into(),
+        structured_schema_validation_error: None,
+    })
+}
+
+fn evaluator_noop_after_all_fallbacks(
+    prior_path: Vec<String>,
+    structured_failure: String,
+    form_failure: String,
+) -> RuntimeEvaluatorOutcome {
+    RuntimeEvaluatorOutcome {
+        output: EvaluatorOutputV1 {
+            schema_version: EVALUATOR_SCHEMA_VERSION,
+            no_op_reason: Some(format!(
+                "structured evaluator failed ({structured_failure}); evaluator_form_v1 fallback failed ({form_failure})"
+            )),
+            ..EvaluatorOutputV1::default()
+        },
+        draft: state_engine::evaluator_ingest::NormalizedEvaluationDraft {
+            warnings: vec![
+                "all evaluator fallback paths failed; no-op patch recorded".to_string()
+            ],
+            ..Default::default()
+        },
+        normalized_json: "{}".into(),
+        normalized: false,
+        warnings: vec![
+            "all evaluator fallback paths failed; no-op patch recorded".to_string()
+        ],
+        conversion: EvaluatorConversionReport {
+            patch: EnginePatch::default(),
+            no_op: true,
+            ..EvaluatorConversionReport::default()
+        },
+        form_spec: None,
+        form_trace: None,
+        form_rejected_rows: Vec::new(),
+        form_response_parse_status: Some("failed".into()),
+        comparison_trace: None,
+        partial_success: true,
+        partial_success_reason: Some("all evaluator fallback paths failed; no-op patch recorded".into()),
+        fallback_path: {
+            let mut path = prior_path;
+            path.push(EVALUATOR_MODE_FORM_V1.to_string());
+            path.push("noop_after_all_fallbacks".to_string());
+            path
+        },
+        fallback_warning: Some("all evaluator fallback paths failed; no-op patch recorded".into()),
+        structured_ops_count: Some(0),
+        syntactic_repair_used: false,
+        structured_enforcement_requested: None,
+        structured_enforcement_validated: false,
+        structured_schema_validation_status: "not_validated".into(),
+        structured_schema_validation_error: Some(format!(
+            "structured_failure={structured_failure}; form_failure={form_failure}"
+        )),
+    }
+}
+
+/// Runtime for `evaluator_structured_v1`: the model returns compact evaluator
+/// ops under provider enforcement. Rust parses, validates evidence/entities,
+/// and compiles those operations into an EnginePatch for the normal ledger path.
+/// Schema-enforced parse failures are contract breaks, so no syntactic repair
+/// path is attempted.
 fn compile_evaluator_structured_runtime(
     raw_response: &str,
     structured_enforcement: Option<StructuredEnforcement>,
+    soul: &Soul,
+    session_world: &SessionWorld,
+    latest_user_message: &str,
+    latest_narrator_response: &str,
+    baseline_recent_event_id: Option<String>,
 ) -> Result<RuntimeEvaluatorOutcome, String> {
-    let strict_parse = serde_json::from_str::<EnginePatch>(raw_response.trim());
-    let (patch, normalized, warnings) = match strict_parse {
-        Ok(patch) => (patch, false, Vec::new()),
+    let enforcement_label = structured_enforcement
+        .map(StructuredEnforcement::as_label)
+        .unwrap_or("none")
+        .to_string();
+    let strict_parse = serde_json::from_str::<EvaluatorStructuredOutputV1>(raw_response.trim());
+    let (ops_output, normalized, warnings) = match strict_parse {
+        Ok(output) => (output, false, Vec::new()),
         Err(err) if structured_enforcement == Some(StructuredEnforcement::JsonSchema) => {
             return Err(format!(
-                "Structured evaluator returned schema-enforced output that failed strict parse: {err}"
+                "malformed_schema_output: Structured evaluator returned schema-enforced output that failed strict parse: {err}"
             ));
         }
-        Err(_) => {
-            let patch = parse_engine_patch_json(raw_response)?;
-            (
-                patch,
-                true,
-                vec!["structured evaluator output required code-fence stripping".to_string()],
-            )
+        Err(err) => {
+            return Err(format!(
+                "malformed_schema_output: Structured evaluator ops parse failed without repair fallback: {err}"
+            ));
         }
     };
-    let normalized_json = serde_json::to_string(&patch)
-        .map_err(|err| format!("Structured evaluator patch serialization failed: {err}"))?;
-    let no_op = patch.is_empty();
+    if ops_output.ops.is_empty()
+        && durable_change_required(latest_user_message, latest_narrator_response).is_some()
+        && !meaningful_no_op_reason(ops_output.no_op_reason.as_deref())
+    {
+        return Err(
+            "zero_ops_on_durable_turn: structured evaluator returned empty ops for durable latest exchange"
+                .into(),
+        );
+    }
+    let context = EvaluatorConversionContext {
+        active_soul_id: soul.character_id.as_str(),
+        active_soul_ids: active_souls_for_v1(soul),
+        latest_user_message,
+        latest_narrator_response,
+        session_world: Some(session_world),
+        baseline_recent_event_id,
+    };
+    let conversion = compile_evaluator_ops_to_engine_patch(&ops_output, &context, soul)
+        .map_err(|err| format!("Structured evaluator semantic validation failed: {err}"))?;
+    let normalized_json = serde_json::to_string(&ops_output)
+        .map_err(|err| format!("Structured evaluator ops serialization failed: {err}"))?;
     Ok(RuntimeEvaluatorOutcome {
         output: EvaluatorOutputV1::default(),
         draft: state_engine::evaluator_ingest::NormalizedEvaluationDraft::default(),
         normalized_json,
         normalized,
         warnings,
-        conversion: EvaluatorConversionReport {
-            patch,
-            accepted_candidate_ids: Vec::new(),
-            rejected_candidates: Vec::new(),
-            evidence_validations: Vec::new(),
-            no_op,
-        },
+        conversion,
         form_spec: None,
         form_trace: None,
         form_rejected_rows: Vec::new(),
@@ -12220,6 +13767,14 @@ fn compile_evaluator_structured_runtime(
         comparison_trace: None,
         partial_success: false,
         partial_success_reason: None,
+        fallback_path: vec![structured_fallback_step(structured_enforcement).to_string()],
+        fallback_warning: None,
+        structured_ops_count: Some(ops_output.ops.len()),
+        syntactic_repair_used: false,
+        structured_enforcement_requested: Some(enforcement_label),
+        structured_enforcement_validated: true,
+        structured_schema_validation_status: "validated".into(),
+        structured_schema_validation_error: None,
     })
 }
 
@@ -12266,6 +13821,14 @@ fn compile_evaluator_v1_runtime(
         comparison_trace: None,
         partial_success: false,
         partial_success_reason: None,
+        fallback_path: vec![EVALUATOR_MODE_V1.to_string()],
+        fallback_warning: None,
+        structured_ops_count: None,
+        syntactic_repair_used: false,
+        structured_enforcement_requested: None,
+        structured_enforcement_validated: false,
+        structured_schema_validation_status: "not_applicable".into(),
+        structured_schema_validation_error: None,
     })
 }
 
@@ -12311,6 +13874,7 @@ fn compile_evaluator_form_runtime(
     form_trace.strict_parse_failed_but_salvage_attempted =
         repair_trace.strict_parse_failed_but_salvage_attempted;
     form_trace.salvage_success = repair_trace.salvage_success;
+    let syntactic_repair_used = form_trace.raw_form_repair_applied;
     let mut conversion = compiled.conversion;
     let mut partial_success = false;
     let mut partial_success_reason = None;
@@ -12357,6 +13921,14 @@ fn compile_evaluator_form_runtime(
         comparison_trace: None,
         partial_success,
         partial_success_reason,
+        fallback_path: vec![EVALUATOR_MODE_FORM_V1.to_string()],
+        fallback_warning: None,
+        structured_ops_count: None,
+        syntactic_repair_used,
+        structured_enforcement_requested: None,
+        structured_enforcement_validated: false,
+        structured_schema_validation_status: "not_applicable".into(),
+        structured_schema_validation_error: None,
     })
 }
 
@@ -12459,6 +14031,17 @@ fn minimal_form_scene_runtime(
         comparison_trace: None,
         partial_success: true,
         partial_success_reason: Some(reason),
+        fallback_path: vec![
+            EVALUATOR_MODE_FORM_V1.to_string(),
+            "minimal_scene_patch".to_string(),
+        ],
+        fallback_warning: Some("legacy form minimal scene fallback used".to_string()),
+        structured_ops_count: None,
+        syntactic_repair_used: true,
+        structured_enforcement_requested: None,
+        structured_enforcement_validated: false,
+        structured_schema_validation_status: "not_applicable".into(),
+        structured_schema_validation_error: None,
     }
 }
 
@@ -12542,6 +14125,157 @@ fn minimal_scene_summary(latest_user_message: &str, latest_narrator_response: &s
         );
     }
     "The current scene advanced.".into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableChangeKind {
+    Location,
+    Object,
+    Relationship,
+    Scene,
+}
+
+fn durable_change_required(user_text: &str, narrator_text: &str) -> Option<DurableChangeKind> {
+    let text = format!("{user_text}\n{narrator_text}").to_ascii_lowercase();
+    let object_terms = [
+        "jacket", "coat", "chair", "hook", "door", "phone", "key", "bag", "cup", "letter", "wet",
+        "damp", "hang", "hung", "place", "placed", "drape", "draped", "move", "moved", "put",
+        "set",
+    ];
+    if object_terms.iter().any(|term| text.contains(term))
+        && [
+            "place", "placed", "drape", "draped", "move", "moved", "hang", "hung", "wet", "damp",
+        ]
+        .iter()
+        .any(|term| text.contains(term))
+    {
+        return Some(DurableChangeKind::Object);
+    }
+    if [
+        "enter",
+        "entered",
+        "step inside",
+        "walk in",
+        "leave",
+        "left",
+        "arrive",
+        "arrived",
+        "outside",
+        "inside",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
+    {
+        return Some(DurableChangeKind::Location);
+    }
+    if [
+        "promise",
+        "apolog",
+        "trust",
+        "betray",
+        "comfort",
+        "threat",
+        "refuse",
+        "boundary",
+        "recognizing",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
+    {
+        return Some(DurableChangeKind::Relationship);
+    }
+    if [
+        "scene",
+        "focus",
+        "near the door",
+        "hallway",
+        "apartment",
+        "kitchen table",
+    ]
+    .iter()
+    .any(|term| text.contains(term))
+    {
+        return Some(DurableChangeKind::Scene);
+    }
+    None
+}
+
+fn meaningful_no_op_reason(reason: Option<&str>) -> bool {
+    let Some(reason) = reason.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let lower = reason.to_ascii_lowercase();
+    reason.chars().count() >= 12
+        && !matches!(
+            lower.as_str(),
+            "none" | "n/a" | "no-op" | "no op" | "nothing" | "no changes"
+        )
+}
+
+fn diagnostic_object_scene_guarantee_patch(
+    soul: &Soul,
+    latest_user_message: &str,
+    latest_narrator_response: &str,
+) -> EnginePatch {
+    let summary = minimal_scene_summary(latest_user_message, latest_narrator_response);
+    let lower = format!("{latest_user_message}\n{latest_narrator_response}").to_ascii_lowercase();
+    let jacket_location = if lower.contains("hook") || lower.contains("near the door") {
+        "hook near the door"
+    } else if lower.contains("chair") {
+        "chair"
+    } else {
+        "current scene"
+    };
+    let jacket_status = if lower.contains("wet") || lower.contains("damp") {
+        "wet"
+    } else {
+        "present"
+    };
+    EnginePatch {
+        world_patch: Some(WorldPatch {
+            scene_state: Some(SceneStatePatch {
+                scene_state_id: Some(format!("scene_guarantee_{}", uuid_like_id())),
+                current_scene: Some(summary.clone()),
+                focus: Some(scene_focus(soul, "preset_male")),
+                participants: minimal_scene_participants(soul, "preset_male"),
+                last_user_action: clean_user_action(latest_user_message),
+                continuity_note: Some(summary.clone()),
+                ..SceneStatePatch::default()
+            }),
+            object_observation_operations: vec![
+                state_engine::patch::ObjectObservationOperationPatch {
+                    operation: "update_object_state".into(),
+                    object_observation_id: Some(format!("object_guarantee_{}", uuid_like_id())),
+                    object_state: Some(state_engine::soul::ObjectState {
+                        object_id: "preset_male_jacket_1".into(),
+                        object_kind: "jacket".into(),
+                        owner_entity_id: Some("preset_male".into()),
+                        location: jacket_location.into(),
+                        status: jacket_status.into(),
+                        last_observed_state: summary,
+                        confidence: 0.65,
+                        ..state_engine::soul::ObjectState::default()
+                    }),
+                    ..state_engine::patch::ObjectObservationOperationPatch::default()
+                },
+            ],
+            ..WorldPatch::default()
+        }),
+        ..EnginePatch::default()
+    }
+}
+
+fn merge_world_guarantee_patch(target: &mut EnginePatch, guarantee: EnginePatch) {
+    let Some(mut guarantee_world) = guarantee.world_patch else {
+        return;
+    };
+    let world = target.world_patch.get_or_insert_with(WorldPatch::default);
+    if world.scene_state.is_none() {
+        world.scene_state = guarantee_world.scene_state.take();
+    }
+    world
+        .object_observation_operations
+        .append(&mut guarantee_world.object_observation_operations);
 }
 
 fn form_scene_player_entity_id(spec: &EvalFormSpec) -> String {
@@ -12662,7 +14396,7 @@ async fn complete_evaluator_with_config(
 ) -> Result<EvaluatorCompletion, String> {
     let timeout = effective_evaluator_timeout_ms(settings).map(Duration::from_millis);
     if selected_evaluator_source(&evaluator_mode(settings)) == EVALUATOR_MODE_STRUCTURED_V1 {
-        let schema = evaluator_patch_json_schema();
+        let schema = evaluator_ops_json_schema();
         let completion = provider
             .complete_structured_prompt(
                 settings,
@@ -12670,7 +14404,7 @@ async fn complete_evaluator_with_config(
                 user_message,
                 0.0,
                 timeout,
-                "engine_patch",
+                EVALUATOR_OPS_SCHEMA_NAME,
                 &schema,
             )
             .await?;
@@ -13088,6 +14822,19 @@ async fn run_background_evaluator_job(
     if let Some(mode) = resolved_evaluator_mode {
         state_updater_settings.evaluator_mode = Some(mode);
     }
+    let resolved_structured_policy = {
+        let state = app.state::<AppState>();
+        state.conn.lock().ok().and_then(|conn| {
+            resolve_structured_evaluator_policy_setting(
+                &conn,
+                &job.conversation_id,
+                &state_updater_settings,
+            )
+        })
+    };
+    if let Some(policy) = resolved_structured_policy {
+        state_updater_settings.structured_evaluator_policy = Some(policy);
+    }
     let evaluator_mode = evaluator_mode(&state_updater_settings);
     let selected_evaluator_source = selected_evaluator_source(&evaluator_mode);
     let active_player_persona = {
@@ -13104,7 +14851,11 @@ async fn run_background_evaluator_job(
                     .expect("built-in player persona exists")
             })
     };
-    let form_spec = (selected_evaluator_source == EVALUATOR_MODE_FORM_V1).then(|| {
+    let form_spec = matches!(
+        selected_evaluator_source,
+        EVALUATOR_MODE_FORM_V1 | EVALUATOR_MODE_STRUCTURED_V1
+    )
+    .then(|| {
         build_eval_form_spec_with_player_persona(
             &soul,
             Some(&session_world),
@@ -13115,6 +14866,17 @@ async fn run_background_evaluator_job(
             &active_player_persona.display_name,
         )
     });
+    let fallback_form_system_prompt = (selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1)
+        .then(|| {
+            build_evaluator_form_prompt_with_player_persona(
+                &soul,
+                Some(&session_world),
+                &snapshot_user_text,
+                &visible_response_for_updater,
+                &active_player_persona.persona_id,
+                &active_player_persona.display_name,
+            )
+        });
     let updater_system_prompt = if selected_evaluator_source == EVALUATOR_MODE_FORM_V1 {
         let mut is_compact =
             state_updater_settings.evaluator_mode.as_deref() == Some("form_v1_compact");
@@ -13347,19 +15109,240 @@ async fn run_background_evaluator_job(
         return;
     }
 
-    let runtime = match response_result.and_then(|completion| {
-        compile_selected_evaluator_runtime(
-            &evaluator_mode,
-            form_spec.clone(),
-            &completion.raw_text,
-            completion.structured_enforcement,
-            &soul,
-            &session_world,
-            &snapshot_user_text,
-            &visible_response_for_updater,
-            baseline_recent_event_id.clone(),
-        )
-    }) {
+    let runtime_result = match response_result {
+        Ok(completion) => {
+            let structured_step = structured_fallback_step(completion.structured_enforcement);
+            match compile_selected_evaluator_runtime(
+                &evaluator_mode,
+                form_spec.clone(),
+                &completion.raw_text,
+                completion.structured_enforcement,
+                &soul,
+                &session_world,
+                &snapshot_user_text,
+                &visible_response_for_updater,
+                baseline_recent_event_id.clone(),
+            ) {
+                Ok(output) => Ok(output),
+                Err(err) if selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1 => {
+                    if completion.structured_enforcement == Some(StructuredEnforcement::JsonSchema)
+                    {
+                        emit_dev_log(
+                            &window,
+                            "warn",
+                            "evaluator",
+                            "structured_schema_claim_failed",
+                            Some(serde_json::json!({
+                                "conversation_id": job.conversation_id.as_str(),
+                                "assistant_message_id": job.assistant_message_id,
+                                "evaluator_job_id": job.evaluator_job_id.as_str(),
+                                "structured_enforcement_requested": StructuredEnforcement::JsonSchema.as_label(),
+                                "structured_schema_validation_status": structured_validation_status_from_error(&err),
+                                "structured_schema_validation_error": err.as_str()
+                            })),
+                        );
+                    }
+                    emit_dev_log(
+                        &window,
+                        "error",
+                        "evaluator",
+                        "structured_evaluator_failed",
+                        Some(serde_json::json!({
+                            "conversation_id": job.conversation_id.as_str(),
+                            "assistant_message_id": job.assistant_message_id,
+                            "evaluator_job_id": job.evaluator_job_id.as_str(),
+                            "error": err.as_str(),
+                            "structured_enforcement": completion.structured_enforcement.map(StructuredEnforcement::as_label)
+                        })),
+                    );
+                    emit_dev_log(
+                        &window,
+                        "warn",
+                        "evaluator",
+                        "structured_evaluator_fallback_to_form_started",
+                        Some(serde_json::json!({
+                            "conversation_id": job.conversation_id.as_str(),
+                            "assistant_message_id": job.assistant_message_id,
+                            "evaluator_job_id": job.evaluator_job_id.as_str()
+                        })),
+                    );
+                    let (fallback_result, _fallback_raw) = complete_form_fallback_runtime(
+                        &provider,
+                        &state_updater_settings,
+                        fallback_form_system_prompt
+                            .as_deref()
+                            .unwrap_or(&updater_system_prompt),
+                        &updater_user_message,
+                        form_spec.clone(),
+                        &soul,
+                        &session_world,
+                        &snapshot_user_text,
+                        &visible_response_for_updater,
+                        baseline_recent_event_id.clone(),
+                        vec![structured_step.to_string()],
+                        err.clone(),
+                    )
+                    .await;
+                    match fallback_result {
+                        Ok(outcome) => {
+                            emit_dev_log(
+                                &window,
+                                "success",
+                                "evaluator",
+                                "structured_evaluator_fallback_to_form_succeeded",
+                                Some(serde_json::json!({
+                                    "conversation_id": job.conversation_id.as_str(),
+                                    "assistant_message_id": job.assistant_message_id,
+                                    "evaluator_job_id": job.evaluator_job_id.as_str(),
+                                    "fallback_path": outcome.fallback_path
+                                })),
+                            );
+                            Ok(outcome)
+                        }
+                        Err(form_err) => {
+                            emit_dev_log(
+                                &window,
+                                "error",
+                                "evaluator",
+                                "structured_evaluator_fallback_to_form_failed",
+                                Some(serde_json::json!({
+                                    "conversation_id": job.conversation_id.as_str(),
+                                    "assistant_message_id": job.assistant_message_id,
+                                    "evaluator_job_id": job.evaluator_job_id.as_str(),
+                                    "error": form_err.as_str()
+                                })),
+                            );
+                            emit_dev_log(
+                                &window,
+                                "warn",
+                                "evaluator",
+                                "evaluator_noop_after_all_fallbacks",
+                                Some(serde_json::json!({
+                                    "conversation_id": job.conversation_id.as_str(),
+                                    "assistant_message_id": job.assistant_message_id,
+                                    "evaluator_job_id": job.evaluator_job_id.as_str()
+                                })),
+                            );
+                            Ok(evaluator_noop_after_all_fallbacks(
+                                vec![structured_step.to_string()],
+                                err,
+                                form_err,
+                            ))
+                        }
+                    }
+                }
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) if selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1 => {
+            if structured_enforcement == Some(StructuredEnforcement::JsonSchema) {
+                emit_dev_log(
+                    &window,
+                    "warn",
+                    "evaluator",
+                    "structured_schema_claim_failed",
+                    Some(serde_json::json!({
+                        "conversation_id": job.conversation_id.as_str(),
+                        "assistant_message_id": job.assistant_message_id,
+                        "evaluator_job_id": job.evaluator_job_id.as_str(),
+                        "structured_enforcement_requested": StructuredEnforcement::JsonSchema.as_label(),
+                        "structured_schema_validation_status": structured_validation_status_from_error(&err),
+                        "structured_schema_validation_error": err.as_str()
+                    })),
+                );
+            }
+            emit_dev_log(
+                &window,
+                "error",
+                "evaluator",
+                "structured_evaluator_failed",
+                Some(serde_json::json!({
+                    "conversation_id": job.conversation_id.as_str(),
+                    "assistant_message_id": job.assistant_message_id,
+                    "evaluator_job_id": job.evaluator_job_id.as_str(),
+                    "error": err.as_str(),
+                    "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label)
+                })),
+            );
+            emit_dev_log(
+                &window,
+                "warn",
+                "evaluator",
+                "structured_evaluator_fallback_to_form_started",
+                Some(serde_json::json!({
+                    "conversation_id": job.conversation_id.as_str(),
+                    "assistant_message_id": job.assistant_message_id,
+                    "evaluator_job_id": job.evaluator_job_id.as_str()
+                })),
+            );
+            let (fallback_result, _fallback_raw) = complete_form_fallback_runtime(
+                &provider,
+                &state_updater_settings,
+                fallback_form_system_prompt
+                    .as_deref()
+                    .unwrap_or(&updater_system_prompt),
+                &updater_user_message,
+                form_spec.clone(),
+                &soul,
+                &session_world,
+                &snapshot_user_text,
+                &visible_response_for_updater,
+                baseline_recent_event_id.clone(),
+                vec![structured_fallback_step(structured_enforcement).to_string()],
+                err.clone(),
+            )
+            .await;
+            match fallback_result {
+                Ok(outcome) => {
+                    emit_dev_log(
+                        &window,
+                        "success",
+                        "evaluator",
+                        "structured_evaluator_fallback_to_form_succeeded",
+                        Some(serde_json::json!({
+                            "conversation_id": job.conversation_id.as_str(),
+                            "assistant_message_id": job.assistant_message_id,
+                            "evaluator_job_id": job.evaluator_job_id.as_str(),
+                            "fallback_path": outcome.fallback_path
+                        })),
+                    );
+                    Ok(outcome)
+                }
+                Err(form_err) => {
+                    emit_dev_log(
+                        &window,
+                        "error",
+                        "evaluator",
+                        "structured_evaluator_fallback_to_form_failed",
+                        Some(serde_json::json!({
+                            "conversation_id": job.conversation_id.as_str(),
+                            "assistant_message_id": job.assistant_message_id,
+                            "evaluator_job_id": job.evaluator_job_id.as_str(),
+                            "error": form_err.as_str()
+                        })),
+                    );
+                    emit_dev_log(
+                        &window,
+                        "warn",
+                        "evaluator",
+                        "evaluator_noop_after_all_fallbacks",
+                        Some(serde_json::json!({
+                            "conversation_id": job.conversation_id.as_str(),
+                            "assistant_message_id": job.assistant_message_id,
+                            "evaluator_job_id": job.evaluator_job_id.as_str()
+                        })),
+                    );
+                    Ok(evaluator_noop_after_all_fallbacks(
+                        vec![structured_fallback_step(structured_enforcement).to_string()],
+                        err,
+                        form_err,
+                    ))
+                }
+            }
+        }
+        Err(err) => Err(err),
+    };
+    let runtime = match runtime_result {
         Ok(mut output) => {
             if !drained_catchup_ids.is_empty() {
                 let state = app.state::<AppState>();
@@ -13657,6 +15640,7 @@ async fn run_background_evaluator_job(
     );
     window.emit("pipeline-trace-updated", &pipeline_trace).ok();
     let converter_trace = evaluator_converter_trace_json(&engine_patch, &conversion);
+    let fallback_trace = evaluator_runtime_fallback_json(&runtime);
     emit_dev_log(
         &window,
         "success",
@@ -13950,7 +15934,8 @@ async fn run_background_evaluator_job(
                 "comparison_trace": runtime.comparison_trace.as_ref(),
                 "elapsed_ms": call_elapsed.as_millis(),
                 "timeout_ms": job.timeout_ms,
-                "timeout_mode": job.timeout_mode.as_str()
+                "timeout_mode": job.timeout_mode.as_str(),
+                "compiled_patch_summary": engine_patch_summary(&engine_patch)
             },
             "evaluator_mode": evaluator_mode.as_str(),
             "selected_evaluator_source": selected_evaluator_source,
@@ -13971,6 +15956,7 @@ async fn run_background_evaluator_job(
             "comparison_trace": runtime.comparison_trace.as_ref(),
             "evaluator_candidate_trace": candidate_trace,
             "converted_engine_patch": converter_trace,
+            "compiled_patch_summary": engine_patch_summary(&engine_patch),
             "ledger_apply_trace": ledger_trace,
             "conversion_error": err.as_str(),
             "before_after_state_summary": {
@@ -13982,8 +15968,10 @@ async fn run_background_evaluator_job(
         trace["pipeline_trace"] = serde_json::to_value(&pipeline_trace).unwrap_or_default();
         if let Some(evaluator_trace) = trace.get_mut("evaluator_trace") {
             insert_json_object_fields(evaluator_trace, &form_trace);
+            insert_json_object_fields(evaluator_trace, &fallback_trace);
         }
         insert_json_object_fields(&mut trace, &form_trace);
+        insert_json_object_fields(&mut trace, &fallback_trace);
         if let Some(log_id) = updater_log_id {
             let state = app.state::<AppState>();
             if let Ok(conn) = state.conn.lock() {
@@ -14136,7 +16124,8 @@ async fn run_background_evaluator_job(
             "no_op_reason": evaluator_output.no_op_reason.as_deref(),
             "elapsed_ms": call_elapsed.as_millis(),
             "timeout_ms": job.timeout_ms,
-            "timeout_mode": job.timeout_mode.as_str()
+            "timeout_mode": job.timeout_mode.as_str(),
+            "compiled_patch_summary": engine_patch_summary(&engine_patch)
         },
         "evaluator_mode": evaluator_mode.as_str(),
         "selected_evaluator_source": selected_evaluator_source,
@@ -14161,6 +16150,7 @@ async fn run_background_evaluator_job(
         "selected_patch_applied_before_comparison_done": evaluator_mode == EVALUATOR_MODE_DUAL_COMPARE,
         "evaluator_candidate_trace": candidate_trace,
         "converted_engine_patch": converter_trace,
+        "compiled_patch_summary": engine_patch_summary(&engine_patch),
         "ledger_apply_trace": ledger_trace,
         "before_after_state_summary": {
             "before": before_state_summary,
@@ -14178,8 +16168,10 @@ async fn run_background_evaluator_job(
     final_trace["pipeline_trace"] = serde_json::to_value(&pipeline_trace).unwrap_or_default();
     if let Some(evaluator_trace) = final_trace.get_mut("evaluator_trace") {
         insert_json_object_fields(evaluator_trace, &form_trace);
+        insert_json_object_fields(evaluator_trace, &fallback_trace);
     }
     insert_json_object_fields(&mut final_trace, &form_trace);
+    insert_json_object_fields(&mut final_trace, &fallback_trace);
     if let Some(log_id) = updater_log_id {
         let state = app.state::<AppState>();
         if let Ok(conn) = state.conn.lock() {
@@ -20340,12 +22332,23 @@ mod tests {
     }
 
     #[test]
-    fn structured_runtime_parses_engine_patch_without_conversion_layer() {
-        let raw = r#"{"schema_version":1,"soul_patch":{"new_memories":[{"content":"Aurora noticed the visitor's steady answer.","tag":"observation"}]},"world_patch":{"recent_event":"Aurora let the visitor in."}}"#;
+    fn structured_runtime_parses_ops_and_compiles_patch() {
+        let (soul, world, user, narrator, _) = form_runtime_fixture();
+        let raw = format!(
+            r#"{{"schema_version":1,"ops":[{{"op":"add_memory","owner_soul_id":"{}","slot":"relationship_memory","content":"Aurora noticed the visitor's steady answer.","evidence_quote":"{}","confidence":0.8,"salience":60,"source_message_id":null,"target_entity_ids":["preset_male"],"truth_status":"scene_event"}}],"no_op_reason":null}}"#,
+            soul.character_id, user
+        );
 
-        let outcome =
-            compile_evaluator_structured_runtime(raw, Some(StructuredEnforcement::JsonSchema))
-                .expect("structured runtime");
+        let outcome = compile_evaluator_structured_runtime(
+            &raw,
+            Some(StructuredEnforcement::JsonSchema),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect("structured runtime");
 
         assert!(!outcome.conversion.patch.is_empty());
         assert!(!outcome.conversion.no_op);
@@ -20356,23 +22359,122 @@ mod tests {
 
     #[test]
     fn structured_runtime_skips_repair_under_schema_enforcement() {
-        let fenced = "```json\n{\"schema_version\":1}\n```";
+        let (soul, world, user, narrator, _) = form_runtime_fixture();
+        let fenced = "```json\n{\"schema_version\":1,\"ops\":[],\"no_op_reason\":\"none\"}\n```";
 
         // Schema-enforced output must parse with serde alone — a fence means
         // the provider broke the contract, so no salvage is attempted.
         assert!(compile_evaluator_structured_runtime(
             fenced,
-            Some(StructuredEnforcement::JsonSchema)
+            Some(StructuredEnforcement::JsonSchema),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
         )
         .is_err());
 
-        // At weaker enforcement levels the fence-stripping fallback applies.
-        let outcome =
-            compile_evaluator_structured_runtime(fenced, Some(StructuredEnforcement::JsonObject))
-                .expect("salvaged");
-        assert!(outcome.normalized);
-        assert!(!outcome.warnings.is_empty());
-        assert!(outcome.conversion.no_op);
+        // Weaker structured modes still do not use the old syntactic repair path.
+        assert!(compile_evaluator_structured_runtime(
+            fenced,
+            Some(StructuredEnforcement::JsonObject),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn json_schema_malformed_output_is_not_validated() {
+        let (soul, world, user, narrator, _) = form_runtime_fixture();
+        let malformed = "{\"no_op_reason\": \"\"";
+
+        let err = compile_evaluator_structured_runtime(
+            malformed,
+            Some(StructuredEnforcement::JsonSchema),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect_err("malformed json_schema output must fail validation");
+
+        assert!(err.contains("malformed_schema_output"));
+        assert_eq!(
+            structured_validation_status_from_error(&err),
+            "malformed_schema_output"
+        );
+    }
+
+    #[test]
+    fn structured_prompt_uses_active_player_as_latest_speaker() {
+        let mut soul = new_default_soul("Aurora");
+        soul.relationships.insert(
+            "default_player".into(),
+            state_engine::soul::Relationship {
+                trust: 4.0,
+                ..Default::default()
+            },
+        );
+
+        let prompt = build_structured_evaluator_prompt_with_player_persona(
+            &soul,
+            None,
+            "preset_male",
+            "Male Persona",
+        );
+
+        assert!(prompt.contains("Latest normal RP speaker entity_id: preset_male"));
+        assert!(prompt.contains("\"target_entity_id\": \"preset_male\""));
+        assert!(!prompt.contains("default_player"));
+    }
+
+    #[test]
+    fn empty_ops_on_object_update_turn_fails() {
+        let (soul, world, _, _, _) = form_runtime_fixture();
+        let user = "I place my wet jacket over the chair.";
+        let narrator = "The wet jacket drips over the chair near Aurora's door.";
+        let raw = r#"{"schema_version":1,"ops":[],"no_op_reason":null}"#;
+
+        let err = compile_evaluator_structured_runtime(
+            raw,
+            Some(StructuredEnforcement::JsonSchema),
+            &soul,
+            &world,
+            user,
+            narrator,
+            None,
+        )
+        .expect_err("durable object turn cannot compile as empty ops");
+
+        assert!(err.contains("zero_ops_on_durable_turn"));
+    }
+
+    #[test]
+    fn wet_jacket_guarantee_patch_creates_preset_male_jacket() {
+        let soul = new_default_soul("Aurora");
+        let patch = diagnostic_object_scene_guarantee_patch(
+            &soul,
+            "I place my wet jacket over the chair.",
+            "The wet jacket drips over the chair.",
+        );
+        let world = patch.world_patch.expect("world guarantee");
+        let object = world
+            .object_observation_operations
+            .first()
+            .and_then(|operation| operation.object_state.as_ref())
+            .expect("object guarantee");
+
+        assert_eq!(object.object_id, "preset_male_jacket_1");
+        assert_eq!(object.owner_entity_id.as_deref(), Some("preset_male"));
+        assert_eq!(object.object_kind, "jacket");
+        assert_eq!(object.location, "chair");
+        assert_eq!(object.status, "wet");
     }
 
     #[test]
@@ -20733,6 +22835,7 @@ mod tests {
             evaluator_timeout_ms: None,
             evaluator_timeout_mode: None,
             evaluator_mode: None,
+            structured_evaluator_policy: Some("required".into()),
             wait_for_evaluator_before_next_turn: None,
             allow_send_with_stale_state: None,
             evaluator_background_enabled: None,
@@ -20759,6 +22862,11 @@ mod tests {
             resolve_evaluator_mode_setting(&conn, "conv-structured", &settings).as_deref(),
             Some(EVALUATOR_MODE_STRUCTURED_V1)
         );
+        assert_eq!(
+            resolve_structured_evaluator_policy_setting(&conn, "conv-structured", &settings)
+                .as_deref(),
+            Some("required")
+        );
 
         // Explicit settings always win.
         settings.evaluator_mode = Some(EVALUATOR_MODE_V1.into());
@@ -20766,6 +22874,13 @@ mod tests {
             resolve_evaluator_mode_setting(&conn, "conv-structured", &settings).as_deref(),
             Some(EVALUATOR_MODE_V1)
         );
+        settings.structured_evaluator_policy = Some("allow_fallback".into());
+        assert_eq!(
+            resolve_structured_evaluator_policy_setting(&conn, "conv-structured", &settings)
+                .as_deref(),
+            Some("allow_fallback")
+        );
+        settings.structured_evaluator_policy = None;
 
         // An explicit profile mode beats the auto-default.
         settings.evaluator_mode = None;
@@ -20787,14 +22902,75 @@ mod tests {
     }
 
     #[test]
+    fn structured_diagnostic_settings_force_structured_mode() {
+        let profile = ProviderProfile {
+            id: "prof".into(),
+            name: "Structured".into(),
+            base_url: "https://api.example/v1?key=secret".into(),
+            api_key: "secret".into(),
+            model: "model".into(),
+            system_prompt: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            narrator_timeout_ms: None,
+            evaluator_timeout_ms: None,
+            evaluator_timeout_mode: None,
+            evaluator_mode: Some(EVALUATOR_MODE_FORM_V1.into()),
+            structured_evaluator_policy: Some("required".into()),
+            wait_for_evaluator_before_next_turn: None,
+            allow_send_with_stale_state: None,
+            evaluator_background_enabled: Some(true),
+            anti_replay_forced_retry_enabled: None,
+            archived_at: None,
+            narrator_compatibility_status: 0,
+            evaluator_compatibility_status: 0,
+            command_compatibility_status: 0,
+            evaluator_contract_version: 0,
+            evaluator_prompt_version: 0,
+            evaluator_last_tested_at: None,
+            evaluator_last_failure_reason: None,
+            structured_output_support: STRUCTURED_SUPPORT_UNTESTED,
+        };
+
+        let settings = diagnostic_structured_settings_from_profile(&profile, "required");
+        assert_eq!(evaluator_mode(&settings), EVALUATOR_MODE_STRUCTURED_V1);
+        assert_eq!(
+            selected_evaluator_source(&evaluator_mode(&settings)),
+            EVALUATOR_MODE_STRUCTURED_V1
+        );
+        assert_eq!(
+            settings.structured_evaluator_policy.as_deref(),
+            Some("required")
+        );
+        assert_eq!(settings.evaluator_background_enabled, Some(false));
+    }
+
+    #[test]
+    fn frontend_settings_surface_structured_evaluator_controls() {
+        let source = include_str!("../../src/App.tsx");
+        assert!(source.contains("Evaluator Mode"));
+        assert!(source.contains("Legacy Form Evaluator"));
+        assert!(source.contains("Structured Ops Evaluator"));
+        assert!(source.contains("Structured Evaluator Policy"));
+        assert!(source.contains("Run Structured Evaluator Diagnostic"));
+        assert!(source.contains("evaluator_mode: stateUpdaterSettings.evaluator_mode"));
+        assert!(source.contains(
+            "structured_evaluator_policy: stateUpdaterSettings.structured_evaluator_policy"
+        ));
+    }
+
+    #[test]
     fn structured_runtime_routes_through_selected_compile() {
         let (soul, world, user, narrator, _) = form_runtime_fixture();
-        let raw = r#"{"schema_version":1,"world_patch":{"recent_event":"The visitor entered the apartment."}}"#;
+        let raw = format!(
+            r#"{{"schema_version":1,"ops":[{{"op":"add_world_event","content":"The visitor entered the apartment.","evidence_quote":"{}"}}],"no_op_reason":null}}"#,
+            user
+        );
 
         let outcome = compile_selected_evaluator_runtime(
             EVALUATOR_MODE_STRUCTURED_V1,
             None,
-            raw,
+            &raw,
             Some(StructuredEnforcement::JsonSchema),
             &soul,
             &world,
@@ -20805,6 +22981,104 @@ mod tests {
         .expect("structured selected");
 
         assert!(outcome.conversion.patch.world_patch.is_some());
+    }
+
+    #[test]
+    fn invalid_structured_output_can_fallback_to_form_runtime() {
+        let (soul, world, user, narrator, spec) = form_runtime_fixture();
+        let structured_err = compile_evaluator_structured_runtime(
+            "{\"schema_version\":1,\"ops\":[{\"op\":\"unknown\"}],\"no_op_reason\":null}",
+            Some(StructuredEnforcement::JsonSchema),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect_err("invalid structured should fail");
+
+        let mut fallback = compile_evaluator_form_runtime_strict(
+            &door_entry_form_response_json(&soul.character_id),
+            spec,
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect("form fallback compiles");
+        fallback.fallback_path = vec![
+            "structured_json_schema".into(),
+            EVALUATOR_MODE_FORM_V1.into(),
+        ];
+        fallback.fallback_warning = Some(format!(
+            "structured evaluator failed; evaluator_form_v1 fallback used: {structured_err}"
+        ));
+
+        assert!(!fallback.conversion.patch.is_empty());
+        assert_eq!(
+            fallback.fallback_path,
+            vec!["structured_json_schema", EVALUATOR_MODE_FORM_V1]
+        );
+        assert!(fallback.fallback_warning.is_some());
+    }
+
+    #[test]
+    fn invalid_structured_and_invalid_form_results_in_noop_warning() {
+        let (soul, world, user, narrator, spec) = form_runtime_fixture();
+        assert!(compile_evaluator_form_runtime_strict(
+            "not json", spec, &soul, &world, &user, &narrator, None,
+        )
+        .is_err());
+
+        let noop = evaluator_noop_after_all_fallbacks(
+            vec!["structured_json_schema".into()],
+            "bad structured".into(),
+            "bad form".into(),
+        );
+
+        assert!(noop.conversion.no_op);
+        assert!(noop.conversion.patch.is_empty());
+        assert!(noop
+            .fallback_path
+            .contains(&"noop_after_all_fallbacks".to_string()));
+        assert!(noop.fallback_warning.is_some());
+    }
+
+    #[test]
+    fn fallback_noop_does_not_duplicate_baseline_patch() {
+        let noop = evaluator_noop_after_all_fallbacks(
+            vec!["structured_json_object".into()],
+            "bad structured".into(),
+            "bad form".into(),
+        );
+        assert!(noop.conversion.patch.is_empty());
+        assert!(noop.conversion.patch.world_patch.is_none());
+        assert!(noop.conversion.patch.soul_patch.is_none());
+    }
+
+    #[test]
+    fn fallback_trace_records_enforcement_and_path() {
+        let (soul, world, user, narrator, _) = form_runtime_fixture();
+        let raw = format!(
+            r#"{{"schema_version":1,"ops":[{{"op":"add_world_event","content":"The visitor entered the apartment.","evidence_quote":"{}"}}],"no_op_reason":null}}"#,
+            user
+        );
+        let outcome = compile_evaluator_structured_runtime(
+            &raw,
+            Some(StructuredEnforcement::JsonObject),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect("structured json object compiles");
+        let trace = evaluator_runtime_fallback_json(&outcome);
+
+        assert_eq!(trace["fallback_path"][0], "structured_json_object");
+        assert_eq!(trace["ops_count"], 1);
+        assert_eq!(trace["syntactic_repair_used"], false);
     }
 
     #[test]

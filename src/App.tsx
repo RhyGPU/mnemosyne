@@ -126,6 +126,8 @@ import {
   upsertSetting,
   upsertSoul,
   runEvaluatorContractTest,
+  runStructuredEvaluatorDiagnostic,
+  StructuredEvaluatorDiagnosticSummary,
   setActiveEvaluatorProfile,
   listenEvaluatorAutoFallbackTriggered,
 } from "./tauri";
@@ -142,6 +144,7 @@ const SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY = "mnemosyne:settings_first_launch_
 const CHAT_START_MODE_STORAGE_KEY = "mnemosyne:chat_start_mode";
 const SHOW_ARCHIVED_SESSIONS_STORAGE_KEY = "mnemosyne:show_archived_sessions";
 const EVALUATOR_EXECUTION_MODE_STORAGE_KEY = "mnemosyne:evaluator_execution_mode";
+const STRUCTURED_EVALUATOR_TRANSPORT_STORAGE_KEY = "mnemosyne:structured_evaluator_transport";
 const SESSIONS_PER_PAGE = 10;
 const DEV_CONSOLE_PAUSED_STORAGE_KEY = "mnemosyne:dev_console_paused";
 const DEV_LOG_LEVEL_FILTER_STORAGE_KEY = "mnemosyne:dev_log_level_filter";
@@ -496,6 +499,8 @@ export function App() {
     narrator_timeout_ms: null,
     evaluator_timeout_ms: 25_000,
     evaluator_timeout_mode: "finite",
+    evaluator_mode: "evaluator_form_v1",
+    structured_evaluator_policy: "prefer",
     wait_for_evaluator_before_next_turn: true,
     allow_send_with_stale_state: false,
     evaluator_background_enabled: false,
@@ -509,6 +514,8 @@ export function App() {
     narrator_timeout_ms: null,
     evaluator_timeout_ms: 25_000,
     evaluator_timeout_mode: "finite",
+    evaluator_mode: "evaluator_form_v1",
+    structured_evaluator_policy: "prefer",
     wait_for_evaluator_before_next_turn: true,
     allow_send_with_stale_state: false,
     evaluator_background_enabled: false,
@@ -520,6 +527,13 @@ export function App() {
   const updateEvaluatorExecutionMode = (mode: string) => {
     setEvaluatorExecutionMode(mode);
     localStorage.setItem(EVALUATOR_EXECUTION_MODE_STORAGE_KEY, mode);
+  };
+  const [structuredEvaluatorTransport, setStructuredEvaluatorTransport] = useState<string>(
+    () => localStorage.getItem(STRUCTURED_EVALUATOR_TRANSPORT_STORAGE_KEY) ?? "auto",
+  );
+  const updateStructuredEvaluatorTransport = (transport: string) => {
+    setStructuredEvaluatorTransport(transport);
+    localStorage.setItem(STRUCTURED_EVALUATOR_TRANSPORT_STORAGE_KEY, transport);
   };
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
   const [view, setView] = useState<AppView>("library");
@@ -558,6 +572,10 @@ export function App() {
   const [devCommandRunning, setDevCommandRunning] = useState(false);
   const [devCommandResult, setDevCommandResult] = useState<string | null>(null);
   const [devCommandError, setDevCommandError] = useState<string | null>(null);
+  const [structuredDiagnosticRunning, setStructuredDiagnosticRunning] = useState(false);
+  const [structuredDiagnosticResult, setStructuredDiagnosticResult] =
+    useState<StructuredEvaluatorDiagnosticSummary | null>(null);
+  const [structuredDiagnosticError, setStructuredDiagnosticError] = useState<string | null>(null);
   const [disclaimerMode, setDisclaimerMode] = useState<DisclaimerMode>(() =>
     hasAcceptedDisclaimerVersion() ? null : "launch",
   );
@@ -1045,6 +1063,8 @@ export function App() {
       narrator_timeout_ms: profile.narrator_timeout_ms ?? null,
       evaluator_timeout_ms: profile.evaluator_timeout_ms ?? 25_000,
       evaluator_timeout_mode: profile.evaluator_timeout_mode ?? "finite",
+      evaluator_mode: profile.evaluator_mode ?? "evaluator_form_v1",
+      structured_evaluator_policy: profile.structured_evaluator_policy ?? "prefer",
       wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn ?? true,
       allow_send_with_stale_state: profile.allow_send_with_stale_state ?? false,
       evaluator_background_enabled: profile.evaluator_background_enabled ?? false,
@@ -1062,6 +1082,8 @@ export function App() {
       narrator_timeout_ms: profile.narrator_timeout_ms ?? null,
       evaluator_timeout_ms: profile.evaluator_timeout_ms ?? 25_000,
       evaluator_timeout_mode: profile.evaluator_timeout_mode ?? "finite",
+      evaluator_mode: profile.evaluator_mode ?? "evaluator_form_v1",
+      structured_evaluator_policy: profile.structured_evaluator_policy ?? "prefer",
       wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn ?? true,
       allow_send_with_stale_state: profile.allow_send_with_stale_state ?? false,
       evaluator_background_enabled: profile.evaluator_background_enabled ?? false,
@@ -1525,6 +1547,7 @@ export function App() {
               {
                 ...(useNarratorProviderForUpdater ? apiSettings : stateUpdaterSettings),
                 evaluator_execution_mode: evaluatorExecutionMode,
+                structured_evaluator_transport: structuredEvaluatorTransport,
               },
               contextMode,
               abortController.signal,
@@ -2704,6 +2727,46 @@ export function App() {
     }
   }
 
+  async function handleRunStructuredDiagnostic() {
+    if (structuredDiagnosticRunning) return;
+    setStructuredDiagnosticRunning(true);
+    setStructuredDiagnosticResult(null);
+    setStructuredDiagnosticError(null);
+    const profileId = selectedStateUpdaterProfileId || selectedProviderProfileId || null;
+    setStatus("Running structured evaluator diagnostic...");
+    try {
+      const summary = await runStructuredEvaluatorDiagnostic(profileId);
+      setStructuredDiagnosticResult(summary);
+      const enforcement = summary.structured_enforcement_per_run?.join(", ") || summary.enforcement_levels.join(", ");
+      const failed =
+        summary.resolved_evaluator_source !== "evaluator_structured_v1" ||
+        summary.evaluator_mode_per_run.some((mode) => mode !== "evaluator_structured_v1") ||
+        summary.runs.some((run) => run.error);
+      setStatus(
+        `${failed ? "FAIL" : "PASS"} structured diagnostic: ${summary.provider_model}; enforcement ${enforcement || "none"}`,
+      );
+      logDev(failed ? "error" : "success", "state_updater", "Structured evaluator diagnostic completed", {
+        pass: !failed,
+        model: summary.provider_model,
+        structured_mode_requested: summary.structured_mode_requested,
+        structured_mode_resolved: summary.structured_mode_resolved,
+        resolved_evaluator_source: summary.resolved_evaluator_source,
+        enforcement: summary.structured_enforcement_per_run,
+        fallback_paths: summary.fallback_paths,
+        payload_history_path: summary.payload_history_path,
+        mne_checkpoint_path: summary.mne_checkpoint_path,
+        summary_json_path: summary.summary_json_path,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStructuredDiagnosticError(message);
+      setStatus(`Structured diagnostic failed: ${message}`);
+      reportError(error, "Structured evaluator diagnostic failed", "state_updater");
+    } finally {
+      setStructuredDiagnosticRunning(false);
+    }
+  }
+
   async function handleSelectStateUpdaterProfile(profileId: string) {
     if (!profileId) {
       setSelectedStateUpdaterProfileId("");
@@ -2776,6 +2839,8 @@ export function App() {
       narrator_timeout_ms: apiSettings.narrator_timeout_ms ?? null,
       evaluator_timeout_ms: apiSettings.evaluator_timeout_ms ?? 25_000,
       evaluator_timeout_mode: apiSettings.evaluator_timeout_mode ?? "finite",
+      evaluator_mode: apiSettings.evaluator_mode ?? "evaluator_form_v1",
+      structured_evaluator_policy: apiSettings.structured_evaluator_policy ?? "prefer",
       wait_for_evaluator_before_next_turn: apiSettings.wait_for_evaluator_before_next_turn ?? true,
       allow_send_with_stale_state: apiSettings.allow_send_with_stale_state ?? false,
       evaluator_background_enabled: apiSettings.evaluator_background_enabled ?? false,
@@ -2831,6 +2896,8 @@ export function App() {
       narrator_timeout_ms: stateUpdaterSettings.narrator_timeout_ms ?? null,
       evaluator_timeout_ms: stateUpdaterSettings.evaluator_timeout_ms ?? 25_000,
       evaluator_timeout_mode: stateUpdaterSettings.evaluator_timeout_mode ?? "finite",
+      evaluator_mode: stateUpdaterSettings.evaluator_mode ?? "evaluator_form_v1",
+      structured_evaluator_policy: stateUpdaterSettings.structured_evaluator_policy ?? "prefer",
       wait_for_evaluator_before_next_turn: stateUpdaterSettings.wait_for_evaluator_before_next_turn ?? true,
       allow_send_with_stale_state: stateUpdaterSettings.allow_send_with_stale_state ?? false,
       evaluator_background_enabled: stateUpdaterSettings.evaluator_background_enabled ?? false,
@@ -3413,6 +3480,51 @@ export function App() {
                 </select>
               </label>
               <label className="field">
+                <span>Evaluator Mode</span>
+                <select
+                  value={effectiveStateUpdaterSettings.evaluator_mode ?? "evaluator_form_v1"}
+                  onChange={(event) =>
+                    updateEffectiveStateUpdaterSettings({
+                      evaluator_mode: event.target.value,
+                    })
+                  }
+                  disabled={busy}
+                >
+                  <option value="evaluator_form_v1">Legacy Form Evaluator</option>
+                  <option value="evaluator_structured_v1">Structured Ops Evaluator</option>
+                </select>
+              </label>
+              <label className="field">
+                <span>Structured Evaluator Policy</span>
+                <select
+                  value={effectiveStateUpdaterSettings.structured_evaluator_policy ?? "prefer"}
+                  onChange={(event) =>
+                    updateEffectiveStateUpdaterSettings({
+                      structured_evaluator_policy: event.target.value,
+                    })
+                  }
+                  disabled={busy}
+                >
+                  <option value="required">required</option>
+                  <option value="prefer">prefer</option>
+                  <option value="allow_fallback">allow_fallback</option>
+                </select>
+              </label>
+              <label className="field">
+                <span>Structured Evaluator Transport</span>
+                <select
+                  value={structuredEvaluatorTransport}
+                  onChange={(event) => updateStructuredEvaluatorTransport(event.target.value)}
+                  disabled={busy}
+                >
+                  <option value="auto">Auto — tool calls first, then JSON schema</option>
+                  <option value="tool_call">Tool calls (require real function calls)</option>
+                  <option value="json_schema">JSON schema (response_format)</option>
+                  <option value="json_object">JSON object</option>
+                  <option value="prompt_json">Prompt-only JSON</option>
+                </select>
+              </label>
+              <label className="field">
                 <span>Execution Mode</span>
                 <select
                   value={evaluatorExecutionMode}
@@ -3576,8 +3688,56 @@ export function App() {
                     <Play size={16} />
                     <span>Run Contract Test</span>
                   </button>
+                  <button
+                    type="button"
+                    className="ghost-action"
+                    onClick={() => void handleRunStructuredDiagnostic()}
+                    disabled={busy || structuredDiagnosticRunning || (!selectedStateUpdaterProfileId && !selectedProviderProfileId)}
+                  >
+                    <Play size={16} />
+                    <span>Run Structured Evaluator Diagnostic</span>
+                  </button>
                 </div>
               </>
+            )}
+            {useNarratorProviderForUpdater && (
+              <div className="button-row">
+                <button
+                  type="button"
+                  className="ghost-action"
+                  onClick={() => void handleRunStructuredDiagnostic()}
+                  disabled={busy || structuredDiagnosticRunning || (!selectedStateUpdaterProfileId && !selectedProviderProfileId)}
+                >
+                  <Play size={16} />
+                  <span>Run Structured Evaluator Diagnostic</span>
+                </button>
+              </div>
+            )}
+            {(structuredDiagnosticResult || structuredDiagnosticError) && (
+              <div className="provider-note">
+                {structuredDiagnosticResult ? (
+                  <>
+                    <strong>
+                      {structuredDiagnosticResult.resolved_evaluator_source === "evaluator_structured_v1" &&
+                      structuredDiagnosticResult.evaluator_mode_per_run.every((mode) => mode === "evaluator_structured_v1") &&
+                      structuredDiagnosticResult.runs.every((run) => !run.error)
+                        ? "PASS"
+                        : "FAIL"}
+                    </strong>{" "}
+                    {structuredDiagnosticResult.provider_model} · enforcement{" "}
+                    {structuredDiagnosticResult.structured_enforcement_per_run.join(", ") || "none"} · fallback{" "}
+                    {structuredDiagnosticResult.fallback_paths.map((path) => path.join(" > ")).join(" | ") || "none"}
+                    <br />
+                    Payload: {structuredDiagnosticResult.payload_history_path}
+                    <br />
+                    MNE: {structuredDiagnosticResult.mne_checkpoint_path}
+                    <br />
+                    Summary: {structuredDiagnosticResult.summary_json_path}
+                  </>
+                ) : (
+                  <><strong>FAIL</strong> {structuredDiagnosticError}</>
+                )}
+              </div>
             )}
           </section>
 
@@ -3621,7 +3781,7 @@ export function App() {
                           color: p.evaluator_compatibility_status === 1 ? "#4caf50" : p.evaluator_compatibility_status === 2 ? "#f44336" : "var(--text-muted, #888)",
                           border: `1px solid ${p.evaluator_compatibility_status === 1 ? "#4caf50" : p.evaluator_compatibility_status === 2 ? "#f44336" : "#888888"}33`
                         }}>
-                          Evaluator: {p.evaluator_compatibility_status === 1 ? "Passed" : p.evaluator_compatibility_status === 2 ? "Failed" : "Untested"}
+                          Evaluator: {p.evaluator_compatibility_status === 1 ? "Schema enforced" : p.evaluator_compatibility_status === 3 ? "JSON object only" : p.evaluator_compatibility_status === 2 ? "Failed" : p.evaluator_compatibility_status === 4 ? "Stale prompt" : "Untested"}
                         </span>
                       </div>
                       <div style={{ display: "flex", gap: "0.5rem" }}>
@@ -5443,6 +5603,37 @@ export function App() {
                       <option value="no_app_timeout">No app timeout</option>
                     </select>
                   </label>
+                  <label className="field">
+                    <span>Evaluator Mode</span>
+                    <select
+                      value={effectiveStateUpdaterSettings.evaluator_mode ?? "evaluator_form_v1"}
+                      onChange={(event) =>
+                        updateEffectiveStateUpdaterSettings({
+                          evaluator_mode: event.target.value,
+                        })
+                      }
+                      disabled={busy}
+                    >
+                      <option value="evaluator_form_v1">Legacy Form Evaluator</option>
+                      <option value="evaluator_structured_v1">Structured Ops Evaluator</option>
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>Structured Evaluator Policy</span>
+                    <select
+                      value={effectiveStateUpdaterSettings.structured_evaluator_policy ?? "prefer"}
+                      onChange={(event) =>
+                        updateEffectiveStateUpdaterSettings({
+                          structured_evaluator_policy: event.target.value,
+                        })
+                      }
+                      disabled={busy}
+                    >
+                      <option value="required">required</option>
+                      <option value="prefer">prefer</option>
+                      <option value="allow_fallback">allow_fallback</option>
+                    </select>
+                  </label>
                 </div>
                 <label className="toggle-row">
                   <input
@@ -5595,8 +5786,56 @@ export function App() {
                         <Play size={16} />
                         <span>Run Contract Test</span>
                       </button>
+                      <button
+                        type="button"
+                        className="ghost-action"
+                        onClick={() => void handleRunStructuredDiagnostic()}
+                        disabled={busy || structuredDiagnosticRunning || (!selectedStateUpdaterProfileId && !selectedProviderProfileId)}
+                      >
+                        <Play size={16} />
+                        <span>Run Structured Evaluator Diagnostic</span>
+                      </button>
                     </div>
                   </>
+                )}
+                {useNarratorProviderForUpdater && (
+                  <div className="button-row">
+                    <button
+                      type="button"
+                      className="ghost-action"
+                      onClick={() => void handleRunStructuredDiagnostic()}
+                      disabled={busy || structuredDiagnosticRunning || (!selectedStateUpdaterProfileId && !selectedProviderProfileId)}
+                    >
+                      <Play size={16} />
+                      <span>Run Structured Evaluator Diagnostic</span>
+                    </button>
+                  </div>
+                )}
+                {(structuredDiagnosticResult || structuredDiagnosticError) && (
+                  <div className="provider-note">
+                    {structuredDiagnosticResult ? (
+                      <>
+                        <strong>
+                          {structuredDiagnosticResult.resolved_evaluator_source === "evaluator_structured_v1" &&
+                          structuredDiagnosticResult.evaluator_mode_per_run.every((mode) => mode === "evaluator_structured_v1") &&
+                          structuredDiagnosticResult.runs.every((run) => !run.error)
+                            ? "PASS"
+                            : "FAIL"}
+                        </strong>{" "}
+                        {structuredDiagnosticResult.provider_model} · enforcement{" "}
+                        {structuredDiagnosticResult.structured_enforcement_per_run.join(", ") || "none"} · fallback{" "}
+                        {structuredDiagnosticResult.fallback_paths.map((path) => path.join(" > ")).join(" | ") || "none"}
+                        <br />
+                        Payload: {structuredDiagnosticResult.payload_history_path}
+                        <br />
+                        MNE: {structuredDiagnosticResult.mne_checkpoint_path}
+                        <br />
+                        Summary: {structuredDiagnosticResult.summary_json_path}
+                      </>
+                    ) : (
+                      <><strong>FAIL</strong> {structuredDiagnosticError}</>
+                    )}
+                  </div>
                 )}
               </div>
             </>

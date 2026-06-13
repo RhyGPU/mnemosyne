@@ -4,6 +4,7 @@ pub mod context_compiler;
 pub mod evaluator;
 pub mod evaluator_form;
 pub mod evaluator_ingest;
+pub mod evaluator_structured;
 pub mod hidden_state;
 pub mod memory;
 pub mod patch;

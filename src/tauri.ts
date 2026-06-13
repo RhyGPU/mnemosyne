@@ -534,6 +534,9 @@ export type ApiProviderSettings = {
     | "dual_compare"
     | string
     | null;
+  structured_evaluator_policy?: "required" | "prefer" | "allow_fallback" | string | null;
+  /** Evaluator transport: "auto" tries real tool-calling first, then the response_format ladder. */
+  structured_evaluator_transport?: "auto" | "tool_call" | "json_schema" | "json_object" | "prompt_json" | string | null;
   wait_for_evaluator_before_next_turn?: boolean | null;
   allow_send_with_stale_state?: boolean | null;
   evaluator_background_enabled?: boolean | null;
@@ -1448,6 +1451,8 @@ export type EvaluatorContractTestReport = {
   raw_response: string;
   /** 0 untested/failed, 1 prompt-only, 2 json_object, 3 json_schema. */
   structured_output_support?: number;
+  evaluator_compatibility_status?: number;
+  evaluator_compatibility_status_label?: string;
 };
 
 export function runEvaluatorContractTest(profileId: string): Promise<EvaluatorContractTestReport> {
@@ -1456,8 +1461,78 @@ export function runEvaluatorContractTest(profileId: string): Promise<EvaluatorCo
       passed: true,
       errors: [],
       raw_response: "{}",
-      structured_output_support: 0
+      structured_output_support: 0,
+      evaluator_compatibility_status: 0,
+      evaluator_compatibility_status_label: "untested"
     };
+  });
+}
+
+export type StructuredEvaluatorDiagnosticRun = {
+  turn_index: number;
+  user_message: string;
+  narrator_response: string;
+  evaluator_mode: string;
+  enforcement_level: string;
+  structured_enforcement_requested: string;
+  structured_enforcement_validated: boolean;
+  structured_schema_validation_status: string;
+  structured_schema_validation_error?: string | null;
+  fallback_path: string[];
+  failure_reasons: string[];
+  ops_count: number;
+  compiled_patch_summary: unknown;
+  syntactic_repair_used: boolean;
+  memory_ops_count: number;
+  relationship_event_ops_count: number;
+  object_update_ops_count: number;
+  scene_update_ops_count: number;
+  state_patch_id?: string | null;
+  error?: string | null;
+};
+
+export type StructuredEvaluatorDiagnosticSummary = {
+  conversation_id: string;
+  provider_profile_id: string;
+  provider_model: string;
+  base_url_redacted: string;
+  structured_mode_requested: string;
+  structured_mode_resolved: string;
+  resolved_evaluator_source: string;
+  structured_policy: string;
+  structured_evaluator_policy: string;
+  evaluator_mode: string;
+  structured_schema_version: number;
+  runs: StructuredEvaluatorDiagnosticRun[];
+  enforcement_levels: string[];
+  evaluator_mode_per_run: string[];
+  structured_enforcement_per_run: string[];
+  structured_enforcement_requested_per_run: string[];
+  structured_enforcement_validated_per_run: boolean[];
+  structured_schema_validation_status_per_run: string[];
+  failure_reasons: string[];
+  fallback_paths: string[][];
+  ops_counts: number[];
+  memory_ops_count: number;
+  relationship_event_ops_count: number;
+  object_update_ops_count: number;
+  scene_update_ops_count: number;
+  syntactic_repair_used: boolean;
+  final_memory_count: number;
+  final_relationship_target_ids: string[];
+  final_object_states: unknown[];
+  final_scene_participants: string[];
+  default_player_leaked_into_normal_rp_state: boolean;
+  payload_history_path: string;
+  mne_checkpoint_path: string;
+  summary_json_path: string;
+};
+
+export function runStructuredEvaluatorDiagnostic(
+  profileId?: string | null,
+): Promise<StructuredEvaluatorDiagnosticSummary> {
+  return invokeOrPreview("run_structured_evaluator_diagnostic", { profileId }, () => {
+    throw new Error("Structured evaluator diagnostics require the Tauri runtime.");
   });
 }
 

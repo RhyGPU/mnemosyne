@@ -135,7 +135,7 @@ mod tests {
         for index in 0..4 {
             soul.memory.recent.push(MemoryEntry {
                 archived: false,
-            is_pinned: false,
+                is_pinned: false,
                 id: format!("mid_{index}"),
                 timestamp: index,
                 content: format!("The room repeats a routine check number {index}."),

@@ -88,7 +88,7 @@ impl<E: Embedder> MemoryScorer<E> {
 pub fn create_scored_memory(soul: &Soul, content: &str, tag: &str) -> MemoryEntry {
     let mut memory = MemoryEntry {
         archived: false,
-            is_pinned: false,
+        is_pinned: false,
         id: format!("mem_{}", Uuid::new_v4()),
         timestamp: current_timestamp(),
         content: content.trim().to_string(),

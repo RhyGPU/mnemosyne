@@ -296,6 +296,12 @@ pub struct ApiProviderSettings {
     pub evaluator_timeout_ms: Option<u64>,
     pub evaluator_timeout_mode: Option<String>,
     pub evaluator_mode: Option<String>,
+    /// structured evaluator fallback policy: required | prefer | allow_fallback.
+    pub structured_evaluator_policy: Option<String>,
+    /// structured evaluator transport: auto | tool_call | json_schema |
+    /// json_object | prompt_json. Missing/unknown means auto (tool-call first,
+    /// then the response_format ladder).
+    pub structured_evaluator_transport: Option<String>,
     pub wait_for_evaluator_before_next_turn: Option<bool>,
     pub allow_send_with_stale_state: Option<bool>,
     pub evaluator_background_enabled: Option<bool>,
@@ -319,7 +325,7 @@ impl Default for ApiProvider {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<ApiRequestMessage>,
@@ -328,6 +334,14 @@ struct ChatCompletionRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<serde_json::Value>,
+    /// OpenAI-compatible tool/function definitions. Present only for the
+    /// tool-call evaluator transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<serde_json::Value>,
+    /// Forces a specific tool when set (`{"type":"function", ...}` or
+    /// `"required"`). Present only for the tool-call transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 /// How strictly the provider enforced structured output for a completion.
@@ -340,6 +354,10 @@ pub enum StructuredEnforcement {
     JsonSchema,
     /// Provider guaranteed syntactically valid JSON, but not the schema.
     JsonObject,
+    /// Provider returned arguments through a tool/function-call contract.
+    ToolCall,
+    /// Provider enforced a grammar contract.
+    Grammar,
     /// No provider-side enforcement; output relies on the prompt alone.
     None,
 }
@@ -349,6 +367,8 @@ impl StructuredEnforcement {
         match self {
             StructuredEnforcement::JsonSchema => "json_schema",
             StructuredEnforcement::JsonObject => "json_object",
+            StructuredEnforcement::ToolCall => "tool_call",
+            StructuredEnforcement::Grammar => "grammar",
             StructuredEnforcement::None => "none",
         }
     }
@@ -368,6 +388,43 @@ pub struct StructuredCompletion {
     pub raw_text: String,
     pub enforcement: StructuredEnforcement,
     pub token_usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredEvaluatorPolicy {
+    Required,
+    Prefer,
+    AllowFallback,
+}
+
+fn structured_evaluator_policy(settings: &ApiProviderSettings) -> StructuredEvaluatorPolicy {
+    match settings.structured_evaluator_policy.as_deref() {
+        Some("required") => StructuredEvaluatorPolicy::Required,
+        Some("allow_fallback") => StructuredEvaluatorPolicy::AllowFallback,
+        _ => StructuredEvaluatorPolicy::Prefer,
+    }
+}
+
+/// Which provider transport to use for the structured evaluator, in priority
+/// order. `Auto` tries real tool-calling first (the strongest enforcement most
+/// OpenAI-compatible providers offer), then the `response_format` ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredEvaluatorTransport {
+    Auto,
+    ToolCall,
+    JsonSchema,
+    JsonObject,
+    PromptJson,
+}
+
+fn structured_evaluator_transport(settings: &ApiProviderSettings) -> StructuredEvaluatorTransport {
+    match settings.structured_evaluator_transport.as_deref() {
+        Some("tool_call") | Some("tool_calls") => StructuredEvaluatorTransport::ToolCall,
+        Some("json_schema") => StructuredEvaluatorTransport::JsonSchema,
+        Some("json_object") => StructuredEvaluatorTransport::JsonObject,
+        Some("prompt_json") => StructuredEvaluatorTransport::PromptJson,
+        _ => StructuredEvaluatorTransport::Auto,
+    }
 }
 
 /// A plain prompt completion that retains provider-reported token usage.
@@ -443,6 +500,21 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ChatChoiceMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallResponse>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallResponse {
+    function: ToolCallFunctionResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolCallFunctionResponse {
+    #[allow(dead_code)]
+    name: Option<String>,
+    /// The model's JSON arguments for the function, as a string to parse.
+    arguments: String,
 }
 
 impl ApiProvider {
@@ -482,6 +554,7 @@ impl ApiProvider {
                     content: user_text.trim().to_string(),
                 },
             ],
+            ..ChatCompletionRequest::default()
         };
 
         let response = self
@@ -597,57 +670,146 @@ impl ApiProvider {
         schema_name: &str,
         schema: &serde_json::Value,
     ) -> Result<StructuredCompletion, String> {
-        let json_schema_format = serde_json::json!({
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_name,
-                "strict": true,
-                "schema": schema,
+        let policy = structured_evaluator_policy(settings);
+        let transport = structured_evaluator_transport(settings);
+
+        // Real tool-calling first (strongest enforcement: the provider returns
+        // arguments through a forced function call, not free text). Tried for
+        // Auto and ToolCall transports.
+        if matches!(
+            transport,
+            StructuredEvaluatorTransport::Auto | StructuredEvaluatorTransport::ToolCall
+        ) {
+            match self
+                .complete_tool_call(
+                    settings,
+                    system_prompt,
+                    user_text,
+                    temperature,
+                    timeout,
+                    schema_name,
+                    schema,
+                )
+                .await
+            {
+                Ok(completion) => {
+                    return Ok(StructuredCompletion {
+                        raw_text: completion.raw_text,
+                        enforcement: StructuredEnforcement::ToolCall,
+                        token_usage: completion.token_usage,
+                    })
+                }
+                // Provider rejected the tool parameters, or the model answered
+                // with prose instead of a tool call: degrade unless the caller
+                // explicitly pinned tool_call or required structured output.
+                Err(error) if is_tool_call_rejection(&error) => {
+                    if transport == StructuredEvaluatorTransport::ToolCall
+                        || policy == StructuredEvaluatorPolicy::Required
+                    {
+                        return Err(format!(
+                            "tool-call transport required but unavailable: {error}"
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
             }
-        });
-        match self
-            .complete_prompt_with_format(
-                settings,
-                system_prompt,
-                user_text,
-                temperature,
-                timeout,
-                Some(json_schema_format),
-            )
-            .await
-        {
-            Ok(completion) => {
-                return Ok(StructuredCompletion {
-                    raw_text: completion.raw_text,
-                    enforcement: StructuredEnforcement::JsonSchema,
-                    token_usage: completion.token_usage,
-                })
-            }
-            Err(error) if !is_response_format_rejection(&error) => return Err(error),
-            Err(_) => {}
         }
 
-        let json_object_format = serde_json::json!({ "type": "json_object" });
-        match self
-            .complete_prompt_with_format(
-                settings,
-                system_prompt,
-                user_text,
-                temperature,
-                timeout,
-                Some(json_object_format),
-            )
-            .await
-        {
-            Ok(completion) => {
-                return Ok(StructuredCompletion {
-                    raw_text: completion.raw_text,
-                    enforcement: StructuredEnforcement::JsonObject,
-                    token_usage: completion.token_usage,
-                })
+        if transport == StructuredEvaluatorTransport::ToolCall {
+            return Err(
+                "tool-call transport selected but produced no tool call and no fallback is permitted"
+                    .into(),
+            );
+        }
+
+        if matches!(
+            transport,
+            StructuredEvaluatorTransport::Auto | StructuredEvaluatorTransport::JsonSchema
+        ) {
+            let json_schema_format = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": true,
+                    "schema": schema,
+                }
+            });
+            match self
+                .complete_prompt_with_format(
+                    settings,
+                    system_prompt,
+                    user_text,
+                    temperature,
+                    timeout,
+                    Some(json_schema_format),
+                )
+                .await
+            {
+                Ok(completion) => {
+                    return Ok(StructuredCompletion {
+                        raw_text: completion.raw_text,
+                        enforcement: StructuredEnforcement::JsonSchema,
+                        token_usage: completion.token_usage,
+                    })
+                }
+                Err(error) if !is_response_format_rejection(&error) => return Err(error),
+                Err(error) => {
+                    if policy == StructuredEvaluatorPolicy::Required
+                        || transport == StructuredEvaluatorTransport::JsonSchema
+                    {
+                        return Err(format!(
+                            "structured output required but json_schema was rejected: {error}"
+                        ));
+                    }
+                }
             }
-            Err(error) if !is_response_format_rejection(&error) => return Err(error),
-            Err(_) => {}
+        }
+
+        if matches!(
+            transport,
+            StructuredEvaluatorTransport::Auto
+                | StructuredEvaluatorTransport::JsonSchema
+                | StructuredEvaluatorTransport::JsonObject
+        ) {
+            let json_object_format = serde_json::json!({ "type": "json_object" });
+            match self
+                .complete_prompt_with_format(
+                    settings,
+                    system_prompt,
+                    user_text,
+                    temperature,
+                    timeout,
+                    Some(json_object_format),
+                )
+                .await
+            {
+                Ok(completion) => {
+                    return Ok(StructuredCompletion {
+                        raw_text: completion.raw_text,
+                        enforcement: StructuredEnforcement::JsonObject,
+                        token_usage: completion.token_usage,
+                    })
+                }
+                Err(error) if !is_response_format_rejection(&error) => return Err(error),
+                Err(error) => {
+                    if policy == StructuredEvaluatorPolicy::Required
+                        || transport == StructuredEvaluatorTransport::JsonObject
+                    {
+                        return Err(format!(
+                            "structured output required but json_object fallback was rejected: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Prompt-only is the weakest rung: no provider enforcement at all.
+        // Permitted only when the caller opted into fallback or explicitly
+        // pinned the prompt_json transport.
+        if policy != StructuredEvaluatorPolicy::AllowFallback
+            && transport != StructuredEvaluatorTransport::PromptJson
+        {
+            return Err("provider returned no structured enforcement; set structured_evaluator_policy=allow_fallback to permit prompt-only fallback".into());
         }
 
         self.complete_prompt_with_format(
@@ -664,6 +826,105 @@ impl ApiProvider {
             enforcement: StructuredEnforcement::None,
             token_usage: completion.token_usage,
         })
+    }
+
+    /// Real OpenAI-compatible tool calling: define `schema` as the parameters
+    /// of a single forced function and read the model's arguments back from
+    /// `tool_calls[0].function.arguments`. The returned `raw_text` is that
+    /// arguments JSON, so the existing ops parser/compiler consume it
+    /// unchanged. A model that answers with prose instead of a tool call is
+    /// treated as a tool-call failure (so the ladder can degrade or fail).
+    async fn complete_tool_call(
+        &self,
+        settings: &ApiProviderSettings,
+        system_prompt: &str,
+        user_text: &str,
+        temperature: f32,
+        timeout: Option<Duration>,
+        function_name: &str,
+        schema: &serde_json::Value,
+    ) -> Result<PromptCompletion, String> {
+        let api_key = settings.api_key.trim();
+        let model = settings.model.trim();
+        let base_url = settings.base_url.trim();
+        if api_key.is_empty() {
+            return Err("API key is required for API provider mode".into());
+        }
+        if model.is_empty() {
+            return Err("Model is required for API provider mode".into());
+        }
+        if base_url.is_empty() {
+            return Err("Base URL is required for API provider mode".into());
+        }
+
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": function_name,
+                "description": "Submit the evaluator's state-change operations for this exchange. Always call this function; never reply with prose.",
+                "parameters": schema,
+            }
+        }]);
+        let tool_choice = serde_json::json!({
+            "type": "function",
+            "function": { "name": function_name }
+        });
+
+        let request = ChatCompletionRequest {
+            model: model.to_string(),
+            temperature,
+            stream: false,
+            messages: vec![
+                ApiRequestMessage {
+                    role: "system".into(),
+                    content: system_prompt.to_string(),
+                },
+                ApiRequestMessage {
+                    role: "user".into(),
+                    content: user_text.trim().to_string(),
+                },
+            ],
+            tools: Some(tools),
+            tool_choice: Some(tool_choice),
+            ..ChatCompletionRequest::default()
+        };
+
+        let mut request_builder = self
+            .client
+            .post(chat_completions_url(base_url))
+            .bearer_auth(api_key)
+            .json(&request);
+        if let Some(timeout) = timeout {
+            request_builder = request_builder.timeout(timeout);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|err| format!("API request failed: {err}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("API request failed with {status}: {body}"));
+        }
+
+        let body = response
+            .json::<ChatCompletionResponse>()
+            .await
+            .map_err(|err| format!("API response parse failed: {err}"))?;
+
+        let token_usage = body.usage;
+        match first_tool_call_arguments(body) {
+            Some(arguments) => Ok(PromptCompletion {
+                raw_text: arguments,
+                token_usage,
+            }),
+            // No tool call came back (model answered with content, or returned
+            // an empty arguments object). Surfaced as a rejection so the ladder
+            // can degrade or fail per transport/policy.
+            None => Err("tool_call response contained no tool_calls arguments".into()),
+        }
     }
 
     async fn complete_prompt_with_format(
@@ -703,6 +964,7 @@ impl ApiProvider {
                     content: user_text.trim().to_string(),
                 },
             ],
+            ..ChatCompletionRequest::default()
         };
 
         let mut request_builder = self
@@ -814,6 +1076,7 @@ impl ApiProvider {
             stream: true,
             response_format: None,
             messages,
+            ..ChatCompletionRequest::default()
         };
 
         let mut request_builder = self
@@ -932,6 +1195,43 @@ fn is_response_format_rejection(error: &str) -> bool {
         || lowered.contains("structured output")
         || lowered.contains("structured_output");
     client_error && names_format
+}
+
+/// Pull the first tool call's `arguments` JSON from a completion response,
+/// ignoring empty argument blobs. `None` means the model did not make a usable
+/// tool call (e.g. it answered with prose instead).
+fn first_tool_call_arguments(body: ChatCompletionResponse) -> Option<String> {
+    body.choices
+        .into_iter()
+        .find_map(|choice| choice.message.tool_calls)
+        .and_then(|calls| calls.into_iter().next())
+        .map(|call| call.function.arguments)
+        .filter(|arguments| !arguments.trim().is_empty())
+}
+
+/// True when a tool-call attempt should degrade to a weaker transport rather
+/// than propagate: either the model produced no tool call, or the provider
+/// rejected the `tools`/`tool_choice` parameters (4xx naming them). A genuine
+/// server/network failure returns false so it propagates.
+fn is_tool_call_rejection(error: &str) -> bool {
+    let lowered = error.to_ascii_lowercase();
+    if lowered.contains("no tool_calls") || lowered.contains("contained no tool_calls") {
+        return true;
+    }
+    let client_error = lowered.contains("400")
+        || lowered.contains("404")
+        || lowered.contains("422")
+        || lowered.contains("501")
+        || lowered.contains("bad request")
+        || lowered.contains("unprocessable")
+        || lowered.contains("not implemented");
+    let names_tools = lowered.contains("tool_choice")
+        || lowered.contains("tool call")
+        || lowered.contains("tool_calls")
+        || lowered.contains("tools")
+        || lowered.contains("function call")
+        || lowered.contains("function_call");
+    client_error && names_tools
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1237,17 +1537,117 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
     )
 }
 
-/// System prompt for `evaluator_structured_v1`: the state-updater rules plus
-/// current state WITHOUT the embedded example patch JSON. The patch shape is
-/// supplied to the provider as an enforced JSON schema (`response_format:
-/// json_schema`), so describing it again in prose only burns prompt tokens.
+/// System prompt for `evaluator_structured_v1`: compact instructions for
+/// schema-enforced evaluator ops. The operation shape is supplied separately
+/// through `response_format: json_schema`; this prompt intentionally avoids the
+/// legacy fillable form and EnginePatch template.
 pub fn build_structured_evaluator_prompt(
     soul: &Soul,
     session_world: Option<&SessionWorld>,
 ) -> String {
+    build_structured_evaluator_prompt_with_player_persona(
+        soul,
+        session_world,
+        "preset_male",
+        "Male Persona",
+    )
+}
+
+pub fn build_structured_evaluator_prompt_with_player_persona(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    player_persona_id: &str,
+    player_persona_display_name: &str,
+) -> String {
     format!(
-        "{STATE_UPDATER_SYSTEM_PROMPT}\n\n{}",
-        state_updater_current_state_block(soul, session_world),
+        "# SYSTEM: Mnemosyne Structured Evaluator Ops V1\n\n\
+Extract only durable state changes supported by the provider-enforced schema.\n\
+Return evaluator ops JSON only. Do not write prose, markdown, code fences, EnginePatch JSON, or evaluator_form_v1.\n\
+Use exact evidence_quote substrings from the latest exchange. Do not invent facts.\n\
+If nothing durable changed, return ops: [] with a specific nonempty no_op_reason.\n\
+Do not return empty ops for entering/leaving a location, object movement/condition changes, relationship-significant actions, or explicit scene changes.\n\
+Resolve user-controlled \"I\" to the active player persona. Use IDs exactly as supplied in current state.\n\
+Current truth comes from the compact state JSON below; Rust validates semantics and applies the ledger.\n\n{}",
+        structured_evaluator_current_state_block(
+            soul,
+            session_world,
+            player_persona_id,
+            player_persona_display_name
+        ),
+    )
+}
+
+fn structured_evaluator_current_state_block(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    player_persona_id: &str,
+    player_persona_display_name: &str,
+) -> String {
+    let world = session_world
+        .map(SessionWorld::world_log)
+        .unwrap_or_else(|| soul.world.clone());
+    let active_soul_id = clean_summary_value(&soul.character_id, "active_soul");
+    let player_id = clean_summary_value(player_persona_id, "preset_male");
+    let player_name = clean_summary_value(player_persona_display_name, "Male Persona");
+    let active_entities = serde_json::json!([
+        {
+            "entity_id": active_soul_id,
+            "display_name": soul.character_name,
+            "entity_type": "soul",
+            "active": true
+        },
+        {
+            "entity_id": player_id,
+            "display_name": player_name,
+            "entity_type": "active_player_persona",
+            "active": true,
+            "latest_speaker": true
+        }
+    ]);
+    let mut relationships = soul.relationships.iter().collect::<Vec<_>>();
+    relationships.sort_by(|left, right| left.0.cmp(right.0));
+    let relationship_summary = relationships
+        .into_iter()
+        .filter_map(|(target, relationship)| {
+            let target = if target == "default_player" || target == "user" {
+                player_id.to_string()
+            } else {
+                target.clone()
+            };
+            if target == "default_player" {
+                return None;
+            }
+            Some(serde_json::json!({
+                "source_soul_id": active_soul_id,
+                "target_entity_id": target,
+                "trust": relationship.trust,
+                "affection": relationship.affection,
+                "intimacy": relationship.intimacy,
+                "fear": relationship.fear,
+                "desire": relationship.desire,
+                "respect": relationship.respect,
+                "conflict": relationship.conflict,
+                "curiosity": relationship.curiosity,
+                "comfort": relationship.comfort,
+                "boundary_pressure": relationship.boundary_pressure
+            }))
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "[CURRENT STATE]\nCharacter: {}\nActive Soul ID: {}\nActive player persona: {} ({})\nLatest normal RP speaker entity_id: {}\nLocation: {}\nTime: {}\nActive plot: {}\nRecent event: {}\n\n[ACTIVE ENTITIES]\n{}\n\n[CURRENT RELATIONSHIPS]\n{}\n\n[PRIOR SCENE_STATE]\n{}\n\n[CURRENT WORLD/OBJECT STATE]\nObjects JSON: {}",
+        soul.character_name,
+        active_soul_id,
+        player_name,
+        player_id,
+        player_id,
+        clean_summary_value(&world.location, "Unspecified"),
+        normalize_updater_time(&world.time_elapsed),
+        world.active_plots.iter().rev().find(|plot| !plot.trim().is_empty()).map(String::as_str).unwrap_or("None"),
+        world.recent_events.iter().rev().find(|event| !event.trim().is_empty()).map(String::as_str).unwrap_or("None"),
+        serde_json::to_string_pretty(&active_entities).unwrap_or_default(),
+        serde_json::to_string_pretty(&relationship_summary).unwrap_or_default(),
+        serde_json::to_string_pretty(&world.scene_state).unwrap_or_default(),
+        serde_json::to_string_pretty(&world.object_states).unwrap_or_default(),
     )
 }
 
@@ -1822,10 +2222,13 @@ mod tests {
                 role: "user".into(),
                 content: "hello".into(),
             }],
+            ..ChatCompletionRequest::default()
         };
         let serialized = serde_json::to_string(&request).expect("serializes");
         assert!(!serialized.contains("response_format"));
         assert!(!serialized.contains("stream"));
+        assert!(!serialized.contains("tools"));
+        assert!(!serialized.contains("tool_choice"));
     }
 
     #[test]
@@ -1843,11 +2246,124 @@ mod tests {
                 }
             })),
             messages: Vec::new(),
+            ..ChatCompletionRequest::default()
         };
         let serialized = serde_json::to_string(&request).expect("serializes");
         assert!(serialized.contains("\"response_format\""));
         assert!(serialized.contains("\"json_schema\""));
         assert!(serialized.contains("\"strict\":true"));
+    }
+
+    #[test]
+    fn transport_selector_maps_settings_to_enum() {
+        let mut settings = ApiProviderSettings::default();
+        assert_eq!(
+            structured_evaluator_transport(&settings),
+            StructuredEvaluatorTransport::Auto
+        );
+        settings.structured_evaluator_transport = Some("tool_call".into());
+        assert_eq!(
+            structured_evaluator_transport(&settings),
+            StructuredEvaluatorTransport::ToolCall
+        );
+        settings.structured_evaluator_transport = Some("json_object".into());
+        assert_eq!(
+            structured_evaluator_transport(&settings),
+            StructuredEvaluatorTransport::JsonObject
+        );
+        settings.structured_evaluator_transport = Some("nonsense".into());
+        assert_eq!(
+            structured_evaluator_transport(&settings),
+            StructuredEvaluatorTransport::Auto
+        );
+    }
+
+    #[test]
+    fn tool_call_request_serializes_tools_and_tool_choice() {
+        let request = ChatCompletionRequest {
+            model: "test-model".into(),
+            temperature: 0.0,
+            stream: false,
+            tools: Some(serde_json::json!([{
+                "type": "function",
+                "function": { "name": "submit_evaluator_ops", "parameters": {"type": "object"} }
+            }])),
+            tool_choice: Some(serde_json::json!({
+                "type": "function",
+                "function": { "name": "submit_evaluator_ops" }
+            })),
+            ..ChatCompletionRequest::default()
+        };
+        let serialized = serde_json::to_string(&request).expect("serializes");
+        assert!(serialized.contains("\"tools\""));
+        assert!(serialized.contains("\"tool_choice\""));
+        assert!(serialized.contains("submit_evaluator_ops"));
+        // response_format must not appear in a tool-call request.
+        assert!(!serialized.contains("response_format"));
+    }
+
+    #[test]
+    fn tool_call_response_extracts_function_arguments() {
+        let body: ChatCompletionResponse = serde_json::from_str(
+            r#"{
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_evaluator_ops",
+                                "arguments": "{\"schema_version\":1,\"ops\":[],\"no_op_reason\":\"nothing\"}"
+                            }
+                        }]
+                    }
+                }]
+            }"#,
+        )
+        .expect("deserializes");
+        let arguments = first_tool_call_arguments(body).expect("arguments present");
+        // The arguments are the exact ops JSON the evaluator parser consumes.
+        let parsed: serde_json::Value = serde_json::from_str(&arguments).expect("valid json");
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["no_op_reason"], "nothing");
+    }
+
+    #[test]
+    fn content_only_response_yields_no_tool_call() {
+        // A model that ignored the forced tool and answered with prose: the
+        // tool transport must report no usable tool call so the ladder degrades.
+        let body: ChatCompletionResponse = serde_json::from_str(
+            r#"{"choices": [{"message": {"content": "Sure, here is some prose."}}]}"#,
+        )
+        .expect("deserializes");
+        assert!(first_tool_call_arguments(body).is_none());
+
+        let empty_args: ChatCompletionResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"function":{"name":"x","arguments":"   "}}]}}]}"#,
+        )
+        .expect("deserializes");
+        assert!(first_tool_call_arguments(empty_args).is_none());
+    }
+
+    #[test]
+    fn tool_call_rejection_detected_for_unsupported_and_missing() {
+        assert!(is_tool_call_rejection(
+            "tool_call response contained no tool_calls arguments"
+        ));
+        assert!(is_tool_call_rejection(
+            "API request failed with 400 Bad Request: tool_choice is not supported"
+        ));
+        assert!(is_tool_call_rejection(
+            "API request failed with 404: function call not implemented"
+        ));
+        // A genuine server/network failure must propagate, not degrade.
+        assert!(!is_tool_call_rejection(
+            "API request failed with 500: upstream error"
+        ));
+        assert!(!is_tool_call_rejection(
+            "API request failed: connection reset"
+        ));
     }
 
     #[test]
