@@ -241,6 +241,8 @@ pub struct EvaluatorConversionReport {
     pub accepted_candidate_ids: Vec<String>,
     pub rejected_candidates: Vec<EvaluatorCandidateRejection>,
     pub evidence_validations: Vec<EvidenceValidationTrace>,
+    pub entity_aliases_resolved: Vec<String>,
+    pub entity_alias_resolution_warnings: Vec<String>,
     pub no_op: bool,
 }
 

@@ -280,11 +280,34 @@ const READER_MODE_PROMPT: &str = r#"## NARRATION MODE: READER
 - Engine-controlled characters may misinterpret situations, miss details, or have incomplete knowledge.
 - Like close third-person scene fiction: stay near the active focus without taking over user-controlled actors."#;
 
-const GOD_MODE_PROMPT: &str = r#"## NARRATION MODE: GOD
-- Provide full narrative access.
-- Include engine-controlled characters' internal thoughts and emotions.
-- Also include environmental details active characters would not notice, hidden information, and dramatic irony.
-- You may reveal secrets, foreshadow future events, describe off-screen action, and provide context active characters lack."#;
+const ACTIVE_DIRECTOR_MODE_PROMPT: &str = r#"## NARRATION MODE: ACTIVE DIRECTOR
+
+[ACTIVE SCENE DIRECTION]
+The narrator is not a passive camera. Engine-controlled characters should actively pursue goals, protect boundaries, test assumptions, interrupt, refuse, redirect, escalate, soften, move through the environment, and create new pressure.
+
+Every normal RP response should do at least TWO:
+- advance an NPC goal
+- change posture/distance/location
+- introduce obstacle/offer/demand/reveal/complication
+- ask a pointed question or take meaningful NPC action
+- update physical scene through NPC/environment action
+- force a clear decision point
+
+Do not merely restate the user's action and describe atmosphere.
+End on an actionable hook.
+
+[USER CONTROL BOUNDARIES]
+- Never choose user thoughts.
+- Never choose user dialogue.
+- Never choose major voluntary user action.
+- NPCs and the world may create pressure, consequences, interruptions, refusals, offers, demands, and decision points around the user-controlled persona."#;
+
+const GM_SIMULATION_MODE_PROMPT: &str = r#"## NARRATION MODE: GM SIMULATION
+- Simulate the scene as an active game master: engine-controlled characters, hazards, time pressure, consequences, and opportunities continue moving.
+- Include engine-controlled characters' internal thoughts and emotions when useful.
+- Also include environmental details active characters would not notice, hidden information, dramatic irony, and off-screen pressure when it serves the scene.
+- You may reveal secrets, foreshadow future events, describe off-screen action, and provide context active characters lack.
+- Maintain user-control boundaries: never choose user thoughts, dialogue, or major voluntary user action."#;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ApiProviderSettings {
@@ -294,6 +317,8 @@ pub struct ApiProviderSettings {
     pub system_prompt: String,
     pub narrator_timeout_ms: Option<u64>,
     pub evaluator_timeout_ms: Option<u64>,
+    pub structured_evaluator_timeout_ms: Option<u64>,
+    pub diagnostic_evaluator_timeout_ms: Option<u64>,
     pub evaluator_timeout_mode: Option<String>,
     pub evaluator_mode: Option<String>,
     /// structured evaluator fallback policy: required | prefer | allow_fallback.
@@ -302,6 +327,9 @@ pub struct ApiProviderSettings {
     /// json_object | prompt_json. Missing/unknown means auto (tool-call first,
     /// then the response_format ladder).
     pub structured_evaluator_transport: Option<String>,
+    /// Max one-shot repair retries for evaluator_structured_v1 tool-call
+    /// failures. Missing means one retry.
+    pub structured_evaluator_max_retries: Option<u32>,
     pub wait_for_evaluator_before_next_turn: Option<bool>,
     pub allow_send_with_stale_state: Option<bool>,
     pub evaluator_background_enabled: Option<bool>,
@@ -388,6 +416,22 @@ pub struct StructuredCompletion {
     pub raw_text: String,
     pub enforcement: StructuredEnforcement,
     pub token_usage: Option<TokenUsage>,
+    pub trace: StructuredCompletionTrace,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StructuredCompletionTrace {
+    pub tool_calls_present: bool,
+    pub tool_call_count: usize,
+    pub tool_call_names: Vec<String>,
+    pub raw_content_present: bool,
+    pub raw_tool_calls_present: bool,
+    pub structured_retry_count: usize,
+    pub structured_retry_reasons: Vec<String>,
+    pub structured_retry_succeeded: Option<bool>,
+    pub structured_retry_final_error: Option<String>,
+    pub structured_retry_used_failed_args: bool,
+    pub structured_retry_repair_prompt_included_error: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,11 +471,19 @@ fn structured_evaluator_transport(settings: &ApiProviderSettings) -> StructuredE
     }
 }
 
+pub fn structured_evaluator_max_retries(settings: &ApiProviderSettings) -> u32 {
+    settings
+        .structured_evaluator_max_retries
+        .unwrap_or(1)
+        .min(3)
+}
+
 /// A plain prompt completion that retains provider-reported token usage.
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptCompletion {
     pub raw_text: String,
     pub token_usage: Option<TokenUsage>,
+    pub trace: StructuredCompletionTrace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -566,20 +618,9 @@ impl ApiProvider {
             .await
             .map_err(|err| format!("API request failed: {err}"))?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("API request failed with {status}: {body}"));
-        }
-
-        let body = response
-            .json::<ChatCompletionResponse>()
-            .await
-            .map_err(|err| format!("API response parse failed: {err}"))?;
-
-        body.choices
-            .into_iter()
-            .find_map(|choice| choice.message.content)
+        let parsed = read_chat_completion(response).await?;
+        parsed
+            .content
             .map(|content| content.trim().to_string())
             .filter(|content| !content.is_empty())
             .ok_or_else(|| "API response did not include assistant content".into())
@@ -672,6 +713,7 @@ impl ApiProvider {
     ) -> Result<StructuredCompletion, String> {
         let policy = structured_evaluator_policy(settings);
         let transport = structured_evaluator_transport(settings);
+        let mut retry_trace = StructuredCompletionTrace::default();
 
         // Real tool-calling first (strongest enforcement: the provider returns
         // arguments through a forced function call, not free text). Tried for
@@ -697,12 +739,60 @@ impl ApiProvider {
                         raw_text: completion.raw_text,
                         enforcement: StructuredEnforcement::ToolCall,
                         token_usage: completion.token_usage,
+                        trace: completion.trace,
                     })
                 }
                 // Provider rejected the tool parameters, or the model answered
                 // with prose instead of a tool call: degrade unless the caller
                 // explicitly pinned tool_call or required structured output.
                 Err(error) if is_tool_call_rejection(&error) => {
+                    if structured_evaluator_max_retries(settings) > 0 {
+                        let reason = classify_provider_tool_call_failure(&error);
+                        retry_trace.structured_retry_count = 1;
+                        retry_trace
+                            .structured_retry_reasons
+                            .push(reason.to_string());
+                        retry_trace.structured_retry_used_failed_args = false;
+                        retry_trace.structured_retry_repair_prompt_included_error = true;
+                        let retry_user_text =
+                            structured_tool_retry_user_message(user_text, None, &error);
+                        match self
+                            .complete_tool_call(
+                                settings,
+                                system_prompt,
+                                &retry_user_text,
+                                temperature,
+                                timeout,
+                                schema_name,
+                                schema,
+                            )
+                            .await
+                        {
+                            Ok(mut completion) => {
+                                completion.trace.structured_retry_count = 1;
+                                completion
+                                    .trace
+                                    .structured_retry_reasons
+                                    .push(reason.to_string());
+                                completion.trace.structured_retry_succeeded = Some(true);
+                                completion.trace.structured_retry_used_failed_args = false;
+                                completion
+                                    .trace
+                                    .structured_retry_repair_prompt_included_error = true;
+                                return Ok(StructuredCompletion {
+                                    raw_text: completion.raw_text,
+                                    enforcement: StructuredEnforcement::ToolCall,
+                                    token_usage: completion.token_usage,
+                                    trace: completion.trace,
+                                });
+                            }
+                            Err(retry_error) => {
+                                retry_trace.structured_retry_succeeded = Some(false);
+                                retry_trace.structured_retry_final_error =
+                                    Some(retry_error.clone());
+                            }
+                        }
+                    }
                     if transport == StructuredEvaluatorTransport::ToolCall
                         || policy == StructuredEvaluatorPolicy::Required
                     {
@@ -746,11 +836,13 @@ impl ApiProvider {
                 .await
             {
                 Ok(completion) => {
+                    let trace = merge_structured_retry_trace(completion.trace, &retry_trace);
                     return Ok(StructuredCompletion {
                         raw_text: completion.raw_text,
                         enforcement: StructuredEnforcement::JsonSchema,
                         token_usage: completion.token_usage,
-                    })
+                        trace,
+                    });
                 }
                 Err(error) if !is_response_format_rejection(&error) => return Err(error),
                 Err(error) => {
@@ -784,11 +876,13 @@ impl ApiProvider {
                 .await
             {
                 Ok(completion) => {
+                    let trace = merge_structured_retry_trace(completion.trace, &retry_trace);
                     return Ok(StructuredCompletion {
                         raw_text: completion.raw_text,
                         enforcement: StructuredEnforcement::JsonObject,
                         token_usage: completion.token_usage,
-                    })
+                        trace,
+                    });
                 }
                 Err(error) if !is_response_format_rejection(&error) => return Err(error),
                 Err(error) => {
@@ -825,7 +919,30 @@ impl ApiProvider {
             raw_text: completion.raw_text,
             enforcement: StructuredEnforcement::None,
             token_usage: completion.token_usage,
+            trace: merge_structured_retry_trace(completion.trace, &retry_trace),
         })
+    }
+
+    pub async fn complete_structured_tool_call_prompt(
+        &self,
+        settings: &ApiProviderSettings,
+        system_prompt: &str,
+        user_text: &str,
+        temperature: f32,
+        timeout: Option<Duration>,
+        schema_name: &str,
+        schema: &serde_json::Value,
+    ) -> Result<PromptCompletion, String> {
+        self.complete_tool_call(
+            settings,
+            system_prompt,
+            user_text,
+            temperature,
+            timeout,
+            schema_name,
+            schema,
+        )
+        .await
     }
 
     /// Real OpenAI-compatible tool calling: define `schema` as the parameters
@@ -861,7 +978,7 @@ impl ApiProvider {
             "type": "function",
             "function": {
                 "name": function_name,
-                "description": "Submit the evaluator's state-change operations for this exchange. Always call this function; never reply with prose.",
+                "description": "Submit the evaluator's state-change operations for this exchange. Always call this function; never reply with prose. Prefer stable entity aliases over raw UUIDs when valid: active_soul, active_player, latest_speaker, session_world.",
                 "parameters": schema,
             }
         }]);
@@ -915,14 +1032,19 @@ impl ApiProvider {
             .map_err(|err| format!("API response parse failed: {err}"))?;
 
         let token_usage = body.usage;
-        match first_tool_call_arguments(body) {
+        let trace = tool_call_trace(&body);
+        match first_tool_call_arguments(&body) {
             Some(arguments) => Ok(PromptCompletion {
                 raw_text: arguments,
                 token_usage,
+                trace,
             }),
             // No tool call came back (model answered with content, or returned
             // an empty arguments object). Surfaced as a rejection so the ladder
             // can degrade or fail per transport/policy.
+            None if trace.raw_content_present => {
+                Err("tool_call response contained content only and no tool_calls arguments".into())
+            }
             None => Err("tool_call response contained no tool_calls arguments".into()),
         }
     }
@@ -981,26 +1103,20 @@ impl ApiProvider {
             .await
             .map_err(|err| format!("API request failed: {err}"))?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("API request failed with {status}: {body}"));
-        }
-
-        let body = response
-            .json::<ChatCompletionResponse>()
-            .await
-            .map_err(|err| format!("API response parse failed: {err}"))?;
-
-        let token_usage = body.usage;
-        body.choices
-            .into_iter()
-            .find_map(|choice| choice.message.content)
+        let parsed = read_chat_completion(response).await?;
+        let token_usage = parsed.token_usage;
+        let trace = StructuredCompletionTrace {
+            raw_content_present: parsed.raw_content_present,
+            ..StructuredCompletionTrace::default()
+        };
+        parsed
+            .content
             .map(|content| content.trim().to_string())
             .filter(|content| !content.is_empty())
             .map(|raw_text| PromptCompletion {
                 raw_text,
                 token_usage,
+                trace,
             })
             .ok_or_else(|| "API response did not include assistant content".into())
     }
@@ -1200,13 +1316,238 @@ fn is_response_format_rejection(error: &str) -> bool {
 /// Pull the first tool call's `arguments` JSON from a completion response,
 /// ignoring empty argument blobs. `None` means the model did not make a usable
 /// tool call (e.g. it answered with prose instead).
-fn first_tool_call_arguments(body: ChatCompletionResponse) -> Option<String> {
+fn first_tool_call_arguments(body: &ChatCompletionResponse) -> Option<String> {
     body.choices
-        .into_iter()
-        .find_map(|choice| choice.message.tool_calls)
-        .and_then(|calls| calls.into_iter().next())
-        .map(|call| call.function.arguments)
+        .iter()
+        .filter_map(|choice| choice.message.tool_calls.as_ref())
+        .flat_map(|calls| calls.iter())
+        .next()
+        .map(|call| call.function.arguments.clone())
         .filter(|arguments| !arguments.trim().is_empty())
+}
+
+fn tool_call_trace(body: &ChatCompletionResponse) -> StructuredCompletionTrace {
+    let tool_call_names = body
+        .choices
+        .iter()
+        .filter_map(|choice| choice.message.tool_calls.as_ref())
+        .flat_map(|calls| calls.iter())
+        .filter_map(|call| call.function.name.clone())
+        .collect::<Vec<_>>();
+    let tool_call_count = body
+        .choices
+        .iter()
+        .filter_map(|choice| choice.message.tool_calls.as_ref())
+        .map(Vec::len)
+        .sum::<usize>();
+    StructuredCompletionTrace {
+        tool_calls_present: tool_call_count > 0,
+        tool_call_count,
+        tool_call_names,
+        raw_content_present: body.choices.iter().any(|choice| {
+            choice
+                .message
+                .content
+                .as_deref()
+                .is_some_and(|content| !content.trim().is_empty())
+        }),
+        raw_tool_calls_present: tool_call_count > 0,
+        ..StructuredCompletionTrace::default()
+    }
+}
+
+/// Assistant text + usage extracted from a non-streaming chat completion,
+/// tolerant of provider response-shape quirks.
+struct ParsedChatCompletion {
+    content: Option<String>,
+    token_usage: Option<TokenUsage>,
+    raw_content_present: bool,
+}
+
+impl ParsedChatCompletion {
+    fn from_strict(body: ChatCompletionResponse) -> Self {
+        let raw_content_present = body.choices.iter().any(|choice| {
+            choice
+                .message
+                .content
+                .as_deref()
+                .is_some_and(|content| !content.trim().is_empty())
+        });
+        let token_usage = body.usage;
+        let content = body
+            .choices
+            .into_iter()
+            .find_map(|choice| choice.message.content);
+        Self {
+            content,
+            token_usage,
+            raw_content_present,
+        }
+    }
+}
+
+/// Cap a raw provider body so it is readable in an error/log without dumping
+/// megabytes. Keeps enough to actually diagnose the shape.
+fn truncate_for_error(body: &str) -> String {
+    const MAX_CHARS: usize = 2000;
+    let trimmed = body.trim();
+    let total = trimmed.chars().count();
+    if total > MAX_CHARS {
+        let head: String = trimmed.chars().take(MAX_CHARS).collect();
+        format!("{head}… [truncated, {total} chars total]")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Some providers return HTTP 200 with an `{ "error": ... }` envelope instead of
+/// a real completion. Pull a human-readable message out of it if present.
+fn provider_error_message(value: &serde_json::Value) -> Option<String> {
+    let error = value.get("error")?;
+    if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+        return Some(message.to_string());
+    }
+    if let Some(message) = error.as_str() {
+        return Some(message.to_string());
+    }
+    Some(error.to_string())
+}
+
+/// `content` may be a plain string or an array of typed parts (multimodal-style
+/// `[{ "type": "text", "text": "…" }]`). Flatten either into plain text.
+fn content_value_to_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let mut combined = String::new();
+            for part in parts {
+                if let Some(text) = part.as_str() {
+                    combined.push_str(text);
+                } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                    combined.push_str(text);
+                } else if let Some(text) = part.get("content").and_then(|t| t.as_str()) {
+                    combined.push_str(text);
+                }
+            }
+            (!combined.is_empty()).then_some(combined)
+        }
+        _ => None,
+    }
+}
+
+fn lenient_chat_content(value: &serde_json::Value) -> Option<String> {
+    let choices = value.get("choices")?.as_array()?;
+    for choice in choices {
+        let Some(message) = choice.get("message").or_else(|| choice.get("delta")) else {
+            continue;
+        };
+        if let Some(text) = message.get("content").and_then(content_value_to_text) {
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+fn lenient_token_usage(value: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = value.get("usage")?;
+    Some(TokenUsage {
+        prompt_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()),
+        completion_tokens: usage.get("completion_tokens").and_then(|v| v.as_u64()),
+    })
+}
+
+/// Read a non-streaming chat completion body. Tries the strict struct first,
+/// then falls back to a lenient walk (content-as-array, `delta`, 200-with-error
+/// envelope). On a genuinely unparseable body the raw text is included in the
+/// error — so failures are visible for diagnosis instead of an opaque
+/// "error decoding response body".
+async fn read_chat_completion(response: reqwest::Response) -> Result<ParsedChatCompletion, String> {
+    let status = response.status();
+    let body_text = response
+        .text()
+        .await
+        .map_err(|err| format!("API response read failed: {err}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "API request failed with {status}: {}",
+            truncate_for_error(&body_text)
+        ));
+    }
+    if let Ok(parsed) = serde_json::from_str::<ChatCompletionResponse>(&body_text) {
+        return Ok(ParsedChatCompletion::from_strict(parsed));
+    }
+    let value: serde_json::Value = serde_json::from_str(&body_text).map_err(|err| {
+        format!(
+            "API response parse failed: {err}; raw body: {}",
+            truncate_for_error(&body_text)
+        )
+    })?;
+    if let Some(message) = provider_error_message(&value) {
+        return Err(format!(
+            "API provider returned an error in a {status} body: {message}"
+        ));
+    }
+    let content = lenient_chat_content(&value);
+    if content.is_none() {
+        return Err(format!(
+            "API response parse failed: no assistant content found; raw body: {}",
+            truncate_for_error(&body_text)
+        ));
+    }
+    let raw_content_present = content
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty());
+    Ok(ParsedChatCompletion {
+        content,
+        token_usage: lenient_token_usage(&value),
+        raw_content_present,
+    })
+}
+
+fn merge_structured_retry_trace(
+    mut trace: StructuredCompletionTrace,
+    retry_trace: &StructuredCompletionTrace,
+) -> StructuredCompletionTrace {
+    if retry_trace.structured_retry_count > 0 {
+        trace.structured_retry_count = retry_trace.structured_retry_count;
+        trace.structured_retry_reasons = retry_trace.structured_retry_reasons.clone();
+        trace.structured_retry_succeeded = retry_trace.structured_retry_succeeded;
+        trace.structured_retry_final_error = retry_trace.structured_retry_final_error.clone();
+        trace.structured_retry_used_failed_args = retry_trace.structured_retry_used_failed_args;
+        trace.structured_retry_repair_prompt_included_error =
+            retry_trace.structured_retry_repair_prompt_included_error;
+    }
+    trace
+}
+
+pub fn structured_tool_retry_user_message(
+    original_user_message: &str,
+    previous_failed_arguments: Option<&str>,
+    validator_error: &str,
+) -> String {
+    let previous_failed_arguments = previous_failed_arguments
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("(none captured)");
+    let failure_kind = classify_provider_tool_call_failure(validator_error);
+    format!(
+        "{original_user_message}\n\n[STRUCTURED TOOL-CALL REPAIR]\nThe previous submit_evaluator_ops tool call failed validation.\n\nFailure kind:\n{failure_kind}\n\nValidator error:\n{validator_error}\n\nPrevious failed tool arguments:\n{previous_failed_arguments}\n\nRepair instructions:\n- Fix only invalid fields.\n- Preserve valid ops where possible.\n- Use aliases instead of raw UUIDs when possible: active_soul, active_player, latest_speaker, session_world.\n- Use exact evidence_quote substrings from latest exchange.\n- Do not paraphrase evidence.\n- Do not add unsupported fields.\n- Call submit_evaluator_ops again."
+    )
+}
+
+fn classify_provider_tool_call_failure(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("no tool_calls") || lower.contains("contained no tool_calls") {
+        "no_tool_calls"
+    } else if lower.contains("content") || lower.contains("prose") {
+        "content_only_response"
+    } else {
+        "schema_parse_failed"
+    }
 }
 
 /// True when a tool-call attempt should degrade to a weaker transport rather
@@ -1566,7 +1907,8 @@ Return evaluator ops JSON only. Do not write prose, markdown, code fences, Engin
 Use exact evidence_quote substrings from the latest exchange. Do not invent facts.\n\
 If nothing durable changed, return ops: [] with a specific nonempty no_op_reason.\n\
 Do not return empty ops for entering/leaving a location, object movement/condition changes, relationship-significant actions, or explicit scene changes.\n\
-Resolve user-controlled \"I\" to the active player persona. Use IDs exactly as supplied in current state.\n\
+Use only fields defined for each op. Never put confidence on update_scene_state; confidence is allowed only on add_memory.\n\
+Resolve user-controlled \"I\" to the active player persona. Prefer aliases instead of copying raw UUIDs when valid: active_soul, active_player, latest_speaker, session_world.\n\
 Current truth comes from the compact state JSON below; Rust validates semantics and applies the ledger.\n\n{}",
         structured_evaluator_current_state_block(
             soul,
@@ -1606,20 +1948,23 @@ fn structured_evaluator_current_state_block(
     ]);
     let mut relationships = soul.relationships.iter().collect::<Vec<_>>();
     relationships.sort_by(|left, right| left.0.cmp(right.0));
-    let relationship_summary = relationships
-        .into_iter()
-        .filter_map(|(target, relationship)| {
-            let target = if target == "default_player" || target == "user" {
-                player_id.to_string()
-            } else {
-                target.clone()
-            };
-            if target == "default_player" {
-                return None;
-            }
-            Some(serde_json::json!({
+    let mut relationship_summary_by_target = std::collections::BTreeMap::new();
+    for (target, relationship) in relationships {
+        let mapped_from_operator = target == "default_player" || target == "user";
+        let target = if mapped_from_operator {
+            player_id.to_string()
+        } else {
+            target.clone()
+        };
+        if target == "default_player" {
+            continue;
+        }
+        if mapped_from_operator && relationship_summary_by_target.contains_key(&target) {
+            continue;
+        }
+        let value = serde_json::json!({
                 "source_soul_id": active_soul_id,
-                "target_entity_id": target,
+                "target_entity_id": target.clone(),
                 "trust": relationship.trust,
                 "affection": relationship.affection,
                 "intimacy": relationship.intimacy,
@@ -1630,8 +1975,11 @@ fn structured_evaluator_current_state_block(
                 "curiosity": relationship.curiosity,
                 "comfort": relationship.comfort,
                 "boundary_pressure": relationship.boundary_pressure
-            }))
-        })
+        });
+        relationship_summary_by_target.insert(target, value);
+    }
+    let relationship_summary = relationship_summary_by_target
+        .into_values()
         .collect::<Vec<_>>();
     format!(
         "[CURRENT STATE]\nCharacter: {}\nActive Soul ID: {}\nActive player persona: {} ({})\nLatest normal RP speaker entity_id: {}\nLocation: {}\nTime: {}\nActive plot: {}\nRecent event: {}\n\n[ACTIVE ENTITIES]\n{}\n\n[CURRENT RELATIONSHIPS]\n{}\n\n[PRIOR SCENE_STATE]\n{}\n\n[CURRENT WORLD/OBJECT STATE]\nObjects JSON: {}",
@@ -2192,7 +2540,9 @@ fn normalize_updater_time(raw: &str) -> String {
 fn mode_prompt_for(mode: &str) -> &'static str {
     match mode.trim().to_lowercase().as_str() {
         "realistic" => REALISTIC_MODE_PROMPT,
-        "god" => GOD_MODE_PROMPT,
+        "active_director" | "active director" => ACTIVE_DIRECTOR_MODE_PROMPT,
+        "gm_simulation" | "gm simulation" => GM_SIMULATION_MODE_PROMPT,
+        "god" => GM_SIMULATION_MODE_PROMPT,
         "custom" => READER_MODE_PROMPT,
         _ => READER_MODE_PROMPT,
     }
@@ -2210,6 +2560,70 @@ fn chat_completions_url(base_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lenient_content_parses_plain_string() {
+        let value = serde_json::json!({
+            "choices": [{ "message": { "content": "hello there" } }]
+        });
+        assert_eq!(lenient_chat_content(&value).as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn lenient_content_flattens_content_part_array() {
+        // OpenRouter / multimodal-style content delivered as typed parts is the
+        // shape that broke the strict struct and aborted the player simulator.
+        let value = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": [
+                        { "type": "text", "text": "first" },
+                        { "type": "text", "text": " second" }
+                    ]
+                }
+            }]
+        });
+        assert_eq!(lenient_chat_content(&value).as_deref(), Some("first second"));
+    }
+
+    #[test]
+    fn lenient_content_reads_streaming_style_delta() {
+        let value = serde_json::json!({
+            "choices": [{ "delta": { "content": "delta text" } }]
+        });
+        assert_eq!(lenient_chat_content(&value).as_deref(), Some("delta text"));
+    }
+
+    #[test]
+    fn provider_error_envelope_is_extracted() {
+        let value = serde_json::json!({ "error": { "message": "model is overloaded" } });
+        assert_eq!(
+            provider_error_message(&value).as_deref(),
+            Some("model is overloaded")
+        );
+        let bare = serde_json::json!({ "error": "rate limited" });
+        assert_eq!(provider_error_message(&bare).as_deref(), Some("rate limited"));
+        let none = serde_json::json!({ "choices": [] });
+        assert!(provider_error_message(&none).is_none());
+    }
+
+    #[test]
+    fn lenient_token_usage_reads_partial_counts() {
+        let value = serde_json::json!({ "usage": { "prompt_tokens": 12 } });
+        let usage = lenient_token_usage(&value).expect("usage present");
+        assert_eq!(usage.prompt_tokens, Some(12));
+        assert_eq!(usage.completion_tokens, None);
+    }
+
+    #[test]
+    fn truncate_for_error_caps_long_bodies() {
+        let body = "x".repeat(5000);
+        let truncated = truncate_for_error(&body);
+        assert!(truncated.contains("truncated"));
+        assert!(truncated.chars().count() < body.chars().count());
+        // Short bodies pass through untouched (just trimmed).
+        assert_eq!(truncate_for_error("  short  "), "short");
+    }
 
     #[test]
     fn chat_request_omits_response_format_when_none() {
@@ -2322,7 +2736,13 @@ mod tests {
             }"#,
         )
         .expect("deserializes");
-        let arguments = first_tool_call_arguments(body).expect("arguments present");
+        let trace = tool_call_trace(&body);
+        assert!(trace.tool_calls_present);
+        assert_eq!(trace.tool_call_count, 1);
+        assert_eq!(trace.tool_call_names, vec!["submit_evaluator_ops"]);
+        assert!(trace.raw_tool_calls_present);
+        assert!(!trace.raw_content_present);
+        let arguments = first_tool_call_arguments(&body).expect("arguments present");
         // The arguments are the exact ops JSON the evaluator parser consumes.
         let parsed: serde_json::Value = serde_json::from_str(&arguments).expect("valid json");
         assert_eq!(parsed["schema_version"], 1);
@@ -2337,13 +2757,32 @@ mod tests {
             r#"{"choices": [{"message": {"content": "Sure, here is some prose."}}]}"#,
         )
         .expect("deserializes");
-        assert!(first_tool_call_arguments(body).is_none());
+        assert!(first_tool_call_arguments(&body).is_none());
 
         let empty_args: ChatCompletionResponse = serde_json::from_str(
             r#"{"choices":[{"message":{"content":null,"tool_calls":[{"function":{"name":"x","arguments":"   "}}]}}]}"#,
         )
         .expect("deserializes");
-        assert!(first_tool_call_arguments(empty_args).is_none());
+        assert!(first_tool_call_arguments(&empty_args).is_none());
+    }
+
+    #[test]
+    fn structured_tool_retry_prompt_is_repair_based_with_failed_args_and_error() {
+        let prompt = structured_tool_retry_user_message(
+            "Latest exchange here.",
+            Some(r#"{"ops":[{"op":"update_scene_state","confidence":0.8}]}"#),
+            "unknown field `confidence` on update_scene_state",
+        );
+
+        assert!(prompt.contains("The previous submit_evaluator_ops tool call failed validation."));
+        assert!(prompt.contains("Failure kind:"));
+        assert!(prompt.contains("Validator error:"));
+        assert!(prompt.contains("unknown field `confidence`"));
+        assert!(prompt.contains("Previous failed tool arguments:"));
+        assert!(prompt.contains("\"confidence\":0.8"));
+        assert!(prompt.contains("Fix only invalid fields."));
+        assert!(prompt.contains("active_soul, active_player, latest_speaker, session_world"));
+        assert!(prompt.contains("Call submit_evaluator_ops again."));
     }
 
     #[test]
@@ -2608,6 +3047,62 @@ mod tests {
         assert!(prompt.contains("[HIDDEN STATE]"));
         assert!(prompt.contains("present_characters"));
         assert!(!prompt.contains("ignored unless custom"));
+    }
+
+    #[test]
+    fn active_director_prompt_contains_active_scene_direction() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "active_director");
+
+        assert!(prompt.contains("[ACTIVE SCENE DIRECTION]"));
+        assert!(prompt.contains("The narrator is not a passive camera."));
+        assert!(prompt.contains("Every normal RP response should do at least TWO"));
+        assert!(prompt.contains("advance an NPC goal"));
+        assert!(prompt.contains("force a clear decision point"));
+        assert!(prompt.contains("End on an actionable hook."));
+    }
+
+    #[test]
+    fn reader_mode_does_not_include_aggressive_director_language() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "reader");
+
+        assert!(prompt.contains("NARRATION MODE: READER"));
+        assert!(!prompt.contains("[ACTIVE SCENE DIRECTION]"));
+        assert!(!prompt.contains("The narrator is not a passive camera."));
+        assert!(!prompt.contains("Every normal RP response should do at least TWO"));
+    }
+
+    #[test]
+    fn active_director_allows_npc_initiative_without_user_control() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+        let settings = ApiProviderSettings {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "key".into(),
+            model: "model".into(),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&settings, &soul, "[CURRENT STATE]", "Active Director");
+
+        assert!(prompt.contains("interrupt, refuse, redirect, escalate"));
+        assert!(prompt.contains("ask a pointed question or take meaningful NPC action"));
+        assert!(prompt.contains("NPCs and the world may create pressure"));
+        assert!(prompt.contains("Never choose user thoughts."));
+        assert!(prompt.contains("Never choose user dialogue."));
+        assert!(prompt.contains("Never choose major voluntary user action."));
+        assert!(prompt.contains("Do not invent new user decisions"));
     }
 
     #[test]

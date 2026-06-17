@@ -31,6 +31,10 @@ import {
 import {
   ApiProviderSettings,
   AssistantMessageVariant,
+  BenchmarkSettings,
+  BenchmarkSummary,
+  BenchmarkTarget,
+  BenchmarkType,
   ChatMessage,
   ConversationSummary,
   ContextPreview,
@@ -62,7 +66,7 @@ import {
   createSessionSoulClone,
   createDefaultSetting,
   dedupeActiveAdjacentUserMessages,
-  deleteConversation,
+  archiveConversation,
   restoreConversation,
   deleteMessage,
   deleteProviderProfile,
@@ -125,6 +129,13 @@ import {
   upsertProviderProfile,
   upsertSetting,
   upsertSoul,
+  runBenchmark,
+  prepareBenchmarkSession,
+  generateBenchmarkPlayerMessage,
+  benchmarkTurnSummary,
+  finalizeBenchmark,
+  BenchmarkSessionInit,
+  BenchmarkTurnSummary,
   runEvaluatorContractTest,
   runStructuredEvaluatorDiagnostic,
   StructuredEvaluatorDiagnosticSummary,
@@ -167,7 +178,7 @@ const DEV_LOG_CATEGORIES: DevLogCategory[] = [
 ];
 const DEV_LOG_LEVELS: DevLogLevel[] = ["info", "warn", "error", "debug", "success"];
 type ProviderKind = "Mock" | "API";
-type NarrativeMode = "Realistic" | "Reader" | "God" | "Custom";
+type NarrativeMode = "Realistic" | "Reader" | "Active Director" | "GM Simulation" | "Custom";
 type AppView = "library" | "chat";
 type ChatStartMode = "continue" | "fresh";
 type DisclaimerMode = "launch" | "manual" | null;
@@ -180,7 +191,8 @@ type DevCommandName =
   | "inspect_turn_branch_integrity"
   | "repair_accidental_normal_send_variants"
   | "export_visible_chat_log"
-  | "export_llm_payload_history";
+  | "export_llm_payload_history"
+  | "run_benchmark";
 
 const DEV_COMMAND_OPTIONS: Array<{ name: DevCommandName; label: string; defaultArgs: string }> = [
   {
@@ -223,6 +235,21 @@ const DEV_COMMAND_OPTIONS: Array<{ name: DevCommandName; label: string; defaultA
     label: "Export Payload History",
     defaultArgs: "{}",
   },
+  {
+    name: "run_benchmark",
+    label: "Run Benchmark",
+    defaultArgs: JSON.stringify(
+      {
+        benchmark_type: "visible_ai_chat",
+        target: "current_session",
+        turn_count: 5,
+        strict_tool_evaluator: true,
+        player_goal: "Build cautious trust with the active Soul while respecting boundaries.",
+      },
+      null,
+      2,
+    ),
+  },
 ];
 
 type ActiveGeneration = {
@@ -232,6 +259,28 @@ type ActiveGeneration = {
   knownAssistantIds: Set<number>;
   replacementAssistantId?: number;
   replacementOriginalContent?: string;
+};
+
+// Mutable state for a live AI-vs-AI benchmark run. Held in a ref (not React
+// state) so the per-turn effect reads/mutates it without re-render churn.
+type BenchmarkLiveContext = {
+  benchmarkId: string;
+  conversationId: string;
+  soulId: string;
+  startedAt: number;
+  playerProfileId: string;
+  playerGoal: string;
+  settings: BenchmarkSettings;
+  narratorSettings: ApiProviderSettings;
+  updaterSettings: ApiProviderSettings;
+  initialMemoryCount: number;
+  initialObjectCount: number;
+  initialRelationshipCount: number;
+  perTurn: BenchmarkTurnSummary[];
+  narratorFailures: number;
+  completedTurns: number;
+  nextTurnIndex: number;
+  lastPlayerText: string;
 };
 
 interface MessageRenderTrace {
@@ -447,6 +496,8 @@ export function App() {
   const [playerPersonas, setPlayerPersonas] = useState<PlayerPersona[]>([]);
   const [activePlayerPersona, setActivePlayerPersonaState] = useState<PlayerPersona | null>(null);
   const [personaModalMode, setPersonaModalMode] = useState<"list" | "add" | "edit" | null>(null);
+  const [personaListConfirmRequired, setPersonaListConfirmRequired] = useState(false);
+  const [personaModalConversationId, setPersonaModalConversationId] = useState<string | null>(null);
   const [personaEditingId, setPersonaEditingId] = useState<string | null>(null);
   const [personaForm, setPersonaForm] = useState<PlayerPersonaInput>({
     display_name: "",
@@ -498,9 +549,12 @@ export function App() {
     system_prompt: loadStoredCustomNarratorPrompt(),
     narrator_timeout_ms: null,
     evaluator_timeout_ms: 25_000,
+    structured_evaluator_timeout_ms: 90_000,
+    diagnostic_evaluator_timeout_ms: 60_000,
     evaluator_timeout_mode: "finite",
     evaluator_mode: "evaluator_form_v1",
     structured_evaluator_policy: "prefer",
+    structured_evaluator_max_retries: 1,
     wait_for_evaluator_before_next_turn: true,
     allow_send_with_stale_state: false,
     evaluator_background_enabled: false,
@@ -513,9 +567,12 @@ export function App() {
     system_prompt: "",
     narrator_timeout_ms: null,
     evaluator_timeout_ms: 25_000,
+    structured_evaluator_timeout_ms: 90_000,
+    diagnostic_evaluator_timeout_ms: 60_000,
     evaluator_timeout_mode: "finite",
     evaluator_mode: "evaluator_form_v1",
     structured_evaluator_policy: "prefer",
+    structured_evaluator_max_retries: 1,
     wait_for_evaluator_before_next_turn: true,
     allow_send_with_stale_state: false,
     evaluator_background_enabled: false,
@@ -576,6 +633,29 @@ export function App() {
   const [structuredDiagnosticResult, setStructuredDiagnosticResult] =
     useState<StructuredEvaluatorDiagnosticSummary | null>(null);
   const [structuredDiagnosticError, setStructuredDiagnosticError] = useState<string | null>(null);
+  const [benchmarkType, setBenchmarkType] = useState<BenchmarkType>("visible_ai_chat");
+  const [benchmarkTarget, setBenchmarkTarget] = useState<BenchmarkTarget>("current_session");
+  const [benchmarkTurnCount, setBenchmarkTurnCount] = useState(5);
+  const [benchmarkPlayerProfileId, setBenchmarkPlayerProfileId] = useState("");
+  const [benchmarkPlayerGoal, setBenchmarkPlayerGoal] = useState(
+    "Build cautious trust with the active Soul while respecting boundaries.",
+  );
+  // Default OFF: a live Visible AI Chat run should mirror a turn you typed so
+  // exported payloads/session show the real pipeline. Strict mode is an opt-in
+  // probe that pins the evaluator to structured tool-calling.
+  const [benchmarkStrictToolEvaluator, setBenchmarkStrictToolEvaluator] = useState(false);
+  const [benchmarkTransport, setBenchmarkTransport] = useState<ApiProviderSettings["structured_evaluator_transport"]>("tool_call");
+  const [benchmarkWaitForEvaluator, setBenchmarkWaitForEvaluator] = useState(true);
+  const [benchmarkRunning, setBenchmarkRunning] = useState(false);
+  const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkSummary | null>(null);
+  const [benchmarkError, setBenchmarkError] = useState<string | null>(null);
+  // Live self-play: drives one visible `executeTurn` per turn via an effect so
+  // the AI-vs-AI exchange streams into the real chat instead of running headless.
+  const [benchmarkLiveActive, setBenchmarkLiveActive] = useState(false);
+  const [benchmarkTurnsRemaining, setBenchmarkTurnsRemaining] = useState(0);
+  const benchmarkCtxRef = useRef<BenchmarkLiveContext | null>(null);
+  const benchmarkTurnInFlightRef = useRef(false);
+  const benchmarkStopRef = useRef(false);
   const [disclaimerMode, setDisclaimerMode] = useState<DisclaimerMode>(() =>
     hasAcceptedDisclaimerVersion() ? null : "launch",
   );
@@ -645,6 +725,34 @@ export function App() {
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId;
   }, [currentConversationId]);
+
+  // Drives the live AI-vs-AI self-play loop. Each time the chat settles (not
+  // busy/updating) and the benchmark conversation is active, fire the next turn
+  // through the normal visible chat path so it streams in real time. Runs one
+  // turn at a time, guarded by benchmarkTurnInFlightRef against re-entry.
+  useEffect(() => {
+    if (!benchmarkLiveActive) return;
+    if (benchmarkTurnInFlightRef.current) return;
+    const ctx = benchmarkCtxRef.current;
+    if (!ctx) return;
+    if (busy || stateUpdating) return;
+    if (currentConversationId !== ctx.conversationId) return;
+    if (!soul || soul.character_id !== ctx.soulId) return;
+    if (benchmarkStopRef.current || benchmarkTurnsRemaining <= 0) {
+      void finishBenchmarkLive();
+      return;
+    }
+    void runOneBenchmarkTurn();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    benchmarkLiveActive,
+    benchmarkTurnsRemaining,
+    busy,
+    stateUpdating,
+    currentConversationId,
+    soul,
+    messages,
+  ]);
 
   function appendDevLog(entry: DevLogEntry) {
     setDevLogs((current) => [...current, sanitizeDevLogEntry(entry)].slice(-DEV_LOG_LIMIT));
@@ -1062,9 +1170,12 @@ export function App() {
       system_prompt: profile.system_prompt,
       narrator_timeout_ms: profile.narrator_timeout_ms ?? null,
       evaluator_timeout_ms: profile.evaluator_timeout_ms ?? 25_000,
+      structured_evaluator_timeout_ms: profile.structured_evaluator_timeout_ms ?? 90_000,
+      diagnostic_evaluator_timeout_ms: profile.diagnostic_evaluator_timeout_ms ?? 60_000,
       evaluator_timeout_mode: profile.evaluator_timeout_mode ?? "finite",
       evaluator_mode: profile.evaluator_mode ?? "evaluator_form_v1",
       structured_evaluator_policy: profile.structured_evaluator_policy ?? "prefer",
+      structured_evaluator_max_retries: profile.structured_evaluator_max_retries ?? 1,
       wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn ?? true,
       allow_send_with_stale_state: profile.allow_send_with_stale_state ?? false,
       evaluator_background_enabled: profile.evaluator_background_enabled ?? false,
@@ -1081,9 +1192,12 @@ export function App() {
       system_prompt: profile.system_prompt,
       narrator_timeout_ms: profile.narrator_timeout_ms ?? null,
       evaluator_timeout_ms: profile.evaluator_timeout_ms ?? 25_000,
+      structured_evaluator_timeout_ms: profile.structured_evaluator_timeout_ms ?? 90_000,
+      diagnostic_evaluator_timeout_ms: profile.diagnostic_evaluator_timeout_ms ?? 60_000,
       evaluator_timeout_mode: profile.evaluator_timeout_mode ?? "finite",
       evaluator_mode: profile.evaluator_mode ?? "evaluator_form_v1",
       structured_evaluator_policy: profile.structured_evaluator_policy ?? "prefer",
+      structured_evaluator_max_retries: profile.structured_evaluator_max_retries ?? 1,
       wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn ?? true,
       allow_send_with_stale_state: profile.allow_send_with_stale_state ?? false,
       evaluator_background_enabled: profile.evaluator_background_enabled ?? false,
@@ -1466,6 +1580,7 @@ export function App() {
     statusLabel?: string,
     replacementAssistantId?: number,
     correctionInstruction?: string,
+    updaterOverride?: Partial<ApiProviderSettings>,
   ) {
     if (!text || busy || stateUpdating || !soul) return;
     const generationId = generationIdRef.current + 1;
@@ -1548,6 +1663,7 @@ export function App() {
                 ...(useNarratorProviderForUpdater ? apiSettings : stateUpdaterSettings),
                 evaluator_execution_mode: evaluatorExecutionMode,
                 structured_evaluator_transport: structuredEvaluatorTransport,
+                ...(updaterOverride ?? {}),
               },
               contextMode,
               abortController.signal,
@@ -1691,8 +1807,10 @@ export function App() {
     return personas;
   }
 
-  async function openPersonaList(conversationId = currentConversationId) {
+  async function openPersonaList(conversationId = currentConversationId, requireConfirm = false) {
     await refreshPlayerPersonas(conversationId);
+    setPersonaModalConversationId(conversationId ?? null);
+    setPersonaListConfirmRequired(requireConfirm);
     setPersonaModalMode("list");
   }
 
@@ -1710,7 +1828,7 @@ export function App() {
   }
 
   async function openPersonaEdit(personaId?: string | null) {
-    const personas = await refreshPlayerPersonas();
+    const personas = await refreshPlayerPersonas(personaModalConversationId ?? currentConversationId);
     const target =
       personas.find((persona) => persona.persona_id === personaId) ??
       activePlayerPersona ??
@@ -1734,11 +1852,29 @@ export function App() {
   }
 
   async function handleSelectPersona(personaId: string) {
-    if (!currentConversationId) return;
-    const active = await setActivePlayerPersona(currentConversationId, personaId);
+    const conversationId = personaModalConversationId ?? currentConversationId;
+    if (!conversationId) return;
+    const active = await setActivePlayerPersona(conversationId, personaId);
     setActivePlayerPersonaState(active);
-    await refreshPlayerPersonas(currentConversationId);
+    await refreshPlayerPersonas(conversationId);
     setStatus(`Active persona: ${active.display_name}`);
+  }
+
+  function handleConfirmPersonaList() {
+    if (!activePlayerPersona) {
+      setStatus("Choose a player persona before continuing.");
+      return;
+    }
+    setPersonaListConfirmRequired(false);
+    setPersonaModalConversationId(null);
+    setPersonaModalMode(null);
+    setStatus(`Chat ready with player persona: ${activePlayerPersona.display_name}`);
+  }
+
+  function closePersonaModal() {
+    setPersonaListConfirmRequired(false);
+    setPersonaModalConversationId(null);
+    setPersonaModalMode(null);
   }
 
   async function handleSavePersona() {
@@ -1746,8 +1882,9 @@ export function App() {
       ...personaForm,
       persona_id: personaEditingId ?? personaForm.persona_id ?? null,
     });
-    await refreshPlayerPersonas();
-    if (currentConversationId) {
+    const conversationId = personaModalConversationId ?? currentConversationId;
+    await refreshPlayerPersonas(conversationId);
+    if (conversationId) {
       await handleSelectPersona(saved.persona_id);
     }
     setPersonaModalMode("list");
@@ -2006,6 +2143,30 @@ export function App() {
     return parsed as Record<string, unknown>;
   }
 
+  function devStringArg(args: Record<string, unknown>, ...keys: string[]) {
+    for (const key of keys) {
+      const value = args[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return null;
+  }
+
+  function devNumberArg(args: Record<string, unknown>, key: string, fallback: number) {
+    const value = args[key];
+    const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+
+  function devBooleanArg(args: Record<string, unknown>, key: string, fallback: boolean) {
+    const value = args[key];
+    if (typeof value === "boolean") return value;
+    if (typeof value === "string") {
+      if (value.toLowerCase() === "true") return true;
+      if (value.toLowerCase() === "false") return false;
+    }
+    return fallback;
+  }
+
   async function runWhitelistedDevCommand(commandName: DevCommandName, argsOverride?: Record<string, unknown>) {
     if (!import.meta.env.DEV) return;
     const args = argsOverride ?? parseDevCommandArgs();
@@ -2034,6 +2195,99 @@ export function App() {
         return exportVisibleChatLog(conversationId);
       case "export_llm_payload_history":
         return exportLlmPayloadHistory(conversationId);
+      case "run_benchmark": {
+        if (!soul) throw new Error("No selected Soul for benchmark.");
+        const rawBenchmarkType = devStringArg(args, "benchmark_type", "benchmarkType") ?? benchmarkType;
+        if (
+          rawBenchmarkType !== "visible_ai_chat" &&
+          rawBenchmarkType !== "scripted_visible_replay" &&
+          rawBenchmarkType !== "headless_regression" &&
+          rawBenchmarkType !== "multi_agent_visible_chat"
+        ) {
+          throw new Error(`Unsupported benchmark_type: ${rawBenchmarkType}`);
+        }
+        const nextBenchmarkType = rawBenchmarkType as BenchmarkType;
+        const rawBenchmarkTarget = devStringArg(args, "target", "benchmarkTarget") ?? benchmarkTarget;
+        if (
+          rawBenchmarkTarget !== "current_session" &&
+          rawBenchmarkTarget !== "new_benchmark_session_from_current_soul" &&
+          rawBenchmarkTarget !== "new_benchmark_session_from_selected_soul_world"
+        ) {
+          throw new Error(`Unsupported benchmark target: ${rawBenchmarkTarget}`);
+        }
+        const requiresPlayerProfile =
+          nextBenchmarkType === "visible_ai_chat" || nextBenchmarkType === "multi_agent_visible_chat";
+        const playerProfileId =
+          devStringArg(args, "player_simulator_profile_id", "playerSimulatorProfileId") ??
+          selectedBenchmarkPlayerProfileId;
+        if (requiresPlayerProfile && !playerProfileId) {
+          throw new Error("Self-play benchmark requires player_simulator_profile_id.");
+        }
+        const updaterSettings = useNarratorProviderForUpdater ? apiSettings : stateUpdaterSettings;
+        const strictToolEvaluator = devBooleanArg(
+          args,
+          "strict_tool_evaluator",
+          benchmarkStrictToolEvaluator,
+        );
+        const benchmarkSettings: BenchmarkSettings = {
+          benchmark_type: nextBenchmarkType,
+          target: rawBenchmarkTarget as BenchmarkTarget,
+          current_conversation_id:
+            (rawBenchmarkTarget as BenchmarkTarget) === "current_session" ? conversationId : null,
+          turn_count: Math.max(1, Math.floor(devNumberArg(args, "turn_count", benchmarkTurnCount))),
+          narrator_style: devStringArg(args, "narrator_style", "narratorStyle") ?? mode,
+          evaluator_mode: strictToolEvaluator
+            ? "evaluator_structured_v1"
+            : devStringArg(args, "evaluator_mode", "evaluatorMode") ??
+              updaterSettings.evaluator_mode ??
+              "evaluator_form_v1",
+          structured_evaluator_transport: strictToolEvaluator
+            ? "tool_call"
+            : devStringArg(args, "structured_evaluator_transport", "structuredEvaluatorTransport") ??
+              benchmarkTransport ??
+              updaterSettings.structured_evaluator_transport ??
+              structuredEvaluatorTransport,
+          structured_evaluator_policy: strictToolEvaluator
+            ? "required"
+            : devStringArg(args, "structured_evaluator_policy", "structuredEvaluatorPolicy") ??
+              updaterSettings.structured_evaluator_policy ??
+              "prefer",
+          structured_evaluator_max_retries: Math.max(
+            0,
+            Math.floor(
+              devNumberArg(
+                args,
+                "structured_evaluator_max_retries",
+                updaterSettings.structured_evaluator_max_retries ?? 1,
+              ),
+            ),
+          ),
+          player_simulator_profile_id: requiresPlayerProfile ? playerProfileId : null,
+          player_goal:
+            devStringArg(args, "player_goal", "playerGoal") ??
+            benchmarkPlayerGoal,
+          export_payload_history: devBooleanArg(args, "export_payload_history", true),
+          export_mne: devBooleanArg(args, "export_mne", true),
+          export_summary_json: devBooleanArg(args, "export_summary_json", true),
+          strict_tool_evaluator: strictToolEvaluator,
+          wait_for_evaluator_each_turn: devBooleanArg(
+            args,
+            "wait_for_evaluator_each_turn",
+            benchmarkWaitForEvaluator,
+          ),
+        };
+        const summary = await runBenchmark(
+          devStringArg(args, "soul_id", "soulId") ?? soul.character_id,
+          devStringArg(args, "setting_id", "settingId") ?? setting?.setting_id ?? null,
+          devStringArg(args, "provider") ?? provider,
+          apiSettings,
+          updaterSettings,
+          benchmarkSettings,
+        );
+        setBenchmarkResult(summary);
+        setBenchmarkError(null);
+        return summary;
+      }
       default: {
         const exhaustive: never = commandName;
         throw new Error(`Command is not whitelisted: ${exhaustive}`);
@@ -2054,13 +2308,35 @@ export function App() {
       const result = await runWhitelistedDevCommand(commandName, argsOverride);
       const formatted = JSON.stringify(result, null, 2);
       setDevCommandResult(formatted);
-      setStatus(`Dev command complete: ${commandName}`);
+      const resultConversationId =
+        result &&
+        typeof result === "object" &&
+        "conversation_id" in result &&
+        typeof result.conversation_id === "string"
+          ? result.conversation_id
+          : conversationId;
+      const benchmarkPassed =
+        result &&
+        typeof result === "object" &&
+        "scorecard" in result &&
+        result.scorecard &&
+        typeof result.scorecard === "object" &&
+        "pass" in result.scorecard
+          ? Boolean(result.scorecard.pass)
+          : null;
+      setStatus(
+        commandName === "run_benchmark" && benchmarkPassed !== null
+          ? `${benchmarkPassed ? "PASS" : "FAIL"} benchmark from Dev Console`
+          : `Dev command complete: ${commandName}`,
+      );
       logDev("success", "app", "Dev command complete", {
         command: commandName,
-        conversation_id: conversationId,
+        conversation_id: resultConversationId,
         result,
       });
-      if (conversationId) {
+      if (commandName === "run_benchmark") {
+        await refreshConversations();
+      } else if (conversationId) {
         await refreshActiveSessionAfterDevCommand(conversationId);
       }
     } catch (error) {
@@ -2134,7 +2410,7 @@ export function App() {
         relationship_targets: Object.keys(sessionSoul.relationships),
       });
       setView("chat");
-      setPersonaModalMode("list");
+      await openPersonaList(nextConversationId, true);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
@@ -2539,7 +2815,7 @@ export function App() {
 
     setBusy(true);
     try {
-      await deleteConversation(conversationId);
+      await archiveConversation(conversationId);
       await refreshConversations();
       if (deletingActiveConversation) {
         if (!currentSessionTitle.startsWith("[Archived] ")) {
@@ -2767,6 +3043,354 @@ export function App() {
     }
   }
 
+  async function handleRunBenchmark() {
+    if (!soul || benchmarkRunning) return;
+    const requiresPlayerProfile =
+      benchmarkType === "visible_ai_chat" || benchmarkType === "multi_agent_visible_chat";
+    if (requiresPlayerProfile && !selectedBenchmarkPlayerProfileId) {
+      setBenchmarkError("Visible AI Chat benchmark requires a Player Simulator profile.");
+      setStatus("Choose a Player Simulator profile before running Visible AI Chat.");
+      return;
+    }
+
+    const updaterSettings = useNarratorProviderForUpdater ? apiSettings : stateUpdaterSettings;
+    const settingsPayload: BenchmarkSettings = {
+      benchmark_type: benchmarkType,
+      target: benchmarkTarget,
+      current_conversation_id: benchmarkTarget === "current_session" ? currentConversationId : null,
+      turn_count: Math.max(1, Math.floor(benchmarkTurnCount) || 1),
+      narrator_style: mode,
+      evaluator_mode: benchmarkStrictToolEvaluator
+        ? "evaluator_structured_v1"
+        : updaterSettings.evaluator_mode ?? "evaluator_form_v1",
+      structured_evaluator_transport: benchmarkStrictToolEvaluator
+        ? "tool_call"
+        : benchmarkTransport ?? updaterSettings.structured_evaluator_transport ?? structuredEvaluatorTransport,
+      structured_evaluator_policy: benchmarkStrictToolEvaluator
+        ? "required"
+        : updaterSettings.structured_evaluator_policy ?? "prefer",
+      structured_evaluator_max_retries: updaterSettings.structured_evaluator_max_retries ?? 1,
+      player_simulator_profile_id: requiresPlayerProfile ? selectedBenchmarkPlayerProfileId : null,
+      player_goal: benchmarkPlayerGoal,
+      export_payload_history: true,
+      export_mne: true,
+      export_summary_json: true,
+      strict_tool_evaluator: benchmarkStrictToolEvaluator,
+      wait_for_evaluator_each_turn: benchmarkWaitForEvaluator,
+    };
+
+    // Visible AI Chat drives turns live through the normal chat path so the
+    // AI-vs-AI exchange streams into the chat window. Other modes (scripted /
+    // headless / mock) keep the blocking backend orchestration.
+    if (benchmarkType === "visible_ai_chat" && provider === "API") {
+      await startLiveBenchmark(settingsPayload, updaterSettings);
+      return;
+    }
+
+    setBenchmarkRunning(true);
+    setBenchmarkResult(null);
+    setBenchmarkError(null);
+    setStatus("Running benchmark...");
+    try {
+      const summary = await runBenchmark(
+        soul.character_id,
+        setting?.setting_id ?? null,
+        provider,
+        apiSettings,
+        updaterSettings,
+        settingsPayload,
+      );
+      setBenchmarkResult(summary);
+      await refreshConversations();
+      if (summary.conversation_id === currentConversationIdRef.current) {
+        setMessages(await listConversationMessages(summary.conversation_id));
+        await refreshContext(soul.character_id, summary.conversation_id);
+      } else {
+        setActiveConversationId(summary.conversation_id);
+        setMessages(await listConversationMessages(summary.conversation_id));
+      }
+      setStatus(`${summary.scorecard.pass ? "PASS" : "FAIL"} benchmark: ${summary.benchmark_id}`);
+      logDev(summary.scorecard.pass ? "success" : "warn", "app", "Benchmark completed", {
+        benchmark_id: summary.benchmark_id,
+        benchmark_type: summary.benchmark_type,
+        pass: summary.scorecard.pass,
+        failure_reasons: summary.scorecard.failure_reasons,
+        summary_json_path: summary.summary_json_path,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setBenchmarkError(message);
+      setStatus(`Benchmark failed: ${message}`);
+      reportError(error, "Benchmark failed", "app");
+    } finally {
+      setBenchmarkRunning(false);
+    }
+  }
+
+  // A live benchmark turn must hit the EXACT same pipeline as a turn you type,
+  // so the exported payloads/session show the real behavior you're diagnosing.
+  // The only optional deviations are:
+  //   - "Wait for evaluator each turn": runs the evaluator as a tracked
+  //     BACKGROUND job (so the evaluator banner stays live), and the loop waits
+  //     on that job before the next turn — keeping per-turn commit ordering.
+  //   - "Strict Tool Evaluator": opt-in probe that pins the evaluator to
+  //     structured tool-calling. OFF (default for faithful repro) = your exact
+  //     chat evaluator settings flow through untouched.
+  function benchmarkLiveUpdaterOverride(settings: BenchmarkSettings): Partial<ApiProviderSettings> {
+    const waitOverride: Partial<ApiProviderSettings> = settings.wait_for_evaluator_each_turn
+      ? {
+          // Background so a job row is created and `evaluator_job_status_changed`
+          // events fire → the tracker UI updates. The loop (waitForBenchmark-
+          // EvaluatorJob) blocks on the job before capturing the turn summary
+          // and the next message, so state is committed in order.
+          evaluator_background_enabled: true,
+          allow_send_with_stale_state: true,
+        }
+      : {};
+    if (!settings.strict_tool_evaluator) {
+      // Faithful repro: no evaluator overrides, just the turn sequencing.
+      return waitOverride;
+    }
+    return {
+      ...waitOverride,
+      evaluator_mode: settings.evaluator_mode ?? undefined,
+      structured_evaluator_transport: settings.structured_evaluator_transport ?? undefined,
+      structured_evaluator_policy: settings.structured_evaluator_policy ?? undefined,
+      structured_evaluator_max_retries: settings.structured_evaluator_max_retries ?? undefined,
+    };
+  }
+
+  // Poll the latest evaluator job for the conversation until it reaches a
+  // terminal state (or Stop / a safety cap). Used between live benchmark turns
+  // so the background evaluator has committed before the next turn — while the
+  // evaluator banner tracks the same job live. Returns when there is no live
+  // job (terminal, or none — e.g. a dialogue-only turn the gate skipped).
+  async function waitForBenchmarkEvaluatorJob(conversationId: string) {
+    const deadlineMs = Date.now() + 300_000; // safety cap above any single job's own timeout
+    while (Date.now() < deadlineMs) {
+      if (benchmarkStopRef.current) return;
+      let job: EvaluatorJob | null = null;
+      try {
+        job = await getLatestEvaluatorJob(conversationId);
+      } catch {
+        return; // best-effort: don't wedge the run on a polling error
+      }
+      if (!job || (job.status !== "pending" && job.status !== "running")) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+  }
+
+  async function startLiveBenchmark(
+    settingsPayload: BenchmarkSettings,
+    updaterSettings: ApiProviderSettings,
+  ) {
+    if (!soul) return;
+    setBenchmarkRunning(true);
+    setBenchmarkResult(null);
+    setBenchmarkError(null);
+    setStatus("Preparing live benchmark session...");
+    try {
+      const init: BenchmarkSessionInit = await prepareBenchmarkSession(
+        soul.character_id,
+        setting?.setting_id ?? null,
+        settingsPayload,
+      );
+      const liveUpdaterSettings: ApiProviderSettings = {
+        ...updaterSettings,
+        evaluator_execution_mode: evaluatorExecutionMode,
+        structured_evaluator_transport: structuredEvaluatorTransport,
+        ...benchmarkLiveUpdaterOverride(settingsPayload),
+      };
+      benchmarkCtxRef.current = {
+        benchmarkId: init.benchmark_id,
+        conversationId: init.conversation_id,
+        soulId: init.session_soul_id,
+        startedAt: init.started_at,
+        playerProfileId: settingsPayload.player_simulator_profile_id ?? "",
+        playerGoal: settingsPayload.player_goal,
+        settings: settingsPayload,
+        narratorSettings: apiSettings,
+        updaterSettings: liveUpdaterSettings,
+        initialMemoryCount: init.initial_memory_count,
+        initialObjectCount: init.initial_object_count,
+        initialRelationshipCount: init.initial_relationship_count,
+        perTurn: [],
+        narratorFailures: 0,
+        completedTurns: 0,
+        nextTurnIndex: 0,
+        lastPlayerText: "",
+      };
+      benchmarkStopRef.current = false;
+      benchmarkTurnInFlightRef.current = false;
+      setActiveConversationId(init.conversation_id);
+      setMessages(await listConversationMessages(init.conversation_id));
+      await refreshContext(soul.character_id, init.conversation_id);
+      setBenchmarkTurnsRemaining(settingsPayload.turn_count);
+      setBenchmarkLiveActive(true);
+      setStatus(`Live benchmark running: 0/${settingsPayload.turn_count} turns`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      benchmarkCtxRef.current = null;
+      setBenchmarkError(message);
+      setStatus(`Benchmark failed: ${message}`);
+      reportError(error, "Benchmark failed", "app");
+      setBenchmarkRunning(false);
+    }
+  }
+
+  async function runOneBenchmarkTurn() {
+    const ctx = benchmarkCtxRef.current;
+    if (!ctx) return;
+    benchmarkTurnInFlightRef.current = true;
+    const turnIndex = ctx.nextTurnIndex;
+    const turnLabel = `Benchmark turn ${turnIndex + 1}/${ctx.settings.turn_count}`;
+    // Null until the player line is generated this turn, so a failure in
+    // generation is recorded as an empty message (not the previous turn's text).
+    let playerText: string | null = null;
+    try {
+      setStatus(`${turnLabel}: AI player thinking...`);
+      playerText = await generateBenchmarkPlayerMessage(
+        ctx.conversationId,
+        ctx.soulId,
+        ctx.playerProfileId,
+        ctx.playerGoal,
+      );
+      ctx.lastPlayerText = playerText;
+      if (benchmarkStopRef.current) {
+        benchmarkTurnInFlightRef.current = false;
+        return;
+      }
+      // Send as a visible user turn; the narrator streams its reply live.
+      await executeTurn(
+        playerText,
+        turnLabel,
+        undefined,
+        undefined,
+        benchmarkLiveUpdaterOverride(ctx.settings),
+      );
+      // Stop may have aborted the narrator mid-stream — don't record a partial
+      // turn; bail and let the effect finalize what actually completed.
+      if (benchmarkStopRef.current) {
+        benchmarkTurnInFlightRef.current = false;
+        return;
+      }
+      // Evaluator runs as a background job (tracked by the banner). Wait for it
+      // to commit before reading the turn summary and starting the next turn,
+      // so per-turn deltas reflect committed state.
+      if (ctx.settings.wait_for_evaluator_each_turn) {
+        setStatus(`${turnLabel}: waiting for evaluator...`);
+        await waitForBenchmarkEvaluatorJob(ctx.conversationId);
+        if (benchmarkStopRef.current) {
+          benchmarkTurnInFlightRef.current = false;
+          return;
+        }
+      }
+      const summary = await benchmarkTurnSummary(
+        ctx.conversationId,
+        turnIndex,
+        playerText,
+        null,
+        ctx.updaterSettings,
+      );
+      ctx.perTurn.push(summary);
+      ctx.completedTurns += 1;
+      ctx.nextTurnIndex = turnIndex + 1;
+      setBenchmarkTurnsRemaining((remaining) => remaining - 1);
+      setStatus(`Live benchmark running: ${ctx.completedTurns}/${ctx.settings.turn_count} turns`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // Distinguish where it broke so the summary isn't misleading: a null
+      // playerText means the AI player-line call failed (the narrator never ran).
+      const stage = playerText === null ? "player line generation" : "narrator turn";
+      ctx.narratorFailures += 1;
+      try {
+        const failedSummary = await benchmarkTurnSummary(
+          ctx.conversationId,
+          turnIndex,
+          playerText ?? "",
+          `${stage} failed: ${message}`,
+          ctx.updaterSettings,
+        );
+        ctx.perTurn.push(failedSummary);
+      } catch {
+        // Summary capture is best-effort once a turn has already failed.
+      }
+      benchmarkStopRef.current = true;
+      setBenchmarkTurnsRemaining(0);
+      logDev("warn", "app", "Live benchmark turn failed", {
+        conversation_id: ctx.conversationId,
+        turn_index: turnIndex,
+        stage,
+        error: message,
+      });
+    } finally {
+      benchmarkTurnInFlightRef.current = false;
+    }
+  }
+
+  async function finishBenchmarkLive() {
+    const ctx = benchmarkCtxRef.current;
+    if (!ctx) return;
+    benchmarkTurnInFlightRef.current = true;
+    setBenchmarkLiveActive(false);
+    setStatus("Finalizing benchmark...");
+    try {
+      const summary = await finalizeBenchmark(
+        ctx.benchmarkId,
+        ctx.conversationId,
+        ctx.startedAt,
+        ctx.narratorSettings,
+        ctx.updaterSettings,
+        ctx.settings,
+        ctx.initialMemoryCount,
+        ctx.initialObjectCount,
+        ctx.initialRelationshipCount,
+        ctx.completedTurns,
+        ctx.narratorFailures,
+        ctx.perTurn,
+      );
+      setBenchmarkResult(summary);
+      setBenchmarkError(null);
+      await refreshConversations();
+      if (ctx.conversationId === currentConversationIdRef.current) {
+        setMessages(await listConversationMessages(ctx.conversationId));
+        await refreshContext(ctx.soulId, ctx.conversationId);
+      }
+      setStatus(`${summary.scorecard.pass ? "PASS" : "FAIL"} benchmark: ${summary.benchmark_id}`);
+      logDev(summary.scorecard.pass ? "success" : "warn", "app", "Benchmark completed", {
+        benchmark_id: summary.benchmark_id,
+        benchmark_type: summary.benchmark_type,
+        pass: summary.scorecard.pass,
+        failure_reasons: summary.scorecard.failure_reasons,
+        summary_json_path: summary.summary_json_path,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setBenchmarkError(message);
+      setStatus(`Benchmark failed: ${message}`);
+      reportError(error, "Benchmark failed", "app");
+    } finally {
+      benchmarkCtxRef.current = null;
+      benchmarkStopRef.current = false;
+      benchmarkTurnInFlightRef.current = false;
+      setBenchmarkRunning(false);
+    }
+  }
+
+  function handleStopBenchmark() {
+    if (!benchmarkLiveActive) return;
+    benchmarkStopRef.current = true;
+    setBenchmarkTurnsRemaining(0);
+    // Abort any in-flight narrator stream so Stop takes effect immediately
+    // rather than waiting out the current turn's network call. (A player-line
+    // call already in flight is a backend command and can't be aborted, but its
+    // timeout is capped at ~90s, so it returns and the loop bails shortly.)
+    generationAbortRef.current?.abort();
+    setStatus("Stopping benchmark...");
+  }
+
   async function handleSelectStateUpdaterProfile(profileId: string) {
     if (!profileId) {
       setSelectedStateUpdaterProfileId("");
@@ -2838,9 +3462,12 @@ export function App() {
       system_prompt: apiSettings.system_prompt,
       narrator_timeout_ms: apiSettings.narrator_timeout_ms ?? null,
       evaluator_timeout_ms: apiSettings.evaluator_timeout_ms ?? 25_000,
+      structured_evaluator_timeout_ms: apiSettings.structured_evaluator_timeout_ms ?? 90_000,
+      diagnostic_evaluator_timeout_ms: apiSettings.diagnostic_evaluator_timeout_ms ?? 60_000,
       evaluator_timeout_mode: apiSettings.evaluator_timeout_mode ?? "finite",
       evaluator_mode: apiSettings.evaluator_mode ?? "evaluator_form_v1",
       structured_evaluator_policy: apiSettings.structured_evaluator_policy ?? "prefer",
+      structured_evaluator_max_retries: apiSettings.structured_evaluator_max_retries ?? 1,
       wait_for_evaluator_before_next_turn: apiSettings.wait_for_evaluator_before_next_turn ?? true,
       allow_send_with_stale_state: apiSettings.allow_send_with_stale_state ?? false,
       evaluator_background_enabled: apiSettings.evaluator_background_enabled ?? false,
@@ -2895,9 +3522,12 @@ export function App() {
       system_prompt: stateUpdaterSettings.system_prompt,
       narrator_timeout_ms: stateUpdaterSettings.narrator_timeout_ms ?? null,
       evaluator_timeout_ms: stateUpdaterSettings.evaluator_timeout_ms ?? 25_000,
+      structured_evaluator_timeout_ms: stateUpdaterSettings.structured_evaluator_timeout_ms ?? 90_000,
+      diagnostic_evaluator_timeout_ms: stateUpdaterSettings.diagnostic_evaluator_timeout_ms ?? 60_000,
       evaluator_timeout_mode: stateUpdaterSettings.evaluator_timeout_mode ?? "finite",
       evaluator_mode: stateUpdaterSettings.evaluator_mode ?? "evaluator_form_v1",
       structured_evaluator_policy: stateUpdaterSettings.structured_evaluator_policy ?? "prefer",
+      structured_evaluator_max_retries: stateUpdaterSettings.structured_evaluator_max_retries ?? 1,
       wait_for_evaluator_before_next_turn: stateUpdaterSettings.wait_for_evaluator_before_next_turn ?? true,
       allow_send_with_stale_state: stateUpdaterSettings.allow_send_with_stale_state ?? false,
       evaluator_background_enabled: stateUpdaterSettings.evaluator_background_enabled ?? false,
@@ -3225,6 +3855,8 @@ export function App() {
   const effectiveStateUpdaterSettings = useNarratorProviderForUpdater
     ? apiSettings
     : stateUpdaterSettings;
+  const selectedBenchmarkPlayerProfileId =
+    benchmarkPlayerProfileId || selectedProviderProfileId || selectedStateUpdaterProfileId;
   const updateEffectiveStateUpdaterSettings = (update: Partial<ApiProviderSettings>) => {
     if (useNarratorProviderForUpdater) {
       setApiSettings((current) => ({ ...current, ...update }));
@@ -3258,7 +3890,7 @@ export function App() {
   const providerModeControls = (
     <div className="settings-grid">
       <label className="field">
-        <span>Narration Mode</span>
+        <span>Narrator Style</span>
         <select
           value={mode}
           onChange={(event) => setMode(event.target.value as NarrativeMode)}
@@ -3266,7 +3898,8 @@ export function App() {
         >
           <option>Realistic</option>
           <option>Reader</option>
-          <option>God</option>
+          <option>Active Director</option>
+          <option>GM Simulation</option>
           <option>Custom</option>
         </select>
       </label>
@@ -3286,6 +3919,187 @@ export function App() {
         </select>
       </label>
     </div>
+  );
+  const benchmarkScoreRows = benchmarkResult
+    ? [
+        ["Visible chat messages created", benchmarkResult.scorecard.visible_chat_messages_created],
+        ["Normal pipeline used", benchmarkResult.scorecard.normal_pipeline_used],
+        ["Player simulator calls", benchmarkResult.scorecard.player_simulator_calls > 0 || benchmarkResult.benchmark_type === "scripted_visible_replay"],
+        ["Narrator calls", benchmarkResult.scorecard.narrator_calls >= benchmarkResult.turn_count_completed],
+        ["Evaluator calls", benchmarkResult.scorecard.evaluator_calls >= benchmarkResult.turn_count_completed],
+        ["Evaluator waited each turn", benchmarkResult.scorecard.evaluator_waited_each_turn],
+        ["Memory updated", benchmarkResult.scorecard.memory_updated],
+        ["Object state updated", benchmarkResult.scorecard.object_state_updated],
+        ["Relationship updated", benchmarkResult.scorecard.relationship_updated],
+        ["Payload history exported", benchmarkResult.scorecard.payload_history_export_succeeded],
+        ["Narrator response each turn", benchmarkResult.scorecard.narrator_visible_response_each_turn],
+        ["Tool call required path", benchmarkResult.scorecard.evaluator_used_tool_call_where_required],
+        ["No form fallback in strict mode", benchmarkResult.scorecard.no_evaluator_form_v1_fallback_in_strict_mode],
+        ["No syntactic repair in strict mode", benchmarkResult.scorecard.syntactic_repair_unused_in_strict_mode],
+        ["Memories increased", benchmarkResult.scorecard.memories_increased_over_time],
+        ["Active player relationship present", benchmarkResult.scorecard.active_player_relationship_changed_when_warranted],
+        ["Object IDs stable", benchmarkResult.scorecard.object_ids_stable],
+        ["No default_player RP relationship leak", benchmarkResult.scorecard.default_player_not_normal_rp_relationship_target],
+        [".mne export succeeded", benchmarkResult.scorecard.mne_export_succeeded],
+      ] as Array<[string, boolean]>
+    : [];
+  const benchmarkRunnerPanel = (
+    <section className="settings-section provider-pass-card">
+      <div className="provider-pass-heading">
+        <div>
+          <span className="eyebrow">Dev</span>
+          <h3>Benchmark Runner</h3>
+          <p>Drives real visible chat turns through the normal narrator and evaluator pipeline.</p>
+        </div>
+        <span className="provider-status-pill">
+          {benchmarkResult ? (benchmarkResult.scorecard.pass ? "PASS" : "FAIL") : "Idle"}
+        </span>
+      </div>
+      <div className="provider-pass-grid">
+        <label className="field">
+          <span>Benchmark Mode</span>
+          <select
+            value={benchmarkType}
+            onChange={(event) => setBenchmarkType(event.target.value as BenchmarkType)}
+            disabled={benchmarkRunning}
+          >
+            <option value="visible_ai_chat">Visible AI Chat</option>
+            <option value="scripted_visible_replay">Scripted Visible Replay</option>
+            <option value="headless_regression">Headless Regression</option>
+            <option value="multi_agent_visible_chat">Multi-Agent Visible Chat</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>Target</span>
+          <select
+            value={benchmarkTarget}
+            onChange={(event) => setBenchmarkTarget(event.target.value as BenchmarkTarget)}
+            disabled={benchmarkRunning}
+          >
+            <option value="current_session">Current Session</option>
+            <option value="new_benchmark_session_from_current_soul">New Benchmark Session From Current Soul</option>
+            <option value="new_benchmark_session_from_selected_soul_world">New Benchmark Session From Selected Soul/World</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>Player Simulator Profile</span>
+          <select
+            value={selectedBenchmarkPlayerProfileId}
+            onChange={(event) => setBenchmarkPlayerProfileId(event.target.value)}
+            disabled={benchmarkRunning}
+          >
+            <option value="">Select profile</option>
+            {providerProfiles.map((profile) => (
+              <option key={profile.id} value={profile.id}>
+                {profile.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field">
+          <span>Player Goal</span>
+          <textarea
+            value={benchmarkPlayerGoal}
+            onChange={(event) => setBenchmarkPlayerGoal(event.target.value)}
+            disabled={benchmarkRunning}
+            rows={3}
+          />
+        </label>
+        <label className="field">
+          <span>Turn Count</span>
+          <input
+            type="number"
+            min="1"
+            max="50"
+            value={benchmarkTurnCount}
+            onChange={(event) => setBenchmarkTurnCount(Math.max(1, Number(event.target.value) || 1))}
+            disabled={benchmarkRunning}
+          />
+        </label>
+        <label className="field">
+          <span>Structured Evaluator Transport</span>
+          <select
+            value={benchmarkStrictToolEvaluator ? "tool_call" : benchmarkTransport ?? "auto"}
+            onChange={(event) => setBenchmarkTransport(event.target.value)}
+            disabled={benchmarkRunning || benchmarkStrictToolEvaluator}
+          >
+            <option value="tool_call">tool_call</option>
+            <option value="auto">auto</option>
+            <option value="json_schema">json_schema</option>
+            <option value="json_object">json_object</option>
+            <option value="prompt_json">prompt_json</option>
+          </select>
+        </label>
+      </div>
+      <label className="toggle-row">
+        <input
+          type="checkbox"
+          checked={benchmarkStrictToolEvaluator}
+          onChange={(event) => setBenchmarkStrictToolEvaluator(event.target.checked)}
+          disabled={benchmarkRunning}
+        />
+        <span>Strict Tool Evaluator (diagnostic probe — overrides your chat evaluator settings)</span>
+      </label>
+      <label className="toggle-row">
+        <input
+          type="checkbox"
+          checked={benchmarkWaitForEvaluator}
+          onChange={(event) => setBenchmarkWaitForEvaluator(event.target.checked)}
+          disabled={benchmarkRunning}
+        />
+        <span>Wait For Evaluator Each Turn</span>
+      </label>
+      <div className="button-row">
+        <button
+          type="button"
+          className="ghost-action"
+          onClick={() => void handleRunBenchmark()}
+          disabled={busy || benchmarkRunning || !soul}
+        >
+          <Play size={16} />
+          <span>{benchmarkRunning ? "Running Benchmark..." : "Run Benchmark"}</span>
+        </button>
+        <button
+          type="button"
+          className="ghost-action"
+          onClick={() => handleStopBenchmark()}
+          disabled={!benchmarkLiveActive}
+        >
+          <Square size={16} />
+          <span>Stop Benchmark</span>
+        </button>
+      </div>
+      {(benchmarkResult || benchmarkError) && (
+        <div className="provider-note">
+          {benchmarkResult ? (
+            <>
+              <strong>{benchmarkResult.scorecard.pass ? "PASS" : "FAIL"}</strong>{" "}
+              {benchmarkResult.benchmark_type} completed {benchmarkResult.turn_count_completed} /{" "}
+              {benchmarkResult.turn_count_requested} turns.
+              <br />
+              Scorecard:{" "}
+              {benchmarkScoreRows.map(([label, passed]) => `${passed ? "PASS" : "FAIL"} ${label}`).join("; ")}
+              {benchmarkResult.scorecard.failure_reasons.length ? (
+                <>
+                  <br />
+                  Failure reasons: {benchmarkResult.scorecard.failure_reasons.join(", ")}
+                </>
+              ) : null}
+              <br />
+              Payload: {benchmarkResult.payload_history_path ?? "not exported"}
+              <br />
+              MNE: {benchmarkResult.mne_export_path ?? "not exported"}
+              <br />
+              Summary: {benchmarkResult.summary_json_path ?? "not exported"}
+            </>
+          ) : (
+            <>
+              <strong>FAIL</strong> {benchmarkError}
+            </>
+          )}
+        </div>
+      )}
+    </section>
   );
   const providerSettingsPanel = (
     <div className="settings-tab-panel">
@@ -3517,7 +4331,7 @@ export function App() {
                   onChange={(event) => updateStructuredEvaluatorTransport(event.target.value)}
                   disabled={busy}
                 >
-                  <option value="auto">Auto — tool calls first, then JSON schema</option>
+                  <option value="auto">Auto ??tool calls first, then JSON schema</option>
                   <option value="tool_call">Tool calls (require real function calls)</option>
                   <option value="json_schema">JSON schema (response_format)</option>
                   <option value="json_object">JSON object</option>
@@ -3531,9 +4345,9 @@ export function App() {
                   onChange={(event) => updateEvaluatorExecutionMode(event.target.value)}
                   disabled={busy}
                 >
-                  <option value="balanced">Balanced — evaluate every turn</option>
-                  <option value="fast">Fast — skip dialogue-only turns, catch up later</option>
-                  <option value="long_context">Long Context — evaluate every turn</option>
+                  <option value="balanced">Balanced ??evaluate every turn</option>
+                  <option value="fast">Fast ??skip dialogue-only turns, catch up later</option>
+                  <option value="long_context">Long Context ??evaluate every turn</option>
                 </select>
               </label>
             </div>
@@ -3849,6 +4663,7 @@ export function App() {
           </section>
         </>
       ) : null}
+      {benchmarkRunnerPanel}
     </div>
   );
   const settingsDrawerToggle = (
@@ -4145,8 +4960,8 @@ export function App() {
               <div>
                 Evaluator tokens:{" "}
                 <span style={{ color: "#f3f4f6" }}>
-                  {latestPipelineTrace.token_usage.evaluator_prompt_tokens ?? "—"} in /{" "}
-                  {latestPipelineTrace.token_usage.evaluator_completion_tokens ?? "—"} out
+                  {latestPipelineTrace.token_usage.evaluator_prompt_tokens ?? "?"} in /{" "}
+                  {latestPipelineTrace.token_usage.evaluator_completion_tokens ?? "?"} out
                   {latestPipelineTrace.token_usage.evaluator_estimated ? " (est.)" : ""}
                 </span>
               </div>
@@ -4652,7 +5467,7 @@ export function App() {
                         : "Edit Persona"}
                   </h2>
                 </div>
-                <button type="button" title="Close" onClick={() => setPersonaModalMode(null)}>
+                <button type="button" title="Close" onClick={closePersonaModal}>
                   <X size={16} />
                 </button>
               </header>
@@ -4684,9 +5499,26 @@ export function App() {
                       </div>
                     </article>
                   ))}
-                  <button type="button" className="persona-add-button" onClick={openPersonaAdd}>
-                    Add Persona
-                  </button>
+                  <div className="persona-list-actions">
+                    <button type="button" className="persona-add-button" onClick={openPersonaAdd}>
+                      Add Persona
+                    </button>
+                    {personaListConfirmRequired ? (
+                      <div className="persona-form-actions">
+                        <button type="button" className="persona-cancel-button" onClick={closePersonaModal}>
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="persona-confirm-button"
+                          onClick={handleConfirmPersonaList}
+                          disabled={!activePlayerPersona}
+                        >
+                          Confirm Persona
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               ) : (
                 <div className="persona-form">
@@ -5401,7 +6233,7 @@ export function App() {
 
         <div className="session-strip launcher-provider-strip">
           <label className="field">
-            <span>Mode</span>
+            <span>Narrator Style</span>
             <select
               value={mode}
               onChange={(event) => setMode(event.target.value as NarrativeMode)}
@@ -5409,7 +6241,8 @@ export function App() {
             >
               <option>Realistic</option>
               <option>Reader</option>
-              <option>God</option>
+              <option>Active Director</option>
+              <option>GM Simulation</option>
               <option>Custom</option>
             </select>
           </label>

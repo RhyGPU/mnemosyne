@@ -187,6 +187,8 @@ pub fn compile_evaluator_ops_to_engine_patch(
         ));
     }
 
+    let mut alias_trace = EntityAliasTrace::default();
+    let output = resolve_output_entity_aliases(output, context, soul, &mut alias_trace)?;
     let evidence_text = normalized_evidence_text(context);
     let mut patch = EnginePatch {
         schema_version: Some(PATCH_PROTOCOL_VERSION),
@@ -305,8 +307,274 @@ pub fn compile_evaluator_ops_to_engine_patch(
         accepted_candidate_ids,
         rejected_candidates: Vec::new(),
         evidence_validations: Vec::new(),
+        entity_aliases_resolved: alias_trace.resolved,
+        entity_alias_resolution_warnings: alias_trace.warnings,
         no_op,
     })
+}
+
+#[derive(Debug, Default)]
+struct EntityAliasTrace {
+    resolved: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn resolve_output_entity_aliases(
+    output: &EvaluatorStructuredOutputV1,
+    context: &EvaluatorConversionContext<'_>,
+    soul: &Soul,
+    trace: &mut EntityAliasTrace,
+) -> Result<EvaluatorStructuredOutputV1, String> {
+    let mut resolved = output.clone();
+    for (index, op) in resolved.ops.iter_mut().enumerate() {
+        match op {
+            EvaluatorOp::AddMemory(op) => {
+                resolve_soul_alias_field(
+                    &mut op.owner_soul_id,
+                    "add_memory.owner_soul_id",
+                    index,
+                    context,
+                    soul,
+                    trace,
+                )?;
+                resolve_entity_alias_vec(
+                    &mut op.target_entity_ids,
+                    "add_memory.target_entity_ids",
+                    index,
+                    context,
+                    soul,
+                    trace,
+                )?;
+            }
+            EvaluatorOp::RelationshipEvent(op) => {
+                resolve_soul_alias_field(
+                    &mut op.source_soul_id,
+                    "relationship_event.source_soul_id",
+                    index,
+                    context,
+                    soul,
+                    trace,
+                )?;
+                resolve_entity_alias_field(
+                    &mut op.target_entity_id,
+                    "relationship_event.target_entity_id",
+                    index,
+                    context,
+                    soul,
+                    trace,
+                )?;
+                resolve_entity_alias_field(
+                    &mut op.actor_entity_id,
+                    "relationship_event.actor_entity_id",
+                    index,
+                    context,
+                    soul,
+                    trace,
+                )?;
+                resolve_soul_alias_field(
+                    &mut op.perceived_by_entity_id,
+                    "relationship_event.perceived_by_entity_id",
+                    index,
+                    context,
+                    soul,
+                    trace,
+                )?;
+            }
+            EvaluatorOp::UpdateObjectState(op) => {
+                resolve_entity_alias_field(
+                    &mut op.owner_entity_id,
+                    "update_object_state.owner_entity_id",
+                    index,
+                    context,
+                    soul,
+                    trace,
+                )?;
+            }
+            EvaluatorOp::UpdateSceneState(op) => {
+                resolve_entity_alias_vec(
+                    &mut op.participants,
+                    "update_scene_state.participants",
+                    index,
+                    context,
+                    soul,
+                    trace,
+                )?;
+            }
+            EvaluatorOp::AddWorldEvent(_) | EvaluatorOp::NoOp(_) => {}
+        }
+    }
+    Ok(resolved)
+}
+
+fn resolve_soul_alias_field(
+    value: &mut String,
+    field: &str,
+    op_index: usize,
+    context: &EvaluatorConversionContext<'_>,
+    soul: &Soul,
+    trace: &mut EntityAliasTrace,
+) -> Result<(), String> {
+    let original = value.trim();
+    let replacement = match original {
+        "active_soul" => Some(context.active_soul_id.to_string()),
+        "session_world" => context
+            .session_world
+            .map(|world| world.world_id.clone())
+            .or_else(|| Some(context.active_soul_id.to_string())),
+        // Narrator-first: a relationship event is recorded and perceived by the
+        // active Soul — never a player. Weak evaluators routinely mis-assign
+        // these soul-only fields (source_soul_id / perceived_by_entity_id) to the
+        // player, which used to reject the ENTIRE patch (→ noop, no memory).
+        // Coerce to the active Soul instead, and log it so the model's mistake
+        // stays visible in the trace rather than being silently lost.
+        "active_player" | "latest_speaker" => {
+            trace.warnings.push(format!(
+                "op:{op_index}:{field}: coerced player alias '{original}' to active soul (narrator-first)"
+            ));
+            Some(context.active_soul_id.to_string())
+        }
+        alias if is_known_entity_alias(alias) => {
+            return Err(format!(
+                "entity alias '{alias}' is not valid for soul id field {field}"
+            ));
+        }
+        other if is_player_entity_id(other) => {
+            trace.warnings.push(format!(
+                "op:{op_index}:{field}: coerced player id '{other}' to active soul (narrator-first)"
+            ));
+            Some(context.active_soul_id.to_string())
+        }
+        _ => None,
+    };
+    if let Some(replacement) = replacement {
+        trace.resolved.push(format!(
+            "op:{op_index}:{field}:{original}->{replacement}"
+        ));
+        *value = replacement;
+    } else {
+        reject_unknown_alias(original, field)?;
+        if !context.active_soul_ids.iter().any(|id| id == original) && original != soul.character_id
+        {
+            trace.warnings.push(format!(
+                "op:{op_index}:{field}: raw soul id '{original}' will be validated without alias correction"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_entity_alias_field(
+    value: &mut String,
+    field: &str,
+    op_index: usize,
+    context: &EvaluatorConversionContext<'_>,
+    soul: &Soul,
+    trace: &mut EntityAliasTrace,
+) -> Result<(), String> {
+    let original = value.trim();
+    let replacement = match original {
+        "latest_speaker" if is_ooc_operator_context(context) && !field.starts_with("update_scene_state") => {
+            return Err(format!(
+                "entity alias 'latest_speaker' is ambiguous in OOC/operator context for field {field}"
+            ));
+        }
+        "active_player" | "latest_speaker" => Some(active_player_entity_id(context, soul)),
+        "active_soul" => Some(context.active_soul_id.to_string()),
+        "session_world" => context.session_world.map(|world| world.world_id.clone()),
+        alias if is_known_entity_alias(alias) => {
+            return Err(format!(
+                "entity alias '{alias}' is not valid for field {field}"
+            ));
+        }
+        _ => None,
+    };
+    if let Some(replacement) = replacement {
+        trace.resolved.push(format!(
+            "op:{op_index}:{field}:{original}->{replacement}"
+        ));
+        *value = replacement;
+    } else {
+        reject_unknown_alias(original, field)?;
+    }
+    Ok(())
+}
+
+fn resolve_entity_alias_vec(
+    values: &mut [String],
+    field: &str,
+    op_index: usize,
+    context: &EvaluatorConversionContext<'_>,
+    soul: &Soul,
+    trace: &mut EntityAliasTrace,
+) -> Result<(), String> {
+    for value in values {
+        resolve_entity_alias_field(value, field, op_index, context, soul, trace)?;
+    }
+    Ok(())
+}
+
+fn active_player_entity_id(context: &EvaluatorConversionContext<'_>, soul: &Soul) -> String {
+    if soul.relationships.contains_key("preset_male") {
+        return "preset_male".into();
+    }
+    if let Some(world) = context.session_world {
+        if let Some(participant) = world
+            .scene_state
+            .participants
+            .iter()
+            .find(|participant| participant.starts_with("preset_") && *participant != "default_player")
+        {
+            return participant.clone();
+        }
+        if let Some(owner) = world
+            .object_states
+            .iter()
+            .filter_map(|object| object.owner_entity_id.as_deref())
+            .find(|owner| owner.starts_with("preset_") && *owner != "default_player")
+        {
+            return owner.to_string();
+        }
+    }
+    soul.relationships
+        .keys()
+        .find(|key| key.starts_with("preset_") && key.as_str() != "default_player")
+        .cloned()
+        .unwrap_or_else(|| "preset_male".into())
+}
+
+fn is_known_entity_alias(value: &str) -> bool {
+    matches!(
+        value,
+        "active_soul" | "active_player" | "latest_speaker" | "session_world"
+    )
+}
+
+/// Player entity ids follow the `preset_*` / `default_player` convention and are
+/// never valid in a soul-only field. Used to coerce a mis-assigned raw player id
+/// to the active Soul (narrator-first) rather than rejecting the whole patch.
+fn is_player_entity_id(value: &str) -> bool {
+    value == "default_player" || value.starts_with("preset_")
+}
+
+fn reject_unknown_alias(value: &str, field: &str) -> Result<(), String> {
+    if value.ends_with("_soul")
+        || value.ends_with("_player")
+        || value.ends_with("_speaker")
+        || value == "active_character"
+        || value == "current_soul"
+    {
+        return Err(format!("unknown entity alias '{value}' in field {field}"));
+    }
+    Ok(())
+}
+
+fn is_ooc_operator_context(context: &EvaluatorConversionContext<'_>) -> bool {
+    let lower = context.latest_user_message.trim_start().to_ascii_lowercase();
+    lower.starts_with("ooc:")
+        || lower.starts_with("[ooc")
+        || lower.starts_with("(ooc")
+        || lower.starts_with("operator:")
+        || lower.starts_with("/ooc")
 }
 
 fn relationship_delta_from_op(op: &RelationshipEventOp, soul: &Soul) -> RelationshipDelta {
@@ -443,11 +711,21 @@ fn normalized_evidence_text(context: &EvaluatorConversionContext<'_>) -> String 
 }
 
 fn normalize_for_match(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
+    let mut normalized = String::with_capacity(value.len());
+    for character in value.chars() {
+        let mapped = match character {
+            '\u{2018}' | '\u{2019}' | '\u{201B}' => '\'',
+            '\u{201C}' | '\u{201D}' | '\u{201F}' => '"',
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => ' ',
+            '*' | '_' | '`' | '~' => continue,
+            character if character.is_ascii_punctuation() => ' ',
+            character if character.is_whitespace() => ' ',
+            character => character.to_ascii_lowercase(),
+        };
+        normalized.push(mapped);
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn stable_object_id(op: &UpdateObjectStateOp, soul: &Soul) -> String {
@@ -692,6 +970,14 @@ mod tests {
     }
 
     #[test]
+    fn update_scene_state_confidence_rejected_by_serde() {
+        let raw = r#"{"schema_version":1,"ops":[{"op":"update_scene_state","current_scene":"Apartment doorway","focus":"Aurora and preset_male","participants":["aurora","preset_male"],"last_user_action":"I wait.","pressure_point":"Aurora decides whether to open the door.","continuity_note":"Rain continues.","confidence":0.8}],"no_op_reason":null}"#;
+        let err = serde_json::from_str::<EvaluatorStructuredOutputV1>(raw)
+            .expect_err("confidence is not valid on update_scene_state");
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
     fn no_op_output_accepted() {
         let output: EvaluatorStructuredOutputV1 = serde_json::from_str(
             r#"{"schema_version":1,"ops":[],"no_op_reason":"nothing durable"}"#,
@@ -755,6 +1041,25 @@ mod tests {
     }
 
     #[test]
+    fn evidence_quote_accepts_markdown_and_smart_punctuation_normalization() {
+        let soul = Soul::default_for_character("Aurora");
+        let output = EvaluatorStructuredOutputV1 {
+            schema_version: 1,
+            ops: vec![EvaluatorOp::AddWorldEvent(AddWorldEventOp {
+                content: "Aurora repeats that the changes were intentional.".into(),
+                evidence_quote: "I changed those. I changed those specifically because—".into(),
+            })],
+            no_op_reason: None,
+        };
+        compile_evaluator_ops_to_engine_patch(
+            &output,
+            &context("", "**I changed those.** I changed those specifically because"),
+            &soul,
+        )
+        .expect("normalized literal substring should validate");
+    }
+
+    #[test]
     fn invalid_entity_fails_semantic_validation() {
         let soul = Soul::default_for_character("Aurora");
         let output = EvaluatorStructuredOutputV1 {
@@ -778,5 +1083,207 @@ mod tests {
             &soul
         )
         .is_err());
+    }
+
+    fn neutral_axes() -> RelationshipAxes {
+        RelationshipAxes {
+            intent: 1,
+            honesty: 1,
+            reliability: 1,
+            boundary_treatment: 1,
+            responsiveness: 1,
+            power_use: 0,
+            evaluation_tone: 1,
+            competence: 0,
+            disclosure: 0,
+            reciprocity: 0,
+            repair: 0,
+            predictability: 1,
+        }
+    }
+
+    fn neutral_modifiers() -> RelationshipModifiers {
+        RelationshipModifiers {
+            salience: 60,
+            certainty: 80,
+            directness: 80,
+            costliness: 0,
+            stakes: 20,
+            repetition: 0,
+        }
+    }
+
+    fn relationship_output(
+        source_soul_id: &str,
+        target_entity_id: &str,
+        actor_entity_id: &str,
+        perceived_by_entity_id: &str,
+    ) -> EvaluatorStructuredOutputV1 {
+        EvaluatorStructuredOutputV1 {
+            schema_version: 1,
+            ops: vec![EvaluatorOp::RelationshipEvent(RelationshipEventOp {
+                source_soul_id: source_soul_id.into(),
+                target_entity_id: target_entity_id.into(),
+                actor_entity_id: actor_entity_id.into(),
+                perceived_by_entity_id: perceived_by_entity_id.into(),
+                evidence_quote: "I wait at the doorway.".into(),
+                axes: neutral_axes(),
+                modifiers: neutral_modifiers(),
+                event_flags_u64: 0,
+            })],
+            no_op_reason: None,
+        }
+    }
+
+    #[test]
+    fn relationship_event_aliases_resolve_before_validation() {
+        let soul = Soul::default_for_character("Aurora");
+        let report = compile_evaluator_ops_to_engine_patch(
+            &relationship_output("active_soul", "active_player", "latest_speaker", "active_soul"),
+            &context("I wait at the doorway.", ""),
+            &soul,
+        )
+        .expect("aliases compile");
+        let delta = &report
+            .patch
+            .soul_patch
+            .as_ref()
+            .unwrap()
+            .relationship_deltas[0];
+        assert_eq!(delta.from.as_deref(), Some("aurora"));
+        assert_eq!(delta.target.as_deref(), Some("preset_male"));
+        assert!(
+            report
+                .entity_aliases_resolved
+                .iter()
+                .any(|entry| entry.contains("relationship_event.actor_entity_id:latest_speaker->preset_male"))
+        );
+    }
+
+    #[test]
+    fn relationship_event_player_in_soul_field_coerces_instead_of_rejecting() {
+        // Regression: laguna/owl-class evaluators put the player in
+        // perceived_by_entity_id (a soul-only field). That used to reject the
+        // whole patch → noop → memory never grew. It must now coerce the
+        // soul-only fields to the active Soul and still apply the relationship
+        // delta. (perceived_by AND source_soul_id both set to the player here.)
+        let soul = Soul::default_for_character("Aurora");
+        let report = compile_evaluator_ops_to_engine_patch(
+            &relationship_output("active_player", "active_player", "active_player", "active_player"),
+            &context("I wait at the doorway.", ""),
+            &soul,
+        )
+        .expect("player in soul-only fields coerces to active soul, not reject");
+        let delta = &report
+            .patch
+            .soul_patch
+            .as_ref()
+            .expect("soul patch present")
+            .relationship_deltas[0];
+        assert_eq!(delta.from.as_deref(), Some("aurora"));
+        assert_eq!(delta.target.as_deref(), Some("preset_male"));
+    }
+
+    #[test]
+    fn relationship_event_raw_player_id_in_soul_field_coerces() {
+        // Same fix for a raw player id (preset_male) rather than the alias.
+        let soul = Soul::default_for_character("Aurora");
+        let report = compile_evaluator_ops_to_engine_patch(
+            &relationship_output("active_soul", "active_player", "active_player", "preset_male"),
+            &context("I wait at the doorway.", ""),
+            &soul,
+        )
+        .expect("raw player id in perceived_by coerces to active soul");
+        assert_eq!(
+            report.patch.soul_patch.as_ref().unwrap().relationship_deltas[0]
+                .from
+                .as_deref(),
+            Some("aurora")
+        );
+    }
+
+    #[test]
+    fn add_memory_aliases_resolve_before_validation() {
+        let soul = Soul::default_for_character("Aurora");
+        let output = EvaluatorStructuredOutputV1 {
+            schema_version: 1,
+            ops: vec![EvaluatorOp::AddMemory(AddMemoryOp {
+                owner_soul_id: "active_soul".into(),
+                slot: MemorySlotOp::RelationshipMemory,
+                content: "Aurora noticed the player's patience.".into(),
+                evidence_quote: "I wait at the doorway.".into(),
+                confidence: 0.8,
+                salience: 60,
+                source_message_id: None,
+                target_entity_ids: vec!["active_player".into()],
+                truth_status: TruthStatusOp::SceneEvent,
+            })],
+            no_op_reason: None,
+        };
+        let report = compile_evaluator_ops_to_engine_patch(
+            &output,
+            &context("I wait at the doorway.", ""),
+            &soul,
+        )
+        .expect("memory aliases compile");
+        let memory = &report.patch.soul_patch.as_ref().unwrap().new_memories[0];
+        assert_eq!(memory.owner_soul_id.as_deref(), Some("aurora"));
+        assert_eq!(memory.target_entity_ids, vec!["preset_male"]);
+    }
+
+    #[test]
+    fn update_object_state_active_player_alias_creates_stable_player_object_id() {
+        let soul = Soul::default_for_character("Aurora");
+        let output = EvaluatorStructuredOutputV1 {
+            schema_version: 1,
+            ops: vec![EvaluatorOp::UpdateObjectState(UpdateObjectStateOp {
+                object_label: "wet jacket".into(),
+                object_type: "jacket".into(),
+                owner_entity_id: "active_player".into(),
+                status: "wet".into(),
+                location: "near door".into(),
+                last_observed_state: "wet jacket near door".into(),
+                evidence_quote: "wet jacket near door".into(),
+            })],
+            no_op_reason: None,
+        };
+        let report = compile_evaluator_ops_to_engine_patch(
+            &output,
+            &context("", "He leaves a wet jacket near door."),
+            &soul,
+        )
+        .expect("object owner alias compiles");
+        let object = report.patch.world_patch.unwrap().object_observation_operations[0]
+            .object_state
+            .clone()
+            .unwrap();
+        assert_eq!(object.owner_entity_id.as_deref(), Some("preset_male"));
+        assert_eq!(object.object_id, "preset_male_jacket_1");
+    }
+
+    #[test]
+    fn latest_speaker_does_not_resolve_to_active_player_for_ooc_relationship_ops() {
+        let soul = Soul::default_for_character("Aurora");
+        let err = compile_evaluator_ops_to_engine_patch(
+            &relationship_output("active_soul", "active_player", "latest_speaker", "active_soul"),
+            &context("OOC: please summarize the state.", ""),
+            &soul,
+        )
+        .expect_err("OOC latest_speaker must not silently become player");
+        assert!(err.contains("latest_speaker"));
+        assert!(err.contains("OOC"));
+    }
+
+    #[test]
+    fn unknown_alias_fails_clearly() {
+        let soul = Soul::default_for_character("Aurora");
+        let err = compile_evaluator_ops_to_engine_patch(
+            &relationship_output("current_soul", "active_player", "active_player", "active_soul"),
+            &context("I wait at the doorway.", ""),
+            &soul,
+        )
+        .expect_err("unknown alias rejected");
+        assert!(err.contains("unknown entity alias"));
+        assert!(err.contains("current_soul"));
     }
 }

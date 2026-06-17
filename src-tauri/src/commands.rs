@@ -70,9 +70,11 @@ use crate::{
             build_evaluator_form_prompt_compact_with_player_persona,
             build_evaluator_form_prompt_with_player_persona, build_evaluator_prompt,
             build_narrator_system_prompt, build_structured_evaluator_prompt,
-            build_structured_evaluator_prompt_with_player_persona, ApiMessage, ApiProvider,
-            ApiProviderSettings, PreparedApiPayload, StructuredEnforcement, TokenUsage,
-            CURRENT_EVALUATOR_CONTRACT_VERSION, CURRENT_EVALUATOR_PROMPT_VERSION,
+            build_structured_evaluator_prompt_with_player_persona,
+            structured_evaluator_max_retries, structured_tool_retry_user_message, ApiMessage,
+            ApiProvider, ApiProviderSettings, PreparedApiPayload, StructuredCompletionTrace,
+            StructuredEnforcement, TokenUsage, CURRENT_EVALUATOR_CONTRACT_VERSION,
+            CURRENT_EVALUATOR_PROMPT_VERSION,
         },
         mock::MockProvider,
     },
@@ -90,6 +92,8 @@ const FULL_CHAT_TOKEN_BUDGET: usize = 6_000;
 const NARRATOR_BRIEF_TARGET_TOKENS: usize = 2_500;
 const STATE_UPDATER_TARGET_TOKENS: usize = 1_600;
 const DEFAULT_EVALUATOR_TIMEOUT_MS: u64 = 25_000;
+const DEFAULT_STRUCTURED_EVALUATOR_TIMEOUT_MS: u64 = 90_000;
+const DEFAULT_DIAGNOSTIC_EVALUATOR_TIMEOUT_MS: u64 = 60_000;
 const NEXT_TURN_GATE_POLL_MS: u64 = 250;
 const NEXT_TURN_GATE_FALLBACK_MAX_MS: u64 = 120_000;
 const ANTI_REPLAY_FORCED_RETRY_ENABLED_DEFAULT: bool = false;
@@ -282,6 +286,147 @@ pub struct ExportResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkType {
+    #[serde(alias = "self_play")]
+    VisibleAiChat,
+    #[serde(alias = "scripted_replay")]
+    ScriptedVisibleReplay,
+    HeadlessRegression,
+    #[serde(alias = "multi_agent_self_play")]
+    MultiAgentVisibleChat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkTarget {
+    CurrentSession,
+    NewBenchmarkSessionFromCurrentSoul,
+    NewBenchmarkSessionFromSelectedSoulWorld,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkSettings {
+    #[serde(alias = "benchmark_type")]
+    pub benchmark_type: BenchmarkType,
+    #[serde(default = "default_benchmark_target")]
+    pub target: BenchmarkTarget,
+    #[serde(default)]
+    pub current_conversation_id: Option<String>,
+    pub turn_count: usize,
+    pub narrator_style: String,
+    pub evaluator_mode: Option<String>,
+    pub structured_evaluator_transport: Option<String>,
+    pub structured_evaluator_policy: Option<String>,
+    pub structured_evaluator_max_retries: Option<u32>,
+    pub player_simulator_profile_id: Option<String>,
+    pub player_goal: String,
+    #[serde(default = "default_true")]
+    pub export_payload_history: bool,
+    #[serde(default = "default_true")]
+    pub export_mne: bool,
+    #[serde(default = "default_true")]
+    pub export_summary_json: bool,
+    #[serde(default)]
+    pub strict_tool_evaluator: bool,
+    #[serde(default = "default_true")]
+    pub wait_for_evaluator_each_turn: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_benchmark_target() -> BenchmarkTarget {
+    BenchmarkTarget::CurrentSession
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkObjectIdentityCheck {
+    pub label: String,
+    pub expected_object_id: String,
+    pub found: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkScorecard {
+    pub visible_chat_messages_created: bool,
+    pub normal_pipeline_used: bool,
+    pub turn_count_requested: usize,
+    pub turn_count_completed: usize,
+    pub player_simulator_calls: usize,
+    pub narrator_calls: usize,
+    pub evaluator_calls: usize,
+    pub evaluator_waited_each_turn: bool,
+    pub memory_updated: bool,
+    pub object_state_updated: bool,
+    pub relationship_updated: bool,
+    pub payload_history_export_succeeded: bool,
+    pub narrator_visible_response_each_turn: bool,
+    pub evaluator_used_tool_call_where_required: bool,
+    pub no_evaluator_form_v1_fallback_in_strict_mode: bool,
+    pub syntactic_repair_unused_in_strict_mode: bool,
+    pub memories_increased_over_time: bool,
+    pub active_player_relationship_changed_when_warranted: bool,
+    pub object_ids_stable: bool,
+    pub default_player_not_normal_rp_relationship_target: bool,
+    pub mne_export_succeeded: bool,
+    pub pass: bool,
+    pub failure_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkTurnSummary {
+    pub turn_index: usize,
+    pub simulated_user_message: String,
+    pub narrator_response_present: bool,
+    pub narrator_error: Option<String>,
+    pub evaluator_mode: String,
+    pub structured_transport_actual: Option<String>,
+    pub tool_calls_present: bool,
+    pub tool_call_count: usize,
+    pub structured_retry_count: usize,
+    pub fallback_path: Vec<String>,
+    pub syntactic_repair_used: bool,
+    pub memory_count_after: usize,
+    pub object_count_after: usize,
+    pub relationship_summary_after: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkSummary {
+    pub benchmark_id: String,
+    pub benchmark_type: String,
+    pub conversation_id: String,
+    pub started_at: i64,
+    pub completed_at: i64,
+    pub turn_count_requested: usize,
+    pub turn_count_completed: usize,
+    pub narrator_model: String,
+    pub evaluator_model: String,
+    pub player_simulator_model: Option<String>,
+    pub narrator_failures: usize,
+    pub evaluator_failures: usize,
+    pub tool_call_success_count: usize,
+    pub tool_call_failure_count: usize,
+    pub retry_count: usize,
+    pub retry_success_count: usize,
+    pub fallback_count: usize,
+    pub syntactic_repair_count: usize,
+    pub default_player_leak_detected: bool,
+    pub duplicate_relationship_context_detected: bool,
+    pub final_memory_count: usize,
+    pub final_object_state_count: usize,
+    pub final_relationship_count: usize,
+    pub per_turn: Vec<BenchmarkTurnSummary>,
+    pub object_identity_checks: Vec<BenchmarkObjectIdentityCheck>,
+    pub mne_export_path: Option<String>,
+    pub payload_history_path: Option<String>,
+    pub summary_json_path: Option<String>,
+    pub scorecard: BenchmarkScorecard,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct SessionStartResult {
     pub soul: Soul,
@@ -412,6 +557,15 @@ pub struct StructuredEvaluatorDiagnosticRun {
     pub scene_update_ops_count: usize,
     pub state_patch_id: Option<String>,
     pub error: Option<String>,
+    pub tool_calls_present: bool,
+    pub tool_call_count: usize,
+    pub tool_call_names: Vec<String>,
+    pub raw_content_present: bool,
+    pub raw_tool_calls_present: bool,
+    pub structured_retry_count: usize,
+    pub structured_retry_reasons: Vec<String>,
+    pub structured_retry_succeeded: Option<bool>,
+    pub structured_retry_final_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +580,10 @@ pub struct StructuredEvaluatorDiagnosticSummary {
     pub structured_policy: String,
     pub structured_evaluator_policy: String,
     pub evaluator_mode: String,
+    pub strict_tool_diagnostic: bool,
+    pub strict_tool_passed: bool,
+    pub fallback_used: bool,
+    pub failure_turns: Vec<usize>,
     pub structured_schema_version: u32,
     pub runs: Vec<StructuredEvaluatorDiagnosticRun>,
     pub enforcement_levels: Vec<String>,
@@ -447,6 +605,7 @@ pub struct StructuredEvaluatorDiagnosticSummary {
     pub final_object_states: Vec<serde_json::Value>,
     pub final_scene_participants: Vec<String>,
     pub default_player_leaked_into_normal_rp_state: bool,
+    pub default_player_in_relationship_context: bool,
     pub payload_history_path: String,
     pub mne_checkpoint_path: String,
     pub summary_json_path: String,
@@ -3500,6 +3659,1222 @@ pub fn export_llm_payload_history(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_benchmark(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    soul_id: String,
+    setting_id: Option<String>,
+    provider: String,
+    narrator_settings: ApiProviderSettings,
+    mut state_updater_settings: ApiProviderSettings,
+    settings: BenchmarkSettings,
+) -> Result<BenchmarkSummary, String> {
+    let started_at = db::now_ts();
+    let benchmark_id = format!("bench_{}", uuid_like_id());
+    let BenchmarkConversationInit {
+        conversation_id,
+        session_soul_id,
+        initial_memory_count,
+        initial_object_count,
+        initial_relationship_count,
+    } = prepare_benchmark_conversation(
+        &state,
+        &benchmark_id,
+        &soul_id,
+        setting_id.as_deref(),
+        &settings,
+    )?;
+
+    state_updater_settings.evaluator_mode = settings
+        .evaluator_mode
+        .clone()
+        .or(state_updater_settings.evaluator_mode.clone());
+    state_updater_settings.structured_evaluator_transport = settings
+        .structured_evaluator_transport
+        .clone()
+        .or(state_updater_settings
+            .structured_evaluator_transport
+            .clone());
+    state_updater_settings.structured_evaluator_policy = settings
+        .structured_evaluator_policy
+        .clone()
+        .or(state_updater_settings.structured_evaluator_policy.clone());
+    state_updater_settings.structured_evaluator_max_retries = settings
+        .structured_evaluator_max_retries
+        .or(state_updater_settings.structured_evaluator_max_retries);
+    if settings.strict_tool_evaluator {
+        state_updater_settings.evaluator_mode = Some(EVALUATOR_MODE_STRUCTURED_V1.into());
+        state_updater_settings.structured_evaluator_transport = Some("tool_call".into());
+        state_updater_settings.structured_evaluator_policy = Some("required".into());
+    }
+
+    let player_profile = if benchmark_requires_player_profile(&settings.benchmark_type) {
+        let profile_id = settings
+            .player_simulator_profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "Self-play benchmark requires a Player Simulator profile".to_string())?;
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        Some(db::get_provider_profile(&conn, profile_id).map_err(|err| err.to_string())?)
+    } else {
+        None
+    };
+
+    let mut narrator_failures = 0usize;
+    let mut turn_count_completed = 0usize;
+    let scripted_turns = benchmark_scripted_turns();
+    let requested_turns = settings.turn_count.max(1);
+    let mut per_turn = Vec::new();
+    let provider_is_mock = provider.eq_ignore_ascii_case("mock")
+        || narrator_settings.api_key.trim().is_empty()
+        || narrator_settings.model.trim().is_empty()
+        || narrator_settings.base_url.trim().is_empty();
+
+    for turn_index in 0..requested_turns {
+        let user_text = match settings.benchmark_type {
+            BenchmarkType::ScriptedVisibleReplay | BenchmarkType::HeadlessRegression => {
+                scripted_turns[turn_index % scripted_turns.len()].to_string()
+            }
+            BenchmarkType::VisibleAiChat | BenchmarkType::MultiAgentVisibleChat => {
+                let profile = player_profile.as_ref().expect("profile checked");
+                generate_benchmark_player_turn(
+                    &state,
+                    &conversation_id,
+                    &session_soul_id,
+                    profile,
+                    &settings.player_goal,
+                )
+                .await?
+            }
+        };
+
+        let turn_result = if provider_is_mock {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            send_mock_turn_with_conn(
+                &conn,
+                conversation_id.clone(),
+                session_soul_id.clone(),
+                user_text.clone(),
+                settings.narrator_style.clone(),
+                None,
+                None,
+            )
+        } else {
+            send_api_turn(
+                app.clone(),
+                window.clone(),
+                state.clone(),
+                conversation_id.clone(),
+                session_soul_id.clone(),
+                user_text.clone(),
+                settings.narrator_style.clone(),
+                narrator_settings.clone(),
+                state_updater_settings.clone(),
+                None,
+                None,
+                Some("brief".into()),
+            )
+            .await
+        };
+
+        match turn_result {
+            Ok(result) if !result.visible_response.trim().is_empty() => {
+                turn_count_completed += 1;
+                if settings.wait_for_evaluator_each_turn {
+                    wait_for_benchmark_evaluators(
+                        &state,
+                        &conversation_id,
+                        &state_updater_settings,
+                    )?;
+                }
+                per_turn.push(build_benchmark_turn_summary(
+                    &state,
+                    &conversation_id,
+                    turn_index,
+                    &user_text,
+                    None,
+                    &state_updater_settings,
+                )?);
+            }
+            Ok(_) => {
+                narrator_failures += 1;
+                per_turn.push(build_benchmark_turn_summary(
+                    &state,
+                    &conversation_id,
+                    turn_index,
+                    &user_text,
+                    Some("Narrator returned an empty visible response"),
+                    &state_updater_settings,
+                )?);
+                break;
+            }
+            Err(err) => {
+                narrator_failures += 1;
+                per_turn.push(build_benchmark_turn_summary(
+                    &state,
+                    &conversation_id,
+                    turn_index,
+                    &user_text,
+                    Some(&err),
+                    &state_updater_settings,
+                )?);
+                break;
+            }
+        }
+    }
+
+    let completed_at = db::now_ts();
+    let summary = build_benchmark_summary(
+        &state,
+        &benchmark_id,
+        benchmark_type_label(&settings.benchmark_type),
+        &conversation_id,
+        started_at,
+        completed_at,
+        requested_turns,
+        turn_count_completed,
+        &narrator_settings,
+        &state_updater_settings,
+        player_profile.as_ref(),
+        narrator_failures,
+        initial_memory_count,
+        initial_object_count,
+        initial_relationship_count,
+        per_turn,
+        settings.strict_tool_evaluator,
+    )?;
+
+    finalize_benchmark_summary(
+        &app,
+        &window,
+        &state,
+        summary,
+        &settings,
+        initial_memory_count,
+        initial_object_count,
+        initial_relationship_count,
+    )
+}
+
+/// Run exports (payload history, .mne, summary JSON), recompute the scorecard,
+/// and emit the completion dev-log for a built `BenchmarkSummary`. Shared by the
+/// blocking `run_benchmark` path and the frontend-driven `finalize_benchmark`
+/// command so both produce identical artifacts.
+fn finalize_benchmark_summary(
+    app: &AppHandle,
+    window: &Window,
+    state: &State<'_, AppState>,
+    mut summary: BenchmarkSummary,
+    settings: &BenchmarkSettings,
+    initial_memory_count: usize,
+    initial_object_count: usize,
+    initial_relationship_count: usize,
+) -> Result<BenchmarkSummary, String> {
+    let conversation_id = summary.conversation_id.clone();
+    if settings.export_payload_history {
+        let logs = {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            db::list_llm_payload_logs(&conn, &conversation_id).map_err(|err| err.to_string())?
+        };
+        let markdown = render_llm_payload_history(&logs);
+        let path = write_export_file(
+            app,
+            &conversation_id,
+            "benchmark-payload-history",
+            &markdown,
+        )?;
+        summary.payload_history_path = Some(path.display().to_string());
+    }
+    if settings.export_mne {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let result = export_current_session_checkpoint_mne_inner(
+            app,
+            window,
+            &conn,
+            &conversation_id,
+            "",
+        )?;
+        summary.mne_export_path = Some(result.path);
+    }
+    summary.scorecard.mne_export_succeeded = summary.mne_export_path.is_some();
+    summary.scorecard = benchmark_scorecard(
+        &summary,
+        settings.strict_tool_evaluator,
+        initial_memory_count,
+        initial_object_count,
+        initial_relationship_count,
+    );
+    summary.scorecard.evaluator_waited_each_turn = settings.wait_for_evaluator_each_turn;
+    if settings.export_summary_json {
+        let path =
+            write_diagnostic_json_file(app, &conversation_id, "benchmark-summary", &summary)?;
+        summary.summary_json_path = Some(path.display().to_string());
+        let json = serde_json::to_string_pretty(&summary).map_err(|err| err.to_string())?;
+        fs::write(&path, json).map_err(|err| err.to_string())?;
+    }
+
+    emit_dev_log(
+        window,
+        if summary.scorecard.pass {
+            "success"
+        } else {
+            "warn"
+        },
+        "app",
+        "benchmark_completed",
+        Some(serde_json::json!({
+            "benchmark_id": summary.benchmark_id,
+            "conversation_id": summary.conversation_id,
+            "pass": summary.scorecard.pass,
+            "failure_reasons": summary.scorecard.failure_reasons
+        })),
+    );
+    Ok(summary)
+}
+
+/// Resolved benchmark conversation plus the entity counts captured *before* any
+/// turns run, so the scorecard can measure deltas.
+struct BenchmarkConversationInit {
+    conversation_id: String,
+    session_soul_id: String,
+    initial_memory_count: usize,
+    initial_object_count: usize,
+    initial_relationship_count: usize,
+}
+
+/// Resolve (or create) the conversation a benchmark runs against, mark it as a
+/// benchmark conversation, and snapshot the starting memory/object/relationship
+/// counts. Extracted from `run_benchmark` so the frontend-driven live path can
+/// set up the same session via `prepare_benchmark_session`.
+fn prepare_benchmark_conversation(
+    state: &State<'_, AppState>,
+    benchmark_id: &str,
+    soul_id: &str,
+    setting_id: Option<&str>,
+    settings: &BenchmarkSettings,
+) -> Result<BenchmarkConversationInit, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    if matches!(settings.target, BenchmarkTarget::CurrentSession) {
+        let conversation_id = settings
+            .current_conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                "Current Session benchmark target requires current_conversation_id".to_string()
+            })?
+            .to_string();
+        let conversation = db::get_conversation_summary(&conn, &conversation_id)
+            .map_err(|err| err.to_string())?;
+        db::mark_conversation_benchmark(&conn, &conversation_id)
+            .map_err(|err| err.to_string())?;
+        let (session_soul, session_world) = if let Ok(branch) =
+            db::get_active_session_branch(&conn, &conversation_id)
+        {
+            let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+                .map_err(|err| err.to_string())?;
+            (rebuilt.soul, rebuilt.session_world)
+        } else {
+            let source =
+                db::get_soul(&conn, &conversation.soul_id).map_err(|err| err.to_string())?;
+            let world = match db::get_conversation_session_world(&conn, &conversation_id)
+                .map_err(|err| err.to_string())?
+            {
+                Some(world) => world,
+                None => db::create_legacy_session_world_from_soul(&conn, &source)
+                    .map_err(|err| err.to_string())?,
+            };
+            (source, world)
+        };
+        Ok(BenchmarkConversationInit {
+            conversation_id,
+            session_soul_id: session_soul.character_id.clone(),
+            initial_memory_count: memory_count(&session_soul),
+            initial_object_count: session_world.object_states.len(),
+            initial_relationship_count: session_soul.relationships.len(),
+        })
+    } else {
+        let source = db::get_soul(&conn, soul_id).map_err(|err| err.to_string())?;
+        let session = session_soul_from_savepoint(&source);
+        let session_world = if let Some(setting_id) = setting_id
+            .map(str::trim)
+            .filter(|setting_id| !setting_id.is_empty())
+        {
+            db::create_session_world_from_setting(&conn, setting_id)
+                .map_err(|err| err.to_string())?
+        } else {
+            db::create_legacy_session_world_from_soul(&conn, &source)
+                .map_err(|err| err.to_string())?
+        };
+        db::upsert_soul(&conn, &session).map_err(|err| err.to_string())?;
+        let conversation_id = format!("benchmark-{}-{}", benchmark_id, session.character_id);
+        db::ensure_conversation_with_title_and_world(
+            &conn,
+            &conversation_id,
+            &session.character_id,
+            Some(&session_world.world_id),
+            session_world.source_setting_id.as_deref(),
+            Some(&format!(
+                "Benchmark {} - {}",
+                benchmark_id, source.character_name
+            )),
+        )
+        .map_err(|err| err.to_string())?;
+        db::mark_conversation_benchmark(&conn, &conversation_id)
+            .map_err(|err| err.to_string())?;
+        db::create_session_branch(&conn, &conversation_id, &session, &session_world)
+            .map_err(|err| err.to_string())?;
+        Ok(BenchmarkConversationInit {
+            conversation_id,
+            session_soul_id: session.character_id.clone(),
+            initial_memory_count: memory_count(&session),
+            initial_object_count: session_world.object_states.len(),
+            initial_relationship_count: session.relationships.len(),
+        })
+    }
+}
+
+/// Session handle returned to the frontend so it can drive the live self-play
+/// loop (one `executeTurn` per turn) and later call `finalize_benchmark`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkSessionInit {
+    pub benchmark_id: String,
+    pub conversation_id: String,
+    pub session_soul_id: String,
+    pub started_at: i64,
+    pub initial_memory_count: usize,
+    pub initial_object_count: usize,
+    pub initial_relationship_count: usize,
+}
+
+/// Set up a benchmark conversation for the frontend-driven live path. The
+/// frontend switches to `conversation_id`, then runs turns through the normal
+/// visible chat (`executeTurn`) so the AI-vs-AI exchange streams in real time.
+#[tauri::command]
+pub fn prepare_benchmark_session(
+    state: State<'_, AppState>,
+    soul_id: String,
+    setting_id: Option<String>,
+    settings: BenchmarkSettings,
+) -> Result<BenchmarkSessionInit, String> {
+    let benchmark_id = format!("bench_{}", uuid_like_id());
+    let started_at = db::now_ts();
+    let init = prepare_benchmark_conversation(
+        &state,
+        &benchmark_id,
+        &soul_id,
+        setting_id.as_deref(),
+        &settings,
+    )?;
+    Ok(BenchmarkSessionInit {
+        benchmark_id,
+        conversation_id: init.conversation_id,
+        session_soul_id: init.session_soul_id,
+        started_at,
+        initial_memory_count: init.initial_memory_count,
+        initial_object_count: init.initial_object_count,
+        initial_relationship_count: init.initial_relationship_count,
+    })
+}
+
+/// Generate the next user-side message for the live self-play loop. Returns only
+/// the text; the frontend then sends it through `executeTurn` exactly as if the
+/// user had typed it, so it renders (and the narrator streams) in visible chat.
+#[tauri::command]
+pub async fn generate_benchmark_player_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    soul_id: String,
+    player_profile_id: String,
+    player_goal: String,
+) -> Result<String, String> {
+    let profile = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::get_provider_profile(&conn, &player_profile_id).map_err(|err| err.to_string())?
+    };
+    generate_benchmark_player_turn(&state, &conversation_id, &soul_id, &profile, &player_goal).await
+}
+
+/// Build the per-turn summary for one live self-play turn after `executeTurn`
+/// has completed and its evaluator has applied. Captures the post-turn entity
+/// counts and the evaluator trace from the latest payload logs.
+#[tauri::command]
+pub fn benchmark_turn_summary(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    turn_index: usize,
+    user_text: String,
+    narrator_error: Option<String>,
+    state_updater_settings: ApiProviderSettings,
+) -> Result<BenchmarkTurnSummary, String> {
+    build_benchmark_turn_summary(
+        &state,
+        &conversation_id,
+        turn_index,
+        &user_text,
+        narrator_error.as_deref(),
+        &state_updater_settings,
+    )
+}
+
+/// Finalize a frontend-driven live benchmark: build the summary from the
+/// recorded per-turn results, run exports, score it, and emit the dev-log.
+/// Mirrors the tail of `run_benchmark` for the live path.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_benchmark(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    benchmark_id: String,
+    conversation_id: String,
+    started_at: i64,
+    narrator_settings: ApiProviderSettings,
+    state_updater_settings: ApiProviderSettings,
+    settings: BenchmarkSettings,
+    initial_memory_count: usize,
+    initial_object_count: usize,
+    initial_relationship_count: usize,
+    turn_count_completed: usize,
+    narrator_failures: usize,
+    per_turn: Vec<BenchmarkTurnSummary>,
+) -> Result<BenchmarkSummary, String> {
+    let player_profile = match settings
+        .player_simulator_profile_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(profile_id) => {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            Some(db::get_provider_profile(&conn, profile_id).map_err(|err| err.to_string())?)
+        }
+        None => None,
+    };
+    let completed_at = db::now_ts();
+    let requested_turns = settings.turn_count.max(1);
+    let summary = build_benchmark_summary(
+        &state,
+        &benchmark_id,
+        benchmark_type_label(&settings.benchmark_type),
+        &conversation_id,
+        started_at,
+        completed_at,
+        requested_turns,
+        turn_count_completed,
+        &narrator_settings,
+        &state_updater_settings,
+        player_profile.as_ref(),
+        narrator_failures,
+        initial_memory_count,
+        initial_object_count,
+        initial_relationship_count,
+        per_turn,
+        settings.strict_tool_evaluator,
+    )?;
+    finalize_benchmark_summary(
+        &app,
+        &window,
+        &state,
+        summary,
+        &settings,
+        initial_memory_count,
+        initial_object_count,
+        initial_relationship_count,
+    )
+}
+
+fn benchmark_scripted_turns() -> Vec<&'static str> {
+    vec![
+        "I step inside, leaving my wet jacket near the door.",
+        "I ask Aurora what she actually wants from me right now.",
+        "I move a little closer, but keep my hands visible.",
+        "I point out the contradiction and ask her to choose.",
+        "I pick up the jacket again and wait for her answer.",
+    ]
+}
+
+fn benchmark_type_label(value: &BenchmarkType) -> &'static str {
+    match value {
+        BenchmarkType::VisibleAiChat => "visible_ai_chat",
+        BenchmarkType::ScriptedVisibleReplay => "scripted_visible_replay",
+        BenchmarkType::HeadlessRegression => "headless_regression",
+        BenchmarkType::MultiAgentVisibleChat => "multi_agent_visible_chat",
+    }
+}
+
+fn benchmark_requires_player_profile(value: &BenchmarkType) -> bool {
+    matches!(
+        value,
+        BenchmarkType::VisibleAiChat | BenchmarkType::MultiAgentVisibleChat
+    )
+}
+
+fn memory_count(soul: &Soul) -> usize {
+    soul.memory.core.len() + soul.memory.recent.len() + soul.memory.schemas.len()
+}
+
+fn provider_profile_to_api_settings(profile: &ProviderProfile) -> ApiProviderSettings {
+    ApiProviderSettings {
+        base_url: profile.base_url.clone(),
+        api_key: profile.api_key.clone(),
+        model: profile.model.clone(),
+        system_prompt: profile.system_prompt.clone(),
+        narrator_timeout_ms: profile.narrator_timeout_ms,
+        evaluator_timeout_ms: profile.evaluator_timeout_ms,
+        structured_evaluator_timeout_ms: None,
+        diagnostic_evaluator_timeout_ms: None,
+        evaluator_timeout_mode: profile.evaluator_timeout_mode.clone(),
+        evaluator_mode: profile.evaluator_mode.clone(),
+        structured_evaluator_policy: profile.structured_evaluator_policy.clone(),
+        structured_evaluator_transport: None,
+        structured_evaluator_max_retries: Some(1),
+        wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn,
+        allow_send_with_stale_state: profile.allow_send_with_stale_state,
+        evaluator_background_enabled: profile.evaluator_background_enabled,
+        anti_replay_forced_retry_enabled: profile.anti_replay_forced_retry_enabled,
+        evaluator_execution_mode: None,
+    }
+}
+
+async fn generate_benchmark_player_turn(
+    state: &State<'_, AppState>,
+    conversation_id: &str,
+    soul_id: &str,
+    profile: &ProviderProfile,
+    player_goal: &str,
+) -> Result<String, String> {
+    let (visible_chat_log, scene_summary, persona_summary) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let messages =
+            db::list_messages(&conn, conversation_id, 24).map_err(|err| err.to_string())?;
+        let visible_chat_log = messages
+            .iter()
+            .filter(|message| message.status == "active")
+            .map(|message| {
+                let label = if message.role == "assistant" {
+                    "Narrator"
+                } else {
+                    "User"
+                };
+                format!(
+                    "{label}: {}",
+                    strip_status_blocks_for_export(&message.content)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let scene_summary = db::get_conversation_session_world(&conn, conversation_id)
+            .ok()
+            .flatten()
+            .map(|world| {
+                format!(
+                    "location: {}; focus: {}; pressure: {}; continuity: {}",
+                    world.location,
+                    world.scene_state.focus,
+                    world.scene_state.pressure_point,
+                    world.scene_state.continuity_note
+                )
+            })
+            .unwrap_or_else(|| "No public scene summary yet.".into());
+        let persona =
+            db::get_active_player_persona(&conn, conversation_id).map_err(|err| err.to_string())?;
+        let persona_summary = format!(
+            "{} ({})\nPronouns: {}\nDescription: {}\nAppearance: {}\nNotes: {}",
+            persona.display_name,
+            persona.persona_id,
+            persona.pronouns,
+            persona.description,
+            persona.appearance.as_deref().unwrap_or(""),
+            persona.notes.as_deref().unwrap_or("")
+        );
+        let _ = db::get_soul(&conn, soul_id).map_err(|err| err.to_string())?;
+        (visible_chat_log, scene_summary, persona_summary)
+    };
+    let system_prompt = benchmark_player_simulator_prompt();
+    let user_prompt = format!(
+        "Benchmark goal:\n{}\n\nActive player persona:\n{}\n\nVisible chat:\n{}\n\nPublic scene summary:\n{}\n\nLast narrator response:\n{}\n\nWrite the next user message only.",
+        if player_goal.trim().is_empty() {
+            "Pursue the scene naturally while respecting continuity."
+        } else {
+            player_goal.trim()
+        },
+        persona_summary,
+        if visible_chat_log.trim().is_empty() {
+            "(no visible chat yet)"
+        } else {
+            visible_chat_log.trim()
+        },
+        scene_summary,
+        visible_chat_log
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("Narrator:"))
+            .unwrap_or("(no narrator response yet)")
+    );
+    let provider = ApiProvider::default();
+    let mut settings = provider_profile_to_api_settings(profile);
+    // Cap each player-line attempt hard. This call runs inside an uninterruptible
+    // Tauri command, so a large profile timeout × retries can stall the whole run
+    // for many minutes with no way to Stop. The player line is short text — 90s
+    // is plenty — and this cap is only on the harness, not the faithful narrator
+    // pipeline. Honor a smaller profile timeout if the user set one. The streaming
+    // transport reads its timeout from `narrator_timeout_ms`, so set it there.
+    const PLAYER_LINE_MAX_TIMEOUT_MS: u64 = 90_000;
+    settings.narrator_timeout_ms = Some(
+        settings
+            .narrator_timeout_ms
+            .filter(|value| *value > 0)
+            .map(|value| value.min(PLAYER_LINE_MAX_TIMEOUT_MS))
+            .unwrap_or(PLAYER_LINE_MAX_TIMEOUT_MS),
+    );
+    // Generate the player line through the SAME streaming transport the narrator
+    // uses. Non-streaming decode flakes on free/alpha models (owl-alpha returns
+    // 200-error envelopes / odd shapes the strict body parser chokes on); the
+    // streaming SSE parser survives them. The chunks aren't surfaced anywhere —
+    // the player line only needs its final text — so the sink is a no-op.
+    //
+    // A single transient hiccup shouldn't kill a multi-turn run, so retry once
+    // with backoff. Persistent/shape errors still surface for diagnosis. Kept to
+    // 2 attempts so the worst case stays bounded (~2×90s) and the run stoppable.
+    const MAX_ATTEMPTS: usize = 2;
+    let mut attempts = 0usize;
+    let mut last_error = String::new();
+    while attempts < MAX_ATTEMPTS {
+        attempts += 1;
+        match provider
+            .complete_streaming(&settings, system_prompt, &user_prompt, |_chunk: &str| {
+                Ok(())
+            })
+            .await
+        {
+            Ok(completion) => return sanitize_player_simulator_message(&completion.raw_text),
+            Err(error) => {
+                last_error = error;
+                if attempts < MAX_ATTEMPTS && is_transient_provider_error(&last_error) {
+                    std::thread::sleep(Duration::from_millis(800 * attempts as u64));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(format!(
+        "player simulator failed after {attempts} attempt(s): {last_error}"
+    ))
+}
+
+/// True for provider failures worth retrying: a transient upstream error, a
+/// timeout, or a rate-limit / 5xx. Persistent shape errors (bad JSON, missing
+/// content) are NOT retried — they should surface so they can be diagnosed.
+fn is_transient_provider_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("provider returned error")
+        || lower.contains("error in a 200")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("overloaded")
+        || lower.contains("temporarily")
+        // Transport/network drop is "API request failed: <err>" (no status).
+        // A status error is "API request failed with <code>: …" — those are
+        // only retried for the explicit 429/5xx codes below, never 4xx.
+        || lower.contains("api request failed:")
+        // Mid-stream drop on the streaming transport.
+        || lower.contains("api stream failed")
+        || lower.contains(" 429")
+        || lower.contains(" 500")
+        || lower.contains(" 502")
+        || lower.contains(" 503")
+        || lower.contains(" 504")
+}
+
+fn benchmark_player_simulator_prompt() -> &'static str {
+    r#"You are the user-side Player Simulator for a Mnemosyne RP benchmark.
+
+You control only the active player persona.
+You are not the narrator.
+You are not the active Soul unless the active player persona is that Soul.
+You must not write the narrator-controlled character's thoughts, dialogue, or actions.
+You must not write backend JSON, tool calls, status blocks, or diagnostics.
+
+Write only the next user message that should be sent into the RP chat.
+
+Stay in character.
+React to the latest visible narrator response.
+Pursue the benchmark goal naturally.
+Respect scene continuity and boundaries.
+Do not rush the scene unless the goal requires it.
+Do not summarize. Do not explain. Output only the user message."#
+}
+
+fn sanitize_player_simulator_message(raw: &str) -> Result<String, String> {
+    let mut text = raw.trim().trim_matches('`').trim().to_string();
+    for prefix in ["User:", "Player:", "Next user message:"] {
+        if text
+            .to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase())
+        {
+            text = text[prefix.len()..].trim().to_string();
+        }
+    }
+    if text.trim().is_empty() {
+        Err("Player simulator returned an empty user message".into())
+    } else {
+        Ok(text)
+    }
+}
+
+fn wait_for_benchmark_evaluators(
+    state: &State<'_, AppState>,
+    conversation_id: &str,
+    settings: &ApiProviderSettings,
+) -> Result<(), String> {
+    let timeout_ms = effective_evaluator_timeout_ms(settings)
+        .unwrap_or(5_000)
+        .max(1_000);
+    let started = Instant::now();
+    loop {
+        let pending = {
+            let conn = state.conn.lock().map_err(|err| err.to_string())?;
+            db::get_pending_evaluator_jobs_for_conversation(&conn, conversation_id)
+                .map_err(|err| err.to_string())?
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= Duration::from_millis(timeout_ms) {
+            return Err(format!(
+                "benchmark evaluator wait timed out with {} pending job(s)",
+                pending.len()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(NEXT_TURN_GATE_POLL_MS));
+    }
+}
+
+#[derive(Debug, Default)]
+struct BenchmarkTraceCounts {
+    evaluator_failures: usize,
+    tool_call_success_count: usize,
+    tool_call_failure_count: usize,
+    retry_count: usize,
+    retry_success_count: usize,
+    fallback_count: usize,
+    syntactic_repair_count: usize,
+}
+
+fn build_benchmark_turn_summary(
+    state: &State<'_, AppState>,
+    conversation_id: &str,
+    turn_index: usize,
+    user_text: &str,
+    narrator_error: Option<&str>,
+    state_updater_settings: &ApiProviderSettings,
+) -> Result<BenchmarkTurnSummary, String> {
+    let (memory_count_after, object_count_after, relationship_summary_after, logs) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let conversation =
+            db::get_conversation_summary(&conn, conversation_id).map_err(|err| err.to_string())?;
+        let (soul, session_world) = if let Ok(branch) =
+            db::get_active_session_branch(&conn, conversation_id)
+        {
+            let rebuilt = db::rebuild_session_state(&conn, conversation_id, &branch.branch_id)
+                .map_err(|err| err.to_string())?;
+            (rebuilt.soul, rebuilt.session_world)
+        } else {
+            let soul = db::get_soul(&conn, &conversation.soul_id).map_err(|err| err.to_string())?;
+            let world = db::get_conversation_session_world(&conn, conversation_id)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| "benchmark conversation has no session world".to_string())?;
+            (soul, world)
+        };
+        let mut relationship_targets = soul.relationships.keys().cloned().collect::<Vec<_>>();
+        relationship_targets.sort();
+        let logs =
+            db::list_llm_payload_logs(&conn, conversation_id).map_err(|err| err.to_string())?;
+        (
+            memory_count(&soul),
+            session_world.object_states.len(),
+            relationship_targets.join(", "),
+            logs,
+        )
+    };
+
+    let evaluator_trace = logs
+        .iter()
+        .rev()
+        .filter(|log| log.provider.contains("evaluator"))
+        .find_map(|log| {
+            log.pipeline_trace_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        })
+        .and_then(|trace| trace.get("evaluator_trace").cloned().or(Some(trace)));
+    let tool_call_count = evaluator_trace
+        .as_ref()
+        .and_then(|trace| trace.get("tool_call_count"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let structured_retry_count = evaluator_trace
+        .as_ref()
+        .and_then(|trace| trace.get("structured_retry_count"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let fallback_path = evaluator_trace
+        .as_ref()
+        .and_then(|trace| trace.get("fallback_path"))
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let structured_transport_actual = evaluator_trace
+        .as_ref()
+        .and_then(|trace| {
+            trace
+                .get("structured_transport_actual")
+                .or_else(|| trace.get("structured_transport_requested"))
+                .or_else(|| trace.get("structured_enforcement_requested"))
+        })
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string);
+    let syntactic_repair_used = evaluator_trace
+        .as_ref()
+        .and_then(|trace| trace.get("syntactic_repair_used"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    Ok(BenchmarkTurnSummary {
+        turn_index,
+        simulated_user_message: user_text.to_string(),
+        narrator_response_present: narrator_error.is_none(),
+        narrator_error: narrator_error.map(ToString::to_string),
+        evaluator_mode: state_updater_settings
+            .evaluator_mode
+            .clone()
+            .unwrap_or_else(|| EVALUATOR_MODE_FORM_V1.into()),
+        structured_transport_actual,
+        tool_calls_present: tool_call_count > 0,
+        tool_call_count,
+        structured_retry_count,
+        fallback_path,
+        syntactic_repair_used,
+        memory_count_after,
+        object_count_after,
+        relationship_summary_after,
+    })
+}
+
+fn build_benchmark_summary(
+    state: &State<'_, AppState>,
+    benchmark_id: &str,
+    benchmark_type: &str,
+    conversation_id: &str,
+    started_at: i64,
+    completed_at: i64,
+    turn_count_requested: usize,
+    turn_count_completed: usize,
+    narrator_settings: &ApiProviderSettings,
+    state_updater_settings: &ApiProviderSettings,
+    player_profile: Option<&ProviderProfile>,
+    narrator_failures: usize,
+    initial_memory_count: usize,
+    initial_object_count: usize,
+    initial_relationship_count: usize,
+    per_turn: Vec<BenchmarkTurnSummary>,
+    strict_tool: bool,
+) -> Result<BenchmarkSummary, String> {
+    let (soul, session_world, logs, conversation) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let conversation =
+            db::get_conversation_summary(&conn, conversation_id).map_err(|err| err.to_string())?;
+        let (soul, session_world) = if let Ok(branch) =
+            db::get_active_session_branch(&conn, conversation_id)
+        {
+            let rebuilt = db::rebuild_session_state(&conn, conversation_id, &branch.branch_id)
+                .map_err(|err| err.to_string())?;
+            (rebuilt.soul, rebuilt.session_world)
+        } else {
+            let soul = db::get_soul(&conn, &conversation.soul_id).map_err(|err| err.to_string())?;
+            let world = db::get_conversation_session_world(&conn, conversation_id)
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| "benchmark conversation has no session world".to_string())?;
+            (soul, world)
+        };
+        let logs =
+            db::list_llm_payload_logs(&conn, conversation_id).map_err(|err| err.to_string())?;
+        (soul, session_world, logs, conversation)
+    };
+    let trace_counts = benchmark_trace_counts(&logs);
+    let final_memory_count = memory_count(&soul);
+    let default_player_leak_detected = soul.relationships.contains_key("default_player")
+        || soul.memory.recent.iter().any(|memory| {
+            memory
+                .target_entity_ids
+                .iter()
+                .any(|target| target == "default_player")
+                && memory.memory_slot.as_deref() == Some("relationship_memory")
+        });
+    let duplicate_relationship_context_detected = logs.iter().any(|log| {
+        duplicate_relationship_context_detected_in_text(&log.system_message)
+            || duplicate_relationship_context_detected_in_text(&log.user_message)
+            || duplicate_relationship_context_detected_in_text(&log.context_text)
+    });
+    let object_identity_checks = Vec::new();
+    let mut summary = BenchmarkSummary {
+        benchmark_id: benchmark_id.to_string(),
+        benchmark_type: benchmark_type.to_string(),
+        conversation_id: conversation.conversation_id,
+        started_at,
+        completed_at,
+        turn_count_requested,
+        turn_count_completed,
+        narrator_model: narrator_settings.model.clone(),
+        evaluator_model: state_updater_settings.model.clone(),
+        player_simulator_model: player_profile.map(|profile| profile.model.clone()),
+        narrator_failures,
+        evaluator_failures: trace_counts.evaluator_failures,
+        tool_call_success_count: trace_counts.tool_call_success_count,
+        tool_call_failure_count: trace_counts.tool_call_failure_count,
+        retry_count: trace_counts.retry_count,
+        retry_success_count: trace_counts.retry_success_count,
+        fallback_count: trace_counts.fallback_count,
+        syntactic_repair_count: trace_counts.syntactic_repair_count,
+        default_player_leak_detected,
+        duplicate_relationship_context_detected,
+        final_memory_count,
+        final_object_state_count: session_world.object_states.len(),
+        final_relationship_count: soul.relationships.len(),
+        per_turn,
+        object_identity_checks,
+        mne_export_path: None,
+        payload_history_path: None,
+        summary_json_path: None,
+        scorecard: BenchmarkScorecard {
+            visible_chat_messages_created: false,
+            normal_pipeline_used: false,
+            turn_count_requested,
+            turn_count_completed,
+            player_simulator_calls: 0,
+            narrator_calls: 0,
+            evaluator_calls: 0,
+            evaluator_waited_each_turn: false,
+            memory_updated: final_memory_count > initial_memory_count,
+            object_state_updated: session_world.object_states.len() != initial_object_count,
+            relationship_updated: soul.relationships.len() != initial_relationship_count,
+            payload_history_export_succeeded: false,
+            narrator_visible_response_each_turn: narrator_failures == 0
+                && turn_count_completed == turn_count_requested,
+            evaluator_used_tool_call_where_required: !strict_tool
+                || trace_counts.tool_call_failure_count == 0,
+            no_evaluator_form_v1_fallback_in_strict_mode: !strict_tool
+                || trace_counts.fallback_count == 0,
+            syntactic_repair_unused_in_strict_mode: !strict_tool
+                || trace_counts.syntactic_repair_count == 0,
+            memories_increased_over_time: final_memory_count > initial_memory_count,
+            active_player_relationship_changed_when_warranted: soul
+                .relationships
+                .contains_key("preset_male"),
+            object_ids_stable: false,
+            default_player_not_normal_rp_relationship_target: !default_player_leak_detected,
+            mne_export_succeeded: false,
+            pass: false,
+            failure_reasons: Vec::new(),
+        },
+    };
+    summary.scorecard = benchmark_scorecard(
+        &summary,
+        strict_tool,
+        initial_memory_count,
+        initial_object_count,
+        initial_relationship_count,
+    );
+    Ok(summary)
+}
+
+fn benchmark_trace_counts(logs: &[LlmPayloadLog]) -> BenchmarkTraceCounts {
+    let mut counts = BenchmarkTraceCounts::default();
+    for log in logs {
+        if log.provider_error.is_some() && log.provider.contains("evaluator") {
+            counts.evaluator_failures += 1;
+        }
+        let Some(trace) = log
+            .pipeline_trace_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        else {
+            continue;
+        };
+        let evaluator_trace = trace.get("evaluator_trace").unwrap_or(&trace);
+        let tool_count = evaluator_trace
+            .get("tool_call_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let validated = evaluator_trace
+            .get("structured_enforcement_validated")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if tool_count > 0 && validated {
+            counts.tool_call_success_count += 1;
+        } else if evaluator_trace
+            .get("structured_transport_requested")
+            .or_else(|| evaluator_trace.get("structured_enforcement_requested"))
+            .and_then(|value| value.as_str())
+            == Some("tool_call")
+        {
+            counts.tool_call_failure_count += 1;
+        }
+        counts.retry_count += evaluator_trace
+            .get("structured_retry_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize;
+        if evaluator_trace
+            .get("structured_retry_succeeded")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            counts.retry_success_count += 1;
+        }
+        if evaluator_trace
+            .get("fallback_path")
+            .and_then(|value| value.as_array())
+            .is_some_and(|path| {
+                path.iter()
+                    .any(|step| step.as_str() == Some(EVALUATOR_MODE_FORM_V1))
+            })
+        {
+            counts.fallback_count += 1;
+        }
+        if evaluator_trace
+            .get("syntactic_repair_used")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            counts.syntactic_repair_count += 1;
+        }
+    }
+    counts
+}
+
+fn duplicate_relationship_context_detected_in_text(text: &str) -> bool {
+    let mut seen = HashSet::new();
+    for line in text.lines() {
+        if !line.contains("->")
+            || !line.to_ascii_lowercase().contains("relationship") && !line.contains("Aurora")
+        {
+            continue;
+        }
+        let key = line.trim();
+        if !key.is_empty() && !seen.insert(key.to_string()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn benchmark_scorecard(
+    summary: &BenchmarkSummary,
+    strict_tool: bool,
+    initial_memory_count: usize,
+    initial_object_count: usize,
+    initial_relationship_count: usize,
+) -> BenchmarkScorecard {
+    let object_ids_stable = summary
+        .object_identity_checks
+        .iter()
+        .all(|check| check.found);
+    let player_simulator_calls = if matches!(
+        summary.benchmark_type.as_str(),
+        "visible_ai_chat" | "multi_agent_visible_chat"
+    ) {
+        summary.turn_count_completed
+    } else {
+        0
+    };
+    let narrator_calls = summary.turn_count_completed + summary.narrator_failures;
+    let evaluator_calls = summary.turn_count_completed;
+    let visible_chat_messages_created = summary.turn_count_completed > 0;
+    let normal_pipeline_used = visible_chat_messages_created && narrator_calls > 0;
+    let mut scorecard = BenchmarkScorecard {
+        visible_chat_messages_created,
+        normal_pipeline_used,
+        turn_count_requested: summary.turn_count_requested,
+        turn_count_completed: summary.turn_count_completed,
+        player_simulator_calls,
+        narrator_calls,
+        evaluator_calls,
+        evaluator_waited_each_turn: true,
+        memory_updated: summary.final_memory_count > initial_memory_count,
+        object_state_updated: summary.final_object_state_count != initial_object_count,
+        relationship_updated: summary.final_relationship_count != initial_relationship_count,
+        payload_history_export_succeeded: summary.payload_history_path.is_some(),
+        narrator_visible_response_each_turn: summary.narrator_failures == 0
+            && summary.turn_count_completed == summary.turn_count_requested,
+        evaluator_used_tool_call_where_required: !strict_tool
+            || (summary.tool_call_failure_count == 0
+                && summary.tool_call_success_count >= summary.turn_count_completed),
+        no_evaluator_form_v1_fallback_in_strict_mode: !strict_tool || summary.fallback_count == 0,
+        syntactic_repair_unused_in_strict_mode: !strict_tool || summary.syntactic_repair_count == 0,
+        memories_increased_over_time: summary.final_memory_count > initial_memory_count,
+        active_player_relationship_changed_when_warranted: summary.final_relationship_count > 0,
+        object_ids_stable,
+        default_player_not_normal_rp_relationship_target: !summary.default_player_leak_detected,
+        mne_export_succeeded: summary.mne_export_path.is_some(),
+        pass: false,
+        failure_reasons: Vec::new(),
+    };
+    let checks = [
+        (
+            scorecard.visible_chat_messages_created,
+            "visible_chat_messages_created",
+        ),
+        (scorecard.normal_pipeline_used, "normal_pipeline_used"),
+        (
+            scorecard.narrator_visible_response_each_turn,
+            "narrator_visible_response_each_turn",
+        ),
+        (
+            scorecard.evaluator_used_tool_call_where_required,
+            "evaluator_used_tool_call_where_required",
+        ),
+        (
+            scorecard.no_evaluator_form_v1_fallback_in_strict_mode,
+            "no_evaluator_form_v1_fallback_in_strict_mode",
+        ),
+        (
+            scorecard.syntactic_repair_unused_in_strict_mode,
+            "syntactic_repair_unused_in_strict_mode",
+        ),
+        (
+            scorecard.memories_increased_over_time,
+            "memories_increased_over_time",
+        ),
+        (
+            scorecard.active_player_relationship_changed_when_warranted,
+            "active_player_relationship_changed_when_warranted",
+        ),
+        (scorecard.object_ids_stable, "object_ids_stable"),
+        (
+            scorecard.default_player_not_normal_rp_relationship_target,
+            "default_player_not_normal_rp_relationship_target",
+        ),
+        (scorecard.mne_export_succeeded, "mne_export_succeeded"),
+    ];
+    scorecard.failure_reasons = checks
+        .into_iter()
+        .filter_map(|(passed, name)| (!passed).then_some(name.to_string()))
+        .collect();
+    scorecard.pass = scorecard.failure_reasons.is_empty();
+    scorecard
+}
+
+#[tauri::command]
 pub fn list_provider_profiles(state: State<'_, AppState>) -> Result<Vec<ProviderProfile>, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::list_provider_profiles(&conn).map_err(|err| err.to_string())
@@ -3679,6 +5054,8 @@ pub async fn run_evaluator_contract_test(
                 .unwrap_or(DEFAULT_EVALUATOR_TIMEOUT_MS)
                 .min(DEFAULT_EVALUATOR_TIMEOUT_MS),
         ),
+        structured_evaluator_timeout_ms: None,
+        diagnostic_evaluator_timeout_ms: None,
         evaluator_timeout_mode: Some("finite".into()),
         // The contract test always exercises the FORM contract (form prompt +
         // form validation), so the call must not route through the structured
@@ -3686,6 +5063,7 @@ pub async fn run_evaluator_contract_test(
         evaluator_mode: Some(EVALUATOR_MODE_FORM_V1.into()),
         structured_evaluator_policy: Some("prefer".into()),
         structured_evaluator_transport: None,
+        structured_evaluator_max_retries: Some(1),
         wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn,
         allow_send_with_stale_state: profile.allow_send_with_stale_state,
         evaluator_background_enabled: profile.evaluator_background_enabled,
@@ -3900,13 +5278,7 @@ pub async fn run_structured_evaluator_diagnostic(
                 })?
         }
     };
-    let structured_policy = profile
-        .structured_evaluator_policy
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("prefer")
-        .to_string();
+    let structured_policy = "required".to_string();
     let settings = diagnostic_structured_settings_from_profile(&profile, &structured_policy);
     let structured_mode_requested = EVALUATOR_MODE_STRUCTURED_V1.to_string();
     let provider = ApiProvider::default();
@@ -3977,6 +5349,7 @@ pub async fn run_structured_evaluator_diagnostic(
     let mut total_object_ops = 0usize;
     let mut total_scene_ops = 0usize;
     let mut syntactic_repair_used = false;
+    let mut default_player_relationship_context_seen = false;
 
     for (index, (user_text, narrator_text)) in turns.iter().enumerate() {
         let (user_message_id, assistant_message_id, branch_id, parent_turn_id, recent_excerpt) = {
@@ -4013,21 +5386,15 @@ pub async fn run_structured_evaluator_diagnostic(
             "preset_male",
             "Male Persona",
         );
-        let fallback_form_system_prompt = build_evaluator_form_prompt_with_player_persona(
-            &soul,
-            Some(&session_world),
-            user_text,
-            narrator_text,
-            "preset_male",
-            "Male Persona",
-        );
         let updater_system_prompt = build_structured_evaluator_prompt_with_player_persona(
             &soul,
             Some(&session_world),
             "preset_male",
             "Male Persona",
         );
-        let prompt_has_default_player = updater_system_prompt.contains("default_player");
+        let prompt_has_default_player =
+            default_player_in_evaluator_relationship_context(&updater_system_prompt);
+        default_player_relationship_context_seen |= prompt_has_default_player;
         let updater_user_message = build_evaluator_user_message(
             user_text,
             narrator_text,
@@ -4103,6 +5470,10 @@ pub async fn run_structured_evaluator_diagnostic(
             ),
             Err(_) => (None, None),
         };
+        let completion_trace = completion
+            .as_ref()
+            .map(|completion| completion.trace.clone())
+            .unwrap_or_default();
         let structured_enforcement_requested = structured_enforcement
             .map(StructuredEnforcement::as_label)
             .unwrap_or("none")
@@ -4125,6 +5496,7 @@ pub async fn run_structured_evaluator_diagnostic(
         }
 
         let structured_step = structured_fallback_step(structured_enforcement).to_string();
+        let mut pending_retry_failure: Option<StructuredRetryFailure> = None;
         let outcome_result = match completion {
             Ok(completion) => match compile_selected_evaluator_runtime(
                 EVALUATOR_MODE_STRUCTURED_V1,
@@ -4137,14 +5509,11 @@ pub async fn run_structured_evaluator_diagnostic(
                 narrator_text,
                 None,
             ) {
-                Ok(outcome) => Ok(outcome),
+                Ok(mut outcome) => {
+                    apply_completion_retry_trace(&mut outcome, &completion.trace);
+                    Ok(outcome)
+                }
                 Err(err) => {
-                    if err.contains("malformed_schema_output") {
-                        run_failure_reasons.push("malformed_schema_output".into());
-                    }
-                    if err.contains("zero_ops_on_durable_turn") {
-                        run_failure_reasons.push("zero_ops_on_durable_turn".into());
-                    }
                     if completion.structured_enforcement == Some(StructuredEnforcement::JsonSchema)
                     {
                         run_failure_reasons.push("schema_claim_not_validated".into());
@@ -4174,23 +5543,36 @@ pub async fn run_structured_evaluator_diagnostic(
                             "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label)
                         })),
                     );
-                    diagnostic_form_fallback(
-                        &window,
+                    match retry_structured_tool_call_after_compile_failure(
                         &provider,
                         &settings,
-                        &fallback_form_system_prompt,
+                        &updater_system_prompt,
                         &updater_user_message,
-                        &form_spec,
+                        &completion,
+                        &err,
                         &soul,
                         &session_world,
                         user_text,
                         narrator_text,
-                        &conversation_id,
-                        assistant_message_id,
-                        vec![structured_step.clone()],
-                        err,
+                        None,
                     )
                     .await
+                    {
+                        Ok(outcome) => Ok(outcome),
+                        Err(retry_failure) => {
+                            if err.contains("malformed_schema_output") {
+                                run_failure_reasons.push("malformed_schema_output".into());
+                            }
+                            if err.contains("zero_ops_on_durable_turn") {
+                                run_failure_reasons.push("zero_ops_on_durable_turn".into());
+                            }
+                            run_failure_reasons.extend(retry_failure.retry_reasons.iter().cloned());
+                            run_failure_reasons
+                                .push("strict_tool_structured_validation_failed".into());
+                            pending_retry_failure = Some(retry_failure.clone());
+                            Err(retry_failure.final_error)
+                        }
+                    }
                 }
             },
             Err(err) => {
@@ -4222,23 +5604,8 @@ pub async fn run_structured_evaluator_diagnostic(
                         "structured_enforcement": structured_enforcement.map(StructuredEnforcement::as_label)
                     })),
                 );
-                diagnostic_form_fallback(
-                    &window,
-                    &provider,
-                    &settings,
-                    &fallback_form_system_prompt,
-                    &updater_user_message,
-                    &form_spec,
-                    &soul,
-                    &session_world,
-                    user_text,
-                    narrator_text,
-                    &conversation_id,
-                    assistant_message_id,
-                    vec![structured_step.clone()],
-                    err,
-                )
-                .await
+                run_failure_reasons.push("strict_tool_call_failed".into());
+                Err(err)
             }
         };
 
@@ -4247,17 +5614,19 @@ pub async fn run_structured_evaluator_diagnostic(
             Ok(outcome) => outcome,
             Err(err) => {
                 error = Some(err.clone());
-                evaluator_noop_after_all_fallbacks(
-                    vec![structured_step.clone()],
-                    "structured diagnostic evaluator call failed".into(),
-                    err,
-                )
+                let mut outcome =
+                    strict_tool_diagnostic_failed_outcome(vec![structured_step.clone()], err);
+                if let Some(retry_failure) = pending_retry_failure.as_ref() {
+                    apply_structured_retry_failure(&mut outcome, retry_failure);
+                }
+                outcome
             }
         };
         let durable_kind = durable_change_required(user_text, narrator_text);
         let mut patch = outcome.conversion.patch.clone();
         let pre_guarantee_counts = diagnostic_patch_counts(&patch);
-        if durable_kind == Some(DurableChangeKind::Object)
+        if error.is_none()
+            && durable_kind == Some(DurableChangeKind::Object)
             && pre_guarantee_counts.object_update_ops_count == 0
         {
             if outcome
@@ -4273,8 +5642,21 @@ pub async fn run_structured_evaluator_diagnostic(
             );
             outcome.conversion.patch = patch.clone();
         }
-        if durable_kind.is_some() && diagnostic_total_patch_ops(&patch) == 0 {
+        if error.is_none() && durable_kind.is_some() && diagnostic_total_patch_ops(&patch) == 0 {
             run_failure_reasons.push("zero_ops_on_durable_turn".into());
+        }
+        if outcome
+            .fallback_path
+            .iter()
+            .any(|step| step == EVALUATOR_MODE_FORM_V1)
+        {
+            run_failure_reasons.push("strict_tool_forbids_evaluator_form_v1_fallback".into());
+        }
+        if !outcome.structured_enforcement_validated {
+            run_failure_reasons.push("structured_enforcement_not_validated".into());
+        }
+        if structured_enforcement != Some(StructuredEnforcement::ToolCall) {
+            run_failure_reasons.push("tool_call_not_validated".into());
         }
         run_failure_reasons.sort();
         run_failure_reasons.dedup();
@@ -4326,7 +5708,17 @@ pub async fn run_structured_evaluator_diagnostic(
                 "structured_schema_validation_status": outcome.structured_schema_validation_status.as_str(),
                 "structured_schema_validation_error": outcome.structured_schema_validation_error.as_deref(),
                 "fallback_path": &outcome.fallback_path,
+                "fallback_used": outcome.fallback_path.iter().any(|step| step == EVALUATOR_MODE_FORM_V1),
                 "failure_reasons": &run_failure_reasons,
+                "tool_calls_present": completion_trace.tool_calls_present,
+                "tool_call_count": completion_trace.tool_call_count,
+                "tool_call_names": &completion_trace.tool_call_names,
+                "raw_content_present": completion_trace.raw_content_present,
+                "raw_tool_calls_present": completion_trace.raw_tool_calls_present,
+                "structured_retry_count": outcome.structured_retry_count,
+                "structured_retry_reasons": &outcome.structured_retry_reasons,
+                "structured_retry_succeeded": outcome.structured_retry_succeeded,
+                "structured_retry_final_error": outcome.structured_retry_final_error.as_deref(),
                 "ops_count": outcome.structured_ops_count.unwrap_or_else(|| diagnostic_total_patch_ops(&patch)),
                 "compiled_patch_summary": engine_patch_summary(&patch),
                 "syntactic_repair_used": outcome.syntactic_repair_used,
@@ -4377,6 +5769,15 @@ pub async fn run_structured_evaluator_diagnostic(
             scene_update_ops_count: patch_counts.scene_update_ops_count,
             state_patch_id: Some(state_patch_id),
             error,
+            tool_calls_present: completion_trace.tool_calls_present,
+            tool_call_count: completion_trace.tool_call_count,
+            tool_call_names: completion_trace.tool_call_names,
+            raw_content_present: completion_trace.raw_content_present,
+            raw_tool_calls_present: completion_trace.raw_tool_calls_present,
+            structured_retry_count: outcome.structured_retry_count,
+            structured_retry_reasons: outcome.structured_retry_reasons.clone(),
+            structured_retry_succeeded: outcome.structured_retry_succeeded,
+            structured_retry_final_error: outcome.structured_retry_final_error.clone(),
         });
     }
 
@@ -4416,6 +5817,38 @@ pub async fn run_structured_evaluator_diagnostic(
     }))
     .unwrap_or_default()
     .contains("default_player");
+    let default_player_in_relationship_context = default_player_relationship_context_seen;
+    let fallback_used = runs.iter().any(|run| {
+        run.fallback_path
+            .iter()
+            .any(|step| step == EVALUATOR_MODE_FORM_V1)
+    });
+    let failure_turns = runs
+        .iter()
+        .filter(|run| {
+            run.error.is_some()
+                || !run.failure_reasons.is_empty()
+                || !run.structured_enforcement_validated
+                || run.enforcement_level != StructuredEnforcement::ToolCall.as_label()
+                || run
+                    .fallback_path
+                    .iter()
+                    .any(|step| step == EVALUATOR_MODE_FORM_V1)
+        })
+        .map(|run| run.turn_index)
+        .collect::<Vec<_>>();
+    let strict_tool_passed = !fallback_used
+        && !default_player_in_relationship_context
+        && failure_turns.is_empty()
+        && runs.iter().all(|run| {
+            run.enforcement_level == StructuredEnforcement::ToolCall.as_label()
+                && run.structured_enforcement_requested
+                    == StructuredEnforcement::ToolCall.as_label()
+                && run.structured_enforcement_validated
+                && run.tool_calls_present
+                && run.tool_call_count > 0
+                && !run.syntactic_repair_used
+        });
     let mut summary = StructuredEvaluatorDiagnosticSummary {
         conversation_id: conversation_id.clone(),
         provider_profile_id: profile.id.clone(),
@@ -4427,6 +5860,10 @@ pub async fn run_structured_evaluator_diagnostic(
         structured_policy: structured_policy.clone(),
         structured_evaluator_policy: structured_policy,
         evaluator_mode: structured_mode_resolved,
+        strict_tool_diagnostic: true,
+        strict_tool_passed,
+        fallback_used,
+        failure_turns,
         structured_schema_version:
             state_engine::evaluator_structured::EVALUATOR_STRUCTURED_SCHEMA_VERSION,
         enforcement_levels: runs
@@ -4473,11 +5910,29 @@ pub async fn run_structured_evaluator_diagnostic(
         final_object_states,
         final_scene_participants,
         default_player_leaked_into_normal_rp_state,
+        default_player_in_relationship_context,
         payload_history_path,
         mne_checkpoint_path: mne_checkpoint.path.clone(),
         summary_json_path: String::new(),
         runs,
     };
+    if summary.fallback_used {
+        summary
+            .failure_reasons
+            .push("strict_tool_forbids_evaluator_form_v1_fallback".into());
+    }
+    if summary.default_player_in_relationship_context {
+        summary
+            .failure_reasons
+            .push("default_player_in_relationship_context".into());
+    }
+    if !summary.strict_tool_passed {
+        summary
+            .failure_reasons
+            .push("strict_tool_diagnostic_failed".into());
+    }
+    summary.failure_reasons.sort();
+    summary.failure_reasons.dedup();
     summary.summary_json_path = write_diagnostic_json_file(
         &app,
         &conversation_id,
@@ -4503,94 +5958,6 @@ pub async fn run_structured_evaluator_diagnostic(
     Ok(summary)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn diagnostic_form_fallback(
-    window: &Window,
-    provider: &ApiProvider,
-    settings: &ApiProviderSettings,
-    fallback_form_system_prompt: &str,
-    updater_user_message: &str,
-    form_spec: &EvalFormSpec,
-    soul: &Soul,
-    session_world: &SessionWorld,
-    user_text: &str,
-    narrator_text: &str,
-    conversation_id: &str,
-    assistant_message_id: i64,
-    prior_path: Vec<String>,
-    structured_failure: String,
-) -> Result<RuntimeEvaluatorOutcome, String> {
-    emit_dev_log(
-        window,
-        "warn",
-        "evaluator",
-        "structured_evaluator_fallback_to_form_started",
-        Some(serde_json::json!({
-            "conversation_id": conversation_id,
-            "assistant_message_id": assistant_message_id
-        })),
-    );
-    let (fallback_result, _fallback_raw) = complete_form_fallback_runtime(
-        provider,
-        settings,
-        fallback_form_system_prompt,
-        updater_user_message,
-        Some(form_spec.clone()),
-        soul,
-        session_world,
-        user_text,
-        narrator_text,
-        None,
-        prior_path.clone(),
-        structured_failure.clone(),
-    )
-    .await;
-    match fallback_result {
-        Ok(outcome) => {
-            emit_dev_log(
-                window,
-                "success",
-                "evaluator",
-                "structured_evaluator_fallback_to_form_succeeded",
-                Some(serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "assistant_message_id": assistant_message_id,
-                    "fallback_path": outcome.fallback_path
-                })),
-            );
-            Ok(outcome)
-        }
-        Err(form_err) => {
-            emit_dev_log(
-                window,
-                "error",
-                "evaluator",
-                "structured_evaluator_fallback_to_form_failed",
-                Some(serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "assistant_message_id": assistant_message_id,
-                    "error": form_err.as_str()
-                })),
-            );
-            emit_dev_log(
-                window,
-                "warn",
-                "evaluator",
-                "evaluator_noop_after_all_fallbacks",
-                Some(serde_json::json!({
-                    "conversation_id": conversation_id,
-                    "assistant_message_id": assistant_message_id
-                })),
-            );
-            Ok(evaluator_noop_after_all_fallbacks(
-                prior_path,
-                structured_failure,
-                form_err,
-            ))
-        }
-    }
-}
-
 fn diagnostic_structured_settings_from_profile(
     profile: &ProviderProfile,
     structured_policy: &str,
@@ -4601,13 +5968,18 @@ fn diagnostic_structured_settings_from_profile(
         model: profile.model.clone(),
         system_prompt: profile.system_prompt.clone(),
         narrator_timeout_ms: profile.narrator_timeout_ms,
-        evaluator_timeout_ms: profile.evaluator_timeout_ms,
-        evaluator_timeout_mode: profile.evaluator_timeout_mode.clone(),
+        evaluator_timeout_ms: Some(
+            profile
+                .evaluator_timeout_ms
+                .unwrap_or(DEFAULT_DIAGNOSTIC_EVALUATOR_TIMEOUT_MS),
+        ),
+        structured_evaluator_timeout_ms: Some(DEFAULT_DIAGNOSTIC_EVALUATOR_TIMEOUT_MS),
+        diagnostic_evaluator_timeout_ms: Some(DEFAULT_DIAGNOSTIC_EVALUATOR_TIMEOUT_MS),
+        evaluator_timeout_mode: Some("finite".into()),
         evaluator_mode: Some(EVALUATOR_MODE_STRUCTURED_V1.into()),
         structured_evaluator_policy: Some(structured_policy.to_string()),
-        // Auto: the diagnostic tries real tool-calling first, then degrades,
-        // and reports the achieved enforcement.
-        structured_evaluator_transport: None,
+        structured_evaluator_transport: Some("tool_call".into()),
+        structured_evaluator_max_retries: Some(1),
         wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn,
         allow_send_with_stale_state: profile.allow_send_with_stale_state,
         evaluator_background_enabled: Some(false),
@@ -7676,7 +9048,21 @@ pub async fn send_api_turn(
                     let _ = update_llm_payload_pipeline_trace(
                         &conn,
                         payload_log_id,
-                        &serde_json::json!({ "pipeline_trace": pipeline_trace }),
+                        &serde_json::json!({
+                            "pipeline_trace": pipeline_trace,
+                            "narrator_trace": {
+                                "request_id": request_id.as_str(),
+                                "turn_id": turn_trace.turn_id.as_deref(),
+                                "conversation_id": conversation_id.as_str(),
+                                "provider": format!("narrator_{}", context_mode.label()),
+                                "model": narrator_settings.model.trim(),
+                                "fallback_used": false,
+                                "fallback_reason": serde_json::Value::Null,
+                                "narrator_retry_count": 0,
+                                "narrator_retry_succeeded": false,
+                                "narrator_provider_error": err.as_str()
+                            }
+                        }),
                     );
                     db::update_llm_payload_log_response(
                         &conn,
@@ -7699,6 +9085,22 @@ pub async fn send_api_turn(
                     "error": err.clone()
                 })),
             );
+            if err
+                .to_ascii_lowercase()
+                .contains("did not include assistant content")
+            {
+                emit_dev_log(
+                    &window,
+                    "error",
+                    "narrator",
+                    "narrator_empty_stream",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "request_id": request_id.as_str(),
+                        "error": err.clone()
+                    })),
+                );
+            }
             return Err(err);
         }
     };
@@ -8626,6 +10028,9 @@ pub async fn send_api_turn(
             "response_integrity_ok": integrity_ok,
             "fallback_used": false,
             "fallback_reason": serde_json::Value::Null,
+            "narrator_retry_count": 0,
+            "narrator_retry_succeeded": serde_json::Value::Null,
+            "narrator_provider_error": serde_json::Value::Null,
             "anti_replay_triggered": debug_replay_detected,
             "anti_replay_retry_count": anti_replay_retry_count,
             "anti_replay_retry_suppressed_by_default": anti_replay_retry_suppressed_by_default,
@@ -9403,7 +10808,7 @@ pub async fn send_api_turn(
     let mut evaluator_pipeline_trace: serde_json::Value;
     let updater_result = match updater_response_result {
         Ok(updater_completion) => {
-            let updater_response = updater_completion.raw_text;
+            let updater_response = updater_completion.raw_text.clone();
             emit_dev_log(
                 &window,
                 "info",
@@ -9447,6 +10852,7 @@ pub async fn send_api_turn(
                 baseline_event_id.clone(),
             ) {
                 Ok(mut outcome) => {
+                    apply_completion_retry_trace(&mut outcome, &updater_completion.trace);
                     if let Some(comparison_trace) = dual_compare_deferred_trace(
                         &evaluator_mode,
                         parse_started.elapsed().as_millis(),
@@ -9486,75 +10892,119 @@ pub async fn send_api_turn(
                             "structured_enforcement": updater_completion.structured_enforcement.map(StructuredEnforcement::as_label)
                         })),
                     );
-                    emit_dev_log(
-                        &window,
-                        "warn",
-                        "evaluator",
-                        "structured_evaluator_fallback_to_form_started",
-                        Some(serde_json::json!({
-                            "conversation_id": conversation_id.as_str(),
-                            "assistant_message_id": assistant_message_id,
-                        })),
-                    );
-                    let (fallback_result, _fallback_raw) = complete_form_fallback_runtime(
+                    match retry_structured_tool_call_after_compile_failure(
                         &provider,
                         &state_updater_settings,
-                        fallback_form_system_prompt
-                            .as_deref()
-                            .unwrap_or(&updater_system_prompt),
+                        &updater_system_prompt,
                         &updater_user_message,
-                        form_spec.clone(),
+                        &updater_completion,
+                        &err,
                         &pre_baseline_soul,
                         &pre_baseline_session_world,
                         &snapshot_user_text,
                         &visible_response_for_updater,
                         baseline_event_id.clone(),
-                        vec![structured_step.to_string()],
-                        err.clone(),
                     )
-                    .await;
-                    match fallback_result {
-                        Ok(outcome) => {
-                            emit_dev_log(
-                                &window,
-                                "success",
-                                "evaluator",
-                                "structured_evaluator_fallback_to_form_succeeded",
-                                Some(serde_json::json!({
-                                    "conversation_id": conversation_id.as_str(),
-                                    "assistant_message_id": assistant_message_id,
-                                    "fallback_path": outcome.fallback_path
-                                })),
-                            );
+                    .await
+                    {
+                        Ok(mut outcome) => {
+                            if let Some(comparison_trace) = dual_compare_deferred_trace(
+                                &evaluator_mode,
+                                parse_started.elapsed().as_millis(),
+                                false,
+                            ) {
+                                outcome.comparison_trace = Some(comparison_trace);
+                            }
                             Ok(outcome)
                         }
-                        Err(form_err) => {
+                        Err(retry_failure) => {
                             emit_dev_log(
                                 &window,
-                                "error",
+                                "warn",
                                 "evaluator",
-                                "structured_evaluator_fallback_to_form_failed",
+                                "structured_evaluator_retry_failed",
                                 Some(serde_json::json!({
                                     "conversation_id": conversation_id.as_str(),
                                     "assistant_message_id": assistant_message_id,
-                                    "error": form_err.as_str()
+                                    "structured_retry_count": retry_failure.retry_count,
+                                    "structured_retry_reasons": &retry_failure.retry_reasons,
+                                    "structured_retry_final_error": retry_failure.final_error.as_str()
                                 })),
                             );
                             emit_dev_log(
                                 &window,
                                 "warn",
                                 "evaluator",
-                                "evaluator_noop_after_all_fallbacks",
+                                "structured_evaluator_fallback_to_form_started",
                                 Some(serde_json::json!({
                                     "conversation_id": conversation_id.as_str(),
                                     "assistant_message_id": assistant_message_id,
                                 })),
                             );
-                            Ok(evaluator_noop_after_all_fallbacks(
+                            let (fallback_result, _fallback_raw) = complete_form_fallback_runtime(
+                                &provider,
+                                &state_updater_settings,
+                                fallback_form_system_prompt
+                                    .as_deref()
+                                    .unwrap_or(&updater_system_prompt),
+                                &updater_user_message,
+                                form_spec.clone(),
+                                &pre_baseline_soul,
+                                &pre_baseline_session_world,
+                                &snapshot_user_text,
+                                &visible_response_for_updater,
+                                baseline_event_id.clone(),
                                 vec![structured_step.to_string()],
-                                err,
-                                form_err,
-                            ))
+                                retry_failure.final_error.clone(),
+                            )
+                            .await;
+                            match fallback_result {
+                                Ok(mut outcome) => {
+                                    apply_structured_retry_failure(&mut outcome, &retry_failure);
+                                    emit_dev_log(
+                                        &window,
+                                        "success",
+                                        "evaluator",
+                                        "structured_evaluator_fallback_to_form_succeeded",
+                                        Some(serde_json::json!({
+                                            "conversation_id": conversation_id.as_str(),
+                                            "assistant_message_id": assistant_message_id,
+                                            "fallback_path": outcome.fallback_path
+                                        })),
+                                    );
+                                    Ok(outcome)
+                                }
+                                Err(form_err) => {
+                                    emit_dev_log(
+                                        &window,
+                                        "error",
+                                        "evaluator",
+                                        "structured_evaluator_fallback_to_form_failed",
+                                        Some(serde_json::json!({
+                                            "conversation_id": conversation_id.as_str(),
+                                            "assistant_message_id": assistant_message_id,
+                                            "error": form_err.as_str()
+                                        })),
+                                    );
+                                    emit_dev_log(
+                                        &window,
+                                        "warn",
+                                        "evaluator",
+                                        "evaluator_noop_after_all_fallbacks",
+                                        Some(serde_json::json!({
+                                            "conversation_id": conversation_id.as_str(),
+                                            "assistant_message_id": assistant_message_id,
+                                        })),
+                                    );
+                                    let mut outcome = evaluator_noop_after_all_fallbacks(
+                                        vec![structured_step.to_string()],
+                                        retry_failure.final_error.clone(),
+                                        form_err,
+                                    );
+                                    apply_structured_retry_failure(&mut outcome, &retry_failure);
+                                    Ok(outcome)
+                                }
+                            }
                         }
                     }
                 }
@@ -12919,9 +14369,11 @@ fn levenshtein(left: &str, right: &str) -> usize {
 }
 
 fn build_entity_updater_context(soul: &Soul, context: &EntityTurnContext) -> String {
+    let include_operator = context.speaker.entity_id == "default_player";
     let active_entities = context
         .entities
         .iter()
+        .filter(|entity| include_operator || entity.entity_id != "default_player")
         .filter(|entity| entity.active_in_scene)
         .map(|entity| {
             format!(
@@ -12930,12 +14382,13 @@ fn build_entity_updater_context(soul: &Soul, context: &EntityTurnContext) -> Str
             )
         })
         .collect::<Vec<_>>();
-    let relationship_lines = context
+    let mut relationship_lines = context
         .entities
         .iter()
+        .filter(|entity| include_operator || entity.entity_id != "default_player")
         .filter(|entity| entity.kind != "soul")
         .filter_map(|entity| {
-            relationship_for_entity(soul, entity).map(|relationship| {
+            relationship_for_entity(soul, entity, include_operator).map(|relationship| {
                 format!(
                     "{} -> {} ({}): trust {:.0}, affection {:.0}, fear {:.0}, desire {:.0}, conflict {:.0}, curiosity {:.0}, comfort {:.0}, dependency {:.0}",
                     soul.character_name,
@@ -12953,6 +14406,8 @@ fn build_entity_updater_context(soul: &Soul, context: &EntityTurnContext) -> Str
             })
         })
         .collect::<Vec<_>>();
+    relationship_lines.sort();
+    relationship_lines.dedup();
 
     format!(
         "[ACTIVE ENTITIES]\n{}\n\n[LATEST SPEAKER ENTITY]\n{}\n\n[RELEVANT RELATIONSHIPS]\n{}",
@@ -12973,11 +14428,10 @@ fn build_entity_updater_context(soul: &Soul, context: &EntityTurnContext) -> Str
 fn relationship_for_entity<'a>(
     soul: &'a Soul,
     entity: &EntityRecord,
+    include_operator: bool,
 ) -> Option<&'a state_engine::soul::Relationship> {
     soul.relationships.get(&entity.entity_id).or_else(|| {
-        if entity.entity_id.eq_ignore_ascii_case("default_player")
-            || entity.kind.eq_ignore_ascii_case("player_persona")
-        {
+        if include_operator && entity.entity_id.eq_ignore_ascii_case("default_player") {
             soul.relationships
                 .get("default_player")
                 .or_else(|| soul.relationships.get("user"))
@@ -12985,6 +14439,26 @@ fn relationship_for_entity<'a>(
             None
         }
     })
+}
+
+fn default_player_in_evaluator_relationship_context(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    if !lower.contains("default_player") {
+        return false;
+    }
+    for marker in [
+        "[relevant relationships]",
+        "[current relationships]",
+        "relationship",
+    ] {
+        if let Some(start) = lower.find(marker) {
+            let section = &lower[start..lower.len().min(start + 4_000)];
+            if section.contains("default_player") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl SpeakerResolution {
@@ -13329,6 +14803,20 @@ struct RuntimeEvaluatorOutcome {
     structured_enforcement_validated: bool,
     structured_schema_validation_status: String,
     structured_schema_validation_error: Option<String>,
+    structured_retry_count: usize,
+    structured_retry_reasons: Vec<String>,
+    structured_retry_succeeded: Option<bool>,
+    structured_retry_final_error: Option<String>,
+    structured_retry_used_failed_args: bool,
+    structured_retry_repair_prompt_included_error: bool,
+    entity_aliases_resolved: Vec<String>,
+    entity_alias_resolution_warnings: Vec<String>,
+    structured_run_classification: String,
+    tool_calls_present: bool,
+    tool_call_count: usize,
+    tool_call_names: Vec<String>,
+    raw_content_present: bool,
+    raw_tool_calls_present: bool,
 }
 
 fn runtime_form_trace_json(outcome: &RuntimeEvaluatorOutcome) -> serde_json::Value {
@@ -13454,15 +14942,14 @@ fn structured_fallback_step(enforcement: Option<StructuredEnforcement>) -> &'sta
 }
 
 fn structured_validation_status_from_error(error: &str) -> &'static str {
-    if error.contains("malformed_schema_output") {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("malformed_schema_output") {
         "malformed_schema_output"
-    } else if error.contains("zero_ops_on_durable_turn") {
+    } else if lower.contains("zero_ops_on_durable_turn") {
         "zero_ops_on_durable_turn"
-    } else if error.contains("semantic validation failed") {
+    } else if lower.contains("semantic validation failed") {
         "semantic_validation_failed"
-    } else if error.to_ascii_lowercase().contains("timed out")
-        || error.to_ascii_lowercase().contains("timeout")
-    {
+    } else if lower.contains("timed out") || lower.contains("timeout") {
         "timeout"
     } else {
         "not_validated"
@@ -13479,7 +14966,26 @@ fn evaluator_runtime_fallback_json(outcome: &RuntimeEvaluatorOutcome) -> serde_j
         "structured_enforcement_requested": outcome.structured_enforcement_requested.as_deref().unwrap_or("none"),
         "structured_enforcement_validated": outcome.structured_enforcement_validated,
         "structured_schema_validation_status": outcome.structured_schema_validation_status.as_str(),
-        "structured_schema_validation_error": outcome.structured_schema_validation_error.as_deref()
+        "structured_schema_validation_error": outcome.structured_schema_validation_error.as_deref(),
+        "structured_retry_count": outcome.structured_retry_count,
+        "structured_retry_reasons": &outcome.structured_retry_reasons,
+        "structured_retry_succeeded": outcome.structured_retry_succeeded,
+        "structured_retry_final_error": outcome.structured_retry_final_error.as_deref(),
+        "structured_retry_used_failed_args": outcome.structured_retry_used_failed_args,
+        "structured_retry_repair_prompt_included_error": outcome.structured_retry_repair_prompt_included_error,
+        "entity_aliases_resolved": &outcome.entity_aliases_resolved,
+        "entity_alias_resolution_warnings": &outcome.entity_alias_resolution_warnings,
+        "structured_run_classification": outcome.structured_run_classification.as_str(),
+        "tool_calls_present": outcome.tool_calls_present,
+        "tool_call_count": outcome.tool_call_count,
+        "tool_call_names": &outcome.tool_call_names,
+        "raw_content_present": outcome.raw_content_present,
+        "raw_tool_calls_present": outcome.raw_tool_calls_present,
+        "structured_transport_requested": outcome.structured_enforcement_requested.as_deref().unwrap_or("none"),
+        "structured_transport_actual": outcome.structured_enforcement_requested.as_deref().unwrap_or("none"),
+        "strict_tool_diagnostic": false,
+        "strict_tool_passed": serde_json::Value::Null,
+        "fallback_used": outcome.fallback_path.iter().any(|step| step == EVALUATOR_MODE_FORM_V1 || step == "minimal_scene_patch")
     })
 }
 
@@ -13643,6 +15149,20 @@ fn compile_evaluator_form_runtime_strict(
         structured_enforcement_validated: false,
         structured_schema_validation_status: "not_applicable".into(),
         structured_schema_validation_error: None,
+        structured_retry_count: 0,
+        structured_retry_reasons: Vec::new(),
+        structured_retry_succeeded: None,
+        structured_retry_final_error: None,
+        structured_retry_used_failed_args: false,
+        structured_retry_repair_prompt_included_error: false,
+        entity_aliases_resolved: Vec::new(),
+        entity_alias_resolution_warnings: Vec::new(),
+        structured_run_classification: "tool_failed_form_fallback_success".into(),
+        tool_calls_present: false,
+        tool_call_count: 0,
+        tool_call_names: Vec::new(),
+        raw_content_present: false,
+        raw_tool_calls_present: false,
     })
 }
 
@@ -13697,6 +15217,79 @@ fn evaluator_noop_after_all_fallbacks(
         structured_schema_validation_error: Some(format!(
             "structured_failure={structured_failure}; form_failure={form_failure}"
         )),
+        structured_retry_count: 0,
+        structured_retry_reasons: Vec::new(),
+        structured_retry_succeeded: None,
+        structured_retry_final_error: None,
+        structured_retry_used_failed_args: false,
+        structured_retry_repair_prompt_included_error: false,
+        entity_aliases_resolved: Vec::new(),
+        entity_alias_resolution_warnings: Vec::new(),
+        structured_run_classification: "tool_failed_noop".into(),
+        tool_calls_present: false,
+        tool_call_count: 0,
+        tool_call_names: Vec::new(),
+        raw_content_present: false,
+        raw_tool_calls_present: false,
+    }
+}
+
+fn strict_tool_diagnostic_failed_outcome(
+    fallback_path: Vec<String>,
+    structured_failure: String,
+) -> RuntimeEvaluatorOutcome {
+    RuntimeEvaluatorOutcome {
+        output: EvaluatorOutputV1 {
+            schema_version: EVALUATOR_SCHEMA_VERSION,
+            no_op_reason: Some(format!(
+                "strict tool-call diagnostic failed without fallback: {structured_failure}"
+            )),
+            ..EvaluatorOutputV1::default()
+        },
+        draft: state_engine::evaluator_ingest::NormalizedEvaluationDraft {
+            warnings: vec!["strict tool-call diagnostic failed; fallback forbidden".to_string()],
+            ..Default::default()
+        },
+        normalized_json: "{}".into(),
+        normalized: false,
+        warnings: vec!["strict tool-call diagnostic failed; fallback forbidden".to_string()],
+        conversion: EvaluatorConversionReport {
+            patch: EnginePatch::default(),
+            no_op: true,
+            ..EvaluatorConversionReport::default()
+        },
+        form_spec: None,
+        form_trace: None,
+        form_rejected_rows: Vec::new(),
+        form_response_parse_status: None,
+        comparison_trace: None,
+        partial_success: false,
+        partial_success_reason: Some("strict tool-call diagnostic failed".into()),
+        fallback_path,
+        fallback_warning: None,
+        structured_ops_count: Some(0),
+        syntactic_repair_used: false,
+        structured_enforcement_requested: Some(StructuredEnforcement::ToolCall.as_label().into()),
+        structured_enforcement_validated: false,
+        structured_schema_validation_status: structured_validation_status_from_error(
+            &structured_failure,
+        )
+        .into(),
+        structured_schema_validation_error: Some(structured_failure),
+        structured_retry_count: 0,
+        structured_retry_reasons: Vec::new(),
+        structured_retry_succeeded: None,
+        structured_retry_final_error: None,
+        structured_retry_used_failed_args: false,
+        structured_retry_repair_prompt_included_error: false,
+        entity_aliases_resolved: Vec::new(),
+        entity_alias_resolution_warnings: Vec::new(),
+        structured_run_classification: "strict_failed".into(),
+        tool_calls_present: false,
+        tool_call_count: 0,
+        tool_call_names: Vec::new(),
+        raw_content_present: false,
+        raw_tool_calls_present: false,
     }
 }
 
@@ -13751,6 +15344,8 @@ fn compile_evaluator_structured_runtime(
     };
     let conversion = compile_evaluator_ops_to_engine_patch(&ops_output, &context, soul)
         .map_err(|err| format!("Structured evaluator semantic validation failed: {err}"))?;
+    let entity_aliases_resolved = conversion.entity_aliases_resolved.clone();
+    let entity_alias_resolution_warnings = conversion.entity_alias_resolution_warnings.clone();
     let normalized_json = serde_json::to_string(&ops_output)
         .map_err(|err| format!("Structured evaluator ops serialization failed: {err}"))?;
     Ok(RuntimeEvaluatorOutcome {
@@ -13775,6 +15370,20 @@ fn compile_evaluator_structured_runtime(
         structured_enforcement_validated: true,
         structured_schema_validation_status: "validated".into(),
         structured_schema_validation_error: None,
+        structured_retry_count: 0,
+        structured_retry_reasons: Vec::new(),
+        structured_retry_succeeded: None,
+        structured_retry_final_error: None,
+        structured_retry_used_failed_args: false,
+        structured_retry_repair_prompt_included_error: false,
+        entity_aliases_resolved,
+        entity_alias_resolution_warnings,
+        structured_run_classification: "pure_tool_success".into(),
+        tool_calls_present: false,
+        tool_call_count: 0,
+        tool_call_names: Vec::new(),
+        raw_content_present: false,
+        raw_tool_calls_present: false,
     })
 }
 
@@ -13807,6 +15416,8 @@ fn compile_evaluator_v1_runtime(
             baseline_recent_event_id,
         },
     );
+    let entity_aliases_resolved = conversion.entity_aliases_resolved.clone();
+    let entity_alias_resolution_warnings = conversion.entity_alias_resolution_warnings.clone();
     Ok(RuntimeEvaluatorOutcome {
         output,
         draft: evaluator_parse.draft,
@@ -13829,6 +15440,20 @@ fn compile_evaluator_v1_runtime(
         structured_enforcement_validated: false,
         structured_schema_validation_status: "not_applicable".into(),
         structured_schema_validation_error: None,
+        structured_retry_count: 0,
+        structured_retry_reasons: Vec::new(),
+        structured_retry_succeeded: None,
+        structured_retry_final_error: None,
+        structured_retry_used_failed_args: false,
+        structured_retry_repair_prompt_included_error: false,
+        entity_aliases_resolved,
+        entity_alias_resolution_warnings,
+        structured_run_classification: "tool_failed_form_fallback_success".into(),
+        tool_calls_present: false,
+        tool_call_count: 0,
+        tool_call_names: Vec::new(),
+        raw_content_present: false,
+        raw_tool_calls_present: false,
     })
 }
 
@@ -13894,6 +15519,8 @@ fn compile_evaluator_form_runtime(
         partial_success = true;
         partial_success_reason = fallback.partial_success_reason;
     }
+    let entity_aliases_resolved = conversion.entity_aliases_resolved.clone();
+    let entity_alias_resolution_warnings = conversion.entity_alias_resolution_warnings.clone();
     let normalized_json = serde_json::to_string(&compiled.output)
         .map_err(|err| format!("Evaluator form compiled output serialization failed: {err}"))?;
     Ok(RuntimeEvaluatorOutcome {
@@ -13929,6 +15556,20 @@ fn compile_evaluator_form_runtime(
         structured_enforcement_validated: false,
         structured_schema_validation_status: "not_applicable".into(),
         structured_schema_validation_error: None,
+        structured_retry_count: 0,
+        structured_retry_reasons: Vec::new(),
+        structured_retry_succeeded: None,
+        structured_retry_final_error: None,
+        structured_retry_used_failed_args: false,
+        structured_retry_repair_prompt_included_error: false,
+        entity_aliases_resolved,
+        entity_alias_resolution_warnings,
+        structured_run_classification: "tool_failed_form_fallback_success".into(),
+        tool_calls_present: false,
+        tool_call_count: 0,
+        tool_call_names: Vec::new(),
+        raw_content_present: false,
+        raw_tool_calls_present: false,
     })
 }
 
@@ -13992,6 +15633,8 @@ fn minimal_form_scene_runtime(
             baseline_recent_event_id,
         },
     );
+    let entity_aliases_resolved = conversion.entity_aliases_resolved.clone();
+    let entity_alias_resolution_warnings = conversion.entity_alias_resolution_warnings.clone();
     let normalized_json = serde_json::to_string(&output).unwrap_or_else(|_| "{}".into());
     let form_spec_event_option_count = spec.allowed_event_types.len();
     let form_existing_memory_option_count = spec.existing_memories.len();
@@ -14042,6 +15685,20 @@ fn minimal_form_scene_runtime(
         structured_enforcement_validated: false,
         structured_schema_validation_status: "not_applicable".into(),
         structured_schema_validation_error: None,
+        structured_retry_count: 0,
+        structured_retry_reasons: Vec::new(),
+        structured_retry_succeeded: None,
+        structured_retry_final_error: None,
+        structured_retry_used_failed_args: false,
+        structured_retry_repair_prompt_included_error: false,
+        entity_aliases_resolved,
+        entity_alias_resolution_warnings,
+        structured_run_classification: "tool_failed_form_fallback_success".into(),
+        tool_calls_present: false,
+        tool_call_count: 0,
+        tool_call_names: Vec::new(),
+        raw_content_present: false,
+        raw_tool_calls_present: false,
     }
 }
 
@@ -14346,9 +16003,15 @@ fn effective_evaluator_timeout_ms(settings: &ApiProviderSettings) -> Option<u64>
     } else {
         Some(
             settings
-                .evaluator_timeout_ms
+                .diagnostic_evaluator_timeout_ms
                 .filter(|value| *value > 0)
-                .unwrap_or(DEFAULT_EVALUATOR_TIMEOUT_MS),
+                .or_else(|| {
+                    settings
+                        .structured_evaluator_timeout_ms
+                        .filter(|value| *value > 0)
+                })
+                .or_else(|| settings.evaluator_timeout_ms.filter(|value| *value > 0))
+                .unwrap_or(DEFAULT_STRUCTURED_EVALUATOR_TIMEOUT_MS),
         )
     }
 }
@@ -14386,6 +16049,15 @@ struct EvaluatorCompletion {
     raw_text: String,
     structured_enforcement: Option<StructuredEnforcement>,
     token_usage: Option<TokenUsage>,
+    trace: StructuredCompletionTrace,
+}
+
+#[derive(Debug, Clone)]
+struct StructuredRetryFailure {
+    final_error: String,
+    retry_count: usize,
+    retry_reasons: Vec<String>,
+    first_trace: StructuredCompletionTrace,
 }
 
 async fn complete_evaluator_with_config(
@@ -14412,6 +16084,7 @@ async fn complete_evaluator_with_config(
             raw_text: completion.raw_text,
             structured_enforcement: Some(completion.enforcement),
             token_usage: completion.token_usage,
+            trace: completion.trace,
         });
     }
     let completion = provider
@@ -14421,7 +16094,165 @@ async fn complete_evaluator_with_config(
         raw_text: completion.raw_text,
         structured_enforcement: None,
         token_usage: completion.token_usage,
+        trace: completion.trace,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn retry_structured_tool_call_after_compile_failure(
+    provider: &ApiProvider,
+    settings: &ApiProviderSettings,
+    system_prompt: &str,
+    user_message: &str,
+    completion: &EvaluatorCompletion,
+    first_error: &str,
+    soul: &Soul,
+    session_world: &SessionWorld,
+    latest_user_message: &str,
+    latest_narrator_response: &str,
+    baseline_recent_event_id: Option<String>,
+) -> Result<RuntimeEvaluatorOutcome, StructuredRetryFailure> {
+    if completion.structured_enforcement != Some(StructuredEnforcement::ToolCall)
+        || structured_evaluator_max_retries(settings) == 0
+    {
+        return Err(StructuredRetryFailure {
+            final_error: first_error.to_string(),
+            retry_count: 0,
+            retry_reasons: Vec::new(),
+            first_trace: completion.trace.clone(),
+        });
+    }
+
+    let reason = structured_failure_kind(first_error).to_string();
+    let retry_user_message =
+        structured_tool_retry_user_message(user_message, Some(&completion.raw_text), first_error);
+    let timeout = effective_evaluator_timeout_ms(settings).map(Duration::from_millis);
+    let schema = evaluator_ops_json_schema();
+    let retry_completion = provider
+        .complete_structured_tool_call_prompt(
+            settings,
+            system_prompt,
+            &retry_user_message,
+            0.0,
+            timeout,
+            EVALUATOR_OPS_SCHEMA_NAME,
+            &schema,
+        )
+        .await
+        .map_err(|retry_error| StructuredRetryFailure {
+            final_error: retry_error,
+            retry_count: 1,
+            retry_reasons: vec![reason.clone()],
+            first_trace: completion.trace.clone(),
+        })?;
+
+    match compile_evaluator_structured_runtime(
+        &retry_completion.raw_text,
+        Some(StructuredEnforcement::ToolCall),
+        soul,
+        session_world,
+        latest_user_message,
+        latest_narrator_response,
+        baseline_recent_event_id,
+    ) {
+        Ok(mut outcome) => {
+            apply_completion_retry_trace(&mut outcome, &retry_completion.trace);
+            outcome.fallback_path = vec![
+                "structured_tool_call".to_string(),
+                "structured_tool_call_retry".to_string(),
+            ];
+            outcome.structured_retry_count = 1;
+            outcome.structured_retry_reasons = vec![reason];
+            outcome.structured_retry_succeeded = Some(true);
+            outcome.structured_retry_final_error = None;
+            outcome.structured_retry_used_failed_args = true;
+            outcome.structured_retry_repair_prompt_included_error = true;
+            outcome.structured_run_classification = "tool_retry_success".into();
+            Ok(outcome)
+        }
+        Err(retry_error) => Err(StructuredRetryFailure {
+            final_error: retry_error,
+            retry_count: 1,
+            retry_reasons: vec![reason],
+            first_trace: completion.trace.clone(),
+        }),
+    }
+}
+
+fn apply_structured_retry_failure(
+    outcome: &mut RuntimeEvaluatorOutcome,
+    retry_failure: &StructuredRetryFailure,
+) {
+    outcome.tool_calls_present = retry_failure.first_trace.tool_calls_present;
+    outcome.tool_call_count = retry_failure.first_trace.tool_call_count;
+    outcome.tool_call_names = retry_failure.first_trace.tool_call_names.clone();
+    outcome.raw_content_present = retry_failure.first_trace.raw_content_present;
+    outcome.raw_tool_calls_present = retry_failure.first_trace.raw_tool_calls_present;
+    if retry_failure.retry_count > 0 {
+        outcome.structured_retry_count = retry_failure.retry_count;
+        outcome.structured_retry_reasons = retry_failure.retry_reasons.clone();
+        outcome.structured_retry_succeeded = Some(false);
+        outcome.structured_retry_final_error = Some(retry_failure.final_error.clone());
+        outcome.structured_retry_used_failed_args = true;
+        outcome.structured_retry_repair_prompt_included_error = true;
+    }
+}
+
+fn apply_completion_retry_trace(
+    outcome: &mut RuntimeEvaluatorOutcome,
+    trace: &StructuredCompletionTrace,
+) {
+    outcome.tool_calls_present = trace.tool_calls_present;
+    outcome.tool_call_count = trace.tool_call_count;
+    outcome.tool_call_names = trace.tool_call_names.clone();
+    outcome.raw_content_present = trace.raw_content_present;
+    outcome.raw_tool_calls_present = trace.raw_tool_calls_present;
+    if trace.structured_retry_count > 0 {
+        outcome.structured_retry_count = trace.structured_retry_count;
+        outcome.structured_retry_reasons = trace.structured_retry_reasons.clone();
+        outcome.structured_retry_succeeded = trace.structured_retry_succeeded;
+        outcome.structured_retry_final_error = trace.structured_retry_final_error.clone();
+        outcome.structured_retry_used_failed_args = trace.structured_retry_used_failed_args;
+        outcome.structured_retry_repair_prompt_included_error =
+            trace.structured_retry_repair_prompt_included_error;
+        if trace.structured_retry_succeeded == Some(true)
+            && outcome.fallback_path == ["structured_tool_call".to_string()]
+        {
+            outcome
+                .fallback_path
+                .push("structured_tool_call_retry".to_string());
+            outcome.structured_run_classification = "tool_retry_success".into();
+        }
+    }
+}
+
+fn structured_failure_kind(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("evidence quote") || lower.contains("evidence_quote") {
+        "evidence_quote_invalid"
+    } else if lower.contains("semantic validation failed") {
+        "semantic_validation_failed"
+    } else if lower.contains("unknown field")
+        || lower.contains("missing field")
+        || lower.contains("invalid type")
+        || lower.contains("unknown variant")
+        || lower.contains("expected")
+    {
+        "schema_validation_failed"
+    } else if lower.contains("malformed_schema_output")
+        || lower.contains("parse failed")
+        || lower.contains("failed strict parse")
+    {
+        "schema_parse_failed"
+    } else if lower.contains("no tool_calls") {
+        "no_tool_calls"
+    } else if lower.contains("content only") {
+        "content_only_response"
+    } else {
+        "semantic_validation_failed"
+    }
 }
 
 /// Fill the evaluator side of the trace's token accounting, falling back to
@@ -15123,7 +16954,10 @@ async fn run_background_evaluator_job(
                 &visible_response_for_updater,
                 baseline_recent_event_id.clone(),
             ) {
-                Ok(output) => Ok(output),
+                Ok(mut output) => {
+                    apply_completion_retry_trace(&mut output, &completion.trace);
+                    Ok(output)
+                }
                 Err(err) if selected_evaluator_source == EVALUATOR_MODE_STRUCTURED_V1 => {
                     if completion.structured_enforcement == Some(StructuredEnforcement::JsonSchema)
                     {
@@ -15155,79 +16989,115 @@ async fn run_background_evaluator_job(
                             "structured_enforcement": completion.structured_enforcement.map(StructuredEnforcement::as_label)
                         })),
                     );
-                    emit_dev_log(
-                        &window,
-                        "warn",
-                        "evaluator",
-                        "structured_evaluator_fallback_to_form_started",
-                        Some(serde_json::json!({
-                            "conversation_id": job.conversation_id.as_str(),
-                            "assistant_message_id": job.assistant_message_id,
-                            "evaluator_job_id": job.evaluator_job_id.as_str()
-                        })),
-                    );
-                    let (fallback_result, _fallback_raw) = complete_form_fallback_runtime(
+                    match retry_structured_tool_call_after_compile_failure(
                         &provider,
                         &state_updater_settings,
-                        fallback_form_system_prompt
-                            .as_deref()
-                            .unwrap_or(&updater_system_prompt),
+                        &updater_system_prompt,
                         &updater_user_message,
-                        form_spec.clone(),
+                        &completion,
+                        &err,
                         &soul,
                         &session_world,
                         &snapshot_user_text,
                         &visible_response_for_updater,
                         baseline_recent_event_id.clone(),
-                        vec![structured_step.to_string()],
-                        err.clone(),
                     )
-                    .await;
-                    match fallback_result {
-                        Ok(outcome) => {
+                    .await
+                    {
+                        Ok(outcome) => Ok(outcome),
+                        Err(retry_failure) => {
                             emit_dev_log(
                                 &window,
-                                "success",
+                                "warn",
                                 "evaluator",
-                                "structured_evaluator_fallback_to_form_succeeded",
+                                "structured_evaluator_retry_failed",
                                 Some(serde_json::json!({
                                     "conversation_id": job.conversation_id.as_str(),
                                     "assistant_message_id": job.assistant_message_id,
                                     "evaluator_job_id": job.evaluator_job_id.as_str(),
-                                    "fallback_path": outcome.fallback_path
-                                })),
-                            );
-                            Ok(outcome)
-                        }
-                        Err(form_err) => {
-                            emit_dev_log(
-                                &window,
-                                "error",
-                                "evaluator",
-                                "structured_evaluator_fallback_to_form_failed",
-                                Some(serde_json::json!({
-                                    "conversation_id": job.conversation_id.as_str(),
-                                    "assistant_message_id": job.assistant_message_id,
-                                    "evaluator_job_id": job.evaluator_job_id.as_str(),
-                                    "error": form_err.as_str()
+                                    "structured_retry_count": retry_failure.retry_count,
+                                    "structured_retry_reasons": &retry_failure.retry_reasons,
+                                    "structured_retry_final_error": retry_failure.final_error.as_str()
                                 })),
                             );
                             emit_dev_log(
                                 &window,
                                 "warn",
                                 "evaluator",
-                                "evaluator_noop_after_all_fallbacks",
+                                "structured_evaluator_fallback_to_form_started",
                                 Some(serde_json::json!({
                                     "conversation_id": job.conversation_id.as_str(),
                                     "assistant_message_id": job.assistant_message_id,
                                     "evaluator_job_id": job.evaluator_job_id.as_str()
                                 })),
                             );
-                            Ok(evaluator_noop_after_all_fallbacks(
+                            let (fallback_result, _fallback_raw) = complete_form_fallback_runtime(
+                                &provider,
+                                &state_updater_settings,
+                                fallback_form_system_prompt
+                                    .as_deref()
+                                    .unwrap_or(&updater_system_prompt),
+                                &updater_user_message,
+                                form_spec.clone(),
+                                &soul,
+                                &session_world,
+                                &snapshot_user_text,
+                                &visible_response_for_updater,
+                                baseline_recent_event_id.clone(),
                                 vec![structured_step.to_string()],
-                                err,
-                                form_err,
-                            ))
+                                retry_failure.final_error.clone(),
+                            )
+                            .await;
+                            match fallback_result {
+                                Ok(mut outcome) => {
+                                    apply_structured_retry_failure(&mut outcome, &retry_failure);
+                                    emit_dev_log(
+                                        &window,
+                                        "success",
+                                        "evaluator",
+                                        "structured_evaluator_fallback_to_form_succeeded",
+                                        Some(serde_json::json!({
+                                            "conversation_id": job.conversation_id.as_str(),
+                                            "assistant_message_id": job.assistant_message_id,
+                                            "evaluator_job_id": job.evaluator_job_id.as_str(),
+                                            "fallback_path": outcome.fallback_path
+                                        })),
+                                    );
+                                    Ok(outcome)
+                                }
+                                Err(form_err) => {
+                                    emit_dev_log(
+                                        &window,
+                                        "error",
+                                        "evaluator",
+                                        "structured_evaluator_fallback_to_form_failed",
+                                        Some(serde_json::json!({
+                                            "conversation_id": job.conversation_id.as_str(),
+                                            "assistant_message_id": job.assistant_message_id,
+                                            "evaluator_job_id": job.evaluator_job_id.as_str(),
+                                            "error": form_err.as_str()
+                                        })),
+                                    );
+                                    emit_dev_log(
+                                        &window,
+                                        "warn",
+                                        "evaluator",
+                                        "evaluator_noop_after_all_fallbacks",
+                                        Some(serde_json::json!({
+                                            "conversation_id": job.conversation_id.as_str(),
+                                            "assistant_message_id": job.assistant_message_id,
+                                            "evaluator_job_id": job.evaluator_job_id.as_str()
+                                        })),
+                                    );
+                                    let mut outcome = evaluator_noop_after_all_fallbacks(
+                                        vec![structured_step.to_string()],
+                                        retry_failure.final_error.clone(),
+                                        form_err,
+                                    );
+                                    apply_structured_retry_failure(&mut outcome, &retry_failure);
+                                    Ok(outcome)
+                                }
+                            }
                         }
                     }
                 }
@@ -16406,6 +18276,8 @@ fn evaluator_converter_trace_json(
         "relationship_patch_count": relationship_patch_count,
         "object_patch_count": object_patch_count,
         "scene_state_patch_present": world_patch.and_then(|patch| patch.scene_state.as_ref()).is_some(),
+        "entity_aliases_resolved": &conversion.entity_aliases_resolved,
+        "entity_alias_resolution_warnings": &conversion.entity_alias_resolution_warnings,
         "conversion_warnings": conversion.rejected_candidates.iter().map(|rejection| {
             serde_json::json!({
                 "candidate_id": rejection.candidate_id,
@@ -18512,6 +20384,30 @@ mod tests {
     use crate::pipeline_trace::PipelineStageTrace;
 
     #[test]
+    fn transient_provider_errors_are_retryable() {
+        assert!(is_transient_provider_error(
+            "API provider returned an error in a 200 OK body: Provider returned error"
+        ));
+        assert!(is_transient_provider_error("API request failed with 429: rate limited"));
+        assert!(is_transient_provider_error("API request failed with 503: upstream"));
+        assert!(is_transient_provider_error("request timed out"));
+        assert!(is_transient_provider_error("API request failed: connection reset"));
+        assert!(is_transient_provider_error("API stream failed: body truncated"));
+        // Shape problems are NOT transient — they must surface for diagnosis.
+        assert!(!is_transient_provider_error(
+            "API response parse failed: no assistant content found; raw body: {…}"
+        ));
+        assert!(!is_transient_provider_error(
+            "API response did not include assistant content"
+        ));
+        assert!(!is_transient_provider_error("API key is required for API provider mode"));
+        // 4xx (auth/bad request) share the "API request failed with" prefix but
+        // must NOT be retried.
+        assert!(!is_transient_provider_error("API request failed with 401: invalid key"));
+        assert!(!is_transient_provider_error("API request failed with 400: bad request"));
+    }
+
+    #[test]
     fn test_is_body_only_markers() {
         assert_eq!(is_body_only_markers(""), true);
         assert_eq!(is_body_only_markers("   "), true);
@@ -18623,6 +20519,153 @@ mod tests {
         let logs = db::list_llm_payload_logs(conn, conversation_id).expect("logs");
         let log = logs.last().expect("latest log");
         serde_json::from_str(log.pipeline_trace_json.as_deref().expect("trace")).expect("json")
+    }
+
+    fn benchmark_summary_fixture() -> BenchmarkSummary {
+        BenchmarkSummary {
+            benchmark_id: "bench-test".into(),
+            benchmark_type: "scripted_visible_replay".into(),
+            conversation_id: "benchmark-test".into(),
+            started_at: 1,
+            completed_at: 2,
+            turn_count_requested: 2,
+            turn_count_completed: 2,
+            narrator_model: "narrator-model".into(),
+            evaluator_model: "evaluator-model".into(),
+            player_simulator_model: None,
+            narrator_failures: 0,
+            evaluator_failures: 0,
+            tool_call_success_count: 2,
+            tool_call_failure_count: 0,
+            retry_count: 0,
+            retry_success_count: 0,
+            fallback_count: 0,
+            syntactic_repair_count: 0,
+            default_player_leak_detected: false,
+            duplicate_relationship_context_detected: false,
+            final_memory_count: 3,
+            final_object_state_count: 1,
+            final_relationship_count: 1,
+            per_turn: Vec::new(),
+            object_identity_checks: vec![BenchmarkObjectIdentityCheck {
+                label: "wet jacket".into(),
+                expected_object_id: "preset_male_jacket_1".into(),
+                found: true,
+            }],
+            mne_export_path: Some("benchmark.mne".into()),
+            payload_history_path: Some("payload.md".into()),
+            summary_json_path: Some("summary.json".into()),
+            scorecard: BenchmarkScorecard {
+                visible_chat_messages_created: true,
+                normal_pipeline_used: true,
+                turn_count_requested: 2,
+                turn_count_completed: 2,
+                player_simulator_calls: 0,
+                narrator_calls: 2,
+                evaluator_calls: 2,
+                evaluator_waited_each_turn: true,
+                memory_updated: true,
+                object_state_updated: true,
+                relationship_updated: true,
+                payload_history_export_succeeded: true,
+                narrator_visible_response_each_turn: true,
+                evaluator_used_tool_call_where_required: true,
+                no_evaluator_form_v1_fallback_in_strict_mode: true,
+                syntactic_repair_unused_in_strict_mode: true,
+                memories_increased_over_time: true,
+                active_player_relationship_changed_when_warranted: true,
+                object_ids_stable: true,
+                default_player_not_normal_rp_relationship_target: true,
+                mne_export_succeeded: true,
+                pass: true,
+                failure_reasons: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn scripted_benchmark_runs_fixed_messages() {
+        let turns = benchmark_scripted_turns();
+
+        assert!(turns.len() >= 5);
+        assert_eq!(
+            turns[0],
+            "I step inside, leaving my wet jacket near the door."
+        );
+        assert!(turns.iter().any(|turn| turn.contains("jacket")));
+    }
+
+    #[test]
+    fn self_play_benchmark_requires_player_simulator_profile() {
+        assert!(!benchmark_requires_player_profile(
+            &BenchmarkType::ScriptedVisibleReplay
+        ));
+        assert!(benchmark_requires_player_profile(
+            &BenchmarkType::VisibleAiChat
+        ));
+        assert!(benchmark_requires_player_profile(
+            &BenchmarkType::MultiAgentVisibleChat
+        ));
+    }
+
+    #[test]
+    fn player_simulator_prompt_keeps_control_on_user_side() {
+        let prompt = benchmark_player_simulator_prompt();
+
+        assert!(prompt.contains("You control only the active player persona"));
+        assert!(prompt.contains("Write only the next user message"));
+        assert!(prompt.contains("You are not the narrator"));
+        assert!(prompt.contains("backend JSON"));
+    }
+
+    #[test]
+    fn strict_benchmark_fails_on_form_fallback() {
+        let mut summary = benchmark_summary_fixture();
+        summary.fallback_count = 1;
+
+        let scorecard = benchmark_scorecard(&summary, true, 1, 0, 0);
+
+        assert!(!scorecard.pass);
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"no_evaluator_form_v1_fallback_in_strict_mode".to_string()));
+    }
+
+    #[test]
+    fn strict_benchmark_fails_without_tool_call_successes() {
+        let mut summary = benchmark_summary_fixture();
+        summary.tool_call_success_count = 0;
+
+        let scorecard = benchmark_scorecard(&summary, true, 1, 0, 0);
+
+        assert!(!scorecard.pass);
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"evaluator_used_tool_call_where_required".to_string()));
+    }
+
+    #[test]
+    fn evaluator_not_called_if_narrator_fails_scorecard() {
+        let mut summary = benchmark_summary_fixture();
+        summary.narrator_failures = 1;
+        summary.turn_count_completed = 0;
+        summary.tool_call_success_count = 0;
+        summary.evaluator_failures = 0;
+
+        let scorecard = benchmark_scorecard(&summary, false, 1, 0, 0);
+
+        assert!(!scorecard.pass);
+        assert!(!scorecard.narrator_visible_response_each_turn);
+        assert_eq!(summary.evaluator_failures, 0);
+    }
+
+    #[test]
+    fn benchmark_summary_reports_export_artifact_paths() {
+        let summary = benchmark_summary_fixture();
+
+        assert_eq!(summary.payload_history_path.as_deref(), Some("payload.md"));
+        assert_eq!(summary.mne_export_path.as_deref(), Some("benchmark.mne"));
+        assert_eq!(summary.summary_json_path.as_deref(), Some("summary.json"));
     }
 
     fn assert_command_trace_skips_rp(trace: &serde_json::Value) {
@@ -20062,6 +22105,60 @@ mod tests {
     }
 
     #[test]
+    fn normal_rp_entity_context_uses_active_player_not_default_player_relationship() {
+        let conn = db::init_memory_connection().expect("db");
+        let mut soul = new_default_soul("Aurora");
+        let mut default_relationship = soul.relationships["user"].clone();
+        default_relationship.trust = 11.0;
+        soul.relationships
+            .insert("default_player".into(), default_relationship);
+        let mut player_relationship = soul.relationships["user"].clone();
+        player_relationship.trust = 64.0;
+        soul.relationships
+            .insert("preset_male".into(), player_relationship);
+        db::upsert_soul(&conn, &soul).expect("upsert");
+        db::ensure_conversation(&conn, "normal-rp-context", &soul.character_id)
+            .expect("conversation");
+
+        let context =
+            resolve_speaker_for_turn(&conn, "normal-rp-context", &soul, "I wait at the doorway.")
+                .expect("resolve");
+        let entity_context = build_entity_updater_context(&soul, &context);
+
+        assert!(entity_context.contains("[RELEVANT RELATIONSHIPS]"));
+        assert!(entity_context.contains("Aurora -> Male Persona (preset_male)"));
+        assert!(!entity_context.contains("Aurora -> User (default_player)"));
+        assert_eq!(
+            entity_context
+                .matches("Aurora -> Male Persona (preset_male)")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ooc_entity_context_may_include_operator_relationship() {
+        let conn = db::init_memory_connection().expect("db");
+        let mut soul = new_default_soul("Aurora");
+        soul.relationships
+            .insert("default_player".into(), soul.relationships["user"].clone());
+        db::upsert_soul(&conn, &soul).expect("upsert");
+        db::ensure_conversation(&conn, "ooc-context", &soul.character_id).expect("conversation");
+
+        let context = resolve_speaker_for_turn(
+            &conn,
+            "ooc-context",
+            &soul,
+            "OOC: please summarize the current state.",
+        )
+        .expect("resolve");
+        let entity_context = build_entity_updater_context(&soul, &context);
+
+        assert!(entity_context.contains("default_player"));
+        assert!(entity_context.contains("Aurora -> User (default_player)"));
+    }
+
+    #[test]
     fn hidden_state_application_updates_soul() {
         let mut soul = new_default_soul("Aurora");
         let state = HiddenState {
@@ -20662,6 +22759,7 @@ mod tests {
             message_count: 1,
             archived_at: None,
             active_evaluator_profile_id: None,
+            is_benchmark: false,
         };
         let messages = vec![ChatMessage {
             id: 1,
@@ -21746,6 +23844,50 @@ mod tests {
     }
 
     #[test]
+    fn payload_history_exports_structured_tool_trace_fields() {
+        let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
+            "evaluator_trace": {
+                "tool_calls_present": true,
+                "tool_call_count": 1,
+                "tool_call_names": ["submit_evaluator_ops"],
+                "raw_content_present": false,
+                "raw_tool_calls_present": true,
+                "structured_transport_requested": "tool_call",
+                "structured_transport_actual": "tool_call",
+                "strict_tool_diagnostic": false,
+                "strict_tool_passed": null,
+                "fallback_used": false,
+                "default_player_in_relationship_context": false,
+                "structured_retry_count": 1,
+                "structured_retry_used_failed_args": true,
+                "structured_retry_repair_prompt_included_error": true,
+                "entity_aliases_resolved": ["op:0:add_memory.owner_soul_id:active_soul->aurora"],
+                "structured_run_classification": "tool_retry_success"
+            }
+        }))]);
+
+        for expected in [
+            "tool_calls_present",
+            "tool_call_count",
+            "tool_call_names",
+            "raw_content_present",
+            "raw_tool_calls_present",
+            "structured_transport_requested",
+            "structured_transport_actual",
+            "strict_tool_diagnostic",
+            "strict_tool_passed",
+            "fallback_used",
+            "default_player_in_relationship_context",
+            "structured_retry_used_failed_args",
+            "structured_retry_repair_prompt_included_error",
+            "entity_aliases_resolved",
+            "structured_run_classification",
+        ] {
+            assert!(exported.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
     fn payload_export_includes_candidate_accept_reject_trace() {
         let exported = render_llm_payload_history(&[payload_trace_log(serde_json::json!({
             "evaluator_candidate_trace": [
@@ -22421,6 +24563,13 @@ mod tests {
                 ..Default::default()
             },
         );
+        soul.relationships.insert(
+            "preset_male".into(),
+            state_engine::soul::Relationship {
+                trust: 44.0,
+                ..Default::default()
+            },
+        );
 
         let prompt = build_structured_evaluator_prompt_with_player_persona(
             &soul,
@@ -22430,7 +24579,15 @@ mod tests {
         );
 
         assert!(prompt.contains("Latest normal RP speaker entity_id: preset_male"));
+        assert!(prompt.contains("active_soul, active_player, latest_speaker, session_world"));
         assert!(prompt.contains("\"target_entity_id\": \"preset_male\""));
+        assert_eq!(
+            prompt
+                .matches("\"target_entity_id\": \"preset_male\"")
+                .count(),
+            1
+        );
+        assert!(prompt.contains("\"trust\": 44.0"));
         assert!(!prompt.contains("default_player"));
     }
 
@@ -22942,6 +25099,19 @@ mod tests {
             settings.structured_evaluator_policy.as_deref(),
             Some("required")
         );
+        assert_eq!(
+            settings.structured_evaluator_transport.as_deref(),
+            Some("tool_call")
+        );
+        assert_eq!(
+            settings.evaluator_timeout_ms,
+            Some(DEFAULT_DIAGNOSTIC_EVALUATOR_TIMEOUT_MS)
+        );
+        assert_eq!(
+            settings.diagnostic_evaluator_timeout_ms,
+            Some(DEFAULT_DIAGNOSTIC_EVALUATOR_TIMEOUT_MS)
+        );
+        assert_eq!(settings.evaluator_timeout_mode.as_deref(), Some("finite"));
         assert_eq!(settings.evaluator_background_enabled, Some(false));
     }
 
@@ -22949,6 +25119,9 @@ mod tests {
     fn frontend_settings_surface_structured_evaluator_controls() {
         let source = include_str!("../../src/App.tsx");
         assert!(source.contains("Evaluator Mode"));
+        assert!(source.contains("Narrator Style"));
+        assert!(source.contains("Active Director"));
+        assert!(source.contains("GM Simulation"));
         assert!(source.contains("Legacy Form Evaluator"));
         assert!(source.contains("Structured Ops Evaluator"));
         assert!(source.contains("Structured Evaluator Policy"));
@@ -22957,6 +25130,25 @@ mod tests {
         assert!(source.contains(
             "structured_evaluator_policy: stateUpdaterSettings.structured_evaluator_policy"
         ));
+    }
+
+    #[test]
+    fn frontend_dev_console_whitelists_run_benchmark() {
+        let source = include_str!("../../src/App.tsx");
+        assert!(source.contains("| \"run_benchmark\""));
+        assert!(source.contains("name: \"run_benchmark\""));
+        assert!(source.contains("label: \"Run Benchmark\""));
+        assert!(source.contains("case \"run_benchmark\""));
+        assert!(source.contains("runBenchmark("));
+    }
+
+    #[test]
+    fn frontend_start_chat_persona_list_requires_confirm() {
+        let source = include_str!("../../src/App.tsx");
+        assert!(source.contains("personaListConfirmRequired"));
+        assert!(source.contains("openPersonaList(nextConversationId, true)"));
+        assert!(source.contains("Confirm Persona"));
+        assert!(source.contains("handleConfirmPersonaList"));
     }
 
     #[test]
@@ -23021,6 +25213,233 @@ mod tests {
             vec!["structured_json_schema", EVALUATOR_MODE_FORM_V1]
         );
         assert!(fallback.fallback_warning.is_some());
+    }
+
+    #[test]
+    fn strict_tool_diagnostic_failure_does_not_use_form_fallback() {
+        let outcome = strict_tool_diagnostic_failed_outcome(
+            vec!["structured_tool_call".into()],
+            "malformed_schema_output: unknown field `confidence`".into(),
+        );
+
+        assert!(outcome.conversion.patch.is_empty());
+        assert_eq!(outcome.fallback_path, vec!["structured_tool_call"]);
+        assert!(!outcome
+            .fallback_path
+            .contains(&EVALUATOR_MODE_FORM_V1.to_string()));
+        assert!(!outcome.structured_enforcement_validated);
+        assert_eq!(
+            outcome.structured_schema_validation_status,
+            "malformed_schema_output"
+        );
+    }
+
+    #[test]
+    fn structured_retry_update_scene_state_confidence_removed_succeeds() {
+        let (soul, world, user, narrator, _) = form_runtime_fixture();
+        let bad_raw = format!(
+            r#"{{"schema_version":1,"ops":[{{"op":"update_scene_state","current_scene":"Apartment doorway","focus":"Aurora and preset_male","participants":["{}","preset_male"],"last_user_action":"{}","pressure_point":"Aurora decides what to say next.","continuity_note":"The doorway exchange continues.","confidence":0.8}}],"no_op_reason":null}}"#,
+            soul.character_id, user
+        );
+        let first_err = compile_evaluator_structured_runtime(
+            &bad_raw,
+            Some(StructuredEnforcement::ToolCall),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect_err("illegal confidence should fail first tool call");
+        assert_eq!(
+            structured_failure_kind(&first_err),
+            "schema_validation_failed"
+        );
+
+        let retry_raw = format!(
+            r#"{{"schema_version":1,"ops":[{{"op":"update_scene_state","current_scene":"Apartment doorway","focus":"Aurora and preset_male","participants":["{}","preset_male"],"last_user_action":"{}","pressure_point":"Aurora decides what to say next.","continuity_note":"The doorway exchange continues."}}],"no_op_reason":null}}"#,
+            soul.character_id, user
+        );
+        let mut outcome = compile_evaluator_structured_runtime(
+            &retry_raw,
+            Some(StructuredEnforcement::ToolCall),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect("retry without confidence succeeds");
+        outcome.fallback_path = vec![
+            "structured_tool_call".into(),
+            "structured_tool_call_retry".into(),
+        ];
+        outcome.structured_retry_count = 1;
+        outcome.structured_retry_reasons = vec![structured_failure_kind(&first_err).into()];
+        outcome.structured_retry_succeeded = Some(true);
+
+        assert_eq!(outcome.structured_retry_count, 1);
+        assert_eq!(outcome.structured_retry_succeeded, Some(true));
+        assert_eq!(
+            outcome.fallback_path,
+            vec!["structured_tool_call", "structured_tool_call_retry"]
+        );
+        assert_eq!(
+            diagnostic_patch_counts(&outcome.conversion.patch).scene_update_ops_count,
+            1
+        );
+    }
+
+    #[test]
+    fn structured_retry_invalid_evidence_quote_uses_valid_quote_and_succeeds() {
+        let (soul, world, user, narrator, _) = form_runtime_fixture();
+        let bad_raw = r#"{"schema_version":1,"ops":[{"op":"add_world_event","content":"The visitor entered.","evidence_quote":"This quote is not present."}],"no_op_reason":null}"#;
+        let first_err = compile_evaluator_structured_runtime(
+            bad_raw,
+            Some(StructuredEnforcement::ToolCall),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect_err("invalid evidence should fail first tool call");
+        assert_eq!(
+            structured_failure_kind(&first_err),
+            "evidence_quote_invalid"
+        );
+
+        let retry_raw = format!(
+            r#"{{"schema_version":1,"ops":[{{"op":"add_world_event","content":"The visitor entered.","evidence_quote":"{}"}}],"no_op_reason":null}}"#,
+            user
+        );
+        let mut outcome = compile_evaluator_structured_runtime(
+            &retry_raw,
+            Some(StructuredEnforcement::ToolCall),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect("retry with exact evidence succeeds");
+        outcome.fallback_path = vec![
+            "structured_tool_call".into(),
+            "structured_tool_call_retry".into(),
+        ];
+        outcome.structured_retry_count = 1;
+        outcome.structured_retry_reasons = vec![structured_failure_kind(&first_err).into()];
+        outcome.structured_retry_succeeded = Some(true);
+
+        assert_eq!(outcome.structured_retry_succeeded, Some(true));
+        assert_eq!(
+            outcome.fallback_path,
+            vec!["structured_tool_call", "structured_tool_call_retry"]
+        );
+        assert_eq!(diagnostic_total_patch_ops(&outcome.conversion.patch), 1);
+    }
+
+    #[test]
+    fn structured_retry_failure_does_not_commit_partial_patch() {
+        let retry_failure = StructuredRetryFailure {
+            final_error: "malformed_schema_output: still invalid".into(),
+            retry_count: 1,
+            retry_reasons: vec!["schema_validation_failed".into()],
+            first_trace: StructuredCompletionTrace::default(),
+        };
+        let mut outcome = strict_tool_diagnostic_failed_outcome(
+            vec!["structured_tool_call".into()],
+            retry_failure.final_error.clone(),
+        );
+        apply_structured_retry_failure(&mut outcome, &retry_failure);
+
+        assert!(outcome.conversion.patch.is_empty());
+        assert_eq!(diagnostic_total_patch_ops(&outcome.conversion.patch), 0);
+        assert_eq!(outcome.structured_retry_succeeded, Some(false));
+        assert_eq!(
+            outcome.structured_retry_final_error.as_deref(),
+            Some("malformed_schema_output: still invalid")
+        );
+    }
+
+    #[test]
+    fn structured_retry_success_compiles_exactly_one_enrichment_patch() {
+        let (soul, world, user, narrator, _) = form_runtime_fixture();
+        let retry_raw = format!(
+            r#"{{"schema_version":1,"ops":[{{"op":"add_world_event","content":"The visitor entered.","evidence_quote":"{}"}}],"no_op_reason":null}}"#,
+            user
+        );
+        let mut outcome = compile_evaluator_structured_runtime(
+            &retry_raw,
+            Some(StructuredEnforcement::ToolCall),
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect("retry compiles one patch");
+        outcome.fallback_path = vec![
+            "structured_tool_call".into(),
+            "structured_tool_call_retry".into(),
+        ];
+        outcome.structured_retry_count = 1;
+        outcome.structured_retry_succeeded = Some(true);
+
+        assert_eq!(diagnostic_total_patch_ops(&outcome.conversion.patch), 1);
+        assert!(!outcome.conversion.patch.is_empty());
+    }
+
+    #[test]
+    fn strict_diagnostic_fails_after_retry_if_still_invalid() {
+        let retry_failure = StructuredRetryFailure {
+            final_error: "Structured evaluator semantic validation failed: evidence quote not found in latest exchange: nope".into(),
+            retry_count: 1,
+            retry_reasons: vec!["evidence_quote_invalid".into()],
+            first_trace: StructuredCompletionTrace::default(),
+        };
+        let mut outcome = strict_tool_diagnostic_failed_outcome(
+            vec!["structured_tool_call".into()],
+            retry_failure.final_error.clone(),
+        );
+        apply_structured_retry_failure(&mut outcome, &retry_failure);
+
+        assert!(!outcome.structured_enforcement_validated);
+        assert_eq!(outcome.structured_retry_succeeded, Some(false));
+        assert!(!outcome
+            .fallback_path
+            .contains(&EVALUATOR_MODE_FORM_V1.to_string()));
+        assert!(outcome.conversion.patch.is_empty());
+    }
+
+    #[test]
+    fn normal_mode_can_fallback_after_structured_retry_failure() {
+        let (soul, world, user, narrator, spec) = form_runtime_fixture();
+        let retry_failure = StructuredRetryFailure {
+            final_error: "malformed_schema_output: retry still had invalid enum".into(),
+            retry_count: 1,
+            retry_reasons: vec!["schema_validation_failed".into()],
+            first_trace: StructuredCompletionTrace::default(),
+        };
+        let mut fallback = compile_evaluator_form_runtime_strict(
+            &door_entry_form_response_json(&soul.character_id),
+            spec,
+            &soul,
+            &world,
+            &user,
+            &narrator,
+            None,
+        )
+        .expect("normal form fallback compiles");
+        fallback.fallback_path = vec!["structured_tool_call".into(), EVALUATOR_MODE_FORM_V1.into()];
+        apply_structured_retry_failure(&mut fallback, &retry_failure);
+
+        assert!(!fallback.conversion.patch.is_empty());
+        assert!(fallback
+            .fallback_path
+            .contains(&EVALUATOR_MODE_FORM_V1.to_string()));
+        assert_eq!(fallback.structured_retry_count, 1);
+        assert_eq!(fallback.structured_retry_succeeded, Some(false));
     }
 
     #[test]
@@ -25013,6 +27432,7 @@ mod tests {
             message_count: 0,
             archived_at: None,
             active_evaluator_profile_id: None,
+            is_benchmark: false,
         };
 
         let messages = vec![ChatMessage {
@@ -25110,6 +27530,7 @@ mod tests {
             active_player_persona_id: "preset_male".into(),
             archived_at: None,
             active_evaluator_profile_id: None,
+            is_benchmark: false,
         };
 
         let messages = vec![ChatMessage {
@@ -25522,6 +27943,7 @@ mod tests {
             active_player_persona_id: "preset_male".into(),
             archived_at: None,
             active_evaluator_profile_id: None,
+            is_benchmark: false,
         };
 
         let messages = vec![ChatMessage {

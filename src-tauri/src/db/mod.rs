@@ -139,6 +139,7 @@ pub struct ConversationSummary {
     pub message_count: i64,
     pub archived_at: Option<i64>,
     pub active_evaluator_profile_id: Option<String>,
+    pub is_benchmark: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -507,6 +508,7 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             world_id TEXT,
             source_setting_id TEXT,
             active_player_persona_id TEXT NOT NULL DEFAULT 'preset_male',
+            is_benchmark INTEGER NOT NULL DEFAULT 0,
             title TEXT NOT NULL DEFAULT 'Untitled Session',
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
@@ -794,6 +796,12 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "conversations",
         "active_player_persona_id",
         "TEXT NOT NULL DEFAULT 'preset_male'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "conversations",
+        "is_benchmark",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
     add_column_if_missing(conn, "messages", "branch_id", "TEXT")?;
     add_column_if_missing(
@@ -1733,7 +1741,8 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
                 WHERE conversation_id = c.id AND is_active != 0 AND message_status = 'active'
             ) AS message_count,
             c.archived_at,
-            c.active_evaluator_profile_id
+            c.active_evaluator_profile_id,
+            c.is_benchmark
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
         WHERE c.archived_at IS NULL
@@ -1756,6 +1765,7 @@ pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<Conversatio
             message_count: row.get(10)?,
             archived_at: row.get(11)?,
             active_evaluator_profile_id: row.get(12)?,
+            is_benchmark: row.get::<_, i64>(13)? != 0,
         })
     })?;
     rows.collect()
@@ -1767,7 +1777,7 @@ pub fn get_conversation_summary(
 ) -> rusqlite::Result<ConversationSummary> {
     conn.query_row(
         "
-        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL), c.world_id, c.source_setting_id, c.active_player_persona_id, c.archived_at, c.active_evaluator_profile_id
+        SELECT c.id, c.title, c.soul_id, c.created_at, c.updated_at, COALESCE(s.source_savepoint_id, NULL), c.world_id, c.source_setting_id, c.active_player_persona_id, c.archived_at, c.active_evaluator_profile_id, c.is_benchmark
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
         WHERE c.id = ?1
@@ -1791,9 +1801,21 @@ pub fn get_conversation_summary(
                 message_count,
                 archived_at: row.get(9)?,
                 active_evaluator_profile_id: row.get(10)?,
+                is_benchmark: row.get::<_, i64>(11)? != 0,
             })
         },
     )
+}
+
+pub fn mark_conversation_benchmark(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<bool> {
+    let affected = conn.execute(
+        "UPDATE conversations SET is_benchmark = 1, updated_at = ?1 WHERE id = ?2",
+        params![now_ts(), conversation_id],
+    )?;
+    Ok(affected > 0)
 }
 
 fn sanitize_conversation_title(title: &str) -> String {
@@ -3047,7 +3069,8 @@ pub fn list_archived_sessions(conn: &Connection) -> rusqlite::Result<Vec<Convers
                 WHERE conversation_id = c.id AND is_active != 0 AND message_status = 'active'
             ) AS message_count,
             c.archived_at,
-            c.active_evaluator_profile_id
+            c.active_evaluator_profile_id,
+            c.is_benchmark
         FROM conversations c
         LEFT JOIN souls s ON s.character_id = c.soul_id
         WHERE c.archived_at IS NOT NULL
@@ -3070,6 +3093,7 @@ pub fn list_archived_sessions(conn: &Connection) -> rusqlite::Result<Vec<Convers
             message_count: row.get(10)?,
             archived_at: row.get(11)?,
             active_evaluator_profile_id: row.get(12)?,
+            is_benchmark: row.get::<_, i64>(13)? != 0,
         })
     })?;
     rows.collect()
@@ -5268,6 +5292,28 @@ mod tests {
         let messages = list_messages(&conn, "mock", 5).expect("messages");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content, "Regenerated");
+    }
+
+    #[test]
+    fn mark_conversation_benchmark_sets_summary_flag() {
+        let conn = init_memory_connection().expect("db");
+        let soul = new_default_soul("Aurora");
+        upsert_soul(&conn, &soul).expect("upsert");
+        ensure_conversation(&conn, "benchmark-session", &soul.character_id).expect("conversation");
+
+        let before = get_conversation_summary(&conn, "benchmark-session").expect("summary");
+        assert!(!before.is_benchmark);
+
+        assert!(mark_conversation_benchmark(&conn, "benchmark-session").expect("mark"));
+        let after = get_conversation_summary(&conn, "benchmark-session").expect("summary");
+        assert!(after.is_benchmark);
+        assert!(list_conversations(&conn)
+            .expect("list")
+            .iter()
+            .any(
+                |conversation| conversation.conversation_id == "benchmark-session"
+                    && conversation.is_benchmark
+            ));
     }
 
     #[test]

@@ -178,6 +178,7 @@ export type ConversationSummary = {
   message_count: number;
   archived_at?: number | null;
   active_evaluator_profile_id?: string | null;
+  is_benchmark?: boolean;
 };
 
 export type PlayerPersona = {
@@ -526,6 +527,8 @@ export type ApiProviderSettings = {
   system_prompt: string;
   narrator_timeout_ms?: number | null;
   evaluator_timeout_ms?: number | null;
+  structured_evaluator_timeout_ms?: number | null;
+  diagnostic_evaluator_timeout_ms?: number | null;
   evaluator_timeout_mode?: "finite" | "no_app_timeout" | string | null;
   evaluator_mode?:
     | "evaluator_v1"
@@ -537,6 +540,7 @@ export type ApiProviderSettings = {
   structured_evaluator_policy?: "required" | "prefer" | "allow_fallback" | string | null;
   /** Evaluator transport: "auto" tries real tool-calling first, then the response_format ladder. */
   structured_evaluator_transport?: "auto" | "tool_call" | "json_schema" | "json_object" | "prompt_json" | string | null;
+  structured_evaluator_max_retries?: number | null;
   wait_for_evaluator_before_next_turn?: boolean | null;
   allow_send_with_stale_state?: boolean | null;
   evaluator_background_enabled?: boolean | null;
@@ -692,11 +696,39 @@ const MODE_PROMPTS: Record<string, string> = {
 - Internal access is limited to active Souls and engine-controlled characters. No internal thoughts for user-controlled characters.
 - Engine-controlled characters may misinterpret situations, miss details, or have incomplete knowledge.
 - Like close third-person scene fiction: stay near the active focus without taking over user-controlled actors.`,
-  God: `## NARRATION MODE: GOD
-- Provide full narrative access.
-- Include engine-controlled characters' internal thoughts and emotions.
-- Also include environmental details active characters would not notice, hidden information, and dramatic irony.
-- You may reveal secrets, foreshadow future events, describe off-screen action, and provide context active characters lack.`,
+  "Active Director": `## NARRATION MODE: ACTIVE DIRECTOR
+
+[ACTIVE SCENE DIRECTION]
+The narrator is not a passive camera. Engine-controlled characters should actively pursue goals, protect boundaries, test assumptions, interrupt, refuse, redirect, escalate, soften, move through the environment, and create new pressure.
+
+Every normal RP response should do at least TWO:
+- advance an NPC goal
+- change posture/distance/location
+- introduce obstacle/offer/demand/reveal/complication
+- ask a pointed question or take meaningful NPC action
+- update physical scene through NPC/environment action
+- force a clear decision point
+
+Do not merely restate the user's action and describe atmosphere.
+End on an actionable hook.
+
+[USER CONTROL BOUNDARIES]
+- Never choose user thoughts.
+- Never choose user dialogue.
+- Never choose major voluntary user action.
+- NPCs and the world may create pressure, consequences, interruptions, refusals, offers, demands, and decision points around the user-controlled persona.`,
+  "GM Simulation": `## NARRATION MODE: GM SIMULATION
+- Simulate the scene as an active game master: engine-controlled characters, hazards, time pressure, consequences, and opportunities continue moving.
+- Include engine-controlled characters' internal thoughts and emotions when useful.
+- Also include environmental details active characters would not notice, hidden information, dramatic irony, and off-screen pressure when it serves the scene.
+- You may reveal secrets, foreshadow future events, describe off-screen action, and provide context active characters lack.
+- Maintain user-control boundaries: never choose user thoughts, dialogue, or major voluntary user action.`,
+  God: `## NARRATION MODE: GM SIMULATION
+- Simulate the scene as an active game master: engine-controlled characters, hazards, time pressure, consequences, and opportunities continue moving.
+- Include engine-controlled characters' internal thoughts and emotions when useful.
+- Also include environmental details active characters would not notice, hidden information, dramatic irony, and off-screen pressure when it serves the scene.
+- You may reveal secrets, foreshadow future events, describe off-screen action, and provide context active characters lack.
+- Maintain user-control boundaries: never choose user thoughts, dialogue, or major voluntary user action.`,
 };
 
 const HIDDEN_STATE_FORMAT_PROMPT = `## HIDDEN STATE FORMAT
@@ -751,6 +783,7 @@ let browserConversations: Array<{
   world_id?: string | null;
   source_setting_id?: string | null;
   active_player_persona_id?: string;
+  is_benchmark?: boolean;
   created_at: number;
   updated_at: number;
 }> = [];
@@ -1489,6 +1522,15 @@ export type StructuredEvaluatorDiagnosticRun = {
   scene_update_ops_count: number;
   state_patch_id?: string | null;
   error?: string | null;
+  tool_calls_present: boolean;
+  tool_call_count: number;
+  tool_call_names: string[];
+  raw_content_present: boolean;
+  raw_tool_calls_present: boolean;
+  structured_retry_count: number;
+  structured_retry_reasons: string[];
+  structured_retry_succeeded?: boolean | null;
+  structured_retry_final_error?: string | null;
 };
 
 export type StructuredEvaluatorDiagnosticSummary = {
@@ -1502,6 +1544,10 @@ export type StructuredEvaluatorDiagnosticSummary = {
   structured_policy: string;
   structured_evaluator_policy: string;
   evaluator_mode: string;
+  strict_tool_diagnostic: boolean;
+  strict_tool_passed: boolean;
+  fallback_used: boolean;
+  failure_turns: number[];
   structured_schema_version: number;
   runs: StructuredEvaluatorDiagnosticRun[];
   enforcement_levels: string[];
@@ -1523,9 +1569,115 @@ export type StructuredEvaluatorDiagnosticSummary = {
   final_object_states: unknown[];
   final_scene_participants: string[];
   default_player_leaked_into_normal_rp_state: boolean;
+  default_player_in_relationship_context: boolean;
   payload_history_path: string;
   mne_checkpoint_path: string;
   summary_json_path: string;
+};
+
+export type BenchmarkType =
+  | "visible_ai_chat"
+  | "scripted_visible_replay"
+  | "headless_regression"
+  | "multi_agent_visible_chat";
+
+export type BenchmarkTarget =
+  | "current_session"
+  | "new_benchmark_session_from_current_soul"
+  | "new_benchmark_session_from_selected_soul_world";
+
+export type BenchmarkSettings = {
+  benchmark_type: BenchmarkType;
+  target: BenchmarkTarget;
+  current_conversation_id?: string | null;
+  turn_count: number;
+  narrator_style: string;
+  evaluator_mode?: string | null;
+  structured_evaluator_transport?: string | null;
+  structured_evaluator_policy?: string | null;
+  structured_evaluator_max_retries?: number | null;
+  player_simulator_profile_id?: string | null;
+  player_goal: string;
+  export_payload_history: boolean;
+  export_mne: boolean;
+  export_summary_json: boolean;
+  strict_tool_evaluator: boolean;
+  wait_for_evaluator_each_turn: boolean;
+};
+
+export type BenchmarkScorecard = {
+  visible_chat_messages_created: boolean;
+  normal_pipeline_used: boolean;
+  turn_count_requested: number;
+  turn_count_completed: number;
+  player_simulator_calls: number;
+  narrator_calls: number;
+  evaluator_calls: number;
+  evaluator_waited_each_turn: boolean;
+  memory_updated: boolean;
+  object_state_updated: boolean;
+  relationship_updated: boolean;
+  payload_history_export_succeeded: boolean;
+  narrator_visible_response_each_turn: boolean;
+  evaluator_used_tool_call_where_required: boolean;
+  no_evaluator_form_v1_fallback_in_strict_mode: boolean;
+  syntactic_repair_unused_in_strict_mode: boolean;
+  memories_increased_over_time: boolean;
+  active_player_relationship_changed_when_warranted: boolean;
+  object_ids_stable: boolean;
+  default_player_not_normal_rp_relationship_target: boolean;
+  mne_export_succeeded: boolean;
+  pass: boolean;
+  failure_reasons: string[];
+};
+
+export type BenchmarkTurnSummary = {
+  turn_index: number;
+  simulated_user_message: string;
+  narrator_response_present: boolean;
+  narrator_error?: string | null;
+  evaluator_mode: string;
+  structured_transport_actual?: string | null;
+  tool_calls_present: boolean;
+  tool_call_count: number;
+  structured_retry_count: number;
+  fallback_path: string[];
+  syntactic_repair_used: boolean;
+  memory_count_after: number;
+  object_count_after: number;
+  relationship_summary_after: string;
+};
+
+export type BenchmarkSummary = {
+  benchmark_id: string;
+  benchmark_type: string;
+  conversation_id: string;
+  started_at: number;
+  completed_at: number;
+  turn_count_requested: number;
+  turn_count_completed: number;
+  narrator_model: string;
+  evaluator_model: string;
+  player_simulator_model?: string | null;
+  narrator_failures: number;
+  evaluator_failures: number;
+  tool_call_success_count: number;
+  tool_call_failure_count: number;
+  retry_count: number;
+  retry_success_count: number;
+  fallback_count: number;
+  syntactic_repair_count: number;
+  default_player_leak_detected: boolean;
+  duplicate_relationship_context_detected: boolean;
+  final_memory_count: number;
+  final_object_state_count: number;
+  final_relationship_count: number;
+  per_turn: BenchmarkTurnSummary[];
+  object_identity_checks: Array<{ label: string; expected_object_id: string; found: boolean }>;
+  mne_export_path?: string | null;
+  payload_history_path?: string | null;
+  summary_json_path?: string | null;
+  scorecard: BenchmarkScorecard;
 };
 
 export function runStructuredEvaluatorDiagnostic(
@@ -1718,8 +1870,8 @@ export function imageAssetSrc(asset?: ImageAsset | null): string {
   return convertFileSrc(asset.thumbnail_path || asset.file_path);
 }
 
-export function deleteConversation(conversationId: string): Promise<boolean> {
-  return invokeOrPreview("delete_conversation", { conversationId }, () => {
+export function archiveConversation(conversationId: string): Promise<boolean> {
+  return invokeOrPreview("archive_session", { conversationId }, () => {
     const conversation = browserConversations.find(
       (item) => item.conversation_id === conversationId,
     );
@@ -1731,6 +1883,122 @@ export function deleteConversation(conversationId: string): Promise<boolean> {
     conversation.updated_at = Math.floor(Date.now() / 1000);
     return true;
   });
+}
+
+export function runBenchmark(
+  soulId: string,
+  settingId: string | null,
+  provider: string,
+  narratorSettings: ApiProviderSettings,
+  stateUpdaterSettings: ApiProviderSettings,
+  settings: BenchmarkSettings,
+): Promise<BenchmarkSummary> {
+  return invokeOrPreview(
+    "run_benchmark",
+    { soulId, settingId, provider, narratorSettings, stateUpdaterSettings, settings },
+    () => {
+      throw new Error("Benchmark Runner requires the Tauri runtime so it can create real visible chat turns.");
+    },
+  );
+}
+
+export type BenchmarkSessionInit = {
+  benchmark_id: string;
+  conversation_id: string;
+  session_soul_id: string;
+  started_at: number;
+  initial_memory_count: number;
+  initial_object_count: number;
+  initial_relationship_count: number;
+};
+
+/** Set up a benchmark conversation for the live self-play loop (frontend-driven). */
+export function prepareBenchmarkSession(
+  soulId: string,
+  settingId: string | null,
+  settings: BenchmarkSettings,
+): Promise<BenchmarkSessionInit> {
+  return invokeOrPreview(
+    "prepare_benchmark_session",
+    { soulId, settingId, settings },
+    () => {
+      throw new Error("Benchmark Runner requires the Tauri runtime so it can create real visible chat turns.");
+    },
+  );
+}
+
+/** Generate the next AI player-side message for the live self-play loop. */
+export function generateBenchmarkPlayerMessage(
+  conversationId: string,
+  soulId: string,
+  playerProfileId: string,
+  playerGoal: string,
+): Promise<string> {
+  return invokeOrPreview(
+    "generate_benchmark_player_message",
+    { conversationId, soulId, playerProfileId, playerGoal },
+    () => {
+      throw new Error("Player Simulator requires the Tauri runtime.");
+    },
+  );
+}
+
+/** Capture the per-turn summary after a live self-play turn has fully applied. */
+export function benchmarkTurnSummary(
+  conversationId: string,
+  turnIndex: number,
+  userText: string,
+  narratorError: string | null,
+  stateUpdaterSettings: ApiProviderSettings,
+): Promise<BenchmarkTurnSummary> {
+  return invokeOrPreview(
+    "benchmark_turn_summary",
+    { conversationId, turnIndex, userText, narratorError, stateUpdaterSettings },
+    () => {
+      throw new Error("Benchmark Runner requires the Tauri runtime.");
+    },
+  );
+}
+
+/** Finalize a live self-play benchmark: build summary, run exports, score it. */
+export function finalizeBenchmark(
+  benchmarkId: string,
+  conversationId: string,
+  startedAt: number,
+  narratorSettings: ApiProviderSettings,
+  stateUpdaterSettings: ApiProviderSettings,
+  settings: BenchmarkSettings,
+  initialMemoryCount: number,
+  initialObjectCount: number,
+  initialRelationshipCount: number,
+  turnCountCompleted: number,
+  narratorFailures: number,
+  perTurn: BenchmarkTurnSummary[],
+): Promise<BenchmarkSummary> {
+  return invokeOrPreview(
+    "finalize_benchmark",
+    {
+      benchmarkId,
+      conversationId,
+      startedAt,
+      narratorSettings,
+      stateUpdaterSettings,
+      settings,
+      initialMemoryCount,
+      initialObjectCount,
+      initialRelationshipCount,
+      turnCountCompleted,
+      narratorFailures,
+      perTurn,
+    },
+    () => {
+      throw new Error("Benchmark Runner requires the Tauri runtime.");
+    },
+  );
+}
+
+export function deleteConversation(conversationId: string): Promise<boolean> {
+  return archiveConversation(conversationId);
 }
 
 export function restoreConversation(conversationId: string): Promise<boolean> {
@@ -2176,6 +2444,7 @@ function ensurePreviewConversation(conversationId: string, soulId: string, title
       world_id: null,
       source_setting_id: null,
       active_player_persona_id: "preset_male",
+      is_benchmark: false,
       created_at: now,
       updated_at: now,
     };
@@ -2194,6 +2463,7 @@ function summarizePreviewConversation(conversation: {
   world_id?: string | null;
   source_setting_id?: string | null;
   active_player_persona_id?: string;
+  is_benchmark?: boolean;
   created_at: number;
   updated_at: number;
 }): ConversationSummary {
@@ -2215,6 +2485,7 @@ function summarizePreviewConversation(conversation: {
     last_message_preview: lastMessage?.content.split(/\s+/).join(" ").slice(0, 140) ?? null,
     message_count: messages.length,
     archived_at: (conversation as any).archived_at ?? null,
+    is_benchmark: conversation.is_benchmark ?? false,
   };
 }
 
@@ -3321,9 +3592,15 @@ function modePromptFor(mode: string) {
   switch (mode) {
     case "Realistic":
       return MODE_PROMPTS.Realistic;
+    case "active_director":
+    case "Active Director":
+      return MODE_PROMPTS["Active Director"];
+    case "gm_simulation":
+    case "GM Simulation":
     case "God":
-      return MODE_PROMPTS.God;
+      return MODE_PROMPTS["GM Simulation"];
     case "Reader":
+    case "reader":
     case "Custom":
       return MODE_PROMPTS.Reader;
     default:
