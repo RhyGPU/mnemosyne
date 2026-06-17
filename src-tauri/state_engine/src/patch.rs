@@ -8,8 +8,8 @@ use crate::{
     memory::create_scored_memory,
     setting::SessionWorld,
     soul::{
-        current_timestamp, MemorySourceType, ObjectState, Relationship, SceneState, Soul,
-        TruthStatus, WorldEventRecord, WorldLog,
+        current_timestamp, MemoryEntry, MemorySourceType, ObjectState, Relationship, SceneState,
+        Soul, TruthStatus, WorldEventRecord, WorldLog,
     },
 };
 
@@ -22,6 +22,52 @@ const MAX_RECENT_MEMORIES: usize = 12;
 const MAX_STORED_MEMORIES: usize = 200;
 const MAX_RECENT_EVENTS: usize = 12;
 const MEMORY_HYGIENE_SCAN_LIMIT: usize = 30;
+
+// --- Living memory lifecycle (slow burn) ----------------------------------
+// Memory importance is no longer frozen at birth. Each turn, ordinary memories
+// quietly fade; genuinely meaningful ones harden into permanent "core" and stop
+// aging; and a small recurring moment can climb into core through reinforcement
+// ("repeated kindness becomes trust"). Tunable — these are the feel knobs.
+//
+/// At/above this salience a memory is "core": permanent, never ages, never fades
+/// out. Reached at birth (a high-impact moment) OR climbed into via reinforcement.
+const CORE_SALIENCE_THRESHOLD: f32 = 85.0;
+/// Per-turn fade subtracted from a non-core memory's retrieval_strength at
+/// salience 0. Scaled down as salience rises (important-but-not-core fades
+/// slower), reaching ~0 at the core threshold. Slow burn: ~10 turns for a
+/// middling (salience ~50) memory to fade out.
+const MEMORY_FADE_BASE: f32 = 12.0;
+/// Below this retrieval_strength a faded, unreinforced, non-core memory leaves
+/// the active pool (archived, not deleted — still restorable/exportable).
+const MEMORY_FADE_FLOOR: f32 = 8.0;
+/// Salience a memory gains each time it is reinforced (a near-duplicate recurs),
+/// so a recurring small moment can graduate into core over several reinforcements.
+const MEMORY_REINFORCE_CLIMB: f32 = 9.0;
+
+/// A core memory is permanent: it does not age and is never faded out.
+fn is_core_memory(memory: &MemoryEntry) -> bool {
+    memory.salience >= CORE_SALIENCE_THRESHOLD
+}
+
+/// Per-turn memory aging. Active, non-pinned, non-core memories lose a little
+/// retrieval_strength (scaled so higher salience fades slower); any that drop
+/// below the fade floor leave the active pool (archived, restorable). Core and
+/// pinned memories never age. Called once per patch apply (≈ once per turn), so
+/// replaying a session reproduces the same fade.
+fn age_memories(soul: &mut Soul) {
+    for memory in soul.memory.recent.iter_mut() {
+        if memory.is_pinned || memory.archived || !memory.is_active || is_core_memory(memory) {
+            continue;
+        }
+        let resistance = (memory.salience / CORE_SALIENCE_THRESHOLD).clamp(0.0, 1.0);
+        let fade = MEMORY_FADE_BASE * (1.0 - resistance);
+        memory.retrieval_strength = (memory.retrieval_strength - fade).max(0.0);
+        if memory.retrieval_strength < MEMORY_FADE_FLOOR {
+            memory.archived = true;
+            memory.is_active = false;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -485,6 +531,9 @@ impl SoulPatch {
 
     fn apply_memories(&self, soul: &mut Soul) -> MemoryApplyReport {
         let mut report = MemoryApplyReport::default();
+        // Age existing memories one step before this turn's new ones land, so
+        // fresh memories aren't decayed the moment they're created.
+        age_memories(soul);
         for operation in &self.memory_operations {
             if apply_memory_operation(soul, operation) {
                 report.events.push(MemoryApplyEvent {
@@ -556,8 +605,16 @@ impl SoulPatch {
             if source_type != MemorySourceType::ImportedLog {
                 if let Some(existing_index) = mergeable_memory_index(soul, content, memory.tag()) {
                     let existing = &mut soul.memory.recent[existing_index];
-                    existing.salience = existing.salience.max(55.0).min(100.0);
-                    existing.retrieval_strength = existing.retrieval_strength.max(55.0).min(100.0);
+                    // Reinforcement: a recurring moment climbs in importance (so
+                    // repeated kindness can become trust, repeated silence
+                    // abandonment) and is refreshed in mind, resetting its fade.
+                    existing.salience = (existing.salience.max(55.0) + MEMORY_REINFORCE_CLIMB).min(100.0);
+                    existing.retrieval_strength = existing.retrieval_strength.max(70.0).min(100.0);
+                    // If reinforcement just pushed it into core, un-fade it.
+                    if is_core_memory(existing) && existing.archived {
+                        existing.archived = false;
+                        existing.is_active = true;
+                    }
                     if existing.confidence.is_none() {
                         existing.confidence = memory
                             .confidence
@@ -2371,22 +2428,28 @@ mod tests {
             "A retired soldier tends the graves outside the gate.",
         ];
         assert!(contents.len() > MAX_RECENT_MEMORIES);
-        for (index, content) in contents.iter().enumerate() {
-            let patch = EnginePatch {
-                schema_version: Some(PATCH_PROTOCOL_VERSION),
-                soul_patch: Some(SoulPatch {
-                    new_memories: vec![MemoryPatch {
-                        content: (*content).into(),
-                        tag: Some("orientation".into()),
-                        salience: Some(40.0 + index as f32),
-                        ..MemoryPatch::default()
-                    }],
-                    ..SoulPatch::default()
-                }),
-                ..EnginePatch::default()
-            };
-            patch.apply_to_soul(&mut soul).expect("patch applies");
-        }
+        // Apply as a single turn's batch so this test isolates cap archival from
+        // the per-turn fade (covered separately below): aging runs once on the
+        // empty pool, then all memories land together and overflow is archived.
+        let new_memories = contents
+            .iter()
+            .enumerate()
+            .map(|(index, content)| MemoryPatch {
+                content: (*content).into(),
+                tag: Some("orientation".into()),
+                salience: Some(40.0 + index as f32),
+                ..MemoryPatch::default()
+            })
+            .collect();
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                new_memories,
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        patch.apply_to_soul(&mut soul).expect("patch applies");
 
         let active = soul
             .memory
@@ -2424,6 +2487,99 @@ mod tests {
             .map(|memory| memory.salience)
             .fold(f32::NEG_INFINITY, f32::max);
         assert!(min_active >= max_archived);
+    }
+
+    #[test]
+    fn ordinary_memory_fades_out_of_active_pool_over_turns() {
+        // Slow burn: an unremarkable, unreinforced memory loses retrieval
+        // strength each turn and eventually leaves the active pool — archived,
+        // not deleted (still stored/restorable).
+        let mut soul = new_default_soul("Aurora");
+        let mut mem = create_scored_memory(
+            &soul,
+            "Aurora and the user shared an unremarkable cup of tea.",
+            "routine",
+        );
+        mem.id = "mem_fade".into();
+        mem.salience = 45.0;
+        mem.retrieval_strength = 45.0;
+        soul.memory.recent.push(mem);
+
+        for _ in 0..15 {
+            age_memories(&mut soul);
+        }
+
+        let mem = soul
+            .memory
+            .recent
+            .iter()
+            .find(|m| m.id == "mem_fade")
+            .expect("faded memory is archived, not deleted");
+        assert!(
+            mem.archived && !mem.is_active,
+            "an unreinforced ordinary memory fades out of the active pool"
+        );
+    }
+
+    #[test]
+    fn core_memory_never_fades() {
+        // A high-impact memory is core (salience >= threshold): it never ages
+        // and never leaves the active pool, no matter how much time passes.
+        let mut soul = new_default_soul("Aurora");
+        let mut mem = create_scored_memory(
+            &soul,
+            "The user pulled Aurora from the burning car and badly burned his own hands.",
+            "near_death",
+        );
+        mem.id = "mem_core".into();
+        mem.salience = 92.0;
+        mem.retrieval_strength = 92.0;
+        soul.memory.recent.push(mem);
+
+        for _ in 0..50 {
+            age_memories(&mut soul);
+        }
+
+        let mem = soul
+            .memory
+            .recent
+            .iter()
+            .find(|m| m.id == "mem_core")
+            .expect("core memory is retained");
+        assert!(
+            mem.is_active && !mem.archived,
+            "a core memory never fades out"
+        );
+        assert_eq!(
+            mem.retrieval_strength, 92.0,
+            "a core memory does not lose retrieval strength"
+        );
+    }
+
+    #[test]
+    fn higher_salience_fades_slower() {
+        // Importance buys time: a more salient (but still non-core) memory loses
+        // strength more slowly than a trivial one over the same span.
+        let mut soul = new_default_soul("Aurora");
+        let mut low = create_scored_memory(&soul, "A passing remark about the weather.", "routine");
+        low.id = "low".into();
+        low.salience = 30.0;
+        low.retrieval_strength = 80.0;
+        let mut high = create_scored_memory(&soul, "Aurora admitted a private fear to the user.", "bonding");
+        high.id = "high".into();
+        high.salience = 75.0;
+        high.retrieval_strength = 80.0;
+        soul.memory.recent.push(low);
+        soul.memory.recent.push(high);
+
+        age_memories(&mut soul);
+
+        let low = soul.memory.recent.iter().find(|m| m.id == "low").unwrap();
+        let high = soul.memory.recent.iter().find(|m| m.id == "high").unwrap();
+        assert!(
+            high.retrieval_strength > low.retrieval_strength,
+            "the more salient memory retains more strength after the same aging"
+        );
     }
 
     #[test]
@@ -2498,22 +2654,27 @@ mod tests {
             "The glassblower trades mirrors for foreign spices.",
             "Frost ruined the eastern vineyard two winters back.",
         ];
-        for (index, content) in contents.iter().enumerate() {
-            let patch = EnginePatch {
-                schema_version: Some(PATCH_PROTOCOL_VERSION),
-                soul_patch: Some(SoulPatch {
-                    new_memories: vec![MemoryPatch {
-                        content: (*content).into(),
-                        tag: Some("orientation".into()),
-                        salience: Some(40.0 + index as f32),
-                        ..MemoryPatch::default()
-                    }],
-                    ..SoulPatch::default()
-                }),
-                ..EnginePatch::default()
-            };
-            patch.apply_to_soul(&mut soul).expect("patch applies");
-        }
+        // Single-turn batch isolates cap archival from the per-turn fade: this
+        // test is about the pinned memory being exempt from cap eviction.
+        let new_memories = contents
+            .iter()
+            .enumerate()
+            .map(|(index, content)| MemoryPatch {
+                content: (*content).into(),
+                tag: Some("orientation".into()),
+                salience: Some(40.0 + index as f32),
+                ..MemoryPatch::default()
+            })
+            .collect();
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            soul_patch: Some(SoulPatch {
+                new_memories,
+                ..SoulPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        patch.apply_to_soul(&mut soul).expect("patch applies");
 
         let pinned = soul
             .memory
