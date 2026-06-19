@@ -1660,6 +1660,17 @@ export type BenchmarkSettings = {
 export type BenchmarkScorecard = {
   visible_chat_messages_created: boolean;
   normal_pipeline_used: boolean;
+  visible_turns_requested: number;
+  visible_turns_completed: number;
+  visible_user_messages_created: number;
+  visible_assistant_messages_created: number;
+  unique_user_message_ids: number;
+  unique_assistant_message_ids: number;
+  internal_evaluator_retry_count: number;
+  internal_evaluator_retry_payload_count: number;
+  duplicate_turn_rows_detected: boolean;
+  duplicate_turn_message_pairs: string[];
+  player_simulator_payload_count: number;
   turn_count_requested: number;
   turn_count_completed: number;
   player_simulator_calls: number;
@@ -1724,6 +1735,17 @@ export type BenchmarkSummary = {
   final_memory_count: number;
   final_object_state_count: number;
   final_relationship_count: number;
+  visible_turns_requested: number;
+  visible_turns_completed: number;
+  visible_user_messages_created: number;
+  visible_assistant_messages_created: number;
+  unique_user_message_ids: number;
+  unique_assistant_message_ids: number;
+  internal_evaluator_retry_count: number;
+  internal_evaluator_retry_payload_count: number;
+  duplicate_turn_rows_detected: boolean;
+  duplicate_turn_message_pairs: string[];
+  player_simulator_payload_count: number;
   per_turn: BenchmarkTurnSummary[];
   object_identity_checks: Array<{ label: string; expected_object_id: string; found: boolean }>;
   mne_export_path?: string | null;

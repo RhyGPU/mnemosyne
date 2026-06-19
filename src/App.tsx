@@ -4110,9 +4110,13 @@ export function App() {
   );
   const benchmarkScoreRows = benchmarkResult
     ? [
+        ["Visible turns", benchmarkResult.scorecard.visible_turns_completed === benchmarkResult.scorecard.visible_turns_requested],
+        ["Visible user messages", benchmarkResult.scorecard.visible_user_messages_created === benchmarkResult.scorecard.visible_turns_requested],
+        ["Visible assistant messages", benchmarkResult.scorecard.visible_assistant_messages_created === benchmarkResult.scorecard.visible_turns_requested],
+        ["Duplicate turn rows", !benchmarkResult.scorecard.duplicate_turn_rows_detected],
         ["Visible chat messages created", benchmarkResult.scorecard.visible_chat_messages_created],
         ["Normal pipeline used", benchmarkResult.scorecard.normal_pipeline_used],
-        ["Player simulator calls", benchmarkResult.scorecard.player_simulator_calls > 0 || benchmarkResult.benchmark_type === "scripted_visible_replay"],
+        ["Player simulator calls", benchmarkResult.scorecard.player_simulator_payload_count > 0 || benchmarkResult.benchmark_type === "scripted_visible_replay"],
         ["Narrator calls", benchmarkResult.scorecard.narrator_calls >= benchmarkResult.turn_count_completed],
         ["Evaluator calls", benchmarkResult.scorecard.evaluator_calls >= benchmarkResult.turn_count_completed],
         ["Evaluator waited each turn", benchmarkResult.scorecard.evaluator_waited_each_turn],
@@ -4271,8 +4275,13 @@ export function App() {
           {benchmarkResult ? (
             <>
               <strong>{benchmarkResult.scorecard.pass ? "PASS" : "FAIL"}</strong>{" "}
-              {benchmarkResult.benchmark_type} completed {benchmarkResult.turn_count_completed} /{" "}
-              {benchmarkResult.turn_count_requested} turns.
+              {benchmarkResult.benchmark_type} visible turns: {benchmarkResult.scorecard.visible_turns_completed} /{" "}
+              {benchmarkResult.scorecard.visible_turns_requested}.
+              <br />
+              Internal evaluator retries: {benchmarkResult.scorecard.internal_evaluator_retry_count} rows /{" "}
+              {benchmarkResult.scorecard.internal_evaluator_retry_payload_count} payloads. Player simulator calls:{" "}
+              {benchmarkResult.scorecard.player_simulator_payload_count}. Duplicate turn rows:{" "}
+              {benchmarkResult.scorecard.duplicate_turn_rows_detected ? "FAIL" : "PASS"}.
               <br />
               Scorecard:{" "}
               {benchmarkScoreRows.map(([label, passed]) => `${passed ? "PASS" : "FAIL"} ${label}`).join("; ")}

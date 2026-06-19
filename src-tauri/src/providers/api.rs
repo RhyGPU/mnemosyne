@@ -2583,7 +2583,10 @@ mod tests {
                 }
             }]
         });
-        assert_eq!(lenient_chat_content(&value).as_deref(), Some("first second"));
+        assert_eq!(
+            lenient_chat_content(&value).as_deref(),
+            Some("first second")
+        );
     }
 
     #[test]
@@ -2602,7 +2605,10 @@ mod tests {
             Some("model is overloaded")
         );
         let bare = serde_json::json!({ "error": "rate limited" });
-        assert_eq!(provider_error_message(&bare).as_deref(), Some("rate limited"));
+        assert_eq!(
+            provider_error_message(&bare).as_deref(),
+            Some("rate limited")
+        );
         let none = serde_json::json!({ "choices": [] });
         assert!(provider_error_message(&none).is_none());
     }

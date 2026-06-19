@@ -3912,13 +3912,8 @@ fn finalize_benchmark_summary(
     }
     if settings.export_mne {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
-        let result = export_current_session_checkpoint_mne_inner(
-            app,
-            window,
-            &conn,
-            &conversation_id,
-            "",
-        )?;
+        let result =
+            export_current_session_checkpoint_mne_inner(app, window, &conn, &conversation_id, "")?;
         summary.mne_export_path = Some(result.path);
     }
     summary.scorecard.mne_export_succeeded = summary.mne_export_path.is_some();
@@ -3989,28 +3984,26 @@ fn prepare_benchmark_conversation(
                 "Current Session benchmark target requires current_conversation_id".to_string()
             })?
             .to_string();
-        let conversation = db::get_conversation_summary(&conn, &conversation_id)
-            .map_err(|err| err.to_string())?;
-        db::mark_conversation_benchmark(&conn, &conversation_id)
-            .map_err(|err| err.to_string())?;
-        let (session_soul, session_world) = if let Ok(branch) =
-            db::get_active_session_branch(&conn, &conversation_id)
-        {
-            let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
-                .map_err(|err| err.to_string())?;
-            (rebuilt.soul, rebuilt.session_world)
-        } else {
-            let source =
-                db::get_soul(&conn, &conversation.soul_id).map_err(|err| err.to_string())?;
-            let world = match db::get_conversation_session_world(&conn, &conversation_id)
-                .map_err(|err| err.to_string())?
-            {
-                Some(world) => world,
-                None => db::create_legacy_session_world_from_soul(&conn, &source)
-                    .map_err(|err| err.to_string())?,
+        let conversation =
+            db::get_conversation_summary(&conn, &conversation_id).map_err(|err| err.to_string())?;
+        db::mark_conversation_benchmark(&conn, &conversation_id).map_err(|err| err.to_string())?;
+        let (session_soul, session_world) =
+            if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
+                let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+                    .map_err(|err| err.to_string())?;
+                (rebuilt.soul, rebuilt.session_world)
+            } else {
+                let source =
+                    db::get_soul(&conn, &conversation.soul_id).map_err(|err| err.to_string())?;
+                let world = match db::get_conversation_session_world(&conn, &conversation_id)
+                    .map_err(|err| err.to_string())?
+                {
+                    Some(world) => world,
+                    None => db::create_legacy_session_world_from_soul(&conn, &source)
+                        .map_err(|err| err.to_string())?,
+                };
+                (source, world)
             };
-            (source, world)
-        };
         Ok(BenchmarkConversationInit {
             conversation_id,
             session_soul_id: session_soul.character_id.clone(),
@@ -4045,8 +4038,7 @@ fn prepare_benchmark_conversation(
             )),
         )
         .map_err(|err| err.to_string())?;
-        db::mark_conversation_benchmark(&conn, &conversation_id)
-            .map_err(|err| err.to_string())?;
+        db::mark_conversation_benchmark(&conn, &conversation_id).map_err(|err| err.to_string())?;
         db::create_session_branch(&conn, &conversation_id, &session, &session_world)
             .map_err(|err| err.to_string())?;
         Ok(BenchmarkConversationInit {
@@ -4386,9 +4378,12 @@ async fn generate_benchmark_player_turn(
     while attempts < MAX_ATTEMPTS {
         attempts += 1;
         match provider
-            .complete_streaming(&settings, system_prompt, &user_prompt, |_chunk: &str| {
-                Ok(())
-            })
+            .complete_streaming(
+                &settings,
+                system_prompt,
+                &user_prompt,
+                |_chunk: &str| Ok(()),
+            )
             .await
         {
             Ok(completion) => {
@@ -4405,8 +4400,8 @@ async fn generate_benchmark_player_turn(
                             base_url: settings.base_url.trim().to_string(),
                             system_message: system_prompt.to_string(),
                             user_message: user_prompt.clone(),
-                            context_text: "visible_chat + public_scene_summary + active_player_persona"
-                                .into(),
+                            context_text:
+                                "visible_chat + public_scene_summary + active_player_persona".into(),
                             estimated_system_tokens: estimate_tokens(system_prompt),
                             estimated_user_tokens: estimate_tokens(&user_prompt),
                             estimated_total_tokens: estimate_tokens(system_prompt)
@@ -4525,7 +4520,10 @@ async fn generate_traditional_rp_turn(
                 } else {
                     "User"
                 };
-                format!("{label}: {}", strip_status_blocks_for_export(&message.content))
+                format!(
+                    "{label}: {}",
+                    strip_status_blocks_for_export(&message.content)
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -4574,7 +4572,12 @@ async fn generate_traditional_rp_turn(
     while attempts < MAX_ATTEMPTS {
         attempts += 1;
         match provider
-            .complete_streaming(&settings, system_prompt, &user_prompt, |_chunk: &str| Ok(()))
+            .complete_streaming(
+                &settings,
+                system_prompt,
+                &user_prompt,
+                |_chunk: &str| Ok(()),
+            )
             .await
         {
             Ok(completion) => return sanitize_player_simulator_message(&completion.raw_text),
@@ -4673,16 +4676,15 @@ fn benchmark_ledger_audit(
         .iter()
         .filter(|log| log.provider == "player_simulator")
         .count();
-    audit.internal_evaluator_retry_payload_count = logs
-        .iter()
-        .filter(|log| {
-            log.request_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with("eval_retry_") || id.starts_with("eval_repair_"))
-                || log.provider.contains("repair")
-                || log.mode.contains("repair")
-        })
-        .count();
+    audit.internal_evaluator_retry_payload_count =
+        logs.iter()
+            .filter(|log| {
+                log.request_id.as_deref().is_some_and(|id| {
+                    id.starts_with("eval_retry_") || id.starts_with("eval_repair_")
+                }) || log.provider.contains("repair")
+                    || log.mode.contains("repair")
+            })
+            .count();
 
     let branch = match db::get_active_session_branch(conn, conversation_id) {
         Ok(branch) => branch,
@@ -4690,7 +4692,8 @@ fn benchmark_ledger_audit(
     };
     let commits =
         db::list_turn_commits_for_branch(conn, &branch.branch_id).map_err(|err| err.to_string())?;
-    let messages = db::list_messages(conn, conversation_id, 20_000).map_err(|err| err.to_string())?;
+    let messages =
+        db::list_messages(conn, conversation_id, 20_000).map_err(|err| err.to_string())?;
     let active_message_ids = messages
         .iter()
         .filter(|message| message.status == "active")
@@ -4718,7 +4721,9 @@ fn benchmark_ledger_audit(
             audit.internal_evaluator_retry_count += 1;
             continue;
         }
-        *visible_pair_counts.entry((user_id, assistant_id)).or_insert(0) += 1;
+        *visible_pair_counts
+            .entry((user_id, assistant_id))
+            .or_insert(0) += 1;
         user_ids.insert(user_id);
         assistant_ids.insert(assistant_id);
     }
@@ -4951,7 +4956,8 @@ fn build_benchmark_summary(
             unique_user_message_ids: ledger_audit.unique_user_message_ids,
             unique_assistant_message_ids: ledger_audit.unique_assistant_message_ids,
             internal_evaluator_retry_count: ledger_audit.internal_evaluator_retry_count,
-            internal_evaluator_retry_payload_count: ledger_audit.internal_evaluator_retry_payload_count,
+            internal_evaluator_retry_payload_count: ledger_audit
+                .internal_evaluator_retry_payload_count,
             duplicate_turn_rows_detected: ledger_audit.duplicate_turn_rows_detected,
             duplicate_turn_message_pairs: ledger_audit.duplicate_turn_message_pairs.clone(),
             player_simulator_payload_count: ledger_audit.player_simulator_payload_count,
@@ -6645,14 +6651,23 @@ pub async fn retry_evaluator_job(
             branch_id,
             source_turn_id.or(parent_turn_id),
             baseline_patch_id,
-            source_user_message_id.or_else(|| commit.as_ref().and_then(|commit| commit.user_message_id)),
-            source_variant_id.or_else(|| commit.as_ref().and_then(|commit| commit.selected_variant_id)),
+            source_user_message_id
+                .or_else(|| commit.as_ref().and_then(|commit| commit.user_message_id)),
+            source_variant_id.or_else(|| {
+                commit
+                    .as_ref()
+                    .and_then(|commit| commit.selected_variant_id)
+            }),
         )
     };
     let request_id = uuid_like_id();
     let evaluator_request_id = format!("eval_retry_{request_id}");
     let before_state_summary = compact_state_summary_json(&soul, &session_world);
-    start_background_evaluator_job(
+    let baseline_patch_id = baseline_patch_id.ok_or_else(|| {
+        "Evaluator retry requires an existing baseline patch; refusing to create a turn row"
+            .to_string()
+    })?;
+    run_evaluator_repair_attempt(
         app,
         window,
         conversation_id,
@@ -6673,7 +6688,6 @@ pub async fn retry_evaluator_job(
         branch_id,
         parent_turn_id,
         user_message_id,
-        false,
         before_state_summary,
         baseline_patch_id,
         None,
@@ -6778,6 +6792,60 @@ fn resolve_evaluator_source_turn(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_evaluator_repair_attempt(
+    app: AppHandle,
+    window: Window,
+    conversation_id: String,
+    assistant_message_id: i64,
+    selected_variant_id: Option<i64>,
+    parent_narrator_request_id: String,
+    evaluator_request_id: String,
+    turn_id: Option<String>,
+    context_mode_label: String,
+    soul: Soul,
+    session_world: SessionWorld,
+    snapshot_user_text: String,
+    visible_response_for_updater: String,
+    context_preview_text: String,
+    state_updater_settings: ApiProviderSettings,
+    entity_updater_context: String,
+    memory_debug_nonce: String,
+    ledger_branch_id: Option<String>,
+    ledger_parent_turn_id: Option<String>,
+    ledger_user_message_id: Option<i64>,
+    before_state_summary: serde_json::Value,
+    baseline_patch_id: String,
+    repair_user_message_override: Option<String>,
+) -> Result<db::EvaluatorJob, String> {
+    start_background_evaluator_job(
+        app,
+        window,
+        conversation_id,
+        assistant_message_id,
+        selected_variant_id,
+        parent_narrator_request_id,
+        evaluator_request_id,
+        turn_id,
+        context_mode_label,
+        soul,
+        session_world,
+        snapshot_user_text,
+        visible_response_for_updater,
+        context_preview_text,
+        state_updater_settings,
+        entity_updater_context,
+        memory_debug_nonce,
+        ledger_branch_id,
+        ledger_parent_turn_id,
+        ledger_user_message_id,
+        false,
+        before_state_summary,
+        Some(baseline_patch_id),
+        repair_user_message_override,
+    )
+}
+
 /// Background op-repair: re-runs ONLY the failed ops through a (configurable,
 /// e.g. local) repair model, up to 5 structured attempts, applying any that now
 /// validate via the same proven evaluator apply path. Fire-and-forget after a
@@ -6867,8 +6935,13 @@ pub async fn repair_evaluator_ops(
             branch_id,
             source_turn_id.or(parent_turn_id),
             baseline_patch_id,
-            source_user_message_id.or_else(|| commit.as_ref().and_then(|commit| commit.user_message_id)),
-            source_variant_id.or_else(|| commit.as_ref().and_then(|commit| commit.selected_variant_id)),
+            source_user_message_id
+                .or_else(|| commit.as_ref().and_then(|commit| commit.user_message_id)),
+            source_variant_id.or_else(|| {
+                commit
+                    .as_ref()
+                    .and_then(|commit| commit.selected_variant_id)
+            }),
         )
     };
 
@@ -6879,7 +6952,11 @@ pub async fn repair_evaluator_ops(
     // budget; it runs against the caller-supplied (e.g. local) endpoint.
     let mut repair_settings = repair_settings;
     repair_settings.evaluator_mode = Some(EVALUATOR_MODE_STRUCTURED_V1.into());
-    if repair_settings.structured_evaluator_max_retries.unwrap_or(0) < 5 {
+    if repair_settings
+        .structured_evaluator_max_retries
+        .unwrap_or(0)
+        < 5
+    {
         repair_settings.structured_evaluator_max_retries = Some(5);
     }
     // Repair is the enrichment, never the baseline: run it in the background and
@@ -6889,7 +6966,11 @@ pub async fn repair_evaluator_ops(
     let request_id = uuid_like_id();
     let evaluator_request_id = format!("eval_repair_{request_id}");
     let before_state_summary = compact_state_summary_json(&soul, &session_world);
-    start_background_evaluator_job(
+    let baseline_patch_id = baseline_patch_id.ok_or_else(|| {
+        "Evaluator repair requires an existing baseline patch; refusing to create a turn row"
+            .to_string()
+    })?;
+    run_evaluator_repair_attempt(
         app,
         window,
         conversation_id,
@@ -6910,7 +6991,6 @@ pub async fn repair_evaluator_ops(
         branch_id,
         parent_turn_id,
         user_message_id,
-        false,
         before_state_summary,
         baseline_patch_id,
         Some(repair_user_message),
@@ -18160,10 +18240,8 @@ async fn run_background_evaluator_job(
     // they are visible AND the frontend can auto-fire a focused background repair.
     // Skipped when this job IS already a repair, to prevent repair-of-repair.
     if repair_user_message_override.is_none() {
-        let failed_ops = rejected_ops_for_repair(
-            &runtime.normalized_json,
-            &conversion.rejected_candidates,
-        );
+        let failed_ops =
+            rejected_ops_for_repair(&runtime.normalized_json, &conversion.rejected_candidates);
         if !failed_ops.is_empty() {
             emit_dev_log(
                 &window,
@@ -19233,9 +19311,7 @@ fn stamp_memory_provenance(
     let Some(soul_patch) = patch.soul_patch.as_mut() else {
         return;
     };
-    let session_id = session_id
-        .map(str::trim)
-        .filter(|id| !id.is_empty());
+    let session_id = session_id.map(str::trim).filter(|id| !id.is_empty());
     for memory in &mut soul_patch.new_memories {
         // The address is system-set, not AI-supplied: which chat log
         // (conversation), which line (assistant message), and which session
@@ -21187,11 +21263,19 @@ mod tests {
         assert!(is_transient_provider_error(
             "API provider returned an error in a 200 OK body: Provider returned error"
         ));
-        assert!(is_transient_provider_error("API request failed with 429: rate limited"));
-        assert!(is_transient_provider_error("API request failed with 503: upstream"));
+        assert!(is_transient_provider_error(
+            "API request failed with 429: rate limited"
+        ));
+        assert!(is_transient_provider_error(
+            "API request failed with 503: upstream"
+        ));
         assert!(is_transient_provider_error("request timed out"));
-        assert!(is_transient_provider_error("API request failed: connection reset"));
-        assert!(is_transient_provider_error("API stream failed: body truncated"));
+        assert!(is_transient_provider_error(
+            "API request failed: connection reset"
+        ));
+        assert!(is_transient_provider_error(
+            "API stream failed: body truncated"
+        ));
         // Shape problems are NOT transient — they must surface for diagnosis.
         assert!(!is_transient_provider_error(
             "API response parse failed: no assistant content found; raw body: {…}"
@@ -21199,11 +21283,17 @@ mod tests {
         assert!(!is_transient_provider_error(
             "API response did not include assistant content"
         ));
-        assert!(!is_transient_provider_error("API key is required for API provider mode"));
+        assert!(!is_transient_provider_error(
+            "API key is required for API provider mode"
+        ));
         // 4xx (auth/bad request) share the "API request failed with" prefix but
         // must NOT be retried.
-        assert!(!is_transient_provider_error("API request failed with 401: invalid key"));
-        assert!(!is_transient_provider_error("API request failed with 400: bad request"));
+        assert!(!is_transient_provider_error(
+            "API request failed with 401: invalid key"
+        ));
+        assert!(!is_transient_provider_error(
+            "API request failed with 400: bad request"
+        ));
     }
 
     #[test]
@@ -21345,6 +21435,17 @@ mod tests {
             final_memory_count: 3,
             final_object_state_count: 1,
             final_relationship_count: 1,
+            visible_turns_requested: 2,
+            visible_turns_completed: 2,
+            visible_user_messages_created: 2,
+            visible_assistant_messages_created: 2,
+            unique_user_message_ids: 2,
+            unique_assistant_message_ids: 2,
+            internal_evaluator_retry_count: 0,
+            internal_evaluator_retry_payload_count: 0,
+            duplicate_turn_rows_detected: false,
+            duplicate_turn_message_pairs: Vec::new(),
+            player_simulator_payload_count: 0,
             per_turn: Vec::new(),
             object_identity_checks: vec![BenchmarkObjectIdentityCheck {
                 label: "wet jacket".into(),
@@ -21357,6 +21458,17 @@ mod tests {
             scorecard: BenchmarkScorecard {
                 visible_chat_messages_created: true,
                 normal_pipeline_used: true,
+                visible_turns_requested: 2,
+                visible_turns_completed: 2,
+                visible_user_messages_created: 2,
+                visible_assistant_messages_created: 2,
+                unique_user_message_ids: 2,
+                unique_assistant_message_ids: 2,
+                internal_evaluator_retry_count: 0,
+                internal_evaluator_retry_payload_count: 0,
+                duplicate_turn_rows_detected: false,
+                duplicate_turn_message_pairs: Vec::new(),
+                player_simulator_payload_count: 0,
                 turn_count_requested: 2,
                 turn_count_completed: 2,
                 player_simulator_calls: 0,
@@ -21465,6 +21577,127 @@ mod tests {
         assert_eq!(summary.payload_history_path.as_deref(), Some("payload.md"));
         assert_eq!(summary.mne_export_path.as_deref(), Some("benchmark.mne"));
         assert_eq!(summary.summary_json_path.as_deref(), Some("summary.json"));
+    }
+
+    #[test]
+    fn benchmark_audit_counts_unique_visible_turns_and_player_simulator_payloads() {
+        let (conn, soul) = command_test_setup("bench-audit");
+        let branch = db::get_active_session_branch(&conn, "bench-audit").expect("branch");
+        for index in 0..5 {
+            let user_id = db::insert_message_and_get_id(
+                &conn,
+                "bench-audit",
+                "user",
+                &format!("user {index}"),
+            )
+            .expect("user");
+            let assistant_id = db::insert_message_and_get_id(
+                &conn,
+                "bench-audit",
+                "assistant",
+                &format!("assistant {index}"),
+            )
+            .expect("assistant");
+            db::record_turn_commit_with_patch_for_turn_id(
+                &conn,
+                &format!("turn-{index}"),
+                "bench-audit",
+                &branch.branch_id,
+                None,
+                Some(user_id),
+                assistant_id,
+                None,
+                &EnginePatch::default(),
+                false,
+            )
+            .expect("turn");
+            db::insert_llm_payload_log(
+                &conn,
+                &LlmPayloadLog {
+                    conversation_id: "bench-audit".into(),
+                    provider: "player_simulator".into(),
+                    model: soul.character_name.clone(),
+                    created_at: db::now_ts(),
+                    ..Default::default()
+                },
+            )
+            .expect("payload");
+        }
+
+        let audit = benchmark_ledger_audit(&conn, "bench-audit").expect("audit");
+        assert_eq!(audit.visible_turns_completed, 5);
+        assert_eq!(audit.visible_user_messages_created, 5);
+        assert_eq!(audit.visible_assistant_messages_created, 5);
+        assert_eq!(audit.player_simulator_payload_count, 5);
+        assert!(!audit.duplicate_turn_rows_detected);
+    }
+
+    #[test]
+    fn duplicate_turn_message_pair_makes_benchmark_fail() {
+        let mut summary = benchmark_summary_fixture();
+        summary.duplicate_turn_rows_detected = true;
+        summary.duplicate_turn_message_pairs = vec!["1:2x2".into()];
+
+        let scorecard = benchmark_scorecard(&summary, false, 1, 0, 0);
+
+        assert!(!scorecard.pass);
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"no_duplicate_turn_rows".to_string()));
+    }
+
+    #[test]
+    fn benchmark_audit_ignores_regenerated_retry_rows_for_visible_completion() {
+        let (conn, _soul) = command_test_setup("bench-retry-audit");
+        let branch = db::get_active_session_branch(&conn, "bench-retry-audit").expect("branch");
+        let user_id =
+            db::insert_message_and_get_id(&conn, "bench-retry-audit", "user", "user").expect("u");
+        let assistant_id =
+            db::insert_message_and_get_id(&conn, "bench-retry-audit", "assistant", "assistant")
+                .expect("a");
+        db::record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "turn-visible",
+            "bench-retry-audit",
+            &branch.branch_id,
+            None,
+            Some(user_id),
+            assistant_id,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("visible turn");
+        db::record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "turn-retry",
+            "bench-retry-audit",
+            &branch.branch_id,
+            Some("turn-visible"),
+            Some(user_id),
+            assistant_id,
+            None,
+            &EnginePatch::default(),
+            true,
+        )
+        .expect("retry turn");
+        db::insert_llm_payload_log(
+            &conn,
+            &LlmPayloadLog {
+                conversation_id: "bench-retry-audit".into(),
+                provider: "evaluator_structured_v1".into(),
+                request_id: Some("eval_repair_test".into()),
+                created_at: db::now_ts(),
+                ..Default::default()
+            },
+        )
+        .expect("repair payload");
+
+        let audit = benchmark_ledger_audit(&conn, "bench-retry-audit").expect("audit");
+        assert_eq!(audit.visible_turns_completed, 1);
+        assert_eq!(audit.internal_evaluator_retry_count, 1);
+        assert_eq!(audit.internal_evaluator_retry_payload_count, 1);
+        assert!(audit.duplicate_turn_rows_detected);
     }
 
     fn assert_command_trace_skips_rp(trace: &serde_json::Value) {
