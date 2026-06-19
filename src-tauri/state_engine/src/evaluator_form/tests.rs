@@ -27,6 +27,7 @@ fn soul_and_world() -> (Soul, SessionWorld) {
         source_conversation_id: None,
         source_message_id: None,
         source_entity_id: None,
+        source_quote: None,
         is_lived_experience: true,
         is_imported_context: false,
         perceived_by_entity_id: Some("aurora_soul".into()),

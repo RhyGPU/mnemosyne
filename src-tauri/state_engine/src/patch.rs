@@ -138,6 +138,8 @@ pub struct MemoryPatch {
     pub source_conversation_id: Option<String>,
     pub source_message_id: Option<i64>,
     pub source_entity_id: Option<String>,
+    /// Exact source line the memory was drawn from (validated evidence quote).
+    pub source_quote: Option<String>,
     pub is_lived_experience: Option<bool>,
     pub is_imported_context: Option<bool>,
     pub perceived_by_entity_id: Option<String>,
@@ -639,6 +641,7 @@ impl SoulPatch {
             recent.source_conversation_id = memory.cleaned_optional(&memory.source_conversation_id);
             recent.source_message_id = memory.source_message_id;
             recent.source_entity_id = memory.cleaned_optional(&memory.source_entity_id);
+            recent.source_quote = memory.cleaned_optional(&memory.source_quote);
             recent.is_imported_context = memory
                 .is_imported_context
                 .unwrap_or_else(|| source_type.imported_or_cross_session());

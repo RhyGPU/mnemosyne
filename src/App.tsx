@@ -132,6 +132,7 @@ import {
   runBenchmark,
   prepareBenchmarkSession,
   generateBenchmarkPlayerMessage,
+  generateTraditionalRpMessage,
   benchmarkTurnSummary,
   finalizeBenchmark,
   BenchmarkSessionInit,
@@ -141,12 +142,20 @@ import {
   StructuredEvaluatorDiagnosticSummary,
   setActiveEvaluatorProfile,
   listenEvaluatorAutoFallbackTriggered,
+  listenEvaluatorOpsRejected,
+  repairEvaluatorOps,
+  startEmbeddedRepairModel,
+  stopEmbeddedRepairModel,
+  embeddedRepairModelStatus,
+  EmbeddedModelStatus,
 } from "./tauri";
 
 const DEFAULT_CONVERSATION_ID = "local-mock";
 const CONSOLIDATION_INTERVAL_TURNS = 10;
 const NARRATOR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:narrator_provider_profile_id";
 const UPDATER_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:state_updater_provider_profile_id";
+const REPAIR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:repair_provider_profile_id";
+const EMBEDDED_MODEL_PATH_STORAGE_KEY = "mnemosyne:embedded_repair_model_path";
 const USE_NARRATOR_FOR_UPDATER_STORAGE_KEY = "mnemosyne:use_narrator_provider_for_updater";
 const CUSTOM_NARRATOR_PROMPT_STORAGE_KEY = "mnemosyne:custom_narrator_prompt";
 const SETTINGS_DRAWER_OPEN_STORAGE_KEY = "mnemosyne:settings_drawer_open";
@@ -270,6 +279,9 @@ type BenchmarkLiveContext = {
   startedAt: number;
   playerProfileId: string;
   playerGoal: string;
+  /** Opposing/user side uses the traditional RP engine (full chat, no memory)
+   * instead of the player simulator — the comparison-benchmark control. */
+  traditionalOpponent: boolean;
   settings: BenchmarkSettings;
   narratorSettings: ApiProviderSettings;
   updaterSettings: ApiProviderSettings;
@@ -538,6 +550,25 @@ export function App() {
   const [selectedStateUpdaterProfileId, setSelectedStateUpdaterProfileId] = useState(() =>
     localStorage.getItem(UPDATER_PROVIDER_PROFILE_STORAGE_KEY) ?? "",
   );
+  // The light, local repair model — its own provider slot, separate from the
+  // narrator and the (smart) evaluator. Empty = fall back to the evaluator's
+  // settings (and, once shipped, the embedded local model).
+  const [selectedRepairProfileId, setSelectedRepairProfileId] = useState(() =>
+    localStorage.getItem(REPAIR_PROVIDER_PROFILE_STORAGE_KEY) ?? "",
+  );
+  // Embedded local repair model (a llamafile the app spawns). Path is hardcoded
+  // by the user here; status is polled from the backend.
+  const [embeddedModelPath, setEmbeddedModelPath] = useState(
+    () => localStorage.getItem(EMBEDDED_MODEL_PATH_STORAGE_KEY) ?? "",
+  );
+  const [embeddedModel, setEmbeddedModel] = useState<EmbeddedModelStatus>({
+    running: false,
+    ready: false,
+    url: null,
+    model: null,
+  });
+  const [embeddedModelBusy, setEmbeddedModelBusy] = useState(false);
+  const [embeddedModelError, setEmbeddedModelError] = useState<string | null>(null);
   const [useNarratorProviderForUpdater, setUseNarratorProviderForUpdater] = useState(
     () => localStorage.getItem(USE_NARRATOR_FOR_UPDATER_STORAGE_KEY) !== "false",
   );
@@ -646,6 +677,10 @@ export function App() {
   const [benchmarkStrictToolEvaluator, setBenchmarkStrictToolEvaluator] = useState(false);
   const [benchmarkTransport, setBenchmarkTransport] = useState<ApiProviderSettings["structured_evaluator_transport"]>("tool_call");
   const [benchmarkWaitForEvaluator, setBenchmarkWaitForEvaluator] = useState(true);
+  // Comparison benchmark: drive the opposing/user side with the traditional RP
+  // engine (full chat, no memory) so you watch it converse with your memory
+  // system live and compare continuity.
+  const [benchmarkTraditionalOpponent, setBenchmarkTraditionalOpponent] = useState(false);
   const [benchmarkRunning, setBenchmarkRunning] = useState(false);
   const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkSummary | null>(null);
   const [benchmarkError, setBenchmarkError] = useState<string | null>(null);
@@ -656,6 +691,9 @@ export function App() {
   const benchmarkCtxRef = useRef<BenchmarkLiveContext | null>(null);
   const benchmarkTurnInFlightRef = useRef(false);
   const benchmarkStopRef = useRef(false);
+  // Latest evaluator/repair endpoint settings, kept fresh so the background
+  // op-repair listener (registered once) always uses current config.
+  const repairSettingsRef = useRef<ApiProviderSettings | null>(null);
   const [disclaimerMode, setDisclaimerMode] = useState<DisclaimerMode>(() =>
     hasAcceptedDisclaimerVersion() ? null : "launch",
   );
@@ -725,6 +763,114 @@ export function App() {
   useEffect(() => {
     currentConversationIdRef.current = currentConversationId;
   }, [currentConversationId]);
+
+  // Keep the repair endpoint settings current. Repair is its own role (a light,
+  // local model): if a Repair Model profile is selected it wins; otherwise fall
+  // back to the evaluator/updater settings. The listener below reads this ref so
+  // it never goes stale. (ProviderProfile is a superset of ApiProviderSettings;
+  // the backend ignores the extra metadata fields.)
+  useEffect(() => {
+    const evalSettings = useNarratorProviderForUpdater ? apiSettings : stateUpdaterSettings;
+    const repairProfile = selectedRepairProfileId
+      ? providerProfiles.find((profile) => profile.id === selectedRepairProfileId)
+      : undefined;
+    // Precedence: a chosen Repair profile wins; else the embedded local model (if
+    // ready); else fall back to the evaluator settings.
+    if (repairProfile) {
+      repairSettingsRef.current = repairProfile;
+    } else if (embeddedModel.ready && embeddedModel.url) {
+      repairSettingsRef.current = {
+        ...evalSettings,
+        base_url: embeddedModel.url,
+        api_key: "local",
+        model: embeddedModel.model ?? "local-model",
+      };
+    } else {
+      repairSettingsRef.current = evalSettings;
+    }
+  });
+
+  // Poll embedded model status on mount and while it's starting (running but not
+  // ready), until it's ready or stopped.
+  useEffect(() => {
+    let active = true;
+    let timer: number | undefined;
+    const tick = async () => {
+      try {
+        const status = await embeddedRepairModelStatus();
+        if (!active) return;
+        setEmbeddedModel(status);
+        if (status.running && !status.ready) {
+          timer = window.setTimeout(() => void tick(), 2000);
+        }
+      } catch {
+        // leave last-known status in place
+      }
+    };
+    void tick();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [embeddedModel.running]);
+
+  async function handleStartEmbeddedModel() {
+    if (!embeddedModelPath.trim()) {
+      setEmbeddedModelError("Set the path to your llamafile first.");
+      return;
+    }
+    setEmbeddedModelBusy(true);
+    setEmbeddedModelError(null);
+    try {
+      const status = await startEmbeddedRepairModel(embeddedModelPath.trim(), 8080, null);
+      setEmbeddedModel(status);
+      setStatus("Embedded repair model starting…");
+    } catch (error) {
+      setEmbeddedModelError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setEmbeddedModelBusy(false);
+    }
+  }
+
+  async function handleStopEmbeddedModel() {
+    setEmbeddedModelBusy(true);
+    try {
+      await stopEmbeddedRepairModel();
+      setEmbeddedModel({ running: false, ready: false, url: null, model: null });
+    } catch (error) {
+      setEmbeddedModelError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setEmbeddedModelBusy(false);
+    }
+  }
+
+  // Auto-fire background op-repair: when the evaluator drops ops (its own
+  // verdict, surfaced by the backend), retry ONLY those ops on the configured
+  // endpoint, in the background. Fires after the original eval job, so there is
+  // no overlap with the main turn's write. Best-effort: failures stay dropped.
+  useEffect(() => {
+    let active = true;
+    let cleanup: (() => void) | undefined;
+    void listenEvaluatorOpsRejected((payload) => {
+      if (!active) return;
+      if (!payload.failed_ops?.length) return;
+      const settings = repairSettingsRef.current;
+      if (!settings) return;
+      void repairEvaluatorOps(
+        payload.conversation_id,
+        payload.assistant_message_id,
+        payload.failed_ops,
+        settings,
+      ).catch(() => undefined);
+    }).then((unlisten) => {
+      cleanup = unlisten;
+      if (!active) cleanup();
+    });
+    return () => {
+      active = false;
+      cleanup?.();
+    };
+  }, []);
 
   // Drives the live AI-vs-AI self-play loop. Each time the chat settles (not
   // busy/updating) and the benchmark conversation is active, fire the next turn
@@ -849,6 +995,14 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(UPDATER_PROVIDER_PROFILE_STORAGE_KEY, selectedStateUpdaterProfileId);
   }, [selectedStateUpdaterProfileId]);
+
+  useEffect(() => {
+    localStorage.setItem(REPAIR_PROVIDER_PROFILE_STORAGE_KEY, selectedRepairProfileId);
+  }, [selectedRepairProfileId]);
+
+  useEffect(() => {
+    localStorage.setItem(EMBEDDED_MODEL_PATH_STORAGE_KEY, embeddedModelPath);
+  }, [embeddedModelPath]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -3160,26 +3314,55 @@ export function App() {
     };
   }
 
-  // Poll the latest evaluator job for the conversation until it reaches a
-  // terminal state (or Stop / a safety cap). Used between live benchmark turns
-  // so the background evaluator has committed before the next turn — while the
-  // evaluator banner tracks the same job live. Returns when there is no live
-  // job (terminal, or none — e.g. a dialogue-only turn the gate skipped).
+  // Wait between live benchmark turns until the background evaluator has
+  // committed — EVENT-DRIVEN: resolves the instant the job's completion event
+  // arrives (no poll lag), which is why this is much faster than the old 700ms
+  // polling loop. A slow 3s poll + a 300s cap are kept only as safety nets in
+  // case an event is missed. Returns immediately if there's no live job (already
+  // terminal, or a dialogue-only turn the gate skipped).
   async function waitForBenchmarkEvaluatorJob(conversationId: string) {
-    const deadlineMs = Date.now() + 300_000; // safety cap above any single job's own timeout
-    while (Date.now() < deadlineMs) {
-      if (benchmarkStopRef.current) return;
-      let job: EvaluatorJob | null = null;
-      try {
-        job = await getLatestEvaluatorJob(conversationId);
-      } catch {
-        return; // best-effort: don't wedge the run on a polling error
-      }
-      if (!job || (job.status !== "pending" && job.status !== "running")) {
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 700));
+    const isTerminal = (status: string) => status !== "pending" && status !== "running";
+    // Fast path: nothing in flight.
+    try {
+      const job = await getLatestEvaluatorJob(conversationId);
+      if (!job || isTerminal(job.status)) return;
+    } catch {
+      return;
     }
+    await new Promise<void>((resolve) => {
+      let done = false;
+      let unlisten: (() => void) | undefined;
+      let cap: number | undefined;
+      let safetyPoll: number | undefined;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (cap !== undefined) window.clearTimeout(cap);
+        if (safetyPoll !== undefined) window.clearInterval(safetyPoll);
+        unlisten?.();
+        resolve();
+      };
+      // Primary signal: the eval job's status-changed event for THIS conversation.
+      void listenEvaluatorJobStatusChanged((job) => {
+        if (job.conversation_id === conversationId && isTerminal(job.status)) finish();
+      }).then((stop) => {
+        unlisten = stop;
+        if (done) stop();
+      });
+      // Safety nets: honor Stop, slow-poll in case an event is dropped, hard cap.
+      cap = window.setTimeout(finish, 300_000);
+      safetyPoll = window.setInterval(() => {
+        if (benchmarkStopRef.current) {
+          finish();
+          return;
+        }
+        void getLatestEvaluatorJob(conversationId)
+          .then((job) => {
+            if (!job || isTerminal(job.status)) finish();
+          })
+          .catch(() => undefined);
+      }, 3000);
+    });
   }
 
   async function startLiveBenchmark(
@@ -3210,6 +3393,7 @@ export function App() {
         startedAt: init.started_at,
         playerProfileId: settingsPayload.player_simulator_profile_id ?? "",
         playerGoal: settingsPayload.player_goal,
+        traditionalOpponent: benchmarkTraditionalOpponent,
         settings: settingsPayload,
         narratorSettings: apiSettings,
         updaterSettings: liveUpdaterSettings,
@@ -3250,8 +3434,12 @@ export function App() {
     // generation is recorded as an empty message (not the previous turn's text).
     let playerText: string | null = null;
     try {
-      setStatus(`${turnLabel}: AI player thinking...`);
-      playerText = await generateBenchmarkPlayerMessage(
+      const opponentLabel = ctx.traditionalOpponent ? "Traditional RP" : "AI player";
+      setStatus(`${turnLabel}: ${opponentLabel} thinking…`);
+      const generate = ctx.traditionalOpponent
+        ? generateTraditionalRpMessage
+        : generateBenchmarkPlayerMessage;
+      playerText = await generate(
         ctx.conversationId,
         ctx.soulId,
         ctx.playerProfileId,
@@ -4049,6 +4237,15 @@ export function App() {
         />
         <span>Wait For Evaluator Each Turn</span>
       </label>
+      <label className="toggle-row">
+        <input
+          type="checkbox"
+          checked={benchmarkTraditionalOpponent}
+          onChange={(event) => setBenchmarkTraditionalOpponent(event.target.checked)}
+          disabled={benchmarkRunning}
+        />
+        <span>Traditional RP opponent (full chat, no memory — comparison)</span>
+      </label>
       <div className="button-row">
         <button
           type="button"
@@ -4553,6 +4750,83 @@ export function App() {
                 )}
               </div>
             )}
+          </section>
+
+          <section className="settings-section provider-pass-card">
+            <div className="provider-pass-heading">
+              <div>
+                <h3>Repair Model</h3>
+                <p>Focused background repair for evaluator ops rejected by validation.</p>
+              </div>
+              <span className="provider-status-pill">
+                {selectedRepairProfileId
+                  ? providerProfiles.find((profile) => profile.id === selectedRepairProfileId)?.name ?? "Profile missing"
+                  : "Same as evaluator"}
+              </span>
+            </div>
+            <div className="provider-pass-grid">
+              <label className="field">
+                <span>Repair Model (light/local)</span>
+                <select
+                  value={selectedRepairProfileId}
+                  onChange={(event) => setSelectedRepairProfileId(event.target.value)}
+                  disabled={busy}
+                >
+                  <option value="">Same as evaluator (no separate repair)</option>
+                  {providerProfiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="provider-pass-grid">
+              <label className="field">
+                <span>Embedded model file (llamafile path)</span>
+                <input
+                  value={embeddedModelPath}
+                  onChange={(event) => setEmbeddedModelPath(event.target.value)}
+                  placeholder="C:\path\to\your-model.llamafile.exe"
+                  disabled={embeddedModelBusy}
+                />
+              </label>
+            </div>
+            <div className="button-row">
+              <button
+                type="button"
+                className="ghost-action"
+                onClick={() => void handleStartEmbeddedModel()}
+                disabled={embeddedModelBusy || embeddedModel.running}
+              >
+                <span>
+                  {embeddedModel.running
+                    ? embeddedModel.ready
+                      ? "Embedded model running"
+                      : "Starting…"
+                    : "Start embedded model"}
+                </span>
+              </button>
+              <button
+                type="button"
+                className="ghost-action"
+                onClick={() => void handleStopEmbeddedModel()}
+                disabled={embeddedModelBusy || !embeddedModel.running}
+              >
+                <span>Stop</span>
+              </button>
+            </div>
+            <p className="provider-note">
+              {embeddedModel.ready
+                ? `Embedded model ready at ${embeddedModel.url} — repair uses it automatically when no profile is selected above.`
+                : embeddedModel.running
+                  ? "Embedded model loading… large models can take a minute."
+                  : "Drop a single-file llamafile in your project, put its full path above, and Start. Repair will use it automatically."}
+              {embeddedModelError ? ` — ${embeddedModelError}` : ""}
+            </p>
+            <p className="provider-note">
+              Pick a saved local/light profile above to point repair at your own endpoint instead.
+            </p>
           </section>
 
           <section className="settings-section provider-pass-card">
@@ -6670,6 +6944,40 @@ export function App() {
                     )}
                   </div>
                 )}
+              </div>
+
+              <div className="provider-pass-card">
+                <div className="provider-pass-heading">
+                  <div>
+                    <h3>Repair Model</h3>
+                    <p>Focused background repair for evaluator ops rejected by validation.</p>
+                  </div>
+                  <span className="provider-status-pill">
+                    {selectedRepairProfileId
+                      ? providerProfiles.find((profile) => profile.id === selectedRepairProfileId)?.name ?? "Profile missing"
+                      : "Same as evaluator"}
+                  </span>
+                </div>
+                <div className="provider-pass-grid">
+                  <label className="field">
+                    <span>Repair Model (light/local)</span>
+                    <select
+                      value={selectedRepairProfileId}
+                      onChange={(event) => setSelectedRepairProfileId(event.target.value)}
+                      disabled={busy}
+                    >
+                      <option value="">Same as evaluator (no separate repair)</option>
+                      {providerProfiles.map((profile) => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <p className="provider-note">
+                  Pick a saved local/light profile here to keep repair separate from narrator and evaluator.
+                </p>
               </div>
             </>
           ) : null}

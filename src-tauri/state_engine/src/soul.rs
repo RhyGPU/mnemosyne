@@ -237,6 +237,12 @@ pub struct MemoryEntry {
     pub source_message_id: Option<i64>,
     #[serde(default)]
     pub source_entity_id: Option<String>,
+    /// The exact source line this memory was drawn from (the model's
+    /// evidence_quote, validated against the turn text). The "quote" half of the
+    /// address/quote provenance: lets tooling and the repair worker pin a memory
+    /// to the precise text it came from.
+    #[serde(default)]
+    pub source_quote: Option<String>,
     #[serde(default = "default_lived_experience")]
     pub is_lived_experience: bool,
     #[serde(default)]
@@ -788,6 +794,7 @@ mod tests {
             source_conversation_id: None,
             source_message_id: None,
             source_entity_id: None,
+            source_quote: None,
             is_lived_experience: true,
             is_imported_context: false,
             perceived_by_entity_id: None,

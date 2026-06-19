@@ -12,6 +12,8 @@ use tauri::Manager;
 
 pub struct AppState {
     pub conn: Mutex<Connection>,
+    /// The embedded local repair model process, if one was started this session.
+    pub local_model: Mutex<Option<commands::EmbeddedModel>>,
 }
 
 pub fn run() {
@@ -24,6 +26,7 @@ pub fn run() {
             }
             app.manage(AppState {
                 conn: Mutex::new(conn),
+                local_model: Mutex::new(None),
             });
             Ok(())
         })
@@ -116,11 +119,13 @@ pub fn run() {
             commands::get_latest_evaluator_job,
             commands::cancel_evaluator_job,
             commands::retry_evaluator_job,
+            commands::repair_evaluator_ops,
             commands::run_evaluator_contract_test,
             commands::run_structured_evaluator_diagnostic,
             commands::run_benchmark,
             commands::prepare_benchmark_session,
             commands::generate_benchmark_player_message,
+            commands::generate_traditional_rp_message,
             commands::benchmark_turn_summary,
             commands::finalize_benchmark,
             commands::set_active_evaluator_profile,
@@ -130,7 +135,23 @@ pub fn run() {
             commands::compile_context,
             commands::preview_api_payload,
             commands::run_consolidation,
+            commands::start_embedded_repair_model,
+            commands::stop_embedded_repair_model,
+            commands::embedded_repair_model_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Mnemosyne");
+        .build(tauri::generate_context!())
+        .expect("error while building Mnemosyne")
+        .run(|app_handle, event| {
+            // Kill the embedded local repair model when the app exits so it
+            // doesn't linger as an orphaned process.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    if let Ok(mut guard) = state.local_model.lock() {
+                        if let Some(mut model) = guard.take() {
+                            let _ = model.child.kill();
+                        }
+                    }
+                }
+            }
+        });
 }

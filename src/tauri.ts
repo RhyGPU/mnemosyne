@@ -1392,6 +1392,58 @@ export function listenEvaluatorAutoFallbackTriggered(
   );
 }
 
+export type EmbeddedModelStatus = {
+  running: boolean;
+  ready: boolean;
+  url?: string | null;
+  model?: string | null;
+};
+
+/** Launch a single-file local model (llamafile) as the embedded repair model. */
+export function startEmbeddedRepairModel(
+  binaryPath: string,
+  port?: number | null,
+  modelName?: string | null,
+): Promise<EmbeddedModelStatus> {
+  return invokeOrPreview(
+    "start_embedded_repair_model",
+    { binaryPath, port: port ?? null, modelName: modelName ?? null },
+    () => {
+      throw new Error("Embedded repair model requires the Tauri runtime.");
+    },
+  );
+}
+
+export function stopEmbeddedRepairModel(): Promise<void> {
+  return invokeOrPreview("stop_embedded_repair_model", {}, () => undefined);
+}
+
+export function embeddedRepairModelStatus(): Promise<EmbeddedModelStatus> {
+  return invokeOrPreview("embedded_repair_model_status", {}, () => ({
+    running: false,
+    ready: false,
+    url: null,
+    model: null,
+  }));
+}
+
+export type EvaluatorOpsRejectedPayload = {
+  conversation_id: string;
+  assistant_message_id: number;
+  failed_ops: EvaluatorOpRepairRequest[];
+};
+
+/** Fired by the backend when the evaluator dropped one or more ops (its own
+ * validation verdict). The frontend uses this to auto-fire a background repair. */
+export function listenEvaluatorOpsRejected(
+  callback: (payload: EvaluatorOpsRejectedPayload) => void,
+): Promise<() => void> {
+  if (!hasTauriRuntime()) return Promise.resolve(() => undefined);
+  return listen<EvaluatorOpsRejectedPayload>("evaluator-ops-rejected", (event) =>
+    callback(event.payload),
+  );
+}
+
 
 export function listProviderProfiles(): Promise<ProviderProfile[]> {
   return invokeOrPreview("list_provider_profiles", {}, () => browserProviderProfiles);
@@ -1902,6 +1954,31 @@ export function runBenchmark(
   );
 }
 
+export type EvaluatorOpRepairRequest = {
+  op_json: string;
+  reason: string;
+};
+
+/**
+ * Fire-and-forget background op-repair: re-runs ONLY the failed ops through a
+ * configurable (e.g. local) repair model, up to 5 attempts, applying any that
+ * now validate. Non-blocking — does not affect chat or the main eval.
+ */
+export function repairEvaluatorOps(
+  conversationId: string,
+  assistantMessageId: number,
+  failedOps: EvaluatorOpRepairRequest[],
+  repairSettings: ApiProviderSettings,
+): Promise<void> {
+  return invokeOrPreview(
+    "repair_evaluator_ops",
+    { conversationId, assistantMessageId, failedOps, repairSettings },
+    () => {
+      throw new Error("Evaluator op-repair requires the Tauri runtime.");
+    },
+  );
+}
+
 export type BenchmarkSessionInit = {
   benchmark_id: string;
   conversation_id: string;
@@ -1939,6 +2016,23 @@ export function generateBenchmarkPlayerMessage(
     { conversationId, soulId, playerProfileId, playerGoal },
     () => {
       throw new Error("Player Simulator requires the Tauri runtime.");
+    },
+  );
+}
+
+/** Like generateBenchmarkPlayerMessage but uses the traditional RP engine
+ * (full transcript, no Soul/memory) — the control side of the comparison. */
+export function generateTraditionalRpMessage(
+  conversationId: string,
+  soulId: string,
+  playerProfileId: string,
+  playerGoal: string,
+): Promise<string> {
+  return invokeOrPreview(
+    "generate_traditional_rp_message",
+    { conversationId, soulId, playerProfileId, playerGoal },
+    () => {
+      throw new Error("Traditional RP engine requires the Tauri runtime.");
     },
   );
 }

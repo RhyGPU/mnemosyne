@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    evaluator::{EvaluatorConversionContext, EvaluatorConversionReport},
+    evaluator::{
+        EvaluatorCandidateRejection, EvaluatorConversionContext, EvaluatorConversionReport,
+    },
     patch::{
         EnginePatch, MemoryPatch, ObjectObservationOperationPatch, RelationshipDelta,
         SceneStatePatch, SoulPatch, WorldEventOperationPatch, WorldPatch, PATCH_PROTOCOL_VERSION,
@@ -188,16 +190,23 @@ pub fn compile_evaluator_ops_to_engine_patch(
     }
 
     let mut alias_trace = EntityAliasTrace::default();
-    let output = resolve_output_entity_aliases(output, context, soul, &mut alias_trace)?;
     let evidence_text = normalized_evidence_text(context);
     let mut patch = EnginePatch {
         schema_version: Some(PATCH_PROTOCOL_VERSION),
         ..EnginePatch::default()
     };
     let mut accepted_candidate_ids = Vec::new();
+    // Partial-accept: resolve + validate each op independently. A single bad op
+    // is dropped and logged (rejected_candidates) instead of discarding the whole
+    // turn's extraction. Only a *total* miss (below) falls through to the form-v1
+    // fallback, preserving the recovery ladder.
+    let mut rejected_candidates: Vec<EvaluatorCandidateRejection> = Vec::new();
 
-    for (index, op) in output.ops.iter().enumerate() {
-        match op {
+    for (index, raw_op) in output.ops.iter().enumerate() {
+        let mut op = raw_op.clone();
+        let outcome: Result<(), String> = (|| {
+            resolve_op_entity_aliases(&mut op, index, context, soul, &mut alias_trace)?;
+            match &op {
             EvaluatorOp::NoOp(_) => {}
             EvaluatorOp::AddMemory(op) => {
                 validate_soul_id(&op.owner_soul_id, context)?;
@@ -210,6 +219,9 @@ pub fn compile_evaluator_ops_to_engine_patch(
                     tag: Some(op.slot.as_label().to_string()),
                     source_type: Some(MemorySourceType::CurrentSession),
                     source_message_id: op.source_message_id,
+                    // Persist the validated evidence quote as the memory's source
+                    // line (the "quote" half of address/quote provenance).
+                    source_quote: non_empty(&op.evidence_quote),
                     perceived_by_entity_id: Some(op.owner_soul_id.clone()),
                     target_entity_ids: op.target_entity_ids.clone(),
                     confidence: Some(op.confidence.clamp(0.0, 1.0)),
@@ -298,14 +310,36 @@ pub fn compile_evaluator_ops_to_engine_patch(
                 });
                 accepted_candidate_ids.push(format!("op:{index}:add_world_event"));
             }
+            }
+            Ok(())
+        })();
+        if let Err(reason) = outcome {
+            rejected_candidates.push(EvaluatorCandidateRejection {
+                candidate_id: format!("op:{index}"),
+                reason,
+            });
         }
+    }
+
+    // Total miss: nothing valid compiled but ops were present and failed — let
+    // the caller fall through to evaluator_form_v1 instead of saving nothing.
+    if accepted_candidate_ids.is_empty() && !rejected_candidates.is_empty() {
+        let reasons = rejected_candidates
+            .iter()
+            .map(|rejection| format!("{}: {}", rejection.candidate_id, rejection.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "all {} evaluator op(s) failed: {reasons}",
+            rejected_candidates.len()
+        ));
     }
 
     let no_op = patch.is_empty();
     Ok(EvaluatorConversionReport {
         patch,
         accepted_candidate_ids,
-        rejected_candidates: Vec::new(),
+        rejected_candidates,
         evidence_validations: Vec::new(),
         entity_aliases_resolved: alias_trace.resolved,
         entity_alias_resolution_warnings: alias_trace.warnings,
@@ -319,15 +353,14 @@ struct EntityAliasTrace {
     warnings: Vec<String>,
 }
 
-fn resolve_output_entity_aliases(
-    output: &EvaluatorStructuredOutputV1,
+fn resolve_op_entity_aliases(
+    op: &mut EvaluatorOp,
+    index: usize,
     context: &EvaluatorConversionContext<'_>,
     soul: &Soul,
     trace: &mut EntityAliasTrace,
-) -> Result<EvaluatorStructuredOutputV1, String> {
-    let mut resolved = output.clone();
-    for (index, op) in resolved.ops.iter_mut().enumerate() {
-        match op {
+) -> Result<(), String> {
+    match op {
             EvaluatorOp::AddMemory(op) => {
                 resolve_soul_alias_field(
                     &mut op.owner_soul_id,
@@ -401,9 +434,8 @@ fn resolve_output_entity_aliases(
                 )?;
             }
             EvaluatorOp::AddWorldEvent(_) | EvaluatorOp::NoOp(_) => {}
-        }
     }
-    Ok(resolved)
+    Ok(())
 }
 
 fn resolve_soul_alias_field(
@@ -1200,6 +1232,94 @@ mod tests {
                 .as_deref(),
             Some("aurora")
         );
+    }
+
+    #[test]
+    fn add_memory_persists_evidence_quote_as_source_quote() {
+        // The "quote" half of address/quote: the validated evidence quote is now
+        // carried onto the memory instead of being discarded after validation.
+        let soul = Soul::default_for_character("Aurora");
+        let output = EvaluatorStructuredOutputV1 {
+            schema_version: 1,
+            ops: vec![EvaluatorOp::AddMemory(AddMemoryOp {
+                owner_soul_id: "active_soul".into(),
+                slot: MemorySlotOp::RelationshipMemory,
+                content: "Aurora noted the user waited at the doorway.".into(),
+                evidence_quote: "I wait at the doorway.".into(),
+                confidence: 0.8,
+                salience: 60,
+                source_message_id: None,
+                target_entity_ids: vec!["active_player".into()],
+                truth_status: TruthStatusOp::SceneEvent,
+            })],
+            no_op_reason: None,
+        };
+        let report = compile_evaluator_ops_to_engine_patch(
+            &output,
+            &context("I wait at the doorway.", ""),
+            &soul,
+        )
+        .expect("compiles");
+        let memory = &report.patch.soul_patch.as_ref().unwrap().new_memories[0];
+        assert_eq!(
+            memory.source_quote.as_deref(),
+            Some("I wait at the doorway."),
+            "the memory carries its exact source line"
+        );
+    }
+
+    #[test]
+    fn partial_accept_keeps_valid_ops_and_drops_the_bad_one() {
+        // The whole point: one fumbled op no longer discards the turn's whole
+        // extraction. The valid memory is kept; the unsupported one is dropped
+        // and logged in rejected_candidates (visible in the trace).
+        let soul = Soul::default_for_character("Aurora");
+        let output = EvaluatorStructuredOutputV1 {
+            schema_version: 1,
+            ops: vec![
+                EvaluatorOp::AddMemory(AddMemoryOp {
+                    owner_soul_id: "active_soul".into(),
+                    slot: MemorySlotOp::RelationshipMemory,
+                    content: "Aurora noticed the user wait patiently at the doorway.".into(),
+                    evidence_quote: "I wait at the doorway.".into(),
+                    confidence: 0.8,
+                    salience: 60,
+                    source_message_id: None,
+                    target_entity_ids: vec!["active_player".into()],
+                    truth_status: TruthStatusOp::SceneEvent,
+                }),
+                EvaluatorOp::AddMemory(AddMemoryOp {
+                    owner_soul_id: "active_soul".into(),
+                    slot: MemorySlotOp::RelationshipMemory,
+                    content: "A fabricated event with no support in the turn.".into(),
+                    // Not present in the evidence text -> validation rejects it.
+                    evidence_quote: "Dragons circled the tower at dusk.".into(),
+                    confidence: 0.8,
+                    salience: 60,
+                    source_message_id: None,
+                    target_entity_ids: vec!["active_player".into()],
+                    truth_status: TruthStatusOp::SceneEvent,
+                }),
+            ],
+            no_op_reason: None,
+        };
+        let report = compile_evaluator_ops_to_engine_patch(
+            &output,
+            &context("I wait at the doorway.", ""),
+            &soul,
+        )
+        .expect("the valid op compiles even though a sibling op fails");
+        assert_eq!(
+            report.patch.soul_patch.as_ref().unwrap().new_memories.len(),
+            1,
+            "the valid memory is kept"
+        );
+        assert_eq!(
+            report.rejected_candidates.len(),
+            1,
+            "the unsupported op is dropped and logged, not silently lost"
+        );
+        assert!(report.rejected_candidates[0].candidate_id.contains("op:1"));
     }
 
     #[test]

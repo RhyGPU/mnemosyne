@@ -353,6 +353,17 @@ pub struct BenchmarkObjectIdentityCheck {
 pub struct BenchmarkScorecard {
     pub visible_chat_messages_created: bool,
     pub normal_pipeline_used: bool,
+    pub visible_turns_requested: usize,
+    pub visible_turns_completed: usize,
+    pub visible_user_messages_created: usize,
+    pub visible_assistant_messages_created: usize,
+    pub unique_user_message_ids: usize,
+    pub unique_assistant_message_ids: usize,
+    pub internal_evaluator_retry_count: usize,
+    pub internal_evaluator_retry_payload_count: usize,
+    pub duplicate_turn_rows_detected: bool,
+    pub duplicate_turn_message_pairs: Vec<String>,
+    pub player_simulator_payload_count: usize,
     pub turn_count_requested: usize,
     pub turn_count_completed: usize,
     pub player_simulator_calls: usize,
@@ -419,6 +430,17 @@ pub struct BenchmarkSummary {
     pub final_memory_count: usize,
     pub final_object_state_count: usize,
     pub final_relationship_count: usize,
+    pub visible_turns_requested: usize,
+    pub visible_turns_completed: usize,
+    pub visible_user_messages_created: usize,
+    pub visible_assistant_messages_created: usize,
+    pub unique_user_message_ids: usize,
+    pub unique_assistant_message_ids: usize,
+    pub internal_evaluator_retry_count: usize,
+    pub internal_evaluator_retry_payload_count: usize,
+    pub duplicate_turn_rows_detected: bool,
+    pub duplicate_turn_message_pairs: Vec<String>,
+    pub player_simulator_payload_count: usize,
     pub per_turn: Vec<BenchmarkTurnSummary>,
     pub object_identity_checks: Vec<BenchmarkObjectIdentityCheck>,
     pub mne_export_path: Option<String>,
@@ -4098,6 +4120,24 @@ pub async fn generate_benchmark_player_message(
     generate_benchmark_player_turn(&state, &conversation_id, &soul_id, &profile, &player_goal).await
 }
 
+/// Like `generate_benchmark_player_message`, but uses the TRADITIONAL RP engine
+/// (full raw transcript, no Soul/memory/scene) — the control side of the
+/// comparison benchmark.
+#[tauri::command]
+pub async fn generate_traditional_rp_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    soul_id: String,
+    player_profile_id: String,
+    player_goal: String,
+) -> Result<String, String> {
+    let profile = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::get_provider_profile(&conn, &player_profile_id).map_err(|err| err.to_string())?
+    };
+    generate_traditional_rp_turn(&state, &conversation_id, &soul_id, &profile, &player_goal).await
+}
+
 /// Build the per-turn summary for one live self-play turn after `executeTurn`
 /// has completed and its evaluator has applied. Captures the post-turn entity
 /// counts and the evaluator trace from the latest payload logs.
@@ -4351,7 +4391,40 @@ async fn generate_benchmark_player_turn(
             })
             .await
         {
-            Ok(completion) => return sanitize_player_simulator_message(&completion.raw_text),
+            Ok(completion) => {
+                let sanitized = sanitize_player_simulator_message(&completion.raw_text)?;
+                if let Ok(conn) = state.conn.lock() {
+                    let _ = db::insert_llm_payload_log(
+                        &conn,
+                        &LlmPayloadLog {
+                            conversation_id: conversation_id.to_string(),
+                            provider: "player_simulator".into(),
+                            mode: "visible_ai_chat".into(),
+                            context_mode: "public_only".into(),
+                            model: settings.model.trim().to_string(),
+                            base_url: settings.base_url.trim().to_string(),
+                            system_message: system_prompt.to_string(),
+                            user_message: user_prompt.clone(),
+                            context_text: "visible_chat + public_scene_summary + active_player_persona"
+                                .into(),
+                            estimated_system_tokens: estimate_tokens(system_prompt),
+                            estimated_user_tokens: estimate_tokens(&user_prompt),
+                            estimated_total_tokens: estimate_tokens(system_prompt)
+                                + estimate_tokens(&user_prompt),
+                            truncated: false,
+                            created_at: db::now_ts(),
+                            request_id: Some(format!("player_simulator_{}", uuid_like_id())),
+                            raw_provider_response: Some(completion.raw_text),
+                            normalized_response: Some(sanitized.clone()),
+                            finish_reason: completion.finish_reason,
+                            provider_request_id: completion.provider_request_id,
+                            provider_response_id: completion.provider_response_id,
+                            ..Default::default()
+                        },
+                    );
+                }
+                return Ok(sanitized);
+            }
             Err(error) => {
                 last_error = error;
                 if attempts < MAX_ATTEMPTS && is_transient_provider_error(&last_error) {
@@ -4410,6 +4483,116 @@ Do not rush the scene unless the goal requires it.
 Do not summarize. Do not explain. Output only the user message."#
 }
 
+fn traditional_rp_prompt() -> &'static str {
+    // The deliberately "dumb" baseline: a traditional RP engine has ONLY the raw
+    // chat transcript — no memory aids, no compiled state, no continuity notes.
+    // This is the control we compare Mnemosyne's memory system against.
+    r#"You are a traditional RP partner, exactly like Character.AI or JanitorAI.
+You have ONLY the conversation transcript below to work from — no memory file, no
+notes, no state summary. Whatever continuity you keep must come from the transcript
+itself.
+
+Play the active player persona's side of the scene. Write only the next user
+message to send into the chat. Stay in character, react to the latest reply, and
+move the scene naturally. Do not write the other character's actions or dialogue.
+Do not write JSON, tool calls, status blocks, or any meta commentary. Output only
+the message."#
+}
+
+/// Generate the next turn using a TRADITIONAL RP engine: the full raw transcript
+/// and a character/persona, with NO Soul, memory, scene state, or evaluator — the
+/// control side of the comparison benchmark. Mirrors the player-sim's transport
+/// (streaming + bounded retry/timeout) but feeds the whole chat and nothing else.
+async fn generate_traditional_rp_turn(
+    state: &State<'_, AppState>,
+    conversation_id: &str,
+    soul_id: &str,
+    profile: &ProviderProfile,
+    player_goal: &str,
+) -> Result<String, String> {
+    let (full_transcript, persona_summary) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        // The whole visible chat — traditional engines lean on raw context length,
+        // not a curated window.
+        let messages =
+            db::list_messages(&conn, conversation_id, 400).map_err(|err| err.to_string())?;
+        let full_transcript = messages
+            .iter()
+            .filter(|message| message.status == "active")
+            .map(|message| {
+                let label = if message.role == "assistant" {
+                    "Character"
+                } else {
+                    "User"
+                };
+                format!("{label}: {}", strip_status_blocks_for_export(&message.content))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let persona =
+            db::get_active_player_persona(&conn, conversation_id).map_err(|err| err.to_string())?;
+        let persona_summary = format!(
+            "{} ({})\nPronouns: {}\nDescription: {}\nAppearance: {}\nNotes: {}",
+            persona.display_name,
+            persona.persona_id,
+            persona.pronouns,
+            persona.description,
+            persona.appearance.as_deref().unwrap_or(""),
+            persona.notes.as_deref().unwrap_or("")
+        );
+        let _ = db::get_soul(&conn, soul_id).map_err(|err| err.to_string())?;
+        (full_transcript, persona_summary)
+    };
+    let system_prompt = traditional_rp_prompt();
+    let user_prompt = format!(
+        "Your character:\n{}\n\nGoal (optional):\n{}\n\nFull conversation so far:\n{}\n\nWrite the next user message only.",
+        persona_summary,
+        if player_goal.trim().is_empty() {
+            "Continue the scene naturally."
+        } else {
+            player_goal.trim()
+        },
+        if full_transcript.trim().is_empty() {
+            "(no messages yet)"
+        } else {
+            full_transcript.trim()
+        }
+    );
+    let provider = ApiProvider::default();
+    let mut settings = provider_profile_to_api_settings(profile);
+    const TRADITIONAL_TURN_MAX_TIMEOUT_MS: u64 = 90_000;
+    settings.narrator_timeout_ms = Some(
+        settings
+            .narrator_timeout_ms
+            .filter(|value| *value > 0)
+            .map(|value| value.min(TRADITIONAL_TURN_MAX_TIMEOUT_MS))
+            .unwrap_or(TRADITIONAL_TURN_MAX_TIMEOUT_MS),
+    );
+    const MAX_ATTEMPTS: usize = 2;
+    let mut attempts = 0usize;
+    let mut last_error = String::new();
+    while attempts < MAX_ATTEMPTS {
+        attempts += 1;
+        match provider
+            .complete_streaming(&settings, system_prompt, &user_prompt, |_chunk: &str| Ok(()))
+            .await
+        {
+            Ok(completion) => return sanitize_player_simulator_message(&completion.raw_text),
+            Err(error) => {
+                last_error = error;
+                if attempts < MAX_ATTEMPTS && is_transient_provider_error(&last_error) {
+                    std::thread::sleep(Duration::from_millis(800 * attempts as u64));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(format!(
+        "traditional RP engine failed after {attempts} attempt(s): {last_error}"
+    ))
+}
+
 fn sanitize_player_simulator_message(raw: &str) -> Result<String, String> {
     let mut text = raw.trim().trim_matches('`').trim().to_string();
     for prefix in ["User:", "Player:", "Next user message:"] {
@@ -4464,6 +4647,95 @@ struct BenchmarkTraceCounts {
     retry_success_count: usize,
     fallback_count: usize,
     syntactic_repair_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BenchmarkLedgerAudit {
+    visible_turns_completed: usize,
+    visible_user_messages_created: usize,
+    visible_assistant_messages_created: usize,
+    unique_user_message_ids: usize,
+    unique_assistant_message_ids: usize,
+    duplicate_turn_rows_detected: bool,
+    duplicate_turn_message_pairs: Vec<String>,
+    internal_evaluator_retry_count: usize,
+    internal_evaluator_retry_payload_count: usize,
+    player_simulator_payload_count: usize,
+}
+
+fn benchmark_ledger_audit(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<BenchmarkLedgerAudit, String> {
+    let mut audit = BenchmarkLedgerAudit::default();
+    let logs = db::list_llm_payload_logs(conn, conversation_id).map_err(|err| err.to_string())?;
+    audit.player_simulator_payload_count = logs
+        .iter()
+        .filter(|log| log.provider == "player_simulator")
+        .count();
+    audit.internal_evaluator_retry_payload_count = logs
+        .iter()
+        .filter(|log| {
+            log.request_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("eval_retry_") || id.starts_with("eval_repair_"))
+                || log.provider.contains("repair")
+                || log.mode.contains("repair")
+        })
+        .count();
+
+    let branch = match db::get_active_session_branch(conn, conversation_id) {
+        Ok(branch) => branch,
+        Err(_) => return Ok(audit),
+    };
+    let commits =
+        db::list_turn_commits_for_branch(conn, &branch.branch_id).map_err(|err| err.to_string())?;
+    let messages = db::list_messages(conn, conversation_id, 20_000).map_err(|err| err.to_string())?;
+    let active_message_ids = messages
+        .iter()
+        .filter(|message| message.status == "active")
+        .map(|message| message.id)
+        .collect::<HashSet<_>>();
+    let mut visible_pair_counts: HashMap<(i64, i64), usize> = HashMap::new();
+    let mut all_pair_counts: HashMap<(i64, i64), usize> = HashMap::new();
+    let mut user_ids = HashSet::new();
+    let mut assistant_ids = HashSet::new();
+
+    for commit in commits
+        .iter()
+        .filter(|commit| commit.is_active && !commit.is_discarded)
+    {
+        let (Some(user_id), Some(assistant_id)) =
+            (commit.user_message_id, commit.assistant_message_id)
+        else {
+            continue;
+        };
+        if !active_message_ids.contains(&user_id) || !active_message_ids.contains(&assistant_id) {
+            continue;
+        }
+        *all_pair_counts.entry((user_id, assistant_id)).or_insert(0) += 1;
+        if commit.is_regenerated_variant {
+            audit.internal_evaluator_retry_count += 1;
+            continue;
+        }
+        *visible_pair_counts.entry((user_id, assistant_id)).or_insert(0) += 1;
+        user_ids.insert(user_id);
+        assistant_ids.insert(assistant_id);
+    }
+
+    audit.duplicate_turn_message_pairs = all_pair_counts
+        .iter()
+        .filter_map(|((user_id, assistant_id), count)| {
+            (*count > 1).then(|| format!("{user_id}:{assistant_id}x{count}"))
+        })
+        .collect();
+    audit.duplicate_turn_rows_detected = !audit.duplicate_turn_message_pairs.is_empty();
+    audit.visible_turns_completed = visible_pair_counts.len();
+    audit.unique_user_message_ids = user_ids.len();
+    audit.unique_assistant_message_ids = assistant_ids.len();
+    audit.visible_user_messages_created = user_ids.len();
+    audit.visible_assistant_messages_created = assistant_ids.len();
+    Ok(audit)
 }
 
 fn build_benchmark_turn_summary(
@@ -4590,7 +4862,7 @@ fn build_benchmark_summary(
     per_turn: Vec<BenchmarkTurnSummary>,
     strict_tool: bool,
 ) -> Result<BenchmarkSummary, String> {
-    let (soul, session_world, logs, conversation) = {
+    let (soul, session_world, logs, conversation, ledger_audit) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         let conversation =
             db::get_conversation_summary(&conn, conversation_id).map_err(|err| err.to_string())?;
@@ -4609,9 +4881,11 @@ fn build_benchmark_summary(
         };
         let logs =
             db::list_llm_payload_logs(&conn, conversation_id).map_err(|err| err.to_string())?;
-        (soul, session_world, logs, conversation)
+        let ledger_audit = benchmark_ledger_audit(&conn, conversation_id)?;
+        (soul, session_world, logs, conversation, ledger_audit)
     };
     let trace_counts = benchmark_trace_counts(&logs);
+    let visible_turn_count_completed = ledger_audit.visible_turns_completed;
     let final_memory_count = memory_count(&soul);
     let default_player_leak_detected = soul.relationships.contains_key("default_player")
         || soul.memory.recent.iter().any(|memory| {
@@ -4634,7 +4908,7 @@ fn build_benchmark_summary(
         started_at,
         completed_at,
         turn_count_requested,
-        turn_count_completed,
+        turn_count_completed: visible_turn_count_completed,
         narrator_model: narrator_settings.model.clone(),
         evaluator_model: state_updater_settings.model.clone(),
         player_simulator_model: player_profile.map(|profile| profile.model.clone()),
@@ -4651,6 +4925,17 @@ fn build_benchmark_summary(
         final_memory_count,
         final_object_state_count: session_world.object_states.len(),
         final_relationship_count: soul.relationships.len(),
+        visible_turns_requested: turn_count_requested,
+        visible_turns_completed: ledger_audit.visible_turns_completed,
+        visible_user_messages_created: ledger_audit.visible_user_messages_created,
+        visible_assistant_messages_created: ledger_audit.visible_assistant_messages_created,
+        unique_user_message_ids: ledger_audit.unique_user_message_ids,
+        unique_assistant_message_ids: ledger_audit.unique_assistant_message_ids,
+        internal_evaluator_retry_count: ledger_audit.internal_evaluator_retry_count,
+        internal_evaluator_retry_payload_count: ledger_audit.internal_evaluator_retry_payload_count,
+        duplicate_turn_rows_detected: ledger_audit.duplicate_turn_rows_detected,
+        duplicate_turn_message_pairs: ledger_audit.duplicate_turn_message_pairs.clone(),
+        player_simulator_payload_count: ledger_audit.player_simulator_payload_count,
         per_turn,
         object_identity_checks,
         mne_export_path: None,
@@ -4659,8 +4944,19 @@ fn build_benchmark_summary(
         scorecard: BenchmarkScorecard {
             visible_chat_messages_created: false,
             normal_pipeline_used: false,
+            visible_turns_requested: turn_count_requested,
+            visible_turns_completed: ledger_audit.visible_turns_completed,
+            visible_user_messages_created: ledger_audit.visible_user_messages_created,
+            visible_assistant_messages_created: ledger_audit.visible_assistant_messages_created,
+            unique_user_message_ids: ledger_audit.unique_user_message_ids,
+            unique_assistant_message_ids: ledger_audit.unique_assistant_message_ids,
+            internal_evaluator_retry_count: ledger_audit.internal_evaluator_retry_count,
+            internal_evaluator_retry_payload_count: ledger_audit.internal_evaluator_retry_payload_count,
+            duplicate_turn_rows_detected: ledger_audit.duplicate_turn_rows_detected,
+            duplicate_turn_message_pairs: ledger_audit.duplicate_turn_message_pairs.clone(),
+            player_simulator_payload_count: ledger_audit.player_simulator_payload_count,
             turn_count_requested,
-            turn_count_completed,
+            turn_count_completed: visible_turn_count_completed,
             player_simulator_calls: 0,
             narrator_calls: 0,
             evaluator_calls: 0,
@@ -4789,21 +5085,31 @@ fn benchmark_scorecard(
         .object_identity_checks
         .iter()
         .all(|check| check.found);
-    let player_simulator_calls = if matches!(
+    let requires_player_simulator = matches!(
         summary.benchmark_type.as_str(),
         "visible_ai_chat" | "multi_agent_visible_chat"
-    ) {
-        summary.turn_count_completed
-    } else {
-        0
-    };
-    let narrator_calls = summary.turn_count_completed + summary.narrator_failures;
-    let evaluator_calls = summary.turn_count_completed;
-    let visible_chat_messages_created = summary.turn_count_completed > 0;
-    let normal_pipeline_used = visible_chat_messages_created && narrator_calls > 0;
+    );
+    let player_simulator_calls = summary.player_simulator_payload_count;
+    let narrator_calls = summary.visible_assistant_messages_created + summary.narrator_failures;
+    let evaluator_calls = summary.visible_turns_completed;
+    let visible_chat_messages_created = summary.visible_turns_completed > 0;
+    let normal_pipeline_used = visible_chat_messages_created
+        && summary.visible_user_messages_created == summary.visible_turns_completed
+        && summary.visible_assistant_messages_created == summary.visible_turns_completed;
     let mut scorecard = BenchmarkScorecard {
         visible_chat_messages_created,
         normal_pipeline_used,
+        visible_turns_requested: summary.visible_turns_requested,
+        visible_turns_completed: summary.visible_turns_completed,
+        visible_user_messages_created: summary.visible_user_messages_created,
+        visible_assistant_messages_created: summary.visible_assistant_messages_created,
+        unique_user_message_ids: summary.unique_user_message_ids,
+        unique_assistant_message_ids: summary.unique_assistant_message_ids,
+        internal_evaluator_retry_count: summary.internal_evaluator_retry_count,
+        internal_evaluator_retry_payload_count: summary.internal_evaluator_retry_payload_count,
+        duplicate_turn_rows_detected: summary.duplicate_turn_rows_detected,
+        duplicate_turn_message_pairs: summary.duplicate_turn_message_pairs.clone(),
+        player_simulator_payload_count: summary.player_simulator_payload_count,
         turn_count_requested: summary.turn_count_requested,
         turn_count_completed: summary.turn_count_completed,
         player_simulator_calls,
@@ -4815,10 +5121,10 @@ fn benchmark_scorecard(
         relationship_updated: summary.final_relationship_count != initial_relationship_count,
         payload_history_export_succeeded: summary.payload_history_path.is_some(),
         narrator_visible_response_each_turn: summary.narrator_failures == 0
-            && summary.turn_count_completed == summary.turn_count_requested,
+            && summary.visible_turns_completed == summary.visible_turns_requested,
         evaluator_used_tool_call_where_required: !strict_tool
             || (summary.tool_call_failure_count == 0
-                && summary.tool_call_success_count >= summary.turn_count_completed),
+                && summary.tool_call_success_count >= summary.visible_turns_completed),
         no_evaluator_form_v1_fallback_in_strict_mode: !strict_tool || summary.fallback_count == 0,
         syntactic_repair_unused_in_strict_mode: !strict_tool || summary.syntactic_repair_count == 0,
         memories_increased_over_time: summary.final_memory_count > initial_memory_count,
@@ -4830,6 +5136,27 @@ fn benchmark_scorecard(
         failure_reasons: Vec::new(),
     };
     let checks = [
+        (
+            scorecard.visible_turns_completed == scorecard.visible_turns_requested,
+            "visible_turns_completed_matches_requested",
+        ),
+        (
+            scorecard.visible_user_messages_created == scorecard.visible_turns_requested,
+            "visible_user_messages_created_matches_requested",
+        ),
+        (
+            scorecard.visible_assistant_messages_created == scorecard.visible_turns_requested,
+            "visible_assistant_messages_created_matches_requested",
+        ),
+        (
+            !scorecard.duplicate_turn_rows_detected,
+            "no_duplicate_turn_rows",
+        ),
+        (
+            !requires_player_simulator
+                || scorecard.player_simulator_payload_count >= scorecard.visible_turns_requested,
+            "player_simulator_payload_count",
+        ),
         (
             scorecard.visible_chat_messages_created,
             "visible_chat_messages_created",
@@ -6256,6 +6583,7 @@ pub async fn retry_evaluator_job(
         entity_updater_context,
         branch_id,
         parent_turn_id,
+        baseline_patch_id,
         user_message_id,
         selected_variant_id,
     ) = {
@@ -6305,6 +6633,8 @@ pub async fn retry_evaluator_job(
                 .map_err(|err| err.to_string())?;
         let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
         let branch_id = branch.map(|branch| branch.branch_id);
+        let (source_turn_id, baseline_patch_id, source_user_message_id, source_variant_id) =
+            resolve_evaluator_source_turn(&conn, &conversation_id, assistant_message_id)?;
         (
             soul,
             session_world,
@@ -6313,11 +6643,10 @@ pub async fn retry_evaluator_job(
             context_preview,
             entity_updater_context,
             branch_id,
-            parent_turn_id,
-            commit.as_ref().and_then(|commit| commit.user_message_id),
-            commit
-                .as_ref()
-                .and_then(|commit| commit.selected_variant_id),
+            source_turn_id.or(parent_turn_id),
+            baseline_patch_id,
+            source_user_message_id.or_else(|| commit.as_ref().and_then(|commit| commit.user_message_id)),
+            source_variant_id.or_else(|| commit.as_ref().and_then(|commit| commit.selected_variant_id)),
         )
     };
     let request_id = uuid_like_id();
@@ -6344,11 +6673,394 @@ pub async fn retry_evaluator_job(
         branch_id,
         parent_turn_id,
         user_message_id,
-        true,
+        false,
         before_state_summary,
+        baseline_patch_id,
         None,
     )?;
     Ok(())
+}
+
+/// One op that failed validation in the main eval, plus why it failed. The op is
+/// the raw JSON the model produced (it already carries its evidence_quote / source
+/// line), so the repair model gets the exact thing to fix and the reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluatorOpRepairRequest {
+    pub op_json: String,
+    pub reason: String,
+}
+
+/// Build the list of failed ops for repair by snapshotting the model's raw ops
+/// (`normalized_json`) and the SYSTEM's own validation verdict
+/// (`rejected_candidates`, candidate_id `op:N` + reason) and pairing them. This is
+/// the "snatch the json + compare" step: the failure verdict is ours, not the
+/// tool-call's, so we can always reconstruct exactly which op failed and why.
+fn rejected_ops_for_repair(
+    normalized_json: &str,
+    rejected: &[state_engine::evaluator::EvaluatorCandidateRejection],
+) -> Vec<EvaluatorOpRepairRequest> {
+    if rejected.is_empty() {
+        return Vec::new();
+    }
+    let Ok(parsed) = serde_json::from_str::<EvaluatorStructuredOutputV1>(normalized_json.trim())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for rejection in rejected {
+        let Some(index_str) = rejection.candidate_id.strip_prefix("op:") else {
+            continue;
+        };
+        let Ok(index) = index_str.trim().parse::<usize>() else {
+            continue;
+        };
+        let Some(op) = parsed.ops.get(index) else {
+            continue;
+        };
+        let Ok(op_json) = serde_json::to_string(op) else {
+            continue;
+        };
+        out.push(EvaluatorOpRepairRequest {
+            op_json,
+            reason: rejection.reason.clone(),
+        });
+    }
+    out
+}
+
+/// Focused repair user message: fix ONLY the failed ops, given each broken op and
+/// its failure reason, anchored to the turn text. Not a full re-extraction.
+fn build_op_repair_user_message(
+    failed_ops: &[EvaluatorOpRepairRequest],
+    user_text: &str,
+    narrator_text: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "REPAIR TASK. The state-extraction ops below failed validation. Return a \
+         corrected ops payload (same schema) containing ONLY fixed versions of these \
+         ops — fix exactly the stated problem, keep everything else faithful to the \
+         scene, invent nothing, and add no new ops.\n\n",
+    );
+    out.push_str("Scene this turn:\n");
+    out.push_str("User: ");
+    out.push_str(user_text.trim());
+    out.push_str("\nNarrator: ");
+    out.push_str(narrator_text.trim());
+    out.push_str("\n\nFailed ops to fix:\n");
+    for (index, failed) in failed_ops.iter().enumerate() {
+        out.push_str(&format!(
+            "\n[{}] failure reason: {}\noriginal op: {}\n",
+            index + 1,
+            failed.reason.trim(),
+            failed.op_json.trim()
+        ));
+    }
+    out.push_str("\nReturn the corrected ops payload now.");
+    out
+}
+
+fn resolve_evaluator_source_turn(
+    conn: &Connection,
+    conversation_id: &str,
+    assistant_message_id: i64,
+) -> Result<(Option<String>, Option<String>, Option<i64>, Option<i64>), String> {
+    let commit = db::get_turn_commit_by_assistant(conn, conversation_id, assistant_message_id)
+        .map_err(|err| err.to_string())?;
+    let Some(commit) = commit else {
+        return Ok((None, None, None, None));
+    };
+    Ok((
+        Some(commit.turn_id),
+        commit.state_patch_id,
+        commit.user_message_id,
+        commit.selected_variant_id,
+    ))
+}
+
+/// Background op-repair: re-runs ONLY the failed ops through a (configurable,
+/// e.g. local) repair model, up to 5 structured attempts, applying any that now
+/// validate via the same proven evaluator apply path. Fire-and-forget after a
+/// turn — it does not block chat or the main eval, and failures stay dropped.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn repair_evaluator_ops(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    conversation_id: String,
+    assistant_message_id: i64,
+    failed_ops: Vec<EvaluatorOpRepairRequest>,
+    repair_settings: ApiProviderSettings,
+) -> Result<(), String> {
+    if failed_ops.is_empty() {
+        return Ok(());
+    }
+    let (
+        soul,
+        session_world,
+        snapshot_user_text,
+        visible_response,
+        context_preview,
+        entity_updater_context,
+        branch_id,
+        parent_turn_id,
+        baseline_patch_id,
+        user_message_id,
+        selected_variant_id,
+    ) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let assistant_message = db::get_message(&conn, &conversation_id, assistant_message_id)
+            .map_err(|err| err.to_string())?;
+        if assistant_message.role != "assistant" {
+            return Err("Evaluator repair requires an assistant message".into());
+        }
+        let snapshot = db::get_turn_snapshot(&conn, &conversation_id, assistant_message_id)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "No turn snapshot found for evaluator repair".to_string())?;
+        let fallback_soul: Soul =
+            serde_json::from_str(&snapshot.soul_json).map_err(|err| err.to_string())?;
+        let commit =
+            db::get_turn_commit_by_assistant(&conn, &conversation_id, assistant_message_id)
+                .map_err(|err| err.to_string())?;
+        let branch = db::get_active_session_branch(&conn, &conversation_id).ok();
+        let (soul, session_world, parent_turn_id) = if let Some(branch) = branch.as_ref() {
+            let parent_turn_id = commit
+                .as_ref()
+                .and_then(|commit| commit.parent_turn_id.clone())
+                .or_else(|| branch.active_turn_id.clone());
+            let rebuilt = db::rebuild_session_state_until(
+                &conn,
+                &conversation_id,
+                &branch.branch_id,
+                parent_turn_id.as_deref(),
+            )
+            .map_err(|err| err.to_string())?;
+            (rebuilt.soul, rebuilt.session_world, parent_turn_id)
+        } else {
+            let session_world =
+                load_session_world_for_context(&window, &conn, &conversation_id, &fallback_soul)
+                    .map_err(|err| err.to_string())?;
+            (fallback_soul, session_world, None)
+        };
+        let messages =
+            db::list_messages(&conn, &conversation_id, 100).map_err(|err| err.to_string())?;
+        let context_preview = compile_context_for_session(
+            &soul,
+            Some(&session_world),
+            &messages_to_context(messages),
+        );
+        let entity_context =
+            resolve_speaker_for_turn(&conn, &conversation_id, &soul, &snapshot.user_text)
+                .map_err(|err| err.to_string())?;
+        let entity_updater_context = build_entity_updater_context(&soul, &entity_context);
+        let branch_id = branch.map(|branch| branch.branch_id);
+        let (source_turn_id, baseline_patch_id, source_user_message_id, source_variant_id) =
+            resolve_evaluator_source_turn(&conn, &conversation_id, assistant_message_id)?;
+        (
+            soul,
+            session_world,
+            snapshot.user_text,
+            strip_hidden_state_blocks(&assistant_message.content),
+            context_preview,
+            entity_updater_context,
+            branch_id,
+            source_turn_id.or(parent_turn_id),
+            baseline_patch_id,
+            source_user_message_id.or_else(|| commit.as_ref().and_then(|commit| commit.user_message_id)),
+            source_variant_id.or_else(|| commit.as_ref().and_then(|commit| commit.selected_variant_id)),
+        )
+    };
+
+    let repair_user_message =
+        build_op_repair_user_message(&failed_ops, &snapshot_user_text, &visible_response);
+
+    // Force the repair onto the structured tool-call path with a generous retry
+    // budget; it runs against the caller-supplied (e.g. local) endpoint.
+    let mut repair_settings = repair_settings;
+    repair_settings.evaluator_mode = Some(EVALUATOR_MODE_STRUCTURED_V1.into());
+    if repair_settings.structured_evaluator_max_retries.unwrap_or(0) < 5 {
+        repair_settings.structured_evaluator_max_retries = Some(5);
+    }
+    // Repair is the enrichment, never the baseline: run it in the background and
+    // commit through the same proven evaluator apply path.
+    repair_settings.evaluator_background_enabled = Some(true);
+
+    let request_id = uuid_like_id();
+    let evaluator_request_id = format!("eval_repair_{request_id}");
+    let before_state_summary = compact_state_summary_json(&soul, &session_world);
+    start_background_evaluator_job(
+        app,
+        window,
+        conversation_id,
+        assistant_message_id,
+        selected_variant_id,
+        request_id,
+        evaluator_request_id,
+        None,
+        "brief".into(),
+        soul,
+        session_world,
+        snapshot_user_text,
+        visible_response,
+        context_preview.text,
+        repair_settings,
+        entity_updater_context,
+        format!("memory-debug-{}", uuid_like_id()),
+        branch_id,
+        parent_turn_id,
+        user_message_id,
+        false,
+        before_state_summary,
+        baseline_patch_id,
+        Some(repair_user_message),
+    )?;
+    Ok(())
+}
+
+/// A spawned local model server (e.g. a llamafile) used as the embedded repair
+/// model. The child handle is kept so we can stop it / kill it on app exit.
+pub struct EmbeddedModel {
+    pub child: std::process::Child,
+    pub url: String,
+    pub port: u16,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddedModelStatus {
+    /// The process is spawned and hasn't exited.
+    pub running: bool,
+    /// The server answered its /health endpoint OK (model loaded, accepting requests).
+    pub ready: bool,
+    pub url: Option<String>,
+    pub model: Option<String>,
+}
+
+impl EmbeddedModelStatus {
+    fn stopped() -> Self {
+        Self {
+            running: false,
+            ready: false,
+            url: None,
+            model: None,
+        }
+    }
+}
+
+/// Spawn a local model server (a single-file llamafile) and use it as the
+/// embedded repair endpoint. Hardcoded/dev-friendly: you pass the path to the
+/// file. Returns immediately after launch (the model can take a while to load) —
+/// poll `embedded_repair_model_status` for readiness. Any prior instance is
+/// stopped first.
+#[tauri::command]
+pub fn start_embedded_repair_model(
+    state: State<'_, AppState>,
+    binary_path: String,
+    port: Option<u16>,
+    model_name: Option<String>,
+) -> Result<EmbeddedModelStatus, String> {
+    use std::process::{Command, Stdio};
+
+    let port = port.unwrap_or(8080);
+    let model = model_name
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "local-model".to_string());
+    let url = format!("http://127.0.0.1:{port}/v1");
+    let path = binary_path.trim().to_string();
+    if path.is_empty() {
+        return Err("Provide the path to your llamafile (the single model file).".into());
+    }
+    if !std::path::Path::new(&path).exists() {
+        return Err(format!("No file found at: {path}"));
+    }
+
+    // Stop any previous instance before launching a new one.
+    {
+        let mut guard = state.local_model.lock().map_err(|err| err.to_string())?;
+        if let Some(mut existing) = guard.take() {
+            let _ = existing.child.kill();
+        }
+    }
+
+    let child = Command::new(&path)
+        .args([
+            "--server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--nobrowser",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("Failed to launch '{path}': {err}"))?;
+
+    {
+        let mut guard = state.local_model.lock().map_err(|err| err.to_string())?;
+        *guard = Some(EmbeddedModel {
+            child,
+            url: url.clone(),
+            port,
+            model: model.clone(),
+        });
+    }
+
+    Ok(EmbeddedModelStatus {
+        running: true,
+        ready: false,
+        url: Some(url),
+        model: Some(model),
+    })
+}
+
+/// Stop the embedded repair model if running.
+#[tauri::command]
+pub fn stop_embedded_repair_model(state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.local_model.lock().map_err(|err| err.to_string())?;
+    if let Some(mut model) = guard.take() {
+        let _ = model.child.kill();
+    }
+    Ok(())
+}
+
+/// Report whether the embedded model is running and ready (one quick /health
+/// probe). The frontend polls this after start to know when repair can use it.
+#[tauri::command]
+pub async fn embedded_repair_model_status(
+    state: State<'_, AppState>,
+) -> Result<EmbeddedModelStatus, String> {
+    let (url, model, port) = {
+        let mut guard = state.local_model.lock().map_err(|err| err.to_string())?;
+        match guard.as_mut() {
+            None => return Ok(EmbeddedModelStatus::stopped()),
+            Some(model) => {
+                // Detect a crashed/exited child and clear it.
+                if matches!(model.child.try_wait(), Ok(Some(_))) {
+                    *guard = None;
+                    return Ok(EmbeddedModelStatus::stopped());
+                }
+                (model.url.clone(), model.model.clone(), model.port)
+            }
+        }
+    };
+    // Probe health WITHOUT holding the lock across the await.
+    let health = format!("http://127.0.0.1:{port}/health");
+    let ready = reqwest::Client::new()
+        .get(&health)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false);
+    Ok(EmbeddedModelStatus {
+        running: true,
+        ready,
+        url: Some(url),
+        model: Some(model),
+    })
 }
 
 #[tauri::command]
@@ -10486,6 +11198,7 @@ pub async fn send_api_turn(
             replacement_assistant_id.is_some(),
             before_state_summary.clone(),
             baseline_patch_id.clone(),
+            None,
         ) {
             Ok(job) => job,
             Err(err) => {
@@ -11241,6 +11954,7 @@ pub async fn send_api_turn(
                     &mut engine_patch,
                     &conversation_id,
                     Some(assistant_message_id),
+                    ledger_branch_id.as_deref(),
                 );
                 let converter_trace = evaluator_converter_trace_json(&engine_patch, &conversion);
                 let form_trace = runtime_form_trace_json(&runtime);
@@ -16375,6 +17089,11 @@ fn start_background_evaluator_job(
     is_regenerated_variant: bool,
     before_state_summary: serde_json::Value,
     baseline_patch_id: Option<String>,
+    // When set, replaces the evaluator's user message with a focused op-repair
+    // request. Everything else (compile, partial-accept, ledger apply, status)
+    // is the normal proven path — this is how the background repair worker reuses
+    // it. None for ordinary evaluation.
+    repair_user_message_override: Option<String>,
 ) -> Result<db::EvaluatorJob, String> {
     let timeout_ms = effective_evaluator_timeout_ms(&state_updater_settings);
     let timeout_mode = evaluator_timeout_mode(&state_updater_settings);
@@ -16438,6 +17157,7 @@ fn start_background_evaluator_job(
             is_regenerated_variant,
             before_state_summary,
             bp_id_clone,
+            repair_user_message_override,
         )
         .await;
     });
@@ -16510,6 +17230,7 @@ async fn run_background_evaluator_job(
     is_regenerated_variant: bool,
     before_state_summary: serde_json::Value,
     baseline_patch_id: Option<String>,
+    repair_user_message_override: Option<String>,
 ) {
     let started = Instant::now();
     let profile_id = {
@@ -16746,14 +17467,19 @@ async fn run_background_evaluator_job(
     } else {
         build_evaluator_prompt(&soul, Some(&session_world))
     };
-    let updater_user_message = build_evaluator_user_message(
-        &snapshot_user_text,
-        &visible_response_for_updater,
-        &context_preview_text,
-        Some(&session_world),
-        Some(&entity_updater_context),
-        Some(&memory_debug_nonce),
-    );
+    let updater_user_message = match repair_user_message_override.as_deref() {
+        // Repair mode: focused "fix only these failed ops" request instead of a
+        // full re-extraction. The system rules and apply path are unchanged.
+        Some(repair) => repair.to_string(),
+        None => build_evaluator_user_message(
+            &snapshot_user_text,
+            &visible_response_for_updater,
+            &context_preview_text,
+            Some(&session_world),
+            Some(&entity_updater_context),
+            Some(&memory_debug_nonce),
+        ),
+    };
     // Fold in exchanges the fast-mode gate skipped; deleted only after this
     // run parses successfully, so failed/retried jobs see them again.
     let catchup_entries = {
@@ -17430,6 +18156,39 @@ async fn run_background_evaluator_job(
     let evaluator_output = runtime.output.clone();
     let conversion = runtime.conversion.clone();
 
+    // Output the failed ops (the system's own verdict — not the tool-call's) so
+    // they are visible AND the frontend can auto-fire a focused background repair.
+    // Skipped when this job IS already a repair, to prevent repair-of-repair.
+    if repair_user_message_override.is_none() {
+        let failed_ops = rejected_ops_for_repair(
+            &runtime.normalized_json,
+            &conversion.rejected_candidates,
+        );
+        if !failed_ops.is_empty() {
+            emit_dev_log(
+                &window,
+                "warn",
+                "evaluator",
+                "evaluator_ops_rejected",
+                Some(serde_json::json!({
+                    "conversation_id": job.conversation_id.as_str(),
+                    "assistant_message_id": job.assistant_message_id,
+                    "evaluator_job_id": job.evaluator_job_id.as_str(),
+                    "failed_op_count": failed_ops.len(),
+                    "failed_ops": &failed_ops,
+                })),
+            );
+            let _ = window.emit(
+                "evaluator-ops-rejected",
+                serde_json::json!({
+                    "conversation_id": job.conversation_id.as_str(),
+                    "assistant_message_id": job.assistant_message_id,
+                    "failed_ops": &failed_ops,
+                }),
+            );
+        }
+    }
+
     emit_dev_log(
         &window,
         "debug",
@@ -17489,6 +18248,7 @@ async fn run_background_evaluator_job(
         &mut engine_patch,
         &job.conversation_id,
         Some(job.assistant_message_id),
+        ledger_branch_id.as_deref(),
     );
     let patch_elapsed = patch_compile_start.elapsed().as_millis() as u64;
     let mut patch_status = "success";
@@ -18468,11 +19228,18 @@ fn stamp_memory_provenance(
     patch: &mut EnginePatch,
     conversation_id: &str,
     assistant_message_id: Option<i64>,
+    session_id: Option<&str>,
 ) {
     let Some(soul_patch) = patch.soul_patch.as_mut() else {
         return;
     };
+    let session_id = session_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
     for memory in &mut soul_patch.new_memories {
+        // The address is system-set, not AI-supplied: which chat log
+        // (conversation), which line (assistant message), and which session
+        // (branch). Only fill what the model left blank so explicit values win.
         if memory
             .source_conversation_id
             .as_deref()
@@ -18482,6 +19249,15 @@ fn stamp_memory_provenance(
         }
         if memory.source_message_id.is_none() {
             memory.source_message_id = assistant_message_id;
+        }
+        if memory
+            .source_session_id
+            .as_deref()
+            .map_or(true, |id| id.trim().is_empty())
+        {
+            if let Some(session_id) = session_id {
+                memory.source_session_id = Some(session_id.to_string());
+            }
         }
     }
 }
@@ -20382,6 +21158,29 @@ fn llm_payload_response_update_from_completion(
 mod tests {
     use super::*;
     use crate::pipeline_trace::PipelineStageTrace;
+
+    #[test]
+    fn op_repair_message_focuses_on_failed_ops_with_reasons() {
+        let failed = vec![
+            EvaluatorOpRepairRequest {
+                op_json: r#"{"op":"relationship_event","perceived_by_entity_id":"preset_male"}"#
+                    .into(),
+                reason: "player not valid in soul-only field".into(),
+            },
+            EvaluatorOpRepairRequest {
+                op_json: r#"{"op":"add_memory","evidence_quote":"Dragons."}"#.into(),
+                reason: "evidence not present in turn".into(),
+            },
+        ];
+        let message = build_op_repair_user_message(&failed, "I wait.", "Aurora watches.");
+        assert!(message.contains("REPAIR TASK"));
+        assert!(message.contains("player not valid in soul-only field"));
+        assert!(message.contains("evidence not present in turn"));
+        assert!(message.contains("preset_male"));
+        // Anchored to the actual turn so the model can re-ground the fix.
+        assert!(message.contains("I wait."));
+        assert!(message.contains("Aurora watches."));
+    }
 
     #[test]
     fn transient_provider_errors_are_retryable() {
@@ -22443,7 +23242,7 @@ mod tests {
         )
         .expect("patch");
 
-        stamp_memory_provenance(&mut patch, "conv_current", Some(42));
+        stamp_memory_provenance(&mut patch, "conv_current", Some(42), Some("branch_abc"));
 
         let memories = &patch.soul_patch.as_ref().expect("soul patch").new_memories;
         assert_eq!(
@@ -22451,7 +23250,9 @@ mod tests {
             Some("conv_current")
         );
         assert_eq!(memories[0].source_message_id, Some(42));
-        // Evaluator-provided provenance is preserved.
+        // Session id is system-stamped onto memories that lack one.
+        assert_eq!(memories[0].source_session_id.as_deref(), Some("branch_abc"));
+        // Evaluator-provided provenance is preserved (not overwritten).
         assert_eq!(
             memories[1].source_conversation_id.as_deref(),
             Some("conv_original")
@@ -24358,6 +25159,7 @@ mod tests {
             source_conversation_id: None,
             source_message_id: None,
             source_entity_id: None,
+            source_quote: None,
             is_lived_experience: true,
             is_imported_context: false,
             perceived_by_entity_id: Some(soul.character_id.clone()),
@@ -27356,6 +28158,7 @@ mod tests {
             source_conversation_id: None,
             source_message_id: None,
             source_entity_id: None,
+            source_quote: None,
             is_lived_experience: true,
             is_imported_context: false,
             perceived_by_entity_id: None,
