@@ -4264,6 +4264,26 @@ pub fn deactivate_downstream_from_message(
     Ok(count)
 }
 
+pub fn hide_latest_matching_active_user_tail(
+    conn: &Connection,
+    conversation_id: &str,
+    user_text: &str,
+) -> rusqlite::Result<Option<i64>> {
+    let expected = user_text.trim();
+    if expected.is_empty() {
+        return Ok(None);
+    }
+    let latest = list_messages(conn, conversation_id, 1)?.into_iter().next();
+    let Some(message) = latest else {
+        return Ok(None);
+    };
+    if message.role != "user" || message.status != "active" || message.content.trim() != expected {
+        return Ok(None);
+    }
+    deactivate_downstream_from_message(conn, conversation_id, message.id)?;
+    Ok(Some(message.id))
+}
+
 fn inactive_restorable_message_ids(
     conn: &Connection,
     conversation_id: &str,

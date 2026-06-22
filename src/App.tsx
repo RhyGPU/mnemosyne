@@ -137,6 +137,8 @@ import {
   finalizeBenchmark,
   BenchmarkSessionInit,
   BenchmarkTurnSummary,
+  hideLatestBenchmarkFailedUserMessage,
+  TurnResult,
   runEvaluatorContractTest,
   runStructuredEvaluatorDiagnostic,
   StructuredEvaluatorDiagnosticSummary,
@@ -187,6 +189,7 @@ const DEV_LOG_CATEGORIES: DevLogCategory[] = [
 ];
 const DEV_LOG_LEVELS: DevLogLevel[] = ["info", "warn", "error", "debug", "success"];
 type ProviderKind = "Mock" | "API";
+type BenchmarkTurnPhase = "player_generation" | "execute_turn" | "evaluator_wait" | "turn_summary" | "completed";
 type NarrativeMode = "Realistic" | "Reader" | "Active Director" | "GM Simulation" | "Custom";
 type AppView = "library" | "chat";
 type ChatStartMode = "continue" | "fresh";
@@ -1735,8 +1738,9 @@ export function App() {
     replacementAssistantId?: number,
     correctionInstruction?: string,
     updaterOverride?: Partial<ApiProviderSettings>,
-  ) {
-    if (!text || busy || stateUpdating || !soul) return;
+    options?: { rethrowErrors?: boolean },
+  ): Promise<TurnResult | undefined> {
+    if (!text || busy || stateUpdating || !soul) return undefined;
     const generationId = generationIdRef.current + 1;
     const turnConversationId = currentConversationId;
     const replacementOriginalContent = replacementAssistantId
@@ -1833,10 +1837,10 @@ export function App() {
               correctionInstruction,
             );
       if (generationIdRef.current !== generationId || abortController.signal.aborted) {
-        return;
+        return undefined;
       }
       if (result.conversation_id !== currentConversationIdRef.current) {
-        return;
+        return undefined;
       }
       setSoul(result.soul);
       setMessages(result.messages);
@@ -1871,6 +1875,7 @@ export function App() {
           state_updater_status: result.debug.state_updater_status,
         },
       );
+      return result;
     } catch (error) {
       const activeGeneration = activeGenerationRef.current;
       const narratorWasSaved =
@@ -1902,6 +1907,9 @@ export function App() {
       } else {
         reportError(error, "Generation failed", provider === "API" ? "api" : "app");
       }
+      if (options?.rethrowErrors) {
+        throw error;
+      }
     } finally {
       if (savedMessagePollId !== undefined) {
         window.clearInterval(savedMessagePollId);
@@ -1913,6 +1921,7 @@ export function App() {
         activeGenerationRef.current = null;
       }
     }
+    return undefined;
   }
 
   async function submitDraft() {
@@ -3320,45 +3329,54 @@ export function App() {
   // polling loop. A slow 3s poll + a 300s cap are kept only as safety nets in
   // case an event is missed. Returns immediately if there's no live job (already
   // terminal, or a dialogue-only turn the gate skipped).
-  async function waitForBenchmarkEvaluatorJob(conversationId: string) {
+  async function waitForBenchmarkEvaluatorJob(conversationId: string): Promise<any> {
     const isTerminal = (status: string) => status !== "pending" && status !== "running";
     // Fast path: nothing in flight.
     try {
       const job = await getLatestEvaluatorJob(conversationId);
-      if (!job || isTerminal(job.status)) return;
+      if (!job || isTerminal(job.status)) return job;
     } catch {
-      return;
+      return undefined;
     }
-    await new Promise<void>((resolve) => {
+    return new Promise<any>((resolve) => {
       let done = false;
       let unlisten: (() => void) | undefined;
       let cap: number | undefined;
       let safetyPoll: number | undefined;
-      const finish = () => {
+      const finishWithJob = async () => {
         if (done) return;
         done = true;
         if (cap !== undefined) window.clearTimeout(cap);
         if (safetyPoll !== undefined) window.clearInterval(safetyPoll);
         unlisten?.();
-        resolve();
+        try {
+          const job = await getLatestEvaluatorJob(conversationId);
+          resolve(job);
+        } catch {
+          resolve(undefined);
+        }
       };
       // Primary signal: the eval job's status-changed event for THIS conversation.
       void listenEvaluatorJobStatusChanged((job) => {
-        if (job.conversation_id === conversationId && isTerminal(job.status)) finish();
+        if (job.conversation_id === conversationId && isTerminal(job.status)) {
+          void finishWithJob();
+        }
       }).then((stop) => {
         unlisten = stop;
         if (done) stop();
       });
       // Safety nets: honor Stop, slow-poll in case an event is dropped, hard cap.
-      cap = window.setTimeout(finish, 300_000);
+      cap = window.setTimeout(finishWithJob, 300_000);
       safetyPoll = window.setInterval(() => {
         if (benchmarkStopRef.current) {
-          finish();
+          void finishWithJob();
           return;
         }
         void getLatestEvaluatorJob(conversationId)
           .then((job) => {
-            if (!job || isTerminal(job.status)) finish();
+            if (!job || isTerminal(job.status)) {
+              void finishWithJob();
+            }
           })
           .catch(() => undefined);
       }, 3000);
@@ -3424,6 +3442,42 @@ export function App() {
     }
   }
 
+  function turnResultEvaluatorCompletedOrSkipped(result: any): boolean {
+    const status = result?.debug?.state_updater_status;
+    if (!status) return false;
+    return status.startsWith("background_") || ["completed", "partial_success", "some_rows_rejected", "stale_skipped"].includes(status);
+  }
+
+  function benchmarkEvaluatorJobCompletedOrSkipped(job: any): boolean {
+    if (!job) return false;
+    return ["completed", "partial_success", "some_rows_rejected", "stale_skipped"].includes(job.status);
+  }
+
+  function fallbackBenchmarkTurnSummary(
+    turnIndex: number,
+    stage: string,
+    userText: string,
+    error: string,
+    stateUpdaterSettings: any,
+  ): BenchmarkTurnSummary {
+    return {
+      turn_index: turnIndex,
+      stage,
+      simulated_user_message: userText,
+      narrator_response_present: false,
+      narrator_error: error,
+      evaluator_mode: stateUpdaterSettings.evaluator_mode || "evaluator_form_v1",
+      tool_calls_present: false,
+      tool_call_count: 0,
+      structured_retry_count: 0,
+      fallback_path: [],
+      syntactic_repair_used: false,
+      memory_count_after: 0,
+      object_count_after: 0,
+      relationship_summary_after: "",
+    };
+  }
+
   async function runOneBenchmarkTurn() {
     const ctx = benchmarkCtxRef.current;
     if (!ctx) return;
@@ -3433,6 +3487,7 @@ export function App() {
     // Null until the player line is generated this turn, so a failure in
     // generation is recorded as an empty message (not the previous turn's text).
     let playerText: string | null = null;
+    let phase: BenchmarkTurnPhase = "player_generation";
     try {
       const opponentLabel = ctx.traditionalOpponent ? "Traditional RP" : "AI player";
       setStatus(`${turnLabel}: ${opponentLabel} thinking…`);
@@ -3451,12 +3506,14 @@ export function App() {
         return;
       }
       // Send as a visible user turn; the narrator streams its reply live.
-      await executeTurn(
+      phase = "execute_turn";
+      const result = await executeTurn(
         playerText,
         turnLabel,
         undefined,
         undefined,
         benchmarkLiveUpdaterOverride(ctx.settings),
+        { rethrowErrors: true },
       );
       // Stop may have aborted the narrator mid-stream — don't record a partial
       // turn; bail and let the effect finalize what actually completed.
@@ -3464,46 +3521,116 @@ export function App() {
         benchmarkTurnInFlightRef.current = false;
         return;
       }
-      // Evaluator runs as a background job (tracked by the banner). Wait for it
-      // to commit before reading the turn summary and starting the next turn,
-      // so per-turn deltas reflect committed state.
-      if (ctx.settings.wait_for_evaluator_each_turn) {
+      if (!result) {
+        throw new Error("executeTurn did not return a completed turn");
+      }
+      if (!turnResultEvaluatorCompletedOrSkipped(result)) {
+        throw new Error(`evaluator_failed: ${result.debug.state_updater_status}`);
+      }
+      // If an evaluator job is running in the background, wait for a terminal
+      // success/skip state before counting this benchmark turn complete.
+      if (
+        ctx.settings.wait_for_evaluator_each_turn ||
+        result.debug.state_updater_status.startsWith("background_")
+      ) {
+        phase = "evaluator_wait";
         setStatus(`${turnLabel}: waiting for evaluator...`);
-        await waitForBenchmarkEvaluatorJob(ctx.conversationId);
+        const evaluatorJob = await waitForBenchmarkEvaluatorJob(ctx.conversationId);
         if (benchmarkStopRef.current) {
           benchmarkTurnInFlightRef.current = false;
           return;
         }
+        if (result.debug.state_updater_status.startsWith("background_") && !evaluatorJob) {
+          throw new Error("evaluator_failed: background evaluator job did not reach a terminal status");
+        }
+        if (!benchmarkEvaluatorJobCompletedOrSkipped(evaluatorJob)) {
+          const detail = evaluatorJob?.error_message ? `: ${evaluatorJob.error_message}` : "";
+          throw new Error(`evaluator_failed: ${evaluatorJob?.status ?? "unknown"}${detail}`);
+        }
       }
+      phase = "turn_summary";
       const summary = await benchmarkTurnSummary(
         ctx.conversationId,
         turnIndex,
         playerText,
+        "completed",
         null,
         ctx.updaterSettings,
       );
       ctx.perTurn.push(summary);
       ctx.completedTurns += 1;
       ctx.nextTurnIndex = turnIndex + 1;
+      phase = "completed";
       setBenchmarkTurnsRemaining((remaining) => remaining - 1);
       setStatus(`Live benchmark running: ${ctx.completedTurns}/${ctx.settings.turn_count} turns`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // Distinguish where it broke so the summary isn't misleading: a null
       // playerText means the AI player-line call failed (the narrator never ran).
-      const stage = playerText === null ? "player line generation" : "narrator turn";
-      ctx.narratorFailures += 1;
+      const stage =
+        playerText === null
+          ? "player_line_generation_failed"
+          : phase === "turn_summary"
+            ? "benchmark_summary_failed"
+          : message.startsWith("evaluator_failed:") ||
+              message.startsWith("state_update_failed_after_narration_saved:") ||
+              phase === "evaluator_wait"
+            ? "evaluator_failed"
+            : "narrator_failed";
+      if (stage === "narrator_failed") {
+        ctx.narratorFailures += 1;
+        try {
+          const hiddenMessageId = await hideLatestBenchmarkFailedUserMessage(
+            ctx.conversationId,
+            playerText ?? "",
+          );
+          if (hiddenMessageId !== null) {
+            setMessages(await listConversationMessages(ctx.conversationId));
+          }
+        } catch (cleanupError) {
+          reportError(
+            cleanupError,
+            "Failed to hide benchmark user message after narrator failure",
+            "app",
+          );
+        }
+      }
       try {
+        const failureDetail =
+          stage === "narrator_failed"
+            ? `narrator_provider_error: ${message}`
+            : stage === "evaluator_failed"
+              ? `evaluator_error: ${message}`
+              : stage === "benchmark_summary_failed"
+                ? `benchmark_summary_error: ${message}`
+                : `player_simulator_error: ${message}`;
         const failedSummary = await benchmarkTurnSummary(
           ctx.conversationId,
           turnIndex,
           playerText ?? "",
-          `${stage} failed: ${message}`,
+          stage,
+          failureDetail,
           ctx.updaterSettings,
         );
         ctx.perTurn.push(failedSummary);
-      } catch {
-        // Summary capture is best-effort once a turn has already failed.
+      } catch (summaryError) {
+        const summaryMessage =
+          summaryError instanceof Error ? summaryError.message : String(summaryError);
+        const fallbackDetail =
+          stage === "narrator_failed"
+            ? `narrator_provider_error: ${message}; fallback_summary_error: ${summaryMessage}`
+            : stage === "benchmark_summary_failed"
+            ? `benchmark_summary_error: ${message}; fallback_summary_error: ${summaryMessage}`
+            : `summary_capture_failed_after_${stage}: ${summaryMessage}; original_error: ${message}`;
+        ctx.perTurn.push(
+          fallbackBenchmarkTurnSummary(
+            turnIndex,
+            stage,
+            playerText ?? "",
+            fallbackDetail,
+            ctx.updaterSettings,
+          ),
+        );
       }
       benchmarkStopRef.current = true;
       setBenchmarkTurnsRemaining(0);
@@ -4291,6 +4418,34 @@ export function App() {
                   Failure reasons: {benchmarkResult.scorecard.failure_reasons.join(", ")}
                 </>
               ) : null}
+              {benchmarkResult.scorecard.narrator_provider_error ? (
+                <>
+                  <br />
+                  <strong>narrator_provider_error:</strong> {benchmarkResult.scorecard.narrator_provider_error}
+                </>
+              ) : null}
+              {benchmarkResult.scorecard.stop_reason ? (
+                <>
+                  <br />
+                  <strong>stop_reason:</strong> {benchmarkResult.scorecard.stop_reason}
+                </>
+              ) : null}
+              {benchmarkResult.scorecard.failed_stage ? (
+                <>
+                  <br />
+                  <strong>failed_stage:</strong> {benchmarkResult.scorecard.failed_stage}
+                </>
+              ) : null}
+              <br />
+              <strong>completed_visible_turns:</strong> {benchmarkResult.scorecard.visible_turns_completed}
+              <br />
+              <strong>requested_turns:</strong> {benchmarkResult.scorecard.visible_turns_requested}
+              <br />
+              <strong>player_simulator_calls:</strong> {benchmarkResult.scorecard.player_simulator_calls}
+              <br />
+              <strong>narrator_calls:</strong> {benchmarkResult.scorecard.narrator_calls}
+              <br />
+              <strong>evaluator_calls:</strong> {benchmarkResult.scorecard.visible_turns_completed === 0 ? "skipped_due_to_no_completed_turn" : benchmarkResult.scorecard.evaluator_calls}
               <br />
               Payload: {benchmarkResult.payload_history_path ?? "not exported"}
               <br />

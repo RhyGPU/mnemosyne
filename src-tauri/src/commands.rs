@@ -375,6 +375,9 @@ pub struct BenchmarkScorecard {
     pub relationship_updated: bool,
     pub payload_history_export_succeeded: bool,
     pub narrator_visible_response_each_turn: bool,
+    pub narrator_provider_error: Option<String>,
+    pub stop_reason: Option<String>,
+    pub failed_stage: Option<String>,
     pub evaluator_used_tool_call_where_required: bool,
     pub no_evaluator_form_v1_fallback_in_strict_mode: bool,
     pub syntactic_repair_unused_in_strict_mode: bool,
@@ -390,6 +393,7 @@ pub struct BenchmarkScorecard {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkTurnSummary {
     pub turn_index: usize,
+    pub stage: String,
     pub simulated_user_message: String,
     pub narrator_response_present: bool,
     pub narrator_error: Option<String>,
@@ -3104,6 +3108,24 @@ pub fn hide_turn_range(
 }
 
 #[tauri::command]
+pub fn hide_latest_benchmark_failed_user_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    user_text: String,
+) -> Result<Option<i64>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let hidden_id = db::hide_latest_matching_active_user_tail(&conn, &conversation_id, &user_text)
+        .map_err(|err| err.to_string())?;
+    if hidden_id.is_some() {
+        if let Ok(branch) = db::get_active_session_branch(&conn, &conversation_id) {
+            db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+                .map_err(|err| err.to_string())?;
+        }
+    }
+    Ok(hidden_id)
+}
+
+#[tauri::command]
 pub fn restore_turn_range(
     state: State<'_, AppState>,
     conversation_id: String,
@@ -3817,6 +3839,7 @@ pub async fn run_benchmark(
                     &conversation_id,
                     turn_index,
                     &user_text,
+                    "completed",
                     None,
                     &state_updater_settings,
                 )?);
@@ -3828,6 +3851,7 @@ pub async fn run_benchmark(
                     &conversation_id,
                     turn_index,
                     &user_text,
+                    "narrator_failed",
                     Some("Narrator returned an empty visible response"),
                     &state_updater_settings,
                 )?);
@@ -3840,6 +3864,7 @@ pub async fn run_benchmark(
                     &conversation_id,
                     turn_index,
                     &user_text,
+                    "narrator_failed",
                     Some(&err),
                     &state_updater_settings,
                 )?);
@@ -4139,6 +4164,7 @@ pub fn benchmark_turn_summary(
     conversation_id: String,
     turn_index: usize,
     user_text: String,
+    stage: String,
     narrator_error: Option<String>,
     state_updater_settings: ApiProviderSettings,
 ) -> Result<BenchmarkTurnSummary, String> {
@@ -4147,6 +4173,7 @@ pub fn benchmark_turn_summary(
         &conversation_id,
         turn_index,
         &user_text,
+        &stage,
         narrator_error.as_deref(),
         &state_updater_settings,
     )
@@ -4748,6 +4775,7 @@ fn build_benchmark_turn_summary(
     conversation_id: &str,
     turn_index: usize,
     user_text: &str,
+    stage: &str,
     narrator_error: Option<&str>,
     state_updater_settings: &ApiProviderSettings,
 ) -> Result<BenchmarkTurnSummary, String> {
@@ -4827,10 +4855,22 @@ fn build_benchmark_turn_summary(
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
 
+    let normalized_stage = if stage.trim().is_empty() {
+        "completed".to_string()
+    } else {
+        stage.trim().to_string()
+    };
+    let narrator_response_present = match normalized_stage.as_str() {
+        "completed" | "evaluator_failed" => true,
+        "narrator_failed" | "player_line_generation_failed" => false,
+        _ => narrator_error.is_none(),
+    };
+
     Ok(BenchmarkTurnSummary {
         turn_index,
+        stage: normalized_stage,
         simulated_user_message: user_text.to_string(),
-        narrator_response_present: narrator_error.is_none(),
+        narrator_response_present,
         narrator_error: narrator_error.map(ToString::to_string),
         evaluator_mode: state_updater_settings
             .evaluator_mode
@@ -4846,6 +4886,42 @@ fn build_benchmark_turn_summary(
         object_count_after,
         relationship_summary_after,
     })
+}
+
+fn latest_narrator_provider_error(logs: &[LlmPayloadLog]) -> Option<String> {
+    logs.iter()
+        .rev()
+        .find(|log| log.provider.starts_with("narrator_") && log.provider_error.is_some())
+        .and_then(|log| log.provider_error.clone())
+        .map(|error| {
+            if error.starts_with("narrator_provider_error:") {
+                error
+            } else {
+                format!("narrator_provider_error: {error}")
+            }
+        })
+}
+
+fn benchmark_visible_turns_completed(
+    ledger_completed: usize,
+    frontend_completed: usize,
+    per_turn: &[BenchmarkTurnSummary],
+) -> usize {
+    if per_turn.is_empty() {
+        return ledger_completed.min(frontend_completed);
+    }
+    let completed_turn_summaries = per_turn
+        .iter()
+        .filter(|turn| {
+            turn.stage == "completed"
+                && !turn.simulated_user_message.trim().is_empty()
+                && turn.narrator_response_present
+                && turn.narrator_error.is_none()
+        })
+        .count();
+    ledger_completed
+        .min(completed_turn_summaries)
+        .min(frontend_completed)
 }
 
 fn build_benchmark_summary(
@@ -4890,8 +4966,39 @@ fn build_benchmark_summary(
         (soul, session_world, logs, conversation, ledger_audit)
     };
     let trace_counts = benchmark_trace_counts(&logs);
-    let visible_turn_count_completed = ledger_audit.visible_turns_completed;
+    let mut per_turn = per_turn;
     let final_memory_count = memory_count(&soul);
+    let final_object_state_count = session_world.object_states.len();
+    let final_relationship_count = soul.relationships.len();
+    if narrator_failures > 0 && !per_turn.iter().any(|turn| turn.stage == "narrator_failed") {
+        if let Some(error) = latest_narrator_provider_error(&logs) {
+            per_turn.push(BenchmarkTurnSummary {
+                turn_index: per_turn.len(),
+                stage: "narrator_failed".into(),
+                simulated_user_message: String::new(),
+                narrator_response_present: false,
+                narrator_error: Some(error),
+                evaluator_mode: state_updater_settings
+                    .evaluator_mode
+                    .clone()
+                    .unwrap_or_else(|| EVALUATOR_MODE_FORM_V1.into()),
+                structured_transport_actual: None,
+                tool_calls_present: false,
+                tool_call_count: 0,
+                structured_retry_count: 0,
+                fallback_path: Vec::new(),
+                syntactic_repair_used: false,
+                memory_count_after: final_memory_count,
+                object_count_after: final_object_state_count,
+                relationship_summary_after: String::new(),
+            });
+        }
+    }
+    let visible_turn_count_completed = benchmark_visible_turns_completed(
+        ledger_audit.visible_turns_completed,
+        turn_count_completed,
+        &per_turn,
+    );
     let default_player_leak_detected = soul.relationships.contains_key("default_player")
         || soul.memory.recent.iter().any(|memory| {
             memory
@@ -4906,6 +5013,11 @@ fn build_benchmark_summary(
             || duplicate_relationship_context_detected_in_text(&log.context_text)
     });
     let object_identity_checks = Vec::new();
+    let narrator_provider_error = per_turn
+        .iter()
+        .rev()
+        .find(|turn| turn.stage == "narrator_failed")
+        .and_then(|turn| turn.narrator_error.clone());
     let mut summary = BenchmarkSummary {
         benchmark_id: benchmark_id.to_string(),
         benchmark_type: benchmark_type.to_string(),
@@ -4928,10 +5040,10 @@ fn build_benchmark_summary(
         default_player_leak_detected,
         duplicate_relationship_context_detected,
         final_memory_count,
-        final_object_state_count: session_world.object_states.len(),
-        final_relationship_count: soul.relationships.len(),
+        final_object_state_count,
+        final_relationship_count,
         visible_turns_requested: turn_count_requested,
-        visible_turns_completed: ledger_audit.visible_turns_completed,
+        visible_turns_completed: visible_turn_count_completed,
         visible_user_messages_created: ledger_audit.visible_user_messages_created,
         visible_assistant_messages_created: ledger_audit.visible_assistant_messages_created,
         unique_user_message_ids: ledger_audit.unique_user_message_ids,
@@ -4950,7 +5062,7 @@ fn build_benchmark_summary(
             visible_chat_messages_created: false,
             normal_pipeline_used: false,
             visible_turns_requested: turn_count_requested,
-            visible_turns_completed: ledger_audit.visible_turns_completed,
+            visible_turns_completed: visible_turn_count_completed,
             visible_user_messages_created: ledger_audit.visible_user_messages_created,
             visible_assistant_messages_created: ledger_audit.visible_assistant_messages_created,
             unique_user_message_ids: ledger_audit.unique_user_message_ids,
@@ -4968,11 +5080,14 @@ fn build_benchmark_summary(
             evaluator_calls: 0,
             evaluator_waited_each_turn: false,
             memory_updated: final_memory_count > initial_memory_count,
-            object_state_updated: session_world.object_states.len() != initial_object_count,
-            relationship_updated: soul.relationships.len() != initial_relationship_count,
+            object_state_updated: final_object_state_count != initial_object_count,
+            relationship_updated: final_relationship_count != initial_relationship_count,
             payload_history_export_succeeded: false,
             narrator_visible_response_each_turn: narrator_failures == 0
                 && turn_count_completed == turn_count_requested,
+            narrator_provider_error: narrator_provider_error.clone(),
+            stop_reason: None,
+            failed_stage: None,
             evaluator_used_tool_call_where_required: !strict_tool
                 || trace_counts.tool_call_failure_count == 0,
             no_evaluator_form_v1_fallback_in_strict_mode: !strict_tool
@@ -5095,13 +5210,46 @@ fn benchmark_scorecard(
         summary.benchmark_type.as_str(),
         "visible_ai_chat" | "multi_agent_visible_chat"
     );
+    let failed_stage_present = summary
+        .per_turn
+        .iter()
+        .any(|turn| turn.stage != "completed");
+    let attempted_player_turns = summary
+        .per_turn
+        .iter()
+        .filter(|turn| !turn.simulated_user_message.trim().is_empty())
+        .count();
+    let expected_player_simulator_calls = if failed_stage_present {
+        attempted_player_turns
+    } else {
+        summary.visible_turns_requested
+    };
     let player_simulator_calls = summary.player_simulator_payload_count;
     let narrator_calls = summary.visible_assistant_messages_created + summary.narrator_failures;
     let evaluator_calls = summary.visible_turns_completed;
+    let narrator_provider_error = summary
+        .per_turn
+        .iter()
+        .rev()
+        .find(|turn| turn.stage == "narrator_failed")
+        .and_then(|turn| turn.narrator_error.clone());
+    let object_state_update_required = !summary.object_identity_checks.is_empty();
     let visible_chat_messages_created = summary.visible_turns_completed > 0;
     let normal_pipeline_used = visible_chat_messages_created
         && summary.visible_user_messages_created == summary.visible_turns_completed
         && summary.visible_assistant_messages_created == summary.visible_turns_completed;
+    let narrator_failed_early = summary.visible_turns_completed == 0
+        && summary.per_turn.iter().any(|turn| turn.stage == "narrator_failed");
+    let stop_reason = if narrator_failed_early {
+        Some("narrator_failed".to_string())
+    } else {
+        None
+    };
+    let failed_stage = if narrator_failed_early {
+        Some("narrator_called".to_string())
+    } else {
+        None
+    };
     let mut scorecard = BenchmarkScorecard {
         visible_chat_messages_created,
         normal_pipeline_used,
@@ -5128,6 +5276,9 @@ fn benchmark_scorecard(
         payload_history_export_succeeded: summary.payload_history_path.is_some(),
         narrator_visible_response_each_turn: summary.narrator_failures == 0
             && summary.visible_turns_completed == summary.visible_turns_requested,
+        narrator_provider_error,
+        stop_reason,
+        failed_stage,
         evaluator_used_tool_call_where_required: !strict_tool
             || (summary.tool_call_failure_count == 0
                 && summary.tool_call_success_count >= summary.visible_turns_completed),
@@ -5141,6 +5292,14 @@ fn benchmark_scorecard(
         pass: false,
         failure_reasons: Vec::new(),
     };
+    if summary.visible_turns_completed == 0 {
+        scorecard.memory_updated = true;
+        scorecard.object_state_updated = true;
+        scorecard.relationship_updated = true;
+        scorecard.memories_increased_over_time = true;
+        scorecard.active_player_relationship_changed_when_warranted = true;
+        scorecard.object_ids_stable = true;
+    }
     let checks = [
         (
             scorecard.visible_turns_completed == scorecard.visible_turns_requested,
@@ -5160,7 +5319,7 @@ fn benchmark_scorecard(
         ),
         (
             !requires_player_simulator
-                || scorecard.player_simulator_payload_count >= scorecard.visible_turns_requested,
+                || scorecard.player_simulator_payload_count >= expected_player_simulator_calls,
             "player_simulator_payload_count",
         ),
         (
@@ -5192,6 +5351,10 @@ fn benchmark_scorecard(
             scorecard.active_player_relationship_changed_when_warranted,
             "active_player_relationship_changed_when_warranted",
         ),
+        (
+            !object_state_update_required || scorecard.object_state_updated,
+            "object_state_updated",
+        ),
         (scorecard.object_ids_stable, "object_ids_stable"),
         (
             scorecard.default_player_not_normal_rp_relationship_target,
@@ -5203,6 +5366,14 @@ fn benchmark_scorecard(
         .into_iter()
         .filter_map(|(passed, name)| (!passed).then_some(name.to_string()))
         .collect();
+    if narrator_failed_early {
+        scorecard.failure_reasons.retain(|reason| reason == "narrator_visible_response_each_turn");
+        if !scorecard.failure_reasons.contains(&"narrator_visible_response_each_turn".to_string()) {
+            scorecard.failure_reasons.push("narrator_visible_response_each_turn".to_string());
+        }
+        scorecard.failure_reasons.push("blocked_by_narrator_failure".to_string());
+        scorecard.failure_reasons.push("skipped_after_narrator_failure".to_string());
+    }
     scorecard.pass = scorecard.failure_reasons.is_empty();
     scorecard
 }
@@ -21480,6 +21651,9 @@ mod tests {
                 relationship_updated: true,
                 payload_history_export_succeeded: true,
                 narrator_visible_response_each_turn: true,
+                narrator_provider_error: None,
+                stop_reason: None,
+                failed_stage: None,
                 evaluator_used_tool_call_where_required: true,
                 no_evaluator_form_v1_fallback_in_strict_mode: true,
                 syntactic_repair_unused_in_strict_mode: true,
@@ -21560,14 +21734,504 @@ mod tests {
         let mut summary = benchmark_summary_fixture();
         summary.narrator_failures = 1;
         summary.turn_count_completed = 0;
+        summary.visible_turns_completed = 0;
+        summary.visible_assistant_messages_created = 0;
         summary.tool_call_success_count = 0;
         summary.evaluator_failures = 0;
+        summary.per_turn = vec![BenchmarkTurnSummary {
+            turn_index: 1,
+            stage: "narrator_failed".into(),
+            simulated_user_message: "I try another line.".into(),
+            narrator_response_present: false,
+            narrator_error: Some(
+                "narrator_provider_error: API stream failed: error decoding response body".into(),
+            ),
+            evaluator_mode: EVALUATOR_MODE_FORM_V1.into(),
+            structured_transport_actual: None,
+            tool_calls_present: false,
+            tool_call_count: 0,
+            structured_retry_count: 0,
+            fallback_path: Vec::new(),
+            syntactic_repair_used: false,
+            memory_count_after: summary.final_memory_count,
+            object_count_after: summary.final_object_state_count,
+            relationship_summary_after: String::new(),
+        }];
 
         let scorecard = benchmark_scorecard(&summary, false, 1, 0, 0);
 
         assert!(!scorecard.pass);
         assert!(!scorecard.narrator_visible_response_each_turn);
+        assert_eq!(
+            scorecard.narrator_provider_error.as_deref(),
+            Some("narrator_provider_error: API stream failed: error decoding response body")
+        );
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"narrator_visible_response_each_turn".to_string()));
         assert_eq!(summary.evaluator_failures, 0);
+    }
+
+    #[test]
+    fn early_narrator_failure_does_not_require_unplayed_player_turns() {
+        let mut summary = benchmark_summary_fixture();
+        summary.benchmark_type = "visible_ai_chat".into();
+        summary.turn_count_requested = 5;
+        summary.visible_turns_requested = 5;
+        summary.turn_count_completed = 1;
+        summary.visible_turns_completed = 1;
+        summary.visible_user_messages_created = 1;
+        summary.visible_assistant_messages_created = 1;
+        summary.unique_user_message_ids = 1;
+        summary.unique_assistant_message_ids = 1;
+        summary.player_simulator_payload_count = 2;
+        summary.narrator_failures = 1;
+        summary.per_turn = vec![
+            BenchmarkTurnSummary {
+                turn_index: 0,
+                stage: "completed".into(),
+                simulated_user_message: "completed user".into(),
+                narrator_response_present: true,
+                narrator_error: None,
+                evaluator_mode: EVALUATOR_MODE_FORM_V1.into(),
+                structured_transport_actual: None,
+                tool_calls_present: false,
+                tool_call_count: 0,
+                structured_retry_count: 0,
+                fallback_path: Vec::new(),
+                syntactic_repair_used: false,
+                memory_count_after: summary.final_memory_count,
+                object_count_after: summary.final_object_state_count,
+                relationship_summary_after: String::new(),
+            },
+            BenchmarkTurnSummary {
+                turn_index: 1,
+                stage: "narrator_failed".into(),
+                simulated_user_message: "failed user".into(),
+                narrator_response_present: false,
+                narrator_error: Some("narrator_provider_error: stream failed".into()),
+                evaluator_mode: EVALUATOR_MODE_FORM_V1.into(),
+                structured_transport_actual: None,
+                tool_calls_present: false,
+                tool_call_count: 0,
+                structured_retry_count: 0,
+                fallback_path: Vec::new(),
+                syntactic_repair_used: false,
+                memory_count_after: summary.final_memory_count,
+                object_count_after: summary.final_object_state_count,
+                relationship_summary_after: String::new(),
+            },
+        ];
+
+        let scorecard = benchmark_scorecard(&summary, false, 1, 0, 0);
+
+        assert!(!scorecard.pass);
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"narrator_visible_response_each_turn".to_string()));
+        assert!(!scorecard
+            .failure_reasons
+            .contains(&"player_simulator_payload_count".to_string()));
+    }
+
+    #[test]
+    fn narrator_provider_error_falls_back_to_payload_log() {
+        let logs = vec![
+            LlmPayloadLog {
+                provider: "player_simulator".into(),
+                provider_error: Some("ignored player error".into()),
+                ..Default::default()
+            },
+            LlmPayloadLog {
+                provider: "narrator_brief".into(),
+                provider_error: Some("API stream failed: error decoding response body".into()),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            latest_narrator_provider_error(&logs).as_deref(),
+            Some("narrator_provider_error: API stream failed: error decoding response body")
+        );
+    }
+
+    #[test]
+    fn narrator_provider_error_fallback_preserves_existing_prefix() {
+        let logs = vec![LlmPayloadLog {
+            provider: "narrator_brief".into(),
+            provider_error: Some("narrator_provider_error: stream failed".into()),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            latest_narrator_provider_error(&logs).as_deref(),
+            Some("narrator_provider_error: stream failed")
+        );
+    }
+
+    #[test]
+    fn visible_turn_completion_is_capped_by_frontend_completed_count() {
+        assert_eq!(benchmark_visible_turns_completed(3, 1, &[]), 1);
+    }
+
+    #[test]
+    fn visible_turn_completion_excludes_failed_stage_rows() {
+        let rows = vec![
+            BenchmarkTurnSummary {
+                turn_index: 0,
+                stage: "completed".into(),
+                simulated_user_message: "ok".into(),
+                narrator_response_present: true,
+                narrator_error: None,
+                evaluator_mode: EVALUATOR_MODE_FORM_V1.into(),
+                structured_transport_actual: None,
+                tool_calls_present: false,
+                tool_call_count: 0,
+                structured_retry_count: 0,
+                fallback_path: Vec::new(),
+                syntactic_repair_used: false,
+                memory_count_after: 0,
+                object_count_after: 0,
+                relationship_summary_after: String::new(),
+            },
+            BenchmarkTurnSummary {
+                turn_index: 1,
+                stage: "benchmark_summary_failed".into(),
+                simulated_user_message: "not complete".into(),
+                narrator_response_present: true,
+                narrator_error: Some("benchmark_summary_error: capture failed".into()),
+                evaluator_mode: EVALUATOR_MODE_FORM_V1.into(),
+                structured_transport_actual: None,
+                tool_calls_present: false,
+                tool_call_count: 0,
+                structured_retry_count: 0,
+                fallback_path: Vec::new(),
+                syntactic_repair_used: false,
+                memory_count_after: 0,
+                object_count_after: 0,
+                relationship_summary_after: String::new(),
+            },
+        ];
+
+        assert_eq!(benchmark_visible_turns_completed(2, 2, &rows), 1);
+    }
+
+    #[test]
+    fn visible_turn_completion_requires_player_text() {
+        let rows = vec![BenchmarkTurnSummary {
+            turn_index: 0,
+            stage: "completed".into(),
+            simulated_user_message: "   ".into(),
+            narrator_response_present: true,
+            narrator_error: None,
+            evaluator_mode: EVALUATOR_MODE_FORM_V1.into(),
+            structured_transport_actual: None,
+            tool_calls_present: false,
+            tool_call_count: 0,
+            structured_retry_count: 0,
+            fallback_path: Vec::new(),
+            syntactic_repair_used: false,
+            memory_count_after: 0,
+            object_count_after: 0,
+            relationship_summary_after: String::new(),
+        }];
+
+        assert_eq!(benchmark_visible_turns_completed(1, 1, &rows), 0);
+    }
+
+    #[test]
+    fn object_state_update_is_optional_without_identity_checks() {
+        let mut summary = benchmark_summary_fixture();
+        summary.object_identity_checks.clear();
+        summary.final_object_state_count = 0;
+
+        let scorecard = benchmark_scorecard(&summary, false, 1, 0, 1);
+
+        assert!(!scorecard.object_state_updated);
+        assert!(!scorecard
+            .failure_reasons
+            .contains(&"object_state_updated".to_string()));
+    }
+
+    #[test]
+    fn failed_visible_benchmark_user_message_can_be_hidden_without_completing_turn() {
+        let (conn, soul) = command_test_setup("bench-narrator-failed-user");
+        let branch =
+            db::get_active_session_branch(&conn, "bench-narrator-failed-user").expect("branch");
+        let completed_user_id = db::insert_message_and_get_id(
+            &conn,
+            "bench-narrator-failed-user",
+            "user",
+            "completed user",
+        )
+        .expect("completed user");
+        let completed_assistant_id = db::insert_message_and_get_id(
+            &conn,
+            "bench-narrator-failed-user",
+            "assistant",
+            "completed assistant",
+        )
+        .expect("completed assistant");
+        db::record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "turn-completed",
+            "bench-narrator-failed-user",
+            &branch.branch_id,
+            None,
+            Some(completed_user_id),
+            completed_assistant_id,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("turn");
+        let failed_user_id = db::insert_message_and_get_id(
+            &conn,
+            "bench-narrator-failed-user",
+            "user",
+            "failed user-only turn",
+        )
+        .expect("failed user");
+        for index in 0..2 {
+            db::insert_llm_payload_log(
+                &conn,
+                &LlmPayloadLog {
+                    conversation_id: "bench-narrator-failed-user".into(),
+                    provider: "player_simulator".into(),
+                    model: soul.character_name.clone(),
+                    request_id: Some(format!("player-{index}")),
+                    created_at: db::now_ts(),
+                    ..Default::default()
+                },
+            )
+            .expect("payload");
+        }
+
+        assert_eq!(
+            db::hide_latest_matching_active_user_tail(
+                &conn,
+                "bench-narrator-failed-user",
+                "failed user-only turn",
+            )
+            .expect("hide failed benchmark user"),
+            Some(failed_user_id)
+        );
+
+        let failed_user = db::get_message(&conn, "bench-narrator-failed-user", failed_user_id)
+            .expect("failed user message remains for audit");
+        assert_ne!(failed_user.status, "active");
+        let active_messages =
+            db::list_messages(&conn, "bench-narrator-failed-user", 20).expect("messages");
+        assert!(active_messages
+            .iter()
+            .all(|message| message.id != failed_user_id));
+
+        let audit = benchmark_ledger_audit(&conn, "bench-narrator-failed-user").expect("audit");
+        assert_eq!(audit.visible_turns_completed, 1);
+        assert_eq!(audit.visible_user_messages_created, 1);
+        assert_eq!(audit.visible_assistant_messages_created, 1);
+        assert_eq!(audit.player_simulator_payload_count, 2);
+    }
+
+    #[test]
+    fn visible_benchmark_narrator_failure_scorecard_counts_only_completed_pairs() {
+        let (conn, soul) = command_test_setup("bench-narrator-failed-scorecard");
+        let branch = db::get_active_session_branch(&conn, "bench-narrator-failed-scorecard")
+            .expect("branch");
+        let completed_user_id = db::insert_message_and_get_id(
+            &conn,
+            "bench-narrator-failed-scorecard",
+            "user",
+            "completed user",
+        )
+        .expect("completed user");
+        let completed_assistant_id = db::insert_message_and_get_id(
+            &conn,
+            "bench-narrator-failed-scorecard",
+            "assistant",
+            "completed assistant",
+        )
+        .expect("completed assistant");
+        db::record_turn_commit_with_patch_for_turn_id(
+            &conn,
+            "turn-completed",
+            "bench-narrator-failed-scorecard",
+            &branch.branch_id,
+            None,
+            Some(completed_user_id),
+            completed_assistant_id,
+            None,
+            &EnginePatch::default(),
+            false,
+        )
+        .expect("completed commit");
+        let failed_user_id = db::insert_message_and_get_id(
+            &conn,
+            "bench-narrator-failed-scorecard",
+            "user",
+            "failed user-only turn",
+        )
+        .expect("failed user");
+        for index in 0..2 {
+            db::insert_llm_payload_log(
+                &conn,
+                &LlmPayloadLog {
+                    conversation_id: "bench-narrator-failed-scorecard".into(),
+                    provider: "player_simulator".into(),
+                    model: soul.character_name.clone(),
+                    request_id: Some(format!("player-{index}")),
+                    created_at: db::now_ts(),
+                    ..Default::default()
+                },
+            )
+            .expect("player payload");
+        }
+        db::insert_llm_payload_log(
+            &conn,
+            &LlmPayloadLog {
+                conversation_id: "bench-narrator-failed-scorecard".into(),
+                provider: "narrator_brief".into(),
+                provider_error: Some("API stream failed: error decoding response body".into()),
+                created_at: db::now_ts(),
+                ..Default::default()
+            },
+        )
+        .expect("narrator payload");
+
+        let hidden = db::hide_latest_matching_active_user_tail(
+            &conn,
+            "bench-narrator-failed-scorecard",
+            "failed user-only turn",
+        )
+        .expect("hide failed benchmark user");
+        assert_eq!(hidden, Some(failed_user_id));
+
+        let logs =
+            db::list_llm_payload_logs(&conn, "bench-narrator-failed-scorecard").expect("logs");
+        let narrator_error = latest_narrator_provider_error(&logs).expect("narrator error");
+        let audit =
+            benchmark_ledger_audit(&conn, "bench-narrator-failed-scorecard").expect("audit");
+        let mut summary = benchmark_summary_fixture();
+        summary.benchmark_type = "visible_ai_chat".into();
+        summary.turn_count_requested = 5;
+        summary.visible_turns_requested = 5;
+        summary.turn_count_completed = audit.visible_turns_completed;
+        summary.visible_turns_completed = audit.visible_turns_completed;
+        summary.visible_user_messages_created = audit.visible_user_messages_created;
+        summary.visible_assistant_messages_created = audit.visible_assistant_messages_created;
+        summary.unique_user_message_ids = audit.unique_user_message_ids;
+        summary.unique_assistant_message_ids = audit.unique_assistant_message_ids;
+        summary.player_simulator_payload_count = audit.player_simulator_payload_count;
+        summary.narrator_failures = 1;
+        summary.tool_call_success_count = audit.visible_turns_completed;
+        summary.object_identity_checks.clear();
+        summary.per_turn = vec![
+            BenchmarkTurnSummary {
+                turn_index: 0,
+                stage: "completed".into(),
+                simulated_user_message: "completed user".into(),
+                narrator_response_present: true,
+                narrator_error: None,
+                evaluator_mode: EVALUATOR_MODE_FORM_V1.into(),
+                structured_transport_actual: None,
+                tool_calls_present: false,
+                tool_call_count: 0,
+                structured_retry_count: 0,
+                fallback_path: Vec::new(),
+                syntactic_repair_used: false,
+                memory_count_after: summary.final_memory_count,
+                object_count_after: summary.final_object_state_count,
+                relationship_summary_after: String::new(),
+            },
+            BenchmarkTurnSummary {
+                turn_index: 1,
+                stage: "narrator_failed".into(),
+                simulated_user_message: "failed user-only turn".into(),
+                narrator_response_present: false,
+                narrator_error: Some(narrator_error.clone()),
+                evaluator_mode: EVALUATOR_MODE_FORM_V1.into(),
+                structured_transport_actual: None,
+                tool_calls_present: false,
+                tool_call_count: 0,
+                structured_retry_count: 0,
+                fallback_path: Vec::new(),
+                syntactic_repair_used: false,
+                memory_count_after: summary.final_memory_count,
+                object_count_after: summary.final_object_state_count,
+                relationship_summary_after: String::new(),
+            },
+        ];
+
+        let scorecard =
+            benchmark_scorecard(&summary, false, 1, summary.final_object_state_count, 0);
+
+        assert_eq!(audit.visible_turns_completed, 1);
+        assert_eq!(audit.visible_user_messages_created, 1);
+        assert_eq!(audit.visible_assistant_messages_created, 1);
+        assert_eq!(audit.player_simulator_payload_count, 2);
+        assert!(!scorecard.pass);
+        assert_eq!(scorecard.visible_turns_completed, 1);
+        assert_eq!(scorecard.visible_user_messages_created, 1);
+        assert_eq!(scorecard.visible_assistant_messages_created, 1);
+        assert_eq!(scorecard.player_simulator_payload_count, 2);
+        assert_eq!(scorecard.narrator_calls, 2);
+        assert_eq!(scorecard.evaluator_calls, 1);
+        assert_eq!(
+            scorecard.narrator_provider_error.as_deref(),
+            Some(narrator_error.as_str())
+        );
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"visible_turns_completed_matches_requested".to_string()));
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"visible_user_messages_created_matches_requested".to_string()));
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"visible_assistant_messages_created_matches_requested".to_string()));
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"narrator_visible_response_each_turn".to_string()));
+        assert!(!scorecard
+            .failure_reasons
+            .contains(&"player_simulator_payload_count".to_string()));
+        assert!(!scorecard
+            .failure_reasons
+            .contains(&"object_state_updated".to_string()));
+    }
+
+    #[test]
+    fn benchmark_tail_user_cleanup_does_not_hide_completed_turn() {
+        let (conn, _soul) = command_test_setup("bench-tail-cleanup-complete");
+        let _user_id = db::insert_message_and_get_id(
+            &conn,
+            "bench-tail-cleanup-complete",
+            "user",
+            "same text",
+        )
+        .expect("user");
+        let assistant_id = db::insert_message_and_get_id(
+            &conn,
+            "bench-tail-cleanup-complete",
+            "assistant",
+            "assistant reply",
+        )
+        .expect("assistant");
+
+        assert_eq!(
+            db::hide_latest_matching_active_user_tail(
+                &conn,
+                "bench-tail-cleanup-complete",
+                "same text",
+            )
+            .expect("no hide"),
+            None
+        );
+        let active_messages =
+            db::list_messages(&conn, "bench-tail-cleanup-complete", 20).expect("messages");
+        assert!(active_messages
+            .iter()
+            .any(|message| message.id == assistant_id && message.status == "active"));
     }
 
     #[test]
@@ -29109,6 +29773,69 @@ mod tests {
         assert!(report.valid);
         assert_eq!(report.summary.soul_name.as_deref(), Some("Aurora"));
         assert_eq!(report.summary.world_name.as_deref(), Some("Kitchen"));
+    }
+
+    #[test]
+    fn early_narrator_failure_scorecard_cleanup() {
+        let mut summary = benchmark_summary_fixture();
+        summary.visible_turns_completed = 0;
+        summary.turn_count_completed = 0;
+        summary.visible_assistant_messages_created = 0;
+        summary.visible_user_messages_created = 1;
+        summary.narrator_failures = 1;
+        summary.player_simulator_payload_count = 1;
+        summary.per_turn = vec![BenchmarkTurnSummary {
+            turn_index: 0,
+            stage: "narrator_failed".into(),
+            simulated_user_message: "hello".into(),
+            narrator_response_present: false,
+            narrator_error: Some("API stream failed: error decoding response body".into()),
+            evaluator_mode: "evaluator_form_v1".into(),
+            structured_transport_actual: None,
+            tool_calls_present: false,
+            tool_call_count: 0,
+            structured_retry_count: 0,
+            fallback_path: Vec::new(),
+            syntactic_repair_used: false,
+            memory_count_after: summary.final_memory_count,
+            object_count_after: summary.final_object_state_count,
+            relationship_summary_after: String::new(),
+        }];
+
+        let scorecard = benchmark_scorecard(&summary, false, 1, 0, 0);
+
+        assert!(!scorecard.pass);
+        assert_eq!(scorecard.stop_reason.as_deref(), Some("narrator_failed"));
+        assert_eq!(scorecard.failed_stage.as_deref(), Some("narrator_called"));
+        assert_eq!(
+            scorecard.narrator_provider_error.as_deref(),
+            Some("API stream failed: error decoding response body")
+        );
+
+        // Required check values
+        assert_eq!(scorecard.visible_turns_completed, 0);
+        assert_eq!(scorecard.player_simulator_calls, 1);
+        assert_eq!(scorecard.narrator_calls, 1);
+        assert_eq!(scorecard.evaluator_calls, 0);
+
+        // Growth checks should not require growth
+        assert!(scorecard.memory_updated);
+        assert!(scorecard.object_state_updated);
+        assert!(scorecard.relationship_updated);
+        assert!(scorecard.memories_increased_over_time);
+        assert!(scorecard.active_player_relationship_changed_when_warranted);
+        assert!(scorecard.object_ids_stable);
+
+        // Failure reasons asserts
+        assert!(scorecard.failure_reasons.contains(&"narrator_visible_response_each_turn".to_string()));
+        assert!(scorecard.failure_reasons.contains(&"blocked_by_narrator_failure".to_string()));
+        assert!(scorecard.failure_reasons.contains(&"skipped_after_narrator_failure".to_string()));
+
+        // Downstream failures should NOT be in failure reasons
+        assert!(!scorecard.failure_reasons.contains(&"visible_turns_completed_matches_requested".to_string()));
+        assert!(!scorecard.failure_reasons.contains(&"memories_increased_over_time".to_string()));
+        assert!(!scorecard.failure_reasons.contains(&"object_state_updated".to_string()));
+        assert!(!scorecard.failure_reasons.contains(&"active_player_relationship_changed_when_warranted".to_string()));
     }
 
     fn write_test_mne_bytes(entries: HashMap<String, Vec<u8>>) -> Vec<u8> {

@@ -94,6 +94,7 @@ pub fn run() {
             commands::restore_session,
             commands::list_archived_sessions,
             commands::hide_turn_range,
+            commands::hide_latest_benchmark_failed_user_message,
             commands::restore_turn_range,
             commands::list_hidden_turns,
             commands::dedupe_active_adjacent_user_messages,

@@ -1682,6 +1682,9 @@ export type BenchmarkScorecard = {
   relationship_updated: boolean;
   payload_history_export_succeeded: boolean;
   narrator_visible_response_each_turn: boolean;
+  narrator_provider_error?: string | null;
+  stop_reason?: string | null;
+  failed_stage?: string | null;
   evaluator_used_tool_call_where_required: boolean;
   no_evaluator_form_v1_fallback_in_strict_mode: boolean;
   syntactic_repair_unused_in_strict_mode: boolean;
@@ -1696,6 +1699,7 @@ export type BenchmarkScorecard = {
 
 export type BenchmarkTurnSummary = {
   turn_index: number;
+  stage: string;
   simulated_user_message: string;
   narrator_response_present: boolean;
   narrator_error?: string | null;
@@ -2064,12 +2068,13 @@ export function benchmarkTurnSummary(
   conversationId: string,
   turnIndex: number,
   userText: string,
+  stage: string,
   narratorError: string | null,
   stateUpdaterSettings: ApiProviderSettings,
 ): Promise<BenchmarkTurnSummary> {
   return invokeOrPreview(
     "benchmark_turn_summary",
-    { conversationId, turnIndex, userText, narratorError, stateUpdaterSettings },
+    { conversationId, turnIndex, userText, stage, narratorError, stateUpdaterSettings },
     () => {
       throw new Error("Benchmark Runner requires the Tauri runtime.");
     },
@@ -2153,6 +2158,26 @@ export function deleteMessage(conversationId: string, messageId: number): Promis
     );
     return browserMessages.length !== beforeCount;
   });
+}
+
+export function hideLatestBenchmarkFailedUserMessage(
+  conversationId: string,
+  userText: string,
+): Promise<number | null> {
+  return invokeOrPreview(
+    "hide_latest_benchmark_failed_user_message",
+    { conversationId, userText },
+    () => {
+      const expected = userText.trim();
+      if (!expected) return null;
+      const latest = [...browserMessages]
+        .filter((message) => message.conversation_id === conversationId)
+        .sort((left, right) => right.id - left.id)[0];
+      if (!latest || latest.role !== "user" || latest.content.trim() !== expected) return null;
+      browserMessages = browserMessages.filter((message) => message.id !== latest.id);
+      return latest.id;
+    },
+  );
 }
 
 export function restoreInactiveMessages(conversationId: string): Promise<RestoreTurnsResult> {
