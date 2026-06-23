@@ -1234,11 +1234,19 @@ fn build_relationship_section(
         );
     }
 
-    let mut relationships = soul.relationships.iter().collect::<Vec<_>>();
-    relationships.sort_by(|left, right| {
-        display_entity_id_for_persona(left.0, player_persona)
-            .cmp(&display_entity_id_for_persona(right.0, player_persona))
-    });
+    let active_persona_id = player_persona.persona_id.trim();
+    let has_active_persona_relationship = !active_persona_id.is_empty()
+        && soul.relationships.contains_key(active_persona_id);
+    let mut relationships = soul
+        .relationships
+        .iter()
+        .filter(|(target, _)| {
+            !(has_active_persona_relationship
+                && (target.eq_ignore_ascii_case("user")
+                    || target.eq_ignore_ascii_case("default_player")))
+        })
+        .collect::<Vec<_>>();
+    relationships.sort_by(|left, right| left.0.cmp(right.0));
     let lines = relationships
         .into_iter()
         .map(|(target, relationship)| {
@@ -1968,6 +1976,10 @@ mod tests {
     fn active_player_persona_replaces_default_player_in_context_surface() {
         let mut soul = new_default_soul("Aurora");
         soul.relationships.get_mut("user").unwrap().trust = 42.0;
+        let mut active_relationship = soul.relationships["user"].clone();
+        active_relationship.trust = 57.0;
+        soul.relationships
+            .insert("persona_jun".into(), active_relationship);
         let persona = PlayerPersonaContext {
             persona_id: "persona_jun".into(),
             display_name: "Jun Persona".into(),
@@ -1986,7 +1998,15 @@ mod tests {
         assert!(preview
             .text
             .contains("Aurora -> Jun Persona (persona_jun):"));
+        assert_eq!(
+            preview
+                .text
+                .matches("Aurora -> Jun Persona (persona_jun):")
+                .count(),
+            1
+        );
         assert!(!preview.text.contains("Aurora -> default_player:"));
+        assert!(!preview.text.contains("Aurora -> user:"));
     }
 
     #[test]

@@ -1431,6 +1431,9 @@ export type EvaluatorOpsRejectedPayload = {
   conversation_id: string;
   assistant_message_id: number;
   failed_ops: EvaluatorOpRepairRequest[];
+  /** "fix_rejected" (correct the failed ops) or "reextract" (no ops; the repair
+   * model re-extracts the whole turn because the evaluator produced nothing). */
+  repair_kind?: string;
 };
 
 /** Fired by the backend when the evaluator dropped one or more ops (its own
@@ -1680,6 +1683,13 @@ export type BenchmarkScorecard = {
   memory_updated: boolean;
   object_state_updated: boolean;
   relationship_updated: boolean;
+  relationship_target_checked?: string | null;
+  relationship_changed_from?: Record<string, unknown> | null;
+  relationship_changed_to?: Record<string, unknown> | null;
+  relationship_delta_patch_ids: string[];
+  relationship_delta_sources: string[];
+  evaluator_provider_failures: number;
+  structured_provider_429_count: number;
   payload_history_export_succeeded: boolean;
   narrator_visible_response_each_turn: boolean;
   narrator_provider_error?: string | null;
@@ -1688,6 +1698,9 @@ export type BenchmarkScorecard = {
   evaluator_used_tool_call_where_required: boolean;
   no_evaluator_form_v1_fallback_in_strict_mode: boolean;
   syntactic_repair_unused_in_strict_mode: boolean;
+  strict_tool_evaluator: boolean;
+  evaluator_mode_actual: string;
+  local_repair_recovered_state_when_warranted: boolean;
   memories_increased_over_time: boolean;
   active_player_relationship_changed_when_warranted: boolean;
   object_ids_stable: boolean;
@@ -1995,10 +2008,11 @@ export function repairEvaluatorOps(
   assistantMessageId: number,
   failedOps: EvaluatorOpRepairRequest[],
   repairSettings: ApiProviderSettings,
+  repairKind?: string,
 ): Promise<void> {
   return invokeOrPreview(
     "repair_evaluator_ops",
-    { conversationId, assistantMessageId, failedOps, repairSettings },
+    { conversationId, assistantMessageId, failedOps, repairSettings, repairKind },
     () => {
       throw new Error("Evaluator op-repair requires the Tauri runtime.");
     },
@@ -2013,6 +2027,8 @@ export type BenchmarkSessionInit = {
   initial_memory_count: number;
   initial_object_count: number;
   initial_relationship_count: number;
+  relationship_target_checked: string;
+  initial_active_player_relationship?: Record<string, unknown> | null;
 };
 
 /** Set up a benchmark conversation for the live self-play loop (frontend-driven). */
@@ -2092,6 +2108,8 @@ export function finalizeBenchmark(
   initialMemoryCount: number,
   initialObjectCount: number,
   initialRelationshipCount: number,
+  relationshipTargetChecked: string,
+  initialActivePlayerRelationship: Record<string, unknown> | null,
   turnCountCompleted: number,
   narratorFailures: number,
   perTurn: BenchmarkTurnSummary[],
@@ -2108,6 +2126,8 @@ export function finalizeBenchmark(
       initialMemoryCount,
       initialObjectCount,
       initialRelationshipCount,
+      relationshipTargetChecked,
+      initialActivePlayerRelationship,
       turnCountCompleted,
       narratorFailures,
       perTurn,

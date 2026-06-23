@@ -158,6 +158,9 @@ const NARRATOR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:narrator_provider_profi
 const UPDATER_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:state_updater_provider_profile_id";
 const REPAIR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:repair_provider_profile_id";
 const EMBEDDED_MODEL_PATH_STORAGE_KEY = "mnemosyne:embedded_repair_model_path";
+const REPAIR_MODEL_AUTO = "";
+const REPAIR_MODEL_EVALUATOR = "__evaluator__";
+const REPAIR_MODEL_EMBEDDED = "__embedded__";
 const USE_NARRATOR_FOR_UPDATER_STORAGE_KEY = "mnemosyne:use_narrator_provider_for_updater";
 const CUSTOM_NARRATOR_PROMPT_STORAGE_KEY = "mnemosyne:custom_narrator_prompt";
 const SETTINGS_DRAWER_OPEN_STORAGE_KEY = "mnemosyne:settings_drawer_open";
@@ -291,6 +294,8 @@ type BenchmarkLiveContext = {
   initialMemoryCount: number;
   initialObjectCount: number;
   initialRelationshipCount: number;
+  relationshipTargetChecked: string;
+  initialActivePlayerRelationship: Record<string, unknown> | null;
   perTurn: BenchmarkTurnSummary[];
   narratorFailures: number;
   completedTurns: number;
@@ -774,14 +779,18 @@ export function App() {
   // the backend ignores the extra metadata fields.)
   useEffect(() => {
     const evalSettings = useNarratorProviderForUpdater ? apiSettings : stateUpdaterSettings;
-    const repairProfile = selectedRepairProfileId
+    const repairProfile = selectedRepairProfileId &&
+      selectedRepairProfileId !== REPAIR_MODEL_EVALUATOR &&
+      selectedRepairProfileId !== REPAIR_MODEL_EMBEDDED
       ? providerProfiles.find((profile) => profile.id === selectedRepairProfileId)
       : undefined;
-    // Precedence: a chosen Repair profile wins; else the embedded local model (if
-    // ready); else fall back to the evaluator settings.
+    const mayUseEmbeddedModel = selectedRepairProfileId !== REPAIR_MODEL_EVALUATOR;
+    // Precedence: a chosen Repair profile wins; explicit/automatic embedded mode
+    // uses the local model when ready; evaluator mode (and unavailable local
+    // model) safely falls back to the evaluator settings.
     if (repairProfile) {
       repairSettingsRef.current = repairProfile;
-    } else if (embeddedModel.ready && embeddedModel.url) {
+    } else if (mayUseEmbeddedModel && embeddedModel.ready && embeddedModel.url) {
       repairSettingsRef.current = {
         ...evalSettings,
         base_url: embeddedModel.url,
@@ -856,14 +865,18 @@ export function App() {
     let cleanup: (() => void) | undefined;
     void listenEvaluatorOpsRejected((payload) => {
       if (!active) return;
-      if (!payload.failed_ops?.length) return;
+      // "reextract" carries no ops (the evaluator produced nothing usable); every
+      // other kind needs at least one failed op to act on.
+      const isReextract = payload.repair_kind === "reextract";
+      if (!isReextract && !payload.failed_ops?.length) return;
       const settings = repairSettingsRef.current;
       if (!settings) return;
       void repairEvaluatorOps(
         payload.conversation_id,
         payload.assistant_message_id,
-        payload.failed_ops,
+        payload.failed_ops ?? [],
         settings,
+        payload.repair_kind,
       ).catch(() => undefined);
     }).then((unlisten) => {
       cleanup = unlisten;
@@ -3307,6 +3320,9 @@ export function App() {
           // EvaluatorJob) blocks on the job before capturing the turn summary
           // and the next message, so state is committed in order.
           evaluator_background_enabled: true,
+          // The frontend waits for the primary evaluator job below. Do not also
+          // block the next narrator on best-effort repair jobs that may outlive it.
+          wait_for_evaluator_before_next_turn: false,
           allow_send_with_stale_state: true,
         }
       : {};
@@ -3326,9 +3342,9 @@ export function App() {
   // Wait between live benchmark turns until the background evaluator has
   // committed — EVENT-DRIVEN: resolves the instant the job's completion event
   // arrives (no poll lag), which is why this is much faster than the old 700ms
-  // polling loop. A slow 3s poll + a 300s cap are kept only as safety nets in
-  // case an event is missed. Returns immediately if there's no live job (already
-  // terminal, or a dialogue-only turn the gate skipped).
+  // polling loop. A slow 3s poll is kept in case an event is missed. The job's
+  // configured timeout is authoritative; in no-app-timeout mode Stop remains
+  // available through the poll. Returns immediately if there's no live job.
   async function waitForBenchmarkEvaluatorJob(conversationId: string): Promise<any> {
     const isTerminal = (status: string) => status !== "pending" && status !== "running";
     // Fast path: nothing in flight.
@@ -3341,12 +3357,10 @@ export function App() {
     return new Promise<any>((resolve) => {
       let done = false;
       let unlisten: (() => void) | undefined;
-      let cap: number | undefined;
       let safetyPoll: number | undefined;
       const finishWithJob = async () => {
         if (done) return;
         done = true;
-        if (cap !== undefined) window.clearTimeout(cap);
         if (safetyPoll !== undefined) window.clearInterval(safetyPoll);
         unlisten?.();
         try {
@@ -3365,8 +3379,7 @@ export function App() {
         unlisten = stop;
         if (done) stop();
       });
-      // Safety nets: honor Stop, slow-poll in case an event is dropped, hard cap.
-      cap = window.setTimeout(finishWithJob, 300_000);
+      // Safety nets: honor Stop and slow-poll in case an event is dropped.
       safetyPoll = window.setInterval(() => {
         if (benchmarkStopRef.current) {
           void finishWithJob();
@@ -3418,6 +3431,8 @@ export function App() {
         initialMemoryCount: init.initial_memory_count,
         initialObjectCount: init.initial_object_count,
         initialRelationshipCount: init.initial_relationship_count,
+        relationshipTargetChecked: init.relationship_target_checked,
+        initialActivePlayerRelationship: init.initial_active_player_relationship ?? null,
         perTurn: [],
         narratorFailures: 0,
         completedTurns: 0,
@@ -3573,6 +3588,7 @@ export function App() {
           : phase === "turn_summary"
             ? "benchmark_summary_failed"
           : message.startsWith("evaluator_failed:") ||
+              message.startsWith("State update in progress") ||
               message.startsWith("state_update_failed_after_narration_saved:") ||
               phase === "evaluator_wait"
             ? "evaluator_failed"
@@ -3662,6 +3678,8 @@ export function App() {
         ctx.initialMemoryCount,
         ctx.initialObjectCount,
         ctx.initialRelationshipCount,
+        ctx.relationshipTargetChecked,
+        ctx.initialActivePlayerRelationship,
         ctx.completedTurns,
         ctx.narratorFailures,
         ctx.perTurn,
@@ -3879,6 +3897,13 @@ export function App() {
     const activeIds = [];
     if (selectedProviderProfileId) activeIds.push(selectedProviderProfileId);
     if (selectedStateUpdaterProfileId) activeIds.push(selectedStateUpdaterProfileId);
+    if (
+      selectedRepairProfileId &&
+      selectedRepairProfileId !== REPAIR_MODEL_EVALUATOR &&
+      selectedRepairProfileId !== REPAIR_MODEL_EMBEDDED
+    ) {
+      activeIds.push(selectedRepairProfileId);
+    }
     if (activeIds.includes(profileId)) {
       window.alert("Cannot archive the active provider profile. Switch profiles first.");
       return;
@@ -4248,19 +4273,26 @@ export function App() {
         ["Evaluator calls", benchmarkResult.scorecard.evaluator_calls >= benchmarkResult.turn_count_completed],
         ["Evaluator waited each turn", benchmarkResult.scorecard.evaluator_waited_each_turn],
         ["Memory updated", benchmarkResult.scorecard.memory_updated],
-        ["Object state updated", benchmarkResult.scorecard.object_state_updated],
+        [
+          "Object state updated (when required)",
+          benchmarkResult.object_identity_checks.length === 0 || benchmarkResult.scorecard.object_state_updated,
+        ],
         ["Relationship updated", benchmarkResult.scorecard.relationship_updated],
         ["Payload history exported", benchmarkResult.scorecard.payload_history_export_succeeded],
         ["Narrator response each turn", benchmarkResult.scorecard.narrator_visible_response_each_turn],
-        ["Tool call required path", benchmarkResult.scorecard.evaluator_used_tool_call_where_required],
-        ["No form fallback in strict mode", benchmarkResult.scorecard.no_evaluator_form_v1_fallback_in_strict_mode],
-        ["No syntactic repair in strict mode", benchmarkResult.scorecard.syntactic_repair_unused_in_strict_mode],
+        // Strict-only checks are meaningless unless strict tool mode was requested.
+        // Show n/a (with the mode that actually ran) instead of a misleading PASS.
+        ["Tool call required path", benchmarkResult.scorecard.strict_tool_evaluator ? benchmarkResult.scorecard.evaluator_used_tool_call_where_required : "n/a"],
+        ["No form fallback in strict mode", benchmarkResult.scorecard.strict_tool_evaluator ? benchmarkResult.scorecard.no_evaluator_form_v1_fallback_in_strict_mode : "n/a"],
+        ["No syntactic repair in strict mode", benchmarkResult.scorecard.strict_tool_evaluator ? benchmarkResult.scorecard.syntactic_repair_unused_in_strict_mode : "n/a"],
+        [`Evaluator mode actual: ${benchmarkResult.scorecard.evaluator_mode_actual || "unknown"}`, "n/a"],
+        ["Local repair recovered state when warranted", benchmarkResult.scorecard.local_repair_recovered_state_when_warranted],
         ["Memories increased", benchmarkResult.scorecard.memories_increased_over_time],
         ["Active player relationship present", benchmarkResult.scorecard.active_player_relationship_changed_when_warranted],
         ["Object IDs stable", benchmarkResult.scorecard.object_ids_stable],
         ["No default_player RP relationship leak", benchmarkResult.scorecard.default_player_not_normal_rp_relationship_target],
         [".mne export succeeded", benchmarkResult.scorecard.mne_export_succeeded],
-      ] as Array<[string, boolean]>
+      ] as Array<[string, boolean | "n/a"]>
     : [];
   const benchmarkRunnerPanel = (
     <section className="settings-section provider-pass-card">
@@ -4411,7 +4443,9 @@ export function App() {
               {benchmarkResult.scorecard.duplicate_turn_rows_detected ? "FAIL" : "PASS"}.
               <br />
               Scorecard:{" "}
-              {benchmarkScoreRows.map(([label, passed]) => `${passed ? "PASS" : "FAIL"} ${label}`).join("; ")}
+              {benchmarkScoreRows
+                .map(([label, passed]) => `${passed === "n/a" ? "n/a" : passed ? "PASS" : "FAIL"} ${label}`)
+                .join("; ")}
               {benchmarkResult.scorecard.failure_reasons.length ? (
                 <>
                   <br />
@@ -4436,6 +4470,20 @@ export function App() {
                   <strong>failed_stage:</strong> {benchmarkResult.scorecard.failed_stage}
                 </>
               ) : null}
+              <br />
+              <strong>relationship_target_checked:</strong>{" "}{benchmarkResult.scorecard.relationship_target_checked ?? "none"}
+              <br />
+              <strong>relationship_changed_from:</strong>{" "}{JSON.stringify(benchmarkResult.scorecard.relationship_changed_from ?? null)}
+              <br />
+              <strong>relationship_changed_to:</strong>{" "}{JSON.stringify(benchmarkResult.scorecard.relationship_changed_to ?? null)}
+              <br />
+              <strong>relationship_delta_patch_ids:</strong>{" "}{benchmarkResult.scorecard.relationship_delta_patch_ids.join(", ") || "none"}
+              <br />
+              <strong>relationship_delta_sources:</strong>{" "}{benchmarkResult.scorecard.relationship_delta_sources.join(", ") || "none"}
+              <br />
+              <strong>evaluator_provider_failures:</strong>{" "}{benchmarkResult.scorecard.evaluator_provider_failures}
+              <br />
+              <strong>structured_provider_429_count:</strong>{" "}{benchmarkResult.scorecard.structured_provider_429_count}
               <br />
               <strong>completed_visible_turns:</strong> {benchmarkResult.scorecard.visible_turns_completed}
               <br />
@@ -4923,9 +4971,17 @@ export function App() {
                 <p>Focused background repair for evaluator ops rejected by validation.</p>
               </div>
               <span className="provider-status-pill">
-                {selectedRepairProfileId
-                  ? providerProfiles.find((profile) => profile.id === selectedRepairProfileId)?.name ?? "Profile missing"
-                  : "Same as evaluator"}
+                {selectedRepairProfileId === REPAIR_MODEL_EMBEDDED
+                  ? embeddedModel.ready
+                    ? "Embedded local ready"
+                    : "Embedded local not ready"
+                  : selectedRepairProfileId === REPAIR_MODEL_EVALUATOR
+                    ? "Same as evaluator"
+                    : selectedRepairProfileId
+                      ? providerProfiles.find((profile) => profile.id === selectedRepairProfileId)?.name ?? "Profile missing"
+                      : embeddedModel.ready
+                        ? "Auto: embedded local"
+                        : "Auto: evaluator"}
               </span>
             </div>
             <div className="provider-pass-grid">
@@ -4936,7 +4992,9 @@ export function App() {
                   onChange={(event) => setSelectedRepairProfileId(event.target.value)}
                   disabled={busy}
                 >
-                  <option value="">Same as evaluator (no separate repair)</option>
+                  <option value={REPAIR_MODEL_AUTO}>Automatic (local when ready, otherwise evaluator)</option>
+                  <option value={REPAIR_MODEL_EMBEDDED}>Embedded local model</option>
+                  <option value={REPAIR_MODEL_EVALUATOR}>Same as evaluator</option>
                   {providerProfiles.map((profile) => (
                     <option key={profile.id} value={profile.id}>
                       {profile.name}
@@ -5008,7 +5066,8 @@ export function App() {
                 {providerProfiles.map((p) => {
                   const isNarratorActive = selectedProviderProfileId === p.id;
                   const isUpdaterActive = selectedStateUpdaterProfileId === p.id;
-                  const isActive = isNarratorActive || isUpdaterActive;
+                  const isRepairActive = selectedRepairProfileId === p.id;
+                  const isActive = isNarratorActive || isUpdaterActive || isRepairActive;
                   return (
                     <div key={p.id} className="profile-list-item" style={{
                       display: "flex",
@@ -5024,6 +5083,7 @@ export function App() {
                         </span>
                         {isNarratorActive && <span className="provider-status-pill" style={{ marginLeft: "0.5rem", fontSize: "0.7rem", padding: "2px 6px" }}>Active Narrator</span>}
                         {isUpdaterActive && <span className="provider-status-pill" style={{ marginLeft: "0.5rem", fontSize: "0.7rem", padding: "2px 6px" }}>Active Updater</span>}
+                        {isRepairActive && <span className="provider-status-pill" style={{ marginLeft: "0.5rem", fontSize: "0.7rem", padding: "2px 6px" }}>Active Repair</span>}
                         <span style={{
                           fontSize: "0.75rem",
                           marginLeft: "0.5rem",
@@ -7117,9 +7177,17 @@ export function App() {
                     <p>Focused background repair for evaluator ops rejected by validation.</p>
                   </div>
                   <span className="provider-status-pill">
-                    {selectedRepairProfileId
-                      ? providerProfiles.find((profile) => profile.id === selectedRepairProfileId)?.name ?? "Profile missing"
-                      : "Same as evaluator"}
+                    {selectedRepairProfileId === REPAIR_MODEL_EMBEDDED
+                      ? embeddedModel.ready
+                        ? "Embedded local ready"
+                        : "Embedded local not ready"
+                      : selectedRepairProfileId === REPAIR_MODEL_EVALUATOR
+                        ? "Same as evaluator"
+                        : selectedRepairProfileId
+                          ? providerProfiles.find((profile) => profile.id === selectedRepairProfileId)?.name ?? "Profile missing"
+                          : embeddedModel.ready
+                            ? "Auto: embedded local"
+                            : "Auto: evaluator"}
                   </span>
                 </div>
                 <div className="provider-pass-grid">
@@ -7130,7 +7198,9 @@ export function App() {
                       onChange={(event) => setSelectedRepairProfileId(event.target.value)}
                       disabled={busy}
                     >
-                      <option value="">Same as evaluator (no separate repair)</option>
+                      <option value={REPAIR_MODEL_AUTO}>Automatic (local when ready, otherwise evaluator)</option>
+                      <option value={REPAIR_MODEL_EMBEDDED}>Embedded local model</option>
+                      <option value={REPAIR_MODEL_EVALUATOR}>Same as evaluator</option>
                       {providerProfiles.map((profile) => (
                         <option key={profile.id} value={profile.id}>
                           {profile.name}
@@ -7140,7 +7210,7 @@ export function App() {
                   </label>
                 </div>
                 <p className="provider-note">
-                  Pick a saved local/light profile here to keep repair separate from narrator and evaluator.
+                  Choose Embedded local model here, then open AI Settings to set the llamafile path and start it.
                 </p>
               </div>
             </>
