@@ -30,3 +30,6 @@ thiserror = "1.0"
 
 [dev-dependencies]
 tempfile = "3.14"
+# Test-only: the repair_bench dev harness needs a tokio runtime to drive the
+# async reqwest provider calls against a live local model. Not in the shipped app.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

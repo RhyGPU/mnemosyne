@@ -11,5 +11,22 @@ Main page's main feature is selecting character so character profile pic and cha
 Main page should only have world and character choosing. settings- can only choose 1. Characters - can select multiple.
 Character and setting creation page should be separate from main page (Library)
 archive session (delete) does not remove it from the UI. At least make a toggle option to see archived and non archived chats
+dev mode separate. Not a side log but a mode that activates or deactivates. Activating a dev mode shows all in chat session. So chat is like a log file and a chat log.
+example:
+log= called llm
+log= response waiting
+log=smth
+chatlog= Narrator: blah blah blah.
+log=staring eval
+log=tool called
+log=system compling
+log= x failed x succeded
+~~~~
+and stuff with a progress bar on the left most screen that tracks with a green check (step done) yellow (loading) red warning triangle sign (error or issue/ paused)
+and starts progress bar for every chat system cycle from I sending chat to repair succeded or not needed.
+
+also in this mode i must type /chat and then type in session chat log user stuff or else Im typing in terminal this system runs enabling me to run commands andd track and check real time. Kinda closer to a claude cli where I can see you work and get feed back while I can use it as a termianal too.
+
+Dev mode should look diff like a matrix color astetic and rigid ui shapes.
 
 overall better looking UI with easier and intuitive design.

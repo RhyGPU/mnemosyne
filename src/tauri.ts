@@ -1690,6 +1690,14 @@ export type BenchmarkScorecard = {
   relationship_delta_sources: string[];
   evaluator_provider_failures: number;
   structured_provider_429_count: number;
+  evaluator_response_failed_count: number;
+  evaluator_empty_patch_count: number;
+  form_rows_rejected_count: number;
+  local_repair_invoked_count: number;
+  local_reextract_invoked_count: number;
+  local_repair_payload_count: number;
+  local_repair_response_count: number;
+  local_repair_state_patch_count: number;
   payload_history_export_succeeded: boolean;
   narrator_visible_response_each_turn: boolean;
   narrator_provider_error?: string | null;
@@ -1701,6 +1709,7 @@ export type BenchmarkScorecard = {
   strict_tool_evaluator: boolean;
   evaluator_mode_actual: string;
   local_repair_recovered_state_when_warranted: boolean;
+  local_repair_unavailable: boolean;
   memories_increased_over_time: boolean;
   active_player_relationship_changed_when_warranted: boolean;
   object_ids_stable: boolean;

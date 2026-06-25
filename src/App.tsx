@@ -577,6 +577,16 @@ export function App() {
   });
   const [embeddedModelBusy, setEmbeddedModelBusy] = useState(false);
   const [embeddedModelError, setEmbeddedModelError] = useState<string | null>(null);
+  const [retryRepairBusy, setRetryRepairBusy] = useState(false);
+  // Mirror the path into a ref so the (once-registered) repair listener can
+  // auto-start the model without a stale closure.
+  const embeddedModelPathRef = useRef(embeddedModelPath);
+  useEffect(() => {
+    embeddedModelPathRef.current = embeddedModelPath;
+  }, [embeddedModelPath]);
+  // Shared in-flight start, so concurrent repair triggers don't each spawn a
+  // model (start kills the prior instance, which would thrash).
+  const localModelReadyPromiseRef = useRef<Promise<boolean> | null>(null);
   const [useNarratorProviderForUpdater, setUseNarratorProviderForUpdater] = useState(
     () => localStorage.getItem(USE_NARRATOR_FOR_UPDATER_STORAGE_KEY) !== "false",
   );
@@ -643,6 +653,12 @@ export function App() {
   const [draftAvatarImageId, setDraftAvatarImageId] = useState<string | null>(null);
   const [previewImageAsset, setPreviewImageAsset] = useState<ImageAsset | null>(null);
   const [status, setStatus] = useState("Ready");
+  // A decently-important failure (a provider/model call, the local model, an
+  // export, etc.). Surfaced as a prominent dismissible banner with a fix hint,
+  // rather than silently retrying or burying it in the status line.
+  const [providerAlert, setProviderAlert] = useState<
+    { title: string; detail?: string; hint?: string } | null
+  >(null);
   const [payloadCopied, setPayloadCopied] = useState(false);
   const [exportFeedback, setExportFeedback] = useState("");
   const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(() =>
@@ -838,7 +854,13 @@ export function App() {
       setEmbeddedModel(status);
       setStatus("Embedded repair model starting…");
     } catch (error) {
-      setEmbeddedModelError(error instanceof Error ? error.message : String(error));
+      const detail = error instanceof Error ? error.message : String(error);
+      setEmbeddedModelError(detail);
+      setProviderAlert({
+        title: "Local repair model failed to start",
+        detail,
+        hint: "Check the llamafile path in Settings, or that the file is runnable.",
+      });
     } finally {
       setEmbeddedModelBusy(false);
     }
@@ -856,6 +878,109 @@ export function App() {
     }
   }
 
+  // Re-run local repair (re-extraction) on every turn of the current session,
+  // using the configured repair endpoint. Lets the user recover state that was
+  // dropped when repair was unavailable — without re-running the whole benchmark.
+  async function handleRetrySessionRepair() {
+    const settings = repairSettingsRef.current;
+    const conversationId = currentConversationId;
+    if (!settings) {
+      setStatus("No repair endpoint configured (pick a Repair Model or start the embedded model).");
+      return;
+    }
+    if (!conversationId) {
+      setStatus("Open a session first.");
+      return;
+    }
+    setRetryRepairBusy(true);
+    try {
+      const targetsLocal = /\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)/i.test(settings.base_url ?? "");
+      if (targetsLocal) {
+        const ready = await ensureLocalRepairModelReady();
+        if (!ready) {
+          setProviderAlert({
+            title: "Local repair model unavailable",
+            detail: "Couldn't reach the local model to retry repair.",
+            hint: "Start the embedded model (or run the .exe yourself) and confirm it's up, then retry.",
+          });
+          return;
+        }
+      }
+      const messages = await listConversationMessages(conversationId);
+      const assistantTurns = messages.filter(
+        (message) => message.role === "assistant" && message.status === "active",
+      );
+      let fired = 0;
+      for (const message of assistantTurns) {
+        try {
+          // reextract: re-derive durable state for the turn; turns without a
+          // baseline patch (e.g. the opening message) error out and are skipped.
+          await repairEvaluatorOps(conversationId, message.id, [], settings, "reextract");
+          fired += 1;
+        } catch {
+          // skip turns that can't be repaired
+        }
+      }
+      setStatus(`Retry repair fired for ${fired} turn(s); state updates in the background.`);
+    } catch (error) {
+      reportError(error, "Retry session repair failed", "state_updater");
+    } finally {
+      setRetryRepairBusy(false);
+    }
+  }
+
+  // Ensure the embedded repair model is actually answering: return true if ready,
+  // otherwise auto-start it (if a path is configured) and poll until ready or
+  // timeout. Concurrent callers share one start via localModelReadyPromiseRef so
+  // we never spawn duplicate servers. Reads the path from a ref to stay valid in
+  // the once-registered repair listener.
+  function ensureLocalRepairModelReady(timeoutMs = 90000): Promise<boolean> {
+    if (!localModelReadyPromiseRef.current) {
+      localModelReadyPromiseRef.current = (async () => {
+        let status: EmbeddedModelStatus | null = null;
+        try {
+          status = await embeddedRepairModelStatus();
+        } catch {
+          status = null;
+        }
+        if (status?.ready) return true;
+        // CRITICAL: only spawn when nothing is running. A running-but-not-ready
+        // model is loading or just busy under load — and start_embedded_repair_model
+        // KILLS the existing instance first. Restarting a busy model mid-repair is a
+        // death spiral on slow CPUs (a /health timeout during generation looks like
+        // "not ready", we kill it, the in-flight repair hits a dead port). So if it's
+        // already running, just wait for it.
+        if (!status?.running) {
+          const path = embeddedModelPathRef.current.trim();
+          if (!path) return false;
+          try {
+            await startEmbeddedRepairModel(path, 8080, null);
+            setStatus("Starting local repair model…");
+          } catch (error) {
+            setEmbeddedModelError(error instanceof Error ? error.message : String(error));
+            return false;
+          }
+        }
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          try {
+            const status = await embeddedRepairModelStatus();
+            setEmbeddedModel(status);
+            if (status.ready) return true;
+            if (!status.running) return false; // child died (e.g. bad flag / crash)
+          } catch {
+            // keep polling until the deadline
+          }
+        }
+        return false;
+      })().finally(() => {
+        localModelReadyPromiseRef.current = null;
+      });
+    }
+    return localModelReadyPromiseRef.current;
+  }
+
   // Auto-fire background op-repair: when the evaluator drops ops (its own
   // verdict, surfaced by the backend), retry ONLY those ops on the configured
   // endpoint, in the background. Fires after the original eval job, so there is
@@ -863,7 +988,7 @@ export function App() {
   useEffect(() => {
     let active = true;
     let cleanup: (() => void) | undefined;
-    void listenEvaluatorOpsRejected((payload) => {
+    void listenEvaluatorOpsRejected(async (payload) => {
       if (!active) return;
       // "reextract" carries no ops (the evaluator produced nothing usable); every
       // other kind needs at least one failed op to act on.
@@ -871,6 +996,24 @@ export function App() {
       if (!isReextract && !payload.failed_ops?.length) return;
       const settings = repairSettingsRef.current;
       if (!settings) return;
+      // If repair targets the local model, verify it's actually reachable first —
+      // otherwise the call silently connection-refuses and state is dropped. Tell
+      // the user to fix it in Settings instead of failing invisibly.
+      const targetsLocalModel = /\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)/i.test(settings.base_url ?? "");
+      if (targetsLocalModel) {
+        // Auto-start the local model on demand rather than relying on the user
+        // having it up; ensure it's actually answering before sending repair.
+        const ready = await ensureLocalRepairModelReady();
+        if (!active) return;
+        if (!ready) {
+          setProviderAlert({
+            title: "Local repair model unavailable",
+            detail: `Repair needs the local model at ${settings.base_url}, but it isn't responding and auto-start failed.`,
+            hint: "Set a valid, runnable llamafile path in Settings.",
+          });
+          return;
+        }
+      }
       void repairEvaluatorOps(
         payload.conversation_id,
         payload.assistant_message_id,
@@ -933,6 +1076,16 @@ export function App() {
     const errorMessage = error instanceof Error ? error.message : String(error);
     setStatus(errorMessage);
     logDev("error", category, message, { error: errorMessage });
+  }
+
+  // Raise the prominent failure banner. `role` is a human label (e.g. "Narrator",
+  // "Evaluator", "Player simulator"); the default hint points the user at Settings.
+  function alertProviderFailure(role: string, detail?: string, hint?: string) {
+    setProviderAlert({
+      title: `${role} API failed`,
+      detail,
+      hint: hint ?? `Open Settings and check the ${role.toLowerCase()} model and API key.`,
+    });
   }
 
   useEffect(() => {
@@ -1248,12 +1401,15 @@ export function App() {
         setStatus("Updating memory/state...");
       } else if (evaluatorJobRefreshesState(job)) {
         setStatus(evaluatorJobStatusText(job));
+        // State advanced, so any prior evaluator failure is resolved.
+        setProviderAlert((current) => (current?.title.startsWith("Evaluator") ? null : current));
         if (job.status !== "stale_skipped" && soulRef.current) {
           void refreshContext(soulRef.current.character_id, job.conversation_id);
           void getSoul(soulRef.current.character_id).then(setSoul).catch(() => undefined);
         }
       } else if (job.status === "failed" || job.status === "timed_out") {
         setStatus(evaluatorJobStatusText(job));
+        alertProviderFailure("Evaluator", job.error_message ?? evaluatorJobStatusText(job));
       } else if (job.status === "canceled") {
         setStatus("State update canceled");
       }
@@ -1754,6 +1910,8 @@ export function App() {
     options?: { rethrowErrors?: boolean },
   ): Promise<TurnResult | undefined> {
     if (!text || busy || stateUpdating || !soul) return undefined;
+    // Clear any stale provider-failure banner at the start of a fresh turn.
+    setProviderAlert(null);
     const generationId = generationIdRef.current + 1;
     const turnConversationId = currentConversationId;
     const replacementOriginalContent = replacementAssistantId
@@ -1912,13 +2070,20 @@ export function App() {
         setStatus("Generation stopped");
         logDev("warn", "warning", "Generation stopped", { conversation_id: turnConversationId });
       } else if (narratorWasSaved) {
-        setStatus(error instanceof Error ? `State update failed; narration saved: ${error.message}` : String(error));
+        const detail = error instanceof Error ? error.message : String(error);
+        setStatus(`State update failed; narration saved: ${detail}`);
         logDev("error", "state_updater", "State update failed after narration save", {
           conversation_id: turnConversationId,
-          error: error instanceof Error ? error.message : String(error),
+          error: detail,
         });
+        if (provider === "API") {
+          alertProviderFailure("Evaluator", detail);
+        }
       } else {
         reportError(error, "Generation failed", provider === "API" ? "api" : "app");
+        if (provider === "API") {
+          alertProviderFailure("Narrator", error instanceof Error ? error.message : String(error));
+        }
       }
       if (options?.rethrowErrors) {
         throw error;
@@ -3405,6 +3570,25 @@ export function App() {
     setBenchmarkResult(null);
     setBenchmarkError(null);
     setStatus("Preparing live benchmark session...");
+    // Auto-start the local repair model if it's configured but not up, and wait
+    // for it to be ready before running turns — so repair has a live endpoint
+    // instead of silently connection-refusing. Non-fatal: if it won't start, we
+    // warn and run anyway (the scorecard reports local_repair_unavailable).
+    if (embeddedModelPath.trim()) {
+      setStatus("Ensuring local repair model is up…");
+      // Single shared implementation (also used by the repair listener): starts
+      // the model if needed and waits for it to actually answer before turn 1.
+      const localReady = await ensureLocalRepairModelReady(120000);
+      if (localReady) {
+        setStatus("Local repair model ready");
+      } else {
+        setProviderAlert({
+          title: "Local repair model didn't start",
+          detail: "Auto-start of the local repair model failed or timed out.",
+          hint: "Check the llamafile path in Settings (the file must be runnable). The run will continue, but repair can't recover state.",
+        });
+      }
+    }
     try {
       const init: BenchmarkSessionInit = await prepareBenchmarkSession(
         soul.character_id,
@@ -3593,6 +3777,20 @@ export function App() {
               phase === "evaluator_wait"
             ? "evaluator_failed"
             : "narrator_failed";
+      // Surface the failing role prominently so the user knows what to fix.
+      if (stage === "player_line_generation_failed") {
+        alertProviderFailure("Player simulator", message);
+      } else if (stage === "narrator_failed") {
+        alertProviderFailure("Narrator", message);
+      } else if (stage === "evaluator_failed") {
+        alertProviderFailure("Evaluator", message);
+      } else if (stage === "benchmark_summary_failed") {
+        setProviderAlert({
+          title: "Benchmark summary failed",
+          detail: message,
+          hint: "The run finished but the summary/export step failed.",
+        });
+      }
       if (stage === "narrator_failed") {
         ctx.narratorFailures += 1;
         try {
@@ -4260,26 +4458,41 @@ export function App() {
       </label>
     </div>
   );
+  const benchmarkStopReason = benchmarkResult?.scorecard.stop_reason ?? null;
+  const benchmarkFailStoppedBeforeCompletion = Boolean(
+    benchmarkResult &&
+      benchmarkStopReason &&
+      benchmarkResult.scorecard.visible_turns_completed < benchmarkResult.scorecard.visible_turns_requested,
+  );
+  const benchmarkEvaluatorFailStopped = benchmarkFailStoppedBeforeCompletion && benchmarkStopReason === "evaluator_failed";
+  const benchmarkNarratorFailStopped = benchmarkFailStoppedBeforeCompletion && benchmarkStopReason === "narrator_failed";
+  const skipAfterBenchmarkFailStop = (passed: boolean): boolean | "n/a" =>
+    benchmarkFailStoppedBeforeCompletion ? "n/a" : passed;
+  const skipGrowthAfterEvaluatorFailStop = (passed: boolean): boolean | "n/a" =>
+    benchmarkEvaluatorFailStopped ? "n/a" : passed;
   const benchmarkScoreRows = benchmarkResult
     ? [
-        ["Visible turns", benchmarkResult.scorecard.visible_turns_completed === benchmarkResult.scorecard.visible_turns_requested],
-        ["Visible user messages", benchmarkResult.scorecard.visible_user_messages_created === benchmarkResult.scorecard.visible_turns_requested],
-        ["Visible assistant messages", benchmarkResult.scorecard.visible_assistant_messages_created === benchmarkResult.scorecard.visible_turns_requested],
+        ["Visible turns", skipAfterBenchmarkFailStop(benchmarkResult.scorecard.visible_turns_completed === benchmarkResult.scorecard.visible_turns_requested)],
+        ["Visible user messages", skipAfterBenchmarkFailStop(benchmarkResult.scorecard.visible_user_messages_created === benchmarkResult.scorecard.visible_turns_requested)],
+        ["Visible assistant messages", skipAfterBenchmarkFailStop(benchmarkResult.scorecard.visible_assistant_messages_created === benchmarkResult.scorecard.visible_turns_requested)],
         ["Duplicate turn rows", !benchmarkResult.scorecard.duplicate_turn_rows_detected],
-        ["Visible chat messages created", benchmarkResult.scorecard.visible_chat_messages_created],
-        ["Normal pipeline used", benchmarkResult.scorecard.normal_pipeline_used],
+        ["Visible chat messages created", skipAfterBenchmarkFailStop(benchmarkResult.scorecard.visible_chat_messages_created)],
+        ["Normal pipeline used", skipAfterBenchmarkFailStop(benchmarkResult.scorecard.normal_pipeline_used)],
         ["Player simulator calls", benchmarkResult.scorecard.player_simulator_payload_count > 0 || benchmarkResult.benchmark_type === "scripted_visible_replay"],
         ["Narrator calls", benchmarkResult.scorecard.narrator_calls >= benchmarkResult.turn_count_completed],
         ["Evaluator calls", benchmarkResult.scorecard.evaluator_calls >= benchmarkResult.turn_count_completed],
         ["Evaluator waited each turn", benchmarkResult.scorecard.evaluator_waited_each_turn],
-        ["Memory updated", benchmarkResult.scorecard.memory_updated],
+        ...(benchmarkEvaluatorFailStopped ? ([["Evaluator completed each turn", false]] as Array<[string, boolean | "n/a"]>) : []),
+        ["Memory updated", skipGrowthAfterEvaluatorFailStop(benchmarkResult.scorecard.memory_updated)],
         [
           "Object state updated (when required)",
-          benchmarkResult.object_identity_checks.length === 0 || benchmarkResult.scorecard.object_state_updated,
+          skipGrowthAfterEvaluatorFailStop(
+            benchmarkResult.object_identity_checks.length === 0 || benchmarkResult.scorecard.object_state_updated,
+          ),
         ],
-        ["Relationship updated", benchmarkResult.scorecard.relationship_updated],
+        ["Relationship updated", skipGrowthAfterEvaluatorFailStop(benchmarkResult.scorecard.relationship_updated)],
         ["Payload history exported", benchmarkResult.scorecard.payload_history_export_succeeded],
-        ["Narrator response each turn", benchmarkResult.scorecard.narrator_visible_response_each_turn],
+        ["Narrator response each turn", benchmarkNarratorFailStopped ? false : benchmarkResult.scorecard.narrator_visible_response_each_turn],
         // Strict-only checks are meaningless unless strict tool mode was requested.
         // Show n/a (with the mode that actually ran) instead of a misleading PASS.
         ["Tool call required path", benchmarkResult.scorecard.strict_tool_evaluator ? benchmarkResult.scorecard.evaluator_used_tool_call_where_required : "n/a"],
@@ -4287,8 +4500,10 @@ export function App() {
         ["No syntactic repair in strict mode", benchmarkResult.scorecard.strict_tool_evaluator ? benchmarkResult.scorecard.syntactic_repair_unused_in_strict_mode : "n/a"],
         [`Evaluator mode actual: ${benchmarkResult.scorecard.evaluator_mode_actual || "unknown"}`, "n/a"],
         ["Local repair recovered state when warranted", benchmarkResult.scorecard.local_repair_recovered_state_when_warranted],
-        ["Memories increased", benchmarkResult.scorecard.memories_increased_over_time],
-        ["Active player relationship present", benchmarkResult.scorecard.active_player_relationship_changed_when_warranted],
+        // Surfaces a dead local endpoint distinctly from "repair tried and failed".
+        ["Local repair endpoint reachable (when needed)", benchmarkResult.scorecard.local_repair_unavailable ? false : "n/a"],
+        ["Memories increased", skipGrowthAfterEvaluatorFailStop(benchmarkResult.scorecard.memories_increased_over_time)],
+        ["Active player relationship present", skipGrowthAfterEvaluatorFailStop(benchmarkResult.scorecard.active_player_relationship_changed_when_warranted)],
         ["Object IDs stable", benchmarkResult.scorecard.object_ids_stable],
         ["No default_player RP relationship leak", benchmarkResult.scorecard.default_player_not_normal_rp_relationship_target],
         [".mne export succeeded", benchmarkResult.scorecard.mne_export_succeeded],
@@ -4484,6 +4699,22 @@ export function App() {
               <strong>evaluator_provider_failures:</strong>{" "}{benchmarkResult.scorecard.evaluator_provider_failures}
               <br />
               <strong>structured_provider_429_count:</strong>{" "}{benchmarkResult.scorecard.structured_provider_429_count}
+              <br />
+              <strong>evaluator_response_failed_count:</strong>{" "}{benchmarkResult.scorecard.evaluator_response_failed_count}
+              <br />
+              <strong>evaluator_empty_patch_count:</strong>{" "}{benchmarkResult.scorecard.evaluator_empty_patch_count}
+              <br />
+              <strong>form_rows_rejected_count:</strong>{" "}{benchmarkResult.scorecard.form_rows_rejected_count}
+              <br />
+              <strong>local_repair_invoked_count:</strong>{" "}{benchmarkResult.scorecard.local_repair_invoked_count}
+              <br />
+              <strong>local_reextract_invoked_count:</strong>{" "}{benchmarkResult.scorecard.local_reextract_invoked_count}
+              <br />
+              <strong>local_repair_payload_count:</strong>{" "}{benchmarkResult.scorecard.local_repair_payload_count}
+              <br />
+              <strong>local_repair_response_count:</strong>{" "}{benchmarkResult.scorecard.local_repair_response_count}
+              <br />
+              <strong>local_repair_state_patch_count:</strong>{" "}{benchmarkResult.scorecard.local_repair_state_patch_count}
               <br />
               <strong>completed_visible_turns:</strong> {benchmarkResult.scorecard.visible_turns_completed}
               <br />
@@ -5036,6 +5267,15 @@ export function App() {
                 disabled={embeddedModelBusy || !embeddedModel.running}
               >
                 <span>Stop</span>
+              </button>
+              <button
+                type="button"
+                className="ghost-action"
+                onClick={() => void handleRetrySessionRepair()}
+                disabled={retryRepairBusy}
+                title="Re-run local repair (re-extraction) on every turn of the current session — recovers state that was dropped when repair was unavailable, without re-running the benchmark."
+              >
+                <span>{retryRepairBusy ? "Retrying repair…" : "Retry repair on session"}</span>
               </button>
             </div>
             <p className="provider-note">
@@ -7974,6 +8214,60 @@ export function App() {
             <pre>{context?.text ?? "No context compiled yet."}</pre>
           </section>
         </section>
+
+        {providerAlert && (
+          <div
+            role="alert"
+            style={{
+              position: "fixed",
+              top: "12px",
+              left: "50%",
+              transform: "translateX(-50%)",
+              zIndex: 1000,
+              maxWidth: "640px",
+              width: "calc(100% - 32px)",
+              background: "#7f1d1d",
+              color: "#fee2e2",
+              border: "1px solid #ef4444",
+              borderRadius: "8px",
+              padding: "10px 14px",
+              boxShadow: "0 6px 24px rgba(0,0,0,0.35)",
+              display: "flex",
+              alignItems: "flex-start",
+              gap: "10px",
+            }}
+          >
+            <div style={{ flex: 1 }}>
+              <strong style={{ display: "block", marginBottom: "2px" }}>
+                {providerAlert.title}
+              </strong>
+              <span style={{ fontSize: "0.85rem", opacity: 0.95 }}>
+                {providerAlert.hint ?? "Open Settings to fix this."}
+                {providerAlert.detail ? (
+                  <span style={{ display: "block", marginTop: "4px", opacity: 0.8, fontSize: "0.78rem" }}>
+                    {providerAlert.detail}
+                  </span>
+                ) : null}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setProviderAlert(null)}
+              aria-label="Dismiss"
+              style={{
+                background: "none",
+                border: "none",
+                color: "#fee2e2",
+                cursor: "pointer",
+                fontSize: "1.1rem",
+                lineHeight: 1,
+                padding: "0 2px",
+              }}
+            >
+              ×
+            </button>
+          </div>
+        )}
 
         <footer className="status-line">
           <span>{status}</span>

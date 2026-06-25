@@ -1919,6 +1919,39 @@ Current truth comes from the compact state JSON below; Rust validates semantics 
     )
 }
 
+/// Recursively drop null / empty-string / empty-object fields and serialize
+/// compact. Lossless for meaning (a `null` device field or pretty-print
+/// whitespace carries no information), but it strips the bulk out of the
+/// evaluator context — the object_states dump alone is mostly null device
+/// fields. This matters most for local CPU repair, where prompt eval of the
+/// full context dominates latency.
+fn compact_context_json(value: &serde_json::Value) -> String {
+    fn strip(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(strip).collect())
+            }
+            serde_json::Value::Object(map) => {
+                let mut out = serde_json::Map::new();
+                for (key, val) in map {
+                    let keep = match val {
+                        serde_json::Value::Null => false,
+                        serde_json::Value::String(text) => !text.is_empty(),
+                        serde_json::Value::Object(obj) => !obj.is_empty(),
+                        _ => true,
+                    };
+                    if keep {
+                        out.insert(key.clone(), strip(val));
+                    }
+                }
+                serde_json::Value::Object(out)
+            }
+            other => other.clone(),
+        }
+    }
+    serde_json::to_string(&strip(value)).unwrap_or_default()
+}
+
 fn structured_evaluator_current_state_block(
     soul: &Soul,
     session_world: Option<&SessionWorld>,
@@ -1992,10 +2025,10 @@ fn structured_evaluator_current_state_block(
         normalize_updater_time(&world.time_elapsed),
         world.active_plots.iter().rev().find(|plot| !plot.trim().is_empty()).map(String::as_str).unwrap_or("None"),
         world.recent_events.iter().rev().find(|event| !event.trim().is_empty()).map(String::as_str).unwrap_or("None"),
-        serde_json::to_string_pretty(&active_entities).unwrap_or_default(),
-        serde_json::to_string_pretty(&relationship_summary).unwrap_or_default(),
-        serde_json::to_string_pretty(&world.scene_state).unwrap_or_default(),
-        serde_json::to_string_pretty(&world.object_states).unwrap_or_default(),
+        compact_context_json(&active_entities),
+        compact_context_json(&serde_json::to_value(&relationship_summary).unwrap_or_default()),
+        compact_context_json(&serde_json::to_value(&world.scene_state).unwrap_or_default()),
+        compact_context_json(&serde_json::to_value(&world.object_states).unwrap_or_default()),
     )
 }
 

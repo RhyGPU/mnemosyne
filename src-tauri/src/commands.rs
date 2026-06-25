@@ -94,6 +94,11 @@ const STATE_UPDATER_TARGET_TOKENS: usize = 1_600;
 const DEFAULT_EVALUATOR_TIMEOUT_MS: u64 = 25_000;
 const DEFAULT_STRUCTURED_EVALUATOR_TIMEOUT_MS: u64 = 90_000;
 const DEFAULT_DIAGNOSTIC_EVALUATOR_TIMEOUT_MS: u64 = 60_000;
+/// Generous ceiling for repair against a LOCAL (loopback) model. CPU inference of
+/// the ~2k-token repair prompt measured ~150s just for prompt eval on an i5; the
+/// normal timeouts (25-90s) always fire first. Repair is background, so this only
+/// matters as an upper bound for a genuinely stuck call.
+const LOCAL_REPAIR_TIMEOUT_MS: u64 = 600_000;
 const NEXT_TURN_GATE_POLL_MS: u64 = 250;
 const NEXT_TURN_GATE_FALLBACK_MAX_MS: u64 = 120_000;
 const ANTI_REPLAY_FORCED_RETRY_ENABLED_DEFAULT: bool = false;
@@ -380,6 +385,14 @@ pub struct BenchmarkScorecard {
     pub relationship_delta_sources: Vec<String>,
     pub evaluator_provider_failures: usize,
     pub structured_provider_429_count: usize,
+    pub evaluator_response_failed_count: usize,
+    pub evaluator_empty_patch_count: usize,
+    pub form_rows_rejected_count: usize,
+    pub local_repair_invoked_count: usize,
+    pub local_reextract_invoked_count: usize,
+    pub local_repair_payload_count: usize,
+    pub local_repair_response_count: usize,
+    pub local_repair_state_patch_count: usize,
     pub payload_history_export_succeeded: bool,
     pub narrator_visible_response_each_turn: bool,
     pub narrator_provider_error: Option<String>,
@@ -399,6 +412,11 @@ pub struct BenchmarkScorecard {
     /// When the primary evaluator failed/produced no state on a turn that
     /// warranted it, local repair must have been invoked AND recovered state.
     pub local_repair_recovered_state_when_warranted: bool,
+    /// Repair was invoked but the local endpoint never answered (payloads sent,
+    /// zero responses). The failure is "endpoint unreachable", NOT "repair tried
+    /// and couldn't fix it" — reported as `local_repair_unavailable` so a dead
+    /// server isn't blamed on the repair model.
+    pub local_repair_unavailable: bool,
     pub memories_increased_over_time: bool,
     pub active_player_relationship_changed_when_warranted: bool,
     pub object_ids_stable: bool,
@@ -4716,6 +4734,14 @@ fn wait_for_benchmark_evaluators(
 struct BenchmarkTraceCounts {
     evaluator_failures: usize,
     structured_provider_429_count: usize,
+    evaluator_response_failed_count: usize,
+    evaluator_empty_patch_count: usize,
+    form_rows_rejected_count: usize,
+    local_repair_invoked_count: usize,
+    local_reextract_invoked_count: usize,
+    local_repair_payload_count: usize,
+    local_repair_response_count: usize,
+    local_repair_state_patch_count: usize,
     tool_call_success_count: usize,
     tool_call_failure_count: usize,
     retry_count: usize,
@@ -5292,6 +5318,14 @@ fn build_benchmark_summary(
             relationship_delta_sources: relationship_diagnostics.delta_sources.clone(),
             evaluator_provider_failures: trace_counts.evaluator_failures,
             structured_provider_429_count: trace_counts.structured_provider_429_count,
+            evaluator_response_failed_count: trace_counts.evaluator_response_failed_count,
+            evaluator_empty_patch_count: trace_counts.evaluator_empty_patch_count,
+            form_rows_rejected_count: trace_counts.form_rows_rejected_count,
+            local_repair_invoked_count: trace_counts.local_repair_invoked_count,
+            local_reextract_invoked_count: trace_counts.local_reextract_invoked_count,
+            local_repair_payload_count: trace_counts.local_repair_payload_count,
+            local_repair_response_count: trace_counts.local_repair_response_count,
+            local_repair_state_patch_count: trace_counts.local_repair_state_patch_count,
             payload_history_export_succeeded: false,
             narrator_visible_response_each_turn: narrator_failures == 0
                 && turn_count_completed == turn_count_requested,
@@ -5308,6 +5342,7 @@ fn build_benchmark_summary(
             strict_tool_evaluator: strict_tool,
             evaluator_mode_actual: String::new(),
             local_repair_recovered_state_when_warranted: false,
+            local_repair_unavailable: false,
             memories_increased_over_time: final_memory_count > initial_memory_count,
             active_player_relationship_changed_when_warranted: soul
                 .relationships
@@ -5343,6 +5378,74 @@ fn benchmark_trace_counts(logs: &[LlmPayloadLog]) -> BenchmarkTraceCounts {
                 .filter(|value| value.is_object())
                 .unwrap_or(trace)
         });
+        let request_id = log.request_id.as_deref().unwrap_or_default();
+        let is_repair_payload = is_evaluator
+            && (request_id.starts_with("eval_repair_")
+                || log.provider.contains("repair")
+                || log.mode.contains("repair"));
+        if is_repair_payload {
+            counts.local_repair_payload_count += 1;
+            if log.user_message.contains("RE-EXTRACTION TASK") {
+                counts.local_reextract_invoked_count += 1;
+            } else {
+                counts.local_repair_invoked_count += 1;
+            }
+            let trace_raw_response_present = evaluator_trace
+                .and_then(|trace| trace.get("raw_evaluator_response"))
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty())
+                || evaluator_trace
+                    .and_then(|trace| trace.get("raw_content_present"))
+                    .and_then(|value| value.as_bool())
+                    == Some(true);
+            if log
+                .raw_provider_response
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || trace_raw_response_present
+            {
+                counts.local_repair_response_count += 1;
+            }
+        }
+        let converted_patch = trace
+            .as_ref()
+            .and_then(|trace| trace.get("converted_engine_patch"));
+        let ledger_apply_trace = trace
+            .as_ref()
+            .and_then(|trace| trace.get("ledger_apply_trace"));
+        let converted_patch_empty = converted_patch
+            .and_then(|value| value.get("patch_empty"))
+            .and_then(|value| value.as_bool())
+            == Some(true);
+        let converted_memory_patch_count = converted_patch
+            .and_then(|value| value.get("memory_patch_count"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let converted_relationship_patch_count = converted_patch
+            .and_then(|value| value.get("relationship_patch_count"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let converted_object_patch_count = converted_patch
+            .and_then(|value| value.get("object_patch_count"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let converted_nonempty_state_patch = converted_memory_patch_count > 0
+            || converted_relationship_patch_count > 0
+            || converted_object_patch_count > 0;
+        let ledger_patch_applied = ledger_apply_trace
+            .and_then(|value| value.get("patch_applied"))
+            .and_then(|value| value.as_bool())
+            == Some(true);
+        let ledger_enrichment_present = ledger_apply_trace
+            .and_then(|value| value.get("enrichment_patch_id"))
+            .is_some_and(|value| !value.is_null());
+        if is_repair_payload
+            && ledger_patch_applied
+            && ledger_enrichment_present
+            && converted_nonempty_state_patch
+        {
+            counts.local_repair_state_patch_count += 1;
+        }
         // An evaluator failure is either a provider-level error OR a trace whose
         // response never parsed. The transport/parse-drop class (a free model
         // stalling and dropping its body) sets NO provider_error — the only
@@ -5354,8 +5457,54 @@ fn benchmark_trace_counts(logs: &[LlmPayloadLog]) -> BenchmarkTraceCounts {
                 .and_then(|value| value.as_str())
                 == Some("failed");
         if provider_error_failed || trace_parse_failed {
+            counts.evaluator_response_failed_count += 1;
+        }
+        let trace_error_text = evaluator_trace
+            .map(|trace| {
+                [
+                    trace
+                        .get("parse_error")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    trace
+                        .get("no_op_reason")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    trace
+                        .get("fallback_warning")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                    trace
+                        .get("structured_schema_validation_error")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default(),
+                ]
+                .join(" ")
+            })
+            .unwrap_or_default();
+        let trace_noop_failed = is_evaluator
+            && evaluator_trace
+                .and_then(|trace| trace.get("fallback_path"))
+                .and_then(|value| value.as_array())
+                .is_some_and(|path| {
+                    path.iter()
+                        .any(|step| step.as_str() == Some("noop_after_all_fallbacks"))
+                })
+            && trace_error_text.contains("failed");
+        if is_evaluator && (converted_patch_empty || trace_noop_failed) {
+            counts.evaluator_empty_patch_count += 1;
+        }
+        if provider_error_failed || trace_parse_failed || trace_noop_failed {
             counts.evaluator_failures += 1;
-            if log
+            let provider_error_text = log.provider_error.as_deref().unwrap_or_default();
+            let failure_text = format!("{provider_error_text} {trace_error_text}");
+            if failure_text.contains("429")
+                && (log.provider.contains("structured")
+                    || log.mode.contains(EVALUATOR_MODE_STRUCTURED_V1)
+                    || failure_text.contains("structured evaluator failed"))
+            {
+                counts.structured_provider_429_count += 1;
+            } else if log
                 .provider_error
                 .as_deref()
                 .is_some_and(|error| error.contains("429"))
@@ -5368,6 +5517,25 @@ fn benchmark_trace_counts(logs: &[LlmPayloadLog]) -> BenchmarkTraceCounts {
         let Some(evaluator_trace) = evaluator_trace else {
             continue;
         };
+        let rejected_from_summary = evaluator_trace
+            .get("form_rows_rejected")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize;
+        if rejected_from_summary > 0 {
+            counts.form_rows_rejected_count += rejected_from_summary;
+        } else if let Some(rows) = evaluator_trace
+            .get("evaluator_row_traces")
+            .and_then(|value| value.as_array())
+        {
+            counts.form_rows_rejected_count += rows
+                .iter()
+                .filter(|row| {
+                    row.get("validation_status")
+                        .and_then(|value| value.as_str())
+                        == Some("rejected")
+                })
+                .count();
+        }
         let tool_count = evaluator_trace
             .get("tool_call_count")
             .and_then(|value| value.as_u64())
@@ -5492,6 +5660,9 @@ fn benchmark_scorecard(
         .iter()
         .find(|turn| turn.stage != "completed");
     let stop_reason = root_failure.map(|turn| turn.stage.clone());
+    let evaluator_failed_before_requested_completion = stop_reason.as_deref()
+        == Some("evaluator_failed")
+        && summary.visible_turns_completed < summary.visible_turns_requested;
     let failed_stage = root_failure.map(|turn| match turn.stage.as_str() {
         "player_line_generation_failed" => "player_simulator_called".to_string(),
         "narrator_failed" => "narrator_called".to_string(),
@@ -5499,9 +5670,9 @@ fn benchmark_scorecard(
         "benchmark_summary_failed" => "benchmark_summary_called".to_string(),
         stage => stage.to_string(),
     });
-    // The evaluator transport actually used (most common per-turn mode), so the
-    // strict-only checks below can't be read as a tool-call pass for a form run.
-    let evaluator_mode_actual = summary
+    // The evaluator transport actually used. Mixed runs are labeled explicitly
+    // so form/structured fallback paths don't masquerade as a single clean mode.
+    let evaluator_mode_counts = summary
         .per_turn
         .iter()
         .map(|turn| turn.evaluator_mode.as_str())
@@ -5509,20 +5680,30 @@ fn benchmark_scorecard(
         .fold(HashMap::new(), |mut acc, mode| {
             *acc.entry(mode.to_string()).or_insert(0usize) += 1;
             acc
-        })
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(mode, _)| mode)
-        .unwrap_or_else(|| "unknown".to_string());
+        });
+    let evaluator_mode_actual = match evaluator_mode_counts.len() {
+        0 => "none".to_string(),
+        1 => evaluator_mode_counts
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "none".to_string()),
+        _ => "mixed".to_string(),
+    };
     // Repair is "warranted" when the primary evaluator failed to produce usable
     // state (transport/parse drops are now counted honestly). When warranted, the
-    // run only passes if local repair was invoked AND state actually advanced.
+    // run only passes if local repair/re-extraction was invoked AND committed a
+    // non-empty enrichment patch. A repair payload that parses to ops: [] or an
+    // empty patch is diagnostic evidence only, never a successful recovery.
     let repair_was_warranted = summary.scorecard.evaluator_provider_failures > 0;
-    let repair_invoked = summary.internal_evaluator_retry_payload_count > 0;
-    let state_advanced =
-        summary.final_memory_count > initial_memory_count || relationship_updated;
+    let repair_invoked = summary.scorecard.local_repair_payload_count > 0;
+    let repair_recovered_state = summary.scorecard.local_repair_state_patch_count > 0;
     let local_repair_recovered_state_when_warranted =
-        !repair_was_warranted || (repair_invoked && state_advanced);
+        !repair_was_warranted || (repair_invoked && repair_recovered_state);
+    // Payloads went out but nothing came back => the local endpoint was down, not
+    // a repair model that tried and failed. Report that honestly.
+    let local_repair_unavailable =
+        repair_was_warranted && repair_invoked && summary.scorecard.local_repair_response_count == 0;
     let mut scorecard = BenchmarkScorecard {
         visible_chat_messages_created,
         normal_pipeline_used,
@@ -5553,6 +5734,14 @@ fn benchmark_scorecard(
         relationship_delta_sources: summary.scorecard.relationship_delta_sources.clone(),
         evaluator_provider_failures: summary.scorecard.evaluator_provider_failures,
         structured_provider_429_count: summary.scorecard.structured_provider_429_count,
+        evaluator_response_failed_count: summary.scorecard.evaluator_response_failed_count,
+        evaluator_empty_patch_count: summary.scorecard.evaluator_empty_patch_count,
+        form_rows_rejected_count: summary.scorecard.form_rows_rejected_count,
+        local_repair_invoked_count: summary.scorecard.local_repair_invoked_count,
+        local_reextract_invoked_count: summary.scorecard.local_reextract_invoked_count,
+        local_repair_payload_count: summary.scorecard.local_repair_payload_count,
+        local_repair_response_count: summary.scorecard.local_repair_response_count,
+        local_repair_state_patch_count: summary.scorecard.local_repair_state_patch_count,
         payload_history_export_succeeded: summary.payload_history_path.is_some(),
         narrator_visible_response_each_turn: summary.narrator_failures == 0
             && summary.visible_assistant_messages_created == summary.visible_user_messages_created,
@@ -5567,6 +5756,7 @@ fn benchmark_scorecard(
         strict_tool_evaluator: strict_tool,
         evaluator_mode_actual,
         local_repair_recovered_state_when_warranted,
+        local_repair_unavailable,
         memories_increased_over_time: summary.final_memory_count > initial_memory_count,
         active_player_relationship_changed_when_warranted: summary
             .scorecard
@@ -5658,6 +5848,15 @@ fn benchmark_scorecard(
         .into_iter()
         .filter_map(|(passed, name)| (!passed).then_some(name.to_string()))
         .collect();
+    // A dead local endpoint is "unavailable", not a repair model that failed to
+    // recover — relabel so the scorecard names the real cause.
+    if scorecard.local_repair_unavailable {
+        for reason in scorecard.failure_reasons.iter_mut() {
+            if reason == "local_repair_recovered_state_when_warranted" {
+                *reason = "local_repair_unavailable".to_string();
+            }
+        }
+    }
     if narrator_failed_early {
         scorecard
             .failure_reasons
@@ -5676,6 +5875,37 @@ fn benchmark_scorecard(
         scorecard
             .failure_reasons
             .push("skipped_after_narrator_failure".to_string());
+    }
+    if evaluator_failed_before_requested_completion {
+        let repair_failed = !scorecard.local_repair_recovered_state_when_warranted;
+        scorecard.failure_reasons.retain(|reason| {
+            matches!(
+                reason.as_str(),
+                "evaluator_used_tool_call_where_required"
+                    | "no_evaluator_form_v1_fallback_in_strict_mode"
+                    | "syntactic_repair_unused_in_strict_mode"
+            )
+        });
+        scorecard
+            .failure_reasons
+            .push("evaluator_failed".to_string());
+        if repair_failed {
+            // Distinguish "endpoint was down" from "repair ran but couldn't fix it".
+            scorecard.failure_reasons.push(
+                if scorecard.local_repair_unavailable {
+                    "local_repair_unavailable"
+                } else {
+                    "local_repair_failed_after_evaluator_failure"
+                }
+                .to_string(),
+            );
+        }
+        scorecard
+            .failure_reasons
+            .push("blocked_by_evaluator_failure".to_string());
+        scorecard
+            .failure_reasons
+            .push("skipped_after_evaluator_failure".to_string());
     }
     scorecard.pass = scorecard.failure_reasons.is_empty();
     scorecard
@@ -7266,7 +7496,9 @@ fn form_rejected_ops_for_repair(
                 .rejection_reason
                 .clone()
                 .filter(|reason| !reason.trim().is_empty())
-                .unwrap_or_else(|| format!("{} row rejected: {}", row.row_kind, row.compiler_result));
+                .unwrap_or_else(|| {
+                    format!("{} row rejected: {}", row.row_kind, row.compiler_result)
+                });
             Some(EvaluatorOpRepairRequest { op_json, reason })
         })
         .collect()
@@ -7280,11 +7512,21 @@ fn form_rejected_ops_for_repair(
 fn build_reextract_user_message(user_text: &str, narrator_text: &str) -> String {
     let mut out = String::new();
     out.push_str(
-        "RE-EXTRACTION TASK. The primary evaluator returned no usable state for this turn. \
-         Extract every durable state change the exchange below supports — memory, \
-         relationship events, object/scene state — as evaluator ops in the standard schema. \
-         Use exact evidence_quote substrings from the exchange, invent nothing, and return \
-         ops: [] with a specific no_op_reason only if nothing durable actually changed.\n\n",
+        "RE-EXTRACTION TASK. The primary evaluator produced no state for this turn, so you are \
+         the fallback — extract what it missed. Most substantive roleplay turns contain at least \
+         one durable change. Actively look for ALL of these before concluding otherwise:\n\
+         - relationship_event: any trust / comfort / respect / affection / fear / tension shift \
+         implied by what a character did — respecting or pushing a boundary, opening up, testing, \
+         reassuring, withdrawing. If a character acted toward another in a way that would move how \
+         they feel, score it.\n\
+         - add_memory: any newly revealed fact, stated intention, or emotionally significant beat \
+         worth remembering later.\n\
+         - object / scene state: anything moved, set down, opened, changed, or newly observed.\n\n\
+         Rules: copy EXACT evidence_quote substrings verbatim from the exchange below; invent \
+         nothing and add no change the text doesn't support; resolve \"I\" to the active player \
+         persona; prefer entity aliases. Return ops: [] ONLY if the turn is genuinely pure filler \
+         or out-of-character chatter, and then give a specific no_op_reason. Do NOT default to \
+         empty — that is the failure the primary already made.\n\n",
     );
     out.push_str("Scene this turn:\n");
     out.push_str("User: ");
@@ -7550,6 +7792,15 @@ pub async fn repair_evaluator_ops(
     if is_loopback_endpoint(&repair_settings.base_url) {
         repair_settings.structured_evaluator_transport = Some("json_schema".into());
         repair_settings.structured_evaluator_policy = Some("allow_fallback".into());
+        // CPU inference of the ~2k-token repair prompt is slow on consumer
+        // hardware (measured ~150s just for prompt eval on an i5-1335U). The
+        // default ~25s evaluator timeout therefore ALWAYS fires before the local
+        // model can answer — reqwest surfaces it as "error sending request",
+        // which looks like a connection failure but is really a timeout. Give the
+        // local endpoint a generous ceiling so it can actually finish. Repair is
+        // background/fire-and-forget, so a long ceiling costs nothing on success.
+        repair_settings.structured_evaluator_timeout_ms = Some(LOCAL_REPAIR_TIMEOUT_MS);
+        repair_settings.evaluator_timeout_ms = Some(LOCAL_REPAIR_TIMEOUT_MS);
     }
     // Repair is the enrichment, never the baseline: run it in the background and
     // commit through the same proven evaluator apply path.
@@ -7594,9 +7845,83 @@ pub async fn repair_evaluator_ops(
 /// model. The child handle is kept so we can stop it / kill it on app exit.
 pub struct EmbeddedModel {
     pub child: std::process::Child,
-    pub url: String,
-    pub port: u16,
+    /// The port we asked the server to bind.
+    pub requested_port: u16,
     pub model: String,
+    /// The port the server ACTUALLY bound, parsed from its startup log. llamafile
+    /// silently falls back to another port if the requested one is taken, so
+    /// trusting `requested_port` led the app to send repair to a dead port. None
+    /// until the "listening on http://…:PORT" line is seen; shared with the
+    /// log-reader thread.
+    pub bound_port: std::sync::Arc<std::sync::Mutex<Option<u16>>>,
+}
+
+impl EmbeddedModel {
+    /// The port to actually talk to: the bound port once discovered, else the
+    /// requested one (server may still be starting).
+    fn effective_port(&self) -> u16 {
+        self.bound_port
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .unwrap_or(self.requested_port)
+    }
+}
+
+/// Pull the bound port out of a llamafile/llama.cpp startup line such as
+/// "llama server listening at http://127.0.0.1:8081" or
+/// "server is listening on http://127.0.0.1:8082".
+fn parse_listening_port(line: &str) -> Option<u16> {
+    if !line.to_ascii_lowercase().contains("listening") {
+        return None;
+    }
+    let after_scheme = line.split("http://").nth(1)?;
+    let after_colon = after_scheme.split(':').nth(1)?;
+    let digits: String = after_colon
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// On Windows a `.llamafile` isn't directly executable; it must be a `.exe`.
+/// Given a path, return its `.exe` sibling iff it's a `.llamafile`, so the
+/// launcher can prefer or produce a runnable file. None for any other extension.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn exe_sibling_for_llamafile(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    let is_llamafile = p
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("llamafile"))
+        .unwrap_or(false);
+    is_llamafile.then(|| p.with_extension("exe").to_string_lossy().into_owned())
+}
+
+/// Drain a child's stdout/stderr, capturing the real bound port from the first
+/// "listening" line. Draining to EOF also prevents the pipe filling and blocking
+/// the server.
+fn spawn_port_log_reader<R: std::io::Read + Send + 'static>(
+    reader: Option<R>,
+    bound_port: std::sync::Arc<std::sync::Mutex<Option<u16>>>,
+) {
+    let Some(reader) = reader else {
+        return;
+    };
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let buffered = std::io::BufReader::new(reader);
+        for line in buffered.lines().map_while(Result::ok) {
+            let already_known = bound_port.lock().map(|g| g.is_some()).unwrap_or(true);
+            if !already_known {
+                if let Some(found) = parse_listening_port(&line) {
+                    if let Ok(mut guard) = bound_port.lock() {
+                        *guard = Some(found);
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7640,9 +7965,26 @@ pub fn start_embedded_repair_model(
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "local-model".to_string());
     let url = format!("http://127.0.0.1:{port}/v1");
-    let path = binary_path.trim().to_string();
+    let mut path = binary_path.trim().to_string();
     if path.is_empty() {
         return Err("Provide the path to your llamafile (the single model file).".into());
+    }
+    // Windows can't execute a bare `.llamafile` (it isn't in PATHEXT and the shell
+    // tries to "open" it). Transparently resolve to a `.exe`: prefer an existing
+    // sibling, otherwise rename the `.llamafile` (instant, same directory). On
+    // Unix the file runs directly, so this is a no-op there.
+    #[cfg(windows)]
+    if let Some(exe) = exe_sibling_for_llamafile(&path) {
+        if std::path::Path::new(&exe).exists() {
+            path = exe;
+        } else if std::path::Path::new(&path).exists() {
+            std::fs::rename(&path, &exe).map_err(|err| {
+                format!(
+                    "Windows needs a .exe to run the model; auto-rename from .llamafile failed: {err}. Rename the file to .exe manually."
+                )
+            })?;
+            path = exe;
+        }
     }
     if !std::path::Path::new(&path).exists() {
         return Err(format!("No file found at: {path}"));
@@ -7656,27 +7998,35 @@ pub fn start_embedded_repair_model(
         }
     }
 
-    let child = Command::new(&path)
+    // NOTE: no `--nobrowser` — it was removed in newer llamafile (0.10.x rejects
+    // it with "invalid argument" and won't start); that build's server does not
+    // auto-open a browser anyway. The remaining flags are stable across versions.
+    // Pipe stdout+stderr so a reader thread can capture the port the server
+    // actually bound (it falls back off a busy port without telling us otherwise).
+    let mut child = Command::new(&path)
         .args([
             "--server",
             "--host",
             "127.0.0.1",
             "--port",
             &port.to_string(),
-            "--nobrowser",
         ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("Failed to launch '{path}': {err}"))?;
+
+    let bound_port = std::sync::Arc::new(std::sync::Mutex::new(None));
+    spawn_port_log_reader(child.stdout.take(), bound_port.clone());
+    spawn_port_log_reader(child.stderr.take(), bound_port.clone());
 
     {
         let mut guard = state.local_model.lock().map_err(|err| err.to_string())?;
         *guard = Some(EmbeddedModel {
             child,
-            url: url.clone(),
-            port,
+            requested_port: port,
             model: model.clone(),
+            bound_port,
         });
     }
 
@@ -7704,7 +8054,7 @@ pub fn stop_embedded_repair_model(state: State<'_, AppState>) -> Result<(), Stri
 pub async fn embedded_repair_model_status(
     state: State<'_, AppState>,
 ) -> Result<EmbeddedModelStatus, String> {
-    let (url, model, port) = {
+    let (model, port) = {
         let mut guard = state.local_model.lock().map_err(|err| err.to_string())?;
         match guard.as_mut() {
             None => return Ok(EmbeddedModelStatus::stopped()),
@@ -7714,10 +8064,12 @@ pub async fn embedded_repair_model_status(
                     *guard = None;
                     return Ok(EmbeddedModelStatus::stopped());
                 }
-                (model.url.clone(), model.model.clone(), model.port)
+                // Use the port the server actually bound, not the one we asked for.
+                (model.model.clone(), model.effective_port())
             }
         }
     };
+    let url = format!("http://127.0.0.1:{port}/v1");
     // Probe health WITHOUT holding the lock across the await.
     let health = format!("http://127.0.0.1:{port}/health");
     let ready = reqwest::Client::new()
@@ -21899,6 +22251,43 @@ mod tests {
     }
 
     #[test]
+    fn exe_sibling_is_derived_only_for_llamafiles() {
+        assert_eq!(
+            exe_sibling_for_llamafile("D:\\models\\qwen.llamafile").as_deref(),
+            Some("D:\\models\\qwen.exe")
+        );
+        assert_eq!(
+            exe_sibling_for_llamafile("/home/u/qwen.LLAMAFILE").as_deref(),
+            Some("/home/u/qwen.exe")
+        );
+        // Already runnable or unrelated extensions are left alone.
+        assert_eq!(exe_sibling_for_llamafile("D:\\models\\qwen.exe"), None);
+        assert_eq!(exe_sibling_for_llamafile("D:\\models\\qwen.gguf"), None);
+        assert_eq!(exe_sibling_for_llamafile("qwen"), None);
+    }
+
+    #[test]
+    fn parse_listening_port_handles_llamafile_log_variants() {
+        assert_eq!(
+            parse_listening_port("llama server listening at http://127.0.0.1:8081"),
+            Some(8081)
+        );
+        assert_eq!(
+            parse_listening_port(
+                "0.04.012 I srv server_main: server is listening on http://127.0.0.1:8082"
+            ),
+            Some(8082)
+        );
+        assert_eq!(
+            parse_listening_port("server is listening on http://0.0.0.0:9090 - starting"),
+            Some(9090)
+        );
+        // Non-listening lines and listening lines without a URL yield nothing.
+        assert_eq!(parse_listening_port("llm_load_tensors: loading model"), None);
+        assert_eq!(parse_listening_port("now listening for connections"), None);
+    }
+
+    #[test]
     fn form_rejected_ops_build_repair_requests_from_rejected_rows() {
         let trace = state_engine::evaluator_form::EvalFormTrace {
             evaluator_row_traces: vec![
@@ -21908,7 +22297,9 @@ mod tests {
                     raw_row: serde_json::json!({ "intent": "-5", "row_enabled": null }),
                     normalized_row: serde_json::json!({}),
                     validation_status: "rejected".to_string(),
-                    rejection_reason: Some("relationship_event_missing_key: row_enabled".to_string()),
+                    rejection_reason: Some(
+                        "relationship_event_missing_key: row_enabled".to_string(),
+                    ),
                     compiler_result: "rejected".to_string(),
                 },
                 state_engine::evaluator_form::EvalRowTrace {
@@ -21938,6 +22329,127 @@ mod tests {
         assert!(message.contains("Aurora watches him."));
         // It is NOT the focused fix prompt.
         assert!(!message.contains("REPAIR TASK"));
+    }
+
+    /// Dev-only repair benchmark. Drives a LIVE local model through the same
+    /// two-stage flow the app uses — a FORM (non-tool-call) state-update attempt,
+    /// then the REPAIR (reextract) pass — and reports, per scene, how many ops the
+    /// repair produced and how many survived validation. Lets you compare local
+    /// models for JSON/repair quality without running the whole app benchmark.
+    ///
+    /// Ignored by default (needs a running model). Run e.g.:
+    ///   set REPAIR_BENCH_URL=http://127.0.0.1:8080/v1
+    ///   set REPAIR_BENCH_MODEL=local
+    ///   cargo test --lib repair_bench_local -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn repair_bench_local() {
+        use std::time::{Duration, Instant};
+
+        let url = std::env::var("REPAIR_BENCH_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080/v1".to_string());
+        let model = std::env::var("REPAIR_BENCH_MODEL").unwrap_or_else(|_| "local".to_string());
+
+        let (soul, world, fixture_user, fixture_narrator, _spec) = form_runtime_fixture();
+        // Scenes that clearly warrant durable state (relationship beats / facts).
+        let scenes: Vec<(&str, String, String)> = vec![
+            ("fixture", fixture_user, fixture_narrator),
+            (
+                "boundary_respect",
+                "I don't reach for the sketchbook. \"Only if you want to show me,\" I say. \"Not because you think that's what I'm here for.\"".to_string(),
+                "Aurora's guard flickers. She studies him a long moment, then slides the book an inch closer. \"...Okay,\" she says quietly.".to_string(),
+            ),
+            (
+                "trust_break",
+                "I laugh and repeat her secret back to her, loud enough for the whole room to hear.".to_string(),
+                "Aurora goes still. The warmth drains from her face; she pulls her jacket tight and turns away without a word.".to_string(),
+            ),
+        ];
+
+        let settings = ApiProviderSettings {
+            base_url: url.clone(),
+            api_key: "local".to_string(),
+            model: model.clone(),
+            structured_evaluator_transport: Some("json_schema".to_string()),
+            structured_evaluator_policy: Some("allow_fallback".to_string()),
+            ..ApiProviderSettings::default()
+        };
+
+        let provider = crate::providers::api::ApiProvider::default();
+        let schema = crate::providers::api::evaluator_patch_json_schema();
+        let structured_system = build_structured_evaluator_prompt(&soul, Some(&world));
+        let form_system = crate::providers::api::build_state_updater_prompt(&soul, Some(&world));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        println!("\n=== repair_bench  model='{model}'  url='{url}' ===");
+        for (name, user, narrator) in &scenes {
+            // Stage 1: FORM (non-tool-call) state-update attempt — what the primary
+            // evaluator does; we only show its raw output for inspection.
+            let form_user = format!("User: {user}\nNarrator: {narrator}");
+            let form_started = Instant::now();
+            let form_raw = runtime
+                .block_on(provider.complete_streaming(&settings, &form_system, &form_user, |_| {
+                    Ok(())
+                }))
+                .map(|completion| completion.raw_text)
+                .unwrap_or_else(|err| format!("<form call failed: {err}>"));
+            let form_elapsed = form_started.elapsed();
+
+            // Stage 2: REPAIR (reextract) — the thing under test. Validated.
+            let repair_user = build_reextract_user_message(user, narrator);
+            let started = Instant::now();
+            let result = runtime.block_on(provider.complete_structured_prompt(
+                &settings,
+                &structured_system,
+                &repair_user,
+                0.3,
+                Some(Duration::from_millis(LOCAL_REPAIR_TIMEOUT_MS)),
+                "evaluator_ops_v1",
+                &schema,
+            ));
+            let elapsed = started.elapsed();
+
+            println!("\n--- scene '{name}' ---");
+            println!(
+                "  form(non-tool): {:.1}s, {} chars raw",
+                form_elapsed.as_secs_f64(),
+                form_raw.trim().len()
+            );
+            match result {
+                Err(err) => println!("  repair: CALL FAILED after {:.1}s: {err}", elapsed.as_secs_f64()),
+                Ok(completion) => match compile_evaluator_structured_runtime(
+                    &completion.raw_text,
+                    Some(StructuredEnforcement::JsonSchema),
+                    &soul,
+                    &world,
+                    user,
+                    narrator,
+                    None,
+                ) {
+                    Err(err) => println!(
+                        "  repair: {:.1}s, ops UNPARSEABLE/empty: {err}\n    raw: {}",
+                        elapsed.as_secs_f64(),
+                        completion.raw_text.trim()
+                    ),
+                    Ok(outcome) => {
+                        println!(
+                            "  repair: {:.1}s, ops_parsed={} accepted={} rejected={}",
+                            elapsed.as_secs_f64(),
+                            outcome.structured_ops_count.unwrap_or(0),
+                            outcome.conversion.accepted_candidate_ids.len(),
+                            outcome.conversion.rejected_candidates.len(),
+                        );
+                        for rejection in &outcome.conversion.rejected_candidates {
+                            println!("      rejected {}: {}", rejection.candidate_id, rejection.reason);
+                        }
+                    }
+                },
+            }
+        }
+        println!("\n=== repair_bench done ===");
     }
 
     #[test]
@@ -22167,6 +22679,14 @@ mod tests {
                 relationship_delta_sources: vec!["enrichment".into()],
                 evaluator_provider_failures: 0,
                 structured_provider_429_count: 0,
+                evaluator_response_failed_count: 0,
+                evaluator_empty_patch_count: 0,
+                form_rows_rejected_count: 0,
+                local_repair_invoked_count: 0,
+                local_reextract_invoked_count: 0,
+                local_repair_payload_count: 0,
+                local_repair_response_count: 0,
+                local_repair_state_patch_count: 0,
                 payload_history_export_succeeded: true,
                 narrator_visible_response_each_turn: true,
                 narrator_provider_error: None,
@@ -22178,6 +22698,7 @@ mod tests {
                 strict_tool_evaluator: false,
                 evaluator_mode_actual: String::new(),
                 local_repair_recovered_state_when_warranted: true,
+                local_repair_unavailable: false,
                 memories_increased_over_time: true,
                 active_player_relationship_changed_when_warranted: true,
                 object_ids_stable: true,
@@ -22336,6 +22857,21 @@ mod tests {
         assert!(!scorecard
             .failure_reasons
             .contains(&"narrator_visible_response_each_turn".to_string()));
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"evaluator_failed".to_string()));
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"blocked_by_evaluator_failure".to_string()));
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"skipped_after_evaluator_failure".to_string()));
+        assert!(!scorecard
+            .failure_reasons
+            .contains(&"visible_turns_completed_matches_requested".to_string()));
+        assert!(!scorecard
+            .failure_reasons
+            .contains(&"relationship_updated".to_string()));
     }
 
     #[test]
@@ -23043,6 +23579,7 @@ mod tests {
 
         let counts = benchmark_trace_counts(&logs);
         assert_eq!(counts.evaluator_failures, 1);
+        assert_eq!(counts.evaluator_response_failed_count, 1);
         // Not a 429 and not the structured path, so the 429 counter stays zero.
         assert_eq!(counts.structured_provider_429_count, 0);
     }
@@ -23052,9 +23589,12 @@ mod tests {
         let mut summary = benchmark_summary_fixture();
         // Primary evaluator failed on turns that warranted state...
         summary.scorecard.evaluator_provider_failures = 2;
-        // ...repair never fired and no state advanced.
-        summary.internal_evaluator_retry_payload_count = 0;
-        summary.final_memory_count = 1;
+        // ...repair fired and even got a successful parse/response, but it did
+        // not commit a non-empty enrichment patch, so it is not recovery.
+        summary.scorecard.local_repair_payload_count = 1;
+        summary.scorecard.local_repair_response_count = 1;
+        summary.scorecard.local_repair_state_patch_count = 0;
+        summary.final_memory_count = 5;
         summary.scorecard.relationship_changed_from = None;
         summary.scorecard.relationship_changed_to = None;
         summary.scorecard.relationship_delta_patch_ids = Vec::new();
@@ -23071,9 +23611,9 @@ mod tests {
     fn warranted_repair_with_recovery_passes_check() {
         let mut summary = benchmark_summary_fixture();
         summary.scorecard.evaluator_provider_failures = 2;
-        // Repair fired and state advanced (memory grew past the initial count).
-        summary.internal_evaluator_retry_payload_count = 2;
-        summary.final_memory_count = 5;
+        // Repair/re-extraction fired and committed a non-empty enrichment patch.
+        summary.scorecard.local_repair_payload_count = 2;
+        summary.scorecard.local_repair_state_patch_count = 1;
 
         let scorecard = benchmark_scorecard(&summary, false, 1, 0, 0);
 
@@ -23081,6 +23621,34 @@ mod tests {
         assert!(!scorecard
             .failure_reasons
             .contains(&"local_repair_recovered_state_when_warranted".to_string()));
+    }
+
+    #[test]
+    fn unreachable_local_repair_is_reported_as_unavailable_not_failed() {
+        let mut summary = benchmark_summary_fixture();
+        // Evaluator failures warranted repair; repair payloads went out but the
+        // local endpoint never answered (connection refused => 0 responses).
+        summary.scorecard.evaluator_provider_failures = 3;
+        summary.scorecard.local_repair_payload_count = 4;
+        summary.scorecard.local_repair_response_count = 0;
+        summary.scorecard.local_repair_state_patch_count = 0;
+        summary.scorecard.relationship_changed_from = None;
+        summary.scorecard.relationship_changed_to = None;
+        summary.scorecard.relationship_delta_patch_ids = Vec::new();
+
+        let scorecard = benchmark_scorecard(&summary, false, 1, 0, 0);
+
+        assert!(scorecard.local_repair_unavailable);
+        // The real cause is named; "repair failed to recover" is NOT used.
+        assert!(scorecard
+            .failure_reasons
+            .contains(&"local_repair_unavailable".to_string()));
+        assert!(!scorecard
+            .failure_reasons
+            .contains(&"local_repair_recovered_state_when_warranted".to_string()));
+        assert!(!scorecard
+            .failure_reasons
+            .contains(&"local_repair_failed_after_evaluator_failure".to_string()));
     }
 
     #[test]
@@ -23095,6 +23663,105 @@ mod tests {
         let counts = benchmark_trace_counts(&logs);
         assert_eq!(counts.evaluator_failures, 1);
         assert_eq!(counts.structured_provider_429_count, 1);
+    }
+
+    #[test]
+    fn benchmark_trace_counts_noop_fallback_provider_failure() {
+        let logs = vec![LlmPayloadLog {
+            provider: "evaluator_structured_v1_background".into(),
+            mode: EVALUATOR_MODE_STRUCTURED_V1.into(),
+            provider_error: None,
+            pipeline_trace_json: Some(
+                serde_json::json!({
+                    "evaluator_trace": {
+                        "parse_status": "success",
+                        "fallback_path": [
+                            "structured_none",
+                            "evaluator_form_v1",
+                            "noop_after_all_fallbacks"
+                        ],
+                        "no_op_reason": "structured evaluator failed (HTTP 429 rate limit); evaluator_form_v1 fallback failed (API request failed)",
+                        "structured_schema_validation_error": "structured_failure=HTTP 429 rate limit"
+                    }
+                })
+                .to_string(),
+            ),
+            ..LlmPayloadLog::default()
+        }];
+
+        let counts = benchmark_trace_counts(&logs);
+        assert_eq!(counts.evaluator_failures, 1);
+        assert_eq!(counts.structured_provider_429_count, 1);
+    }
+
+    #[test]
+    fn benchmark_trace_counts_repair_success_requires_nonempty_enrichment() {
+        let logs = vec![
+            LlmPayloadLog {
+                provider: "evaluator_structured_v1_background".into(),
+                mode: EVALUATOR_MODE_STRUCTURED_V1.into(),
+                request_id: Some("eval_repair_empty".into()),
+                user_message: "RE-EXTRACTION TASK. Re-extract state.".into(),
+                raw_provider_response: Some(r#"{"ops":[]}"#.into()),
+                pipeline_trace_json: Some(
+                    serde_json::json!({
+                        "evaluator_trace": {
+                            "parse_status": "success",
+                            "raw_content_present": true
+                        },
+                        "converted_engine_patch": {
+                            "patch_empty": true,
+                            "memory_patch_count": 0,
+                            "relationship_patch_count": 0,
+                            "object_patch_count": 0
+                        },
+                        "ledger_apply_trace": {
+                            "patch_applied": false,
+                            "enrichment_patch_id": null
+                        }
+                    })
+                    .to_string(),
+                ),
+                ..LlmPayloadLog::default()
+            },
+            LlmPayloadLog {
+                provider: "evaluator_structured_v1_background".into(),
+                mode: EVALUATOR_MODE_STRUCTURED_V1.into(),
+                request_id: Some("eval_repair_nonempty".into()),
+                user_message: "REPAIR TASK. Fix rejected ops.".into(),
+                raw_provider_response: Some(r#"{"ops":[{"op":"add_memory"}]}"#.into()),
+                pipeline_trace_json: Some(
+                    serde_json::json!({
+                        "evaluator_trace": {
+                            "parse_status": "success",
+                            "form_rows_rejected": 1,
+                            "raw_content_present": true
+                        },
+                        "converted_engine_patch": {
+                            "patch_empty": false,
+                            "memory_patch_count": 1,
+                            "relationship_patch_count": 0,
+                            "object_patch_count": 0
+                        },
+                        "ledger_apply_trace": {
+                            "patch_applied": true,
+                            "enrichment_patch_id": "patch_enrichment_1"
+                        }
+                    })
+                    .to_string(),
+                ),
+                ..LlmPayloadLog::default()
+            },
+        ];
+
+        let counts = benchmark_trace_counts(&logs);
+        assert_eq!(counts.local_reextract_invoked_count, 1);
+        assert_eq!(counts.local_repair_invoked_count, 1);
+        assert_eq!(counts.local_repair_payload_count, 2);
+        assert_eq!(counts.local_repair_response_count, 2);
+        assert_eq!(counts.local_repair_state_patch_count, 1);
+        assert_eq!(counts.evaluator_empty_patch_count, 1);
+        assert_eq!(counts.form_rows_rejected_count, 1);
     }
 
     fn assert_command_trace_skips_rp(trace: &serde_json::Value) {
@@ -27012,14 +27679,15 @@ mod tests {
 
         assert!(prompt.contains("Latest normal RP speaker entity_id: preset_male"));
         assert!(prompt.contains("active_soul, active_player, latest_speaker, session_world"));
-        assert!(prompt.contains("\"target_entity_id\": \"preset_male\""));
+        // Context JSON is now compact (no space after the colon) to cut tokens.
+        assert!(prompt.contains("\"target_entity_id\":\"preset_male\""));
         assert_eq!(
             prompt
-                .matches("\"target_entity_id\": \"preset_male\"")
+                .matches("\"target_entity_id\":\"preset_male\"")
                 .count(),
             1
         );
-        assert!(prompt.contains("\"trust\": 44.0"));
+        assert!(prompt.contains("\"trust\":44.0"));
         assert!(!prompt.contains("default_player"));
     }
 
