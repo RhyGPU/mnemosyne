@@ -6,6 +6,16 @@
   color: #8a8473;
 }
 
+.grid-empty {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 28px 16px;
+  text-align: center;
+}
+
 /* Inviting chat empty state with capability hints */
 .chat-empty {
   max-width: 520px;
@@ -139,6 +149,17 @@
   flex: 1;
   min-width: 0;
   width: auto;
+}
+
+/* The fixed composer must start after the session sidebar, not cover it. */
+.chat-with-sidebar .chat-only-composer {
+  left: 264px;
+}
+
+@media (max-width: 860px) {
+  .chat-with-sidebar .chat-only-composer {
+    left: 0;
+  }
 }
 
 .chat-sidebar {

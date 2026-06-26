@@ -7002,7 +7002,13 @@ export function App() {
 
           <section className="compact-list library-list world-picker-list" aria-label="Saved worlds">
             {settings.length === 0 ? (
-              <p className="muted">No saved Settings yet.</p>
+              <div className="grid-empty">
+                <p className="muted">No worlds yet.</p>
+                <button type="button" className="ghost-action primary-cta" onClick={() => { void handleCreateSetting(); setView("editor"); }} disabled={busy}>
+                  <Sparkles size={16} />
+                  <span>Create your first world</span>
+                </button>
+              </div>
             ) : (
               settings.map((item) => (
                 <button
@@ -7193,7 +7199,13 @@ export function App() {
 
           <section className="character-grid" aria-label="Saved characters">
             {souls.length === 0 ? (
-              <p className="muted">No saved Souls yet.</p>
+              <div className="grid-empty">
+                <p className="muted">No characters yet — Mnemosyne ships with none; bring your own.</p>
+                <button type="button" className="ghost-action primary-cta" onClick={() => { void handleCreateSoul(); setView("editor"); }} disabled={busy}>
+                  <Sparkles size={16} />
+                  <span>Create your first character</span>
+                </button>
+              </div>
             ) : (
               souls.map((item) => (
                 <article
