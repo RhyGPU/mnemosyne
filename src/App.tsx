@@ -6474,9 +6474,18 @@ export function App() {
         <section className="chat-only-scroll" ref={chatOnlyBodyRef} onScroll={handleChatScroll}>
           <div className="chat-only-body" aria-live="polite" aria-atomic="false">
           {activeMessages.length === 0 ? (
-            <div className="empty-state">
-              <MessageSquareText size={34} />
-              <p>No messages yet.</p>
+            <div className="empty-state chat-empty">
+              <SoulAvatar soulName={soul?.character_name ?? "Mnemosyne"} asset={selectedAvatarAsset} />
+              <h2>Start the scene with {soul?.character_name ?? "your character"}</h2>
+              <p>
+                Type an action or a line of dialogue below to begin. Mnemosyne tracks memory, mood, and
+                relationships as the story unfolds.
+              </p>
+              <ul className="chat-empty-hints">
+                <li><code>*you step inside, still damp from the rain*</code> — narrate an action</li>
+                <li><code>/ooc &lt;message&gt;</code> — talk out of character</li>
+                <li><code>/help</code> — list every command</li>
+              </ul>
             </div>
           ) : (
             activeMessages.map((message) => {
@@ -6599,6 +6608,13 @@ export function App() {
               );
             })
           )}
+          {busy && activeMessages.length > 0 ? (
+            <div className="typing-indicator" aria-label={`${soul?.character_name ?? "Narrator"} is writing`}>
+              <span />
+              <span />
+              <span />
+            </div>
+          ) : null}
           <div ref={chatBottomRef} aria-hidden="true" />
           </div>
           {showJumpToLatest ? (
