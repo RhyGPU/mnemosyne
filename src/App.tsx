@@ -5726,6 +5726,7 @@ export function App() {
           Close
         </button>
       </header>
+      <div className="settings-drawer-main">
       <nav className="settings-drawer-tabs" aria-label="Settings categories">
         {(["ai", "chat", "library", "dev"] as SettingsTab[]).map((tab) => (
           <button
@@ -5733,8 +5734,18 @@ export function App() {
             type="button"
             className={settingsTab === tab ? "selected" : ""}
             onClick={() => setSettingsTab(tab)}
+            title={tab.toUpperCase()}
           >
-            {tab.toUpperCase()}
+            {tab === "ai" ? (
+              <Sparkles size={18} />
+            ) : tab === "chat" ? (
+              <MessageSquareText size={18} />
+            ) : tab === "library" ? (
+              <FolderOpen size={18} />
+            ) : (
+              <Terminal size={18} />
+            )}
+            <span>{tab === "ai" ? "AI" : tab === "chat" ? "Chat" : tab === "library" ? "Library" : "Dev"}</span>
           </button>
         ))}
       </nav>
@@ -5931,6 +5942,7 @@ export function App() {
             </section>
           </div>
         ) : null}
+      </div>
       </div>
     </aside>
   ) : null;
