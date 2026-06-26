@@ -492,6 +492,11 @@ const PSYCHE_PRESETS: Record<PsychePresetName, PsycheDraft> = {
   },
 };
 
+// The launcher's provider-settings card duplicates the Settings drawer (AI tab).
+// Kept in source but not rendered on Home so providers have one home (the drawer).
+// Typed boolean (not literal false) so TS keeps narrowing inside the block.
+const SHOW_LAUNCHER_PROVIDER_CARD: boolean = false;
+
 export function App() {
   const [souls, setSouls] = useState<SoulSummary[]>([]);
   const [archivedSouls, setArchivedSouls] = useState<SoulSummary[]>([]);
@@ -7350,7 +7355,7 @@ export function App() {
       </section>
       )}
 
-      {view === "library" && (
+      {SHOW_LAUNCHER_PROVIDER_CARD && (
       <section className="workspace-card provider-card">
         <header className="panel-header">
           <div>
