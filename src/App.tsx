@@ -78,6 +78,7 @@ import {
   restoreSetting,
   listArchivedSettings,
   deleteSoul,
+  purgeSoul,
   exportLlmPayloadHistory,
   exportCharacterSoulMne,
   exportCurrentSessionCheckpointMne,
@@ -203,7 +204,7 @@ type NarrativeMode = "Realistic" | "Reader" | "Active Director" | "GM Simulation
 type AppView = "library" | "editor" | "chat";
 type ChatStartMode = "continue" | "fresh";
 type DisclaimerMode = "launch" | "manual" | null;
-type SettingsTab = "ai" | "chat" | "library" | "dev";
+type SettingsTab = "ai" | "chat" | "dev";
 type DevCommandName =
   | "dedupe_active_adjacent_user_messages"
   | "restore_inactive_messages"
@@ -3508,6 +3509,39 @@ export function App() {
     }
   }
 
+  async function handlePurgeSoul() {
+    if (!soul) return;
+    const confirmed = window.confirm(
+      `PERMANENTLY delete ${soul.character_name}? This creates a safety backup but cannot be undone from the UI. Type OK to confirm.`,
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    try {
+      await purgeSoul(soul.character_id);
+      const remaining = await listSouls();
+      setSouls(remaining);
+      setArchivedSouls(await listArchivedSouls());
+      await refreshConversations();
+      setActiveConversationId(null);
+      setMessages([]);
+      setContext(null);
+      if (remaining.length === 0) {
+        setSoul(null);
+        setStatus("Character permanently deleted");
+        return;
+      }
+      const nextSoul = await getSoul(remaining[0].character_id);
+      setSoul(nextSoul);
+      setCreatorFieldsFromSoul(nextSoul);
+      setSelectedCharacterIds([nextSoul.character_id]);
+      setStatus("Character permanently deleted; selected next");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleArchiveSetting() {
     if (!setting) return;
 
@@ -5728,7 +5762,7 @@ export function App() {
       </header>
       <div className="settings-drawer-main">
       <nav className="settings-drawer-tabs" aria-label="Settings categories">
-        {(["ai", "chat", "library", "dev"] as SettingsTab[]).map((tab) => (
+        {(["ai", "chat", "dev"] as SettingsTab[]).map((tab) => (
           <button
             key={tab}
             type="button"
@@ -5740,12 +5774,10 @@ export function App() {
               <Sparkles size={18} />
             ) : tab === "chat" ? (
               <MessageSquareText size={18} />
-            ) : tab === "library" ? (
-              <FolderOpen size={18} />
             ) : (
               <Terminal size={18} />
             )}
-            <span>{tab === "ai" ? "AI" : tab === "chat" ? "Chat" : tab === "library" ? "Library" : "Dev"}</span>
+            <span>{tab === "ai" ? "AI" : tab === "chat" ? "Chat" : "Dev"}</span>
           </button>
         ))}
       </nav>
@@ -5815,63 +5847,6 @@ export function App() {
                   <span>Export Session .mne</span>
                 </button>
               </div>
-            </section>
-          </div>
-        ) : null}
-        {settingsTab === "library" ? (
-          <div className="settings-tab-panel">
-            <section className="settings-section">
-              <div className="settings-section-heading">
-                <div>
-                  <span className="eyebrow">Library</span>
-                  <h3>Import And Export</h3>
-                </div>
-              </div>
-              <div className="settings-action-list">
-                <button type="button" className="ghost-action" onClick={() => settingImportInputRef.current?.click()} disabled={busy}>
-                  <FileUp size={16} />
-                  <span>Import World JSON</span>
-                </button>
-                <button type="button" className="ghost-action" onClick={() => importInputRef.current?.click()} disabled={busy}>
-                  <FileUp size={16} />
-                  <span>Import Character JSON</span>
-                </button>
-                <button type="button" className="ghost-action" onClick={handleImportMne} disabled={busy}>
-                  <FileUp size={16} />
-                  <span>Import .mne Bundle</span>
-                </button>
-                <button type="button" className="ghost-action" onClick={handleExportSettingMne} disabled={!setting || busy}>
-                  <FileDown size={16} />
-                  <span>Export World .mne</span>
-                </button>
-                <button type="button" className="ghost-action" onClick={handleExportSoulMne} disabled={!soul || busy}>
-                  <FileDown size={16} />
-                  <span>Export Character .mne</span>
-                </button>
-                <button type="button" className="ghost-action" onClick={handleExportScenarioMne} disabled={!soul || !setting || busy}>
-                  <FileDown size={16} />
-                  <span>Export Scenario .mne</span>
-                </button>
-              </div>
-            </section>
-            <section className="settings-section">
-              <div className="settings-section-heading">
-                <div>
-                  <span className="eyebrow">Editors</span>
-                  <h3>World And Character</h3>
-                </div>
-              </div>
-              <div className="settings-action-list">
-                <button type="button" className="ghost-action" onClick={() => setSettingEditorOpen(true)}>
-                  <Database size={16} />
-                  <span>Open World Editor</span>
-                </button>
-                <button type="button" className="ghost-action" onClick={() => setSoulEditorOpen(true)}>
-                  <Brain size={16} />
-                  <span>Open Character Editor</span>
-                </button>
-              </div>
-              <p className="settings-note">The launcher stays focused on choosing a world, primary character, and session; larger forms stay collapsed until opened.</p>
             </section>
           </div>
         ) : null}
@@ -6938,6 +6913,9 @@ export function App() {
         </div>
       </header>
 
+      <input ref={settingImportInputRef} className="hidden-file" type="file" accept="application/json,.json,.setting" onChange={handleImportSettingFile} />
+      <input ref={importInputRef} className="hidden-file" type="file" accept="application/json,.json,.soul,.md,.txt" onChange={handleImportSoulFile} />
+
       {view === "library" && (
       <section className="library-grid launcher-grid">
         <section className="workspace-card library-card">
@@ -6949,56 +6927,6 @@ export function App() {
             </div>
             <Database aria-hidden="true" />
           </header>
-
-          <div className="action-grid compact-actions">
-            <input
-              ref={settingImportInputRef}
-              className="hidden-file"
-              type="file"
-              accept="application/json,.json,.setting"
-              onChange={handleImportSettingFile}
-            />
-            <button title="New Setting" onClick={handleCreateSetting} disabled={busy}>
-              <Sparkles size={18} />
-              <span>New</span>
-            </button>
-            <button
-              title="Import Setting"
-              onClick={() => settingImportInputRef.current?.click()}
-              disabled={busy}
-            >
-              <FileUp size={18} />
-              <span>Import</span>
-            </button>
-            <button title="Export Setting" onClick={handleSaveSetting} disabled={!setting || busy}>
-              <FileDown size={18} />
-              <span>Export</span>
-            </button>
-            <button title="Export World as .mne" onClick={handleExportSettingMne} disabled={!setting || busy}>
-              <FileDown size={18} />
-              <span>.mne</span>
-            </button>
-            <button
-              title="Persist current Setting"
-              onClick={async () => {
-                const nextSetting = await persistCurrentSetting();
-                if (nextSetting) setStatus("Setting persisted");
-              }}
-              disabled={!setting || busy}
-            >
-              <Save size={18} />
-              <span>Save</span>
-            </button>
-            <button
-              className="danger-button"
-              title="Archive selected Setting"
-              onClick={handleArchiveSetting}
-              disabled={!setting || busy}
-            >
-              <Archive size={18} />
-              <span>Archive</span>
-            </button>
-          </div>
 
           <section className="compact-list library-list world-picker-list" aria-label="Saved worlds">
             {settings.length === 0 ? (
@@ -7062,61 +6990,6 @@ export function App() {
             </div>
             <SoulAvatar soulName={soul?.character_name ?? "Mnemosyne"} asset={selectedAvatarAsset} />
           </header>
-
-          <div className="action-grid compact-actions">
-            <input
-              ref={importInputRef}
-              className="hidden-file"
-              type="file"
-              accept="application/json,.json,.soul,.md,.txt"
-              onChange={handleImportSoulFile}
-            />
-            <button title="New Soul" onClick={handleCreateSoul} disabled={busy}>
-              <Sparkles size={18} />
-              <span>New</span>
-            </button>
-            <button
-              title="Import Soul"
-              onClick={() => importInputRef.current?.click()}
-              disabled={busy}
-            >
-              <FileUp size={18} />
-              <span>Import</span>
-            </button>
-            <button title="Snapshot current Soul into the library" onClick={handleCreateSnapshot} disabled={!soul || busy}>
-              <Save size={18} />
-              <span>Snapshot</span>
-            </button>
-            <button title="Export Current Soul without modifying the app library" onClick={handleSaveSoul} disabled={!soul || busy}>
-              <FileDown size={18} />
-              <span>Export JSON</span>
-            </button>
-            <button title="Export Soul as .mne" onClick={handleExportSoulMne} disabled={!soul || busy}>
-              <FileDown size={18} />
-              <span>Export .mne</span>
-            </button>
-            <button title="Export Soul + World as .mne" onClick={handleExportScenarioMne} disabled={!soul || !setting || busy}>
-              <FileDown size={18} />
-              <span>Scenario .mne</span>
-            </button>
-            <button title="Import .mne bundle" onClick={handleImportMne} disabled={busy}>
-              <FileUp size={18} />
-              <span>Import .mne</span>
-            </button>
-            <button title="Run consolidation" onClick={handleConsolidate} disabled={!soul || busy}>
-              <RefreshCcw size={18} />
-              <span>Sleep</span>
-            </button>
-            <button
-              className="danger-button"
-              title="Archive selected Soul"
-              onClick={handleDeleteSoul}
-              disabled={!soul || busy}
-            >
-              <Trash2 size={18} />
-              <span>Archive</span>
-            </button>
-          </div>
 
           <section className="character-grid" aria-label="Saved characters">
             {souls.length === 0 ? (
@@ -7850,6 +7723,30 @@ export function App() {
 
       {view === "editor" && (
       <section className="play-grid">
+        <div className="editor-toolbar">
+          <div className="editor-action-group">
+            <span className="editor-action-label">World</span>
+            <button type="button" title="New World" onClick={handleCreateSetting} disabled={busy}><Sparkles size={16} /><span>New</span></button>
+            <button type="button" title="Import World JSON" onClick={() => settingImportInputRef.current?.click()} disabled={busy}><FileUp size={16} /><span>Import</span></button>
+            <button type="button" title="Export World JSON" onClick={handleSaveSetting} disabled={!setting || busy}><FileDown size={16} /><span>Export</span></button>
+            <button type="button" title="Export World as .mne" onClick={handleExportSettingMne} disabled={!setting || busy}><FileDown size={16} /><span>.mne</span></button>
+            <button type="button" title="Persist current World" onClick={async () => { const next = await persistCurrentSetting(); if (next) setStatus("World saved"); }} disabled={!setting || busy}><Save size={16} /><span>Save</span></button>
+            <button type="button" className="ghost-action danger" title="Archive World" onClick={handleArchiveSetting} disabled={!setting || busy}><Archive size={16} /><span>Archive</span></button>
+          </div>
+          <div className="editor-action-group">
+            <span className="editor-action-label">Character</span>
+            <button type="button" title="New Character" onClick={handleCreateSoul} disabled={busy}><Sparkles size={16} /><span>New</span></button>
+            <button type="button" title="Import Character JSON" onClick={() => importInputRef.current?.click()} disabled={busy}><FileUp size={16} /><span>Import</span></button>
+            <button type="button" title="Import .mne bundle" onClick={handleImportMne} disabled={busy}><FileUp size={16} /><span>.mne In</span></button>
+            <button type="button" title="Snapshot Character to library" onClick={handleCreateSnapshot} disabled={!soul || busy}><Save size={16} /><span>Snapshot</span></button>
+            <button type="button" title="Export Character JSON" onClick={handleSaveSoul} disabled={!soul || busy}><FileDown size={16} /><span>Export</span></button>
+            <button type="button" title="Export Character as .mne" onClick={handleExportSoulMne} disabled={!soul || busy}><FileDown size={16} /><span>Char .mne</span></button>
+            <button type="button" title="Export Character + World as Scenario .mne" onClick={handleExportScenarioMne} disabled={!soul || !setting || busy}><FileDown size={16} /><span>Scenario</span></button>
+            <button type="button" title="Run consolidation (Sleep)" onClick={handleConsolidate} disabled={!soul || busy}><RefreshCcw size={16} /><span>Sleep</span></button>
+            <button type="button" className="ghost-action danger" title="Archive Character" onClick={handleDeleteSoul} disabled={!soul || busy}><Archive size={16} /><span>Archive</span></button>
+            <button type="button" className="ghost-action purge" title="Hard-delete Character — permanent" onClick={handlePurgeSoul} disabled={!soul || busy}><Trash2 size={16} /><span>Purge</span></button>
+          </div>
+        </div>
         <aside className="studio-panel">
           <section className="setting-section workspace-card">
             <header className="panel-header">
@@ -8663,7 +8560,7 @@ function loadStoredChatStartMode(): ChatStartMode {
 function loadStoredSettingsTab(): SettingsTab {
   try {
     const raw = localStorage.getItem(SETTINGS_DRAWER_TAB_STORAGE_KEY);
-    return raw === "ai" || raw === "chat" || raw === "library" || raw === "dev" ? raw : "ai";
+    return raw === "ai" || raw === "chat" || raw === "dev" ? raw : "ai";
   } catch {
     return "ai";
   }
