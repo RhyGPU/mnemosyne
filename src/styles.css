@@ -398,7 +398,9 @@ button {
 }
 
 .play-grid {
-  display: none;
+  display: block;
+  width: min(960px, 100%);
+  margin: 0 auto;
 }
 
 .setup-grid,
