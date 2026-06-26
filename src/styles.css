@@ -16,6 +16,36 @@
   text-align: center;
 }
 
+/* Respect reduced-motion: disable decorative animation/transitions. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .typing-indicator span {
+    transform: none !important;
+    opacity: 0.7 !important;
+  }
+  .cli-cursor {
+    opacity: 1 !important;
+  }
+}
+
+/* Clear keyboard focus across interactive elements (a11y). */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+.chat-sidebar-item:focus-visible {
+  outline: 2px solid #1d5e52;
+  outline-offset: 2px;
+}
+
 /* Inviting chat empty state with capability hints */
 .chat-empty {
   max-width: 520px;
