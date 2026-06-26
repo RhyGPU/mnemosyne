@@ -1,5 +1,11 @@
 @import "tailwindcss";
 
+.field-hint {
+  margin-top: 4px;
+  font-size: 0.72rem;
+  color: #8a8473;
+}
+
 :root {
   color: #16201c;
   background: #f6f4ef;

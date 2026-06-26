@@ -573,6 +573,37 @@ export function App() {
   const [contextMode, setContextMode] = useState<ContextMode>("brief");
   const [providerProfiles, setProviderProfiles] = useState<ProviderProfile[]>([]);
   const [archivedProviderProfiles, setArchivedProviderProfiles] = useState<ProviderProfile[]>([]);
+  // User-curated list of model ids, surfaced as autocomplete on every model
+  // field so models can be chosen in-app without being configured elsewhere.
+  const [knownModels, setKnownModels] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem("mnemosyne:known_models");
+      const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+      return Array.isArray(parsed) ? parsed.filter((m): m is string => typeof m === "string") : [];
+    } catch {
+      return [];
+    }
+  });
+  function rememberModel(id: string) {
+    const trimmed = id.trim();
+    if (!trimmed) return;
+    setKnownModels((current) => {
+      if (current.includes(trimmed)) return current;
+      const next = [...current, trimmed].sort((a, b) => a.localeCompare(b));
+      try {
+        localStorage.setItem("mnemosyne:known_models", JSON.stringify(next));
+      } catch {
+        /* ignore persistence errors */
+      }
+      return next;
+    });
+  }
+  useEffect(() => {
+    providerProfiles.forEach((profile) => {
+      if (profile.model) rememberModel(profile.model);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providerProfiles]);
   const [narratorProviderProfileName, setNarratorProviderProfileName] = useState("Narrator API");
   const [updaterProviderProfileName, setUpdaterProviderProfileName] = useState("Updater API");
   const [selectedProviderProfileId, setSelectedProviderProfileId] = useState(() =>
@@ -4987,12 +5018,20 @@ export function App() {
                 <span>Model</span>
                 <input
                   value={apiSettings.model}
+                  list="mnemosyne-models"
                   onChange={(event) =>
                     setApiSettings((current) => ({ ...current, model: event.target.value }))
                   }
-                  placeholder="Model name"
+                  onBlur={(event) => rememberModel(event.target.value)}
+                  placeholder="Type or pick a model"
                   disabled={busy}
                 />
+                <datalist id="mnemosyne-models">
+                  {knownModels.map((m) => (
+                    <option key={m} value={m} />
+                  ))}
+                </datalist>
+                <small className="field-hint">{knownModels.length} saved · type a new id and it’s remembered</small>
               </label>
               <label className="field">
                 <span>Narrator Timeout (seconds)</span>
@@ -5268,13 +5307,15 @@ export function App() {
                     <span>Model</span>
                     <input
                       value={stateUpdaterSettings.model}
+                      list="mnemosyne-models"
                       onChange={(event) =>
                         setStateUpdaterSettings((current) => ({
                           ...current,
                           model: event.target.value,
                         }))
                       }
-                      placeholder="Cheaper/local model"
+                      onBlur={(event) => rememberModel(event.target.value)}
+                      placeholder="Type or pick a model"
                       disabled={busy}
                     />
                   </label>
