@@ -40,6 +40,9 @@ export type RecentMemory = {
     | "verified_engine"
     | "actual_system_event"
     | "unknown";
+  is_pinned?: boolean;
+  is_active?: boolean;
+  archived?: boolean;
   architecture_verified?: boolean;
 };
 
@@ -907,6 +910,12 @@ export function listPlayerPersonas(): Promise<PlayerPersona[]> {
   );
 }
 
+export function listArchivedPlayerPersonas(): Promise<PlayerPersona[]> {
+  return invokeOrPreview("list_archived_player_personas", {}, () =>
+    browserPlayerPersonas.filter((persona) => persona.is_archived),
+  );
+}
+
 export function getActivePlayerPersona(conversationId: string): Promise<PlayerPersona> {
   return invokeOrPreview("get_active_player_persona", { conversationId }, () => {
     const conversation = browserConversations.find((item) => item.conversation_id === conversationId);
@@ -1206,6 +1215,15 @@ export function archiveSoul(soulId: string): Promise<boolean> {
   });
 }
 
+export function purgeSoul(soulId: string): Promise<boolean> {
+  return invokeOrPreview("purge_soul", { soulId }, () => {
+    const index = browserSouls.findIndex((item) => item.character_id === soulId);
+    if (index === -1) return false;
+    browserSouls.splice(index, 1);
+    return true;
+  });
+}
+
 export function restoreSoul(soulId: string): Promise<boolean> {
   return invokeOrPreview("restore_soul", { soulId }, () => {
     const soul = browserSouls.find((item) => item.character_id === soulId);
@@ -1256,6 +1274,18 @@ export function archiveSetting(settingId: string, activeOrDefaultIds: string[]):
       return Promise.resolve(true);
     }
     return Promise.resolve(false);
+  });
+}
+
+export function purgeSetting(settingId: string, activeOrDefaultIds: string[]): Promise<boolean> {
+  return invokeOrPreview("purge_setting", { settingId, activeOrDefaultIds }, () => {
+    if (activeOrDefaultIds.includes(settingId)) {
+      return Promise.reject(new Error("Cannot purge the active/default setting. Switch settings first."));
+    }
+    const index = browserSettings.findIndex((item) => item.setting_id === settingId);
+    if (index === -1) return Promise.resolve(false);
+    browserSettings.splice(index, 1);
+    return Promise.resolve(true);
   });
 }
 

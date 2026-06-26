@@ -1886,6 +1886,19 @@ pub fn list_player_personas(conn: &Connection) -> rusqlite::Result<Vec<PlayerPer
     Ok(personas)
 }
 
+pub fn list_archived_player_personas(conn: &Connection) -> rusqlite::Result<Vec<PlayerPersona>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT persona_id, display_name, description, gender_code, pronouns, appearance, voice_style, boundaries, notes, is_archived, created_at, updated_at
+        FROM player_personas
+        WHERE is_archived = 1
+        ORDER BY updated_at DESC, display_name COLLATE NOCASE ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], player_persona_from_row)?;
+    rows.collect()
+}
+
 pub fn get_player_persona(
     conn: &Connection,
     persona_id: &str,
@@ -5574,7 +5587,13 @@ mod tests {
             .expect("list")
             .iter()
             .any(|persona| persona.persona_id == "persona_jun"));
+        let archived = list_archived_player_personas(&conn).expect("list archived");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].persona_id, "persona_jun");
         assert!(restore_player_persona(&conn, "persona_jun").expect("restore custom"));
+        assert!(list_archived_player_personas(&conn)
+            .expect("list archived after restore")
+            .is_empty());
         assert!(list_player_personas(&conn)
             .expect("list restored")
             .iter()

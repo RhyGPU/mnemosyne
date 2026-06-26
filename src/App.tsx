@@ -61,6 +61,7 @@ import {
   clearSoulWorldState,
   cancelEvaluatorJob,
   compileContext,
+  curateMemory,
   createUserImageMessageFromFile,
   createDefaultSoul,
   createSessionSoulClone,
@@ -100,11 +101,14 @@ import {
   listArchivedSessions,
   openSessionDataLocation,
   listProviderProfiles,
+  archivePlayerPersona,
   listPlayerPersonas,
+  listArchivedPlayerPersonas,
   listAssistantMessageVariants,
   listConversationMessages,
   listSettings,
   listSouls,
+  listArchivedSouls,
   listenApiStream,
   listenChatMessageSaved,
   listenDevLog,
@@ -115,6 +119,8 @@ import {
   repairAccidentalNormalSendVariants,
   renameConversation,
   restoreInactiveMessages,
+  restorePlayerPersona,
+  restoreSoul,
   retryEvaluatorJob,
   runConsolidation,
   saveSessionAsNewSoul,
@@ -488,7 +494,9 @@ const PSYCHE_PRESETS: Record<PsychePresetName, PsycheDraft> = {
 
 export function App() {
   const [souls, setSouls] = useState<SoulSummary[]>([]);
+  const [archivedSouls, setArchivedSouls] = useState<SoulSummary[]>([]);
   const [settings, setSettings] = useState<SettingSummary[]>([]);
+  const [archivedSettings, setArchivedSettings] = useState<SettingSummary[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   async function refreshConversations() {
     try {
@@ -504,6 +512,20 @@ export function App() {
       } catch (_) {}
     }
   }
+  async function refreshArchivedSettings() {
+    try {
+      setArchivedSettings(await listArchivedSettings());
+    } catch (error) {
+      logDev("warn", "db", "Failed to list archived worlds", { error: String(error) });
+    }
+  }
+  async function refreshArchivedSouls() {
+    try {
+      setArchivedSouls(await listArchivedSouls());
+    } catch (error) {
+      logDev("warn", "db", "Failed to list archived characters", { error: String(error) });
+    }
+  }
   const [soul, setSoul] = useState<Soul | null>(null);
   const [setting, setSetting] = useState<SettingSoul | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -514,6 +536,7 @@ export function App() {
   const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
   const [slashSelectedIndex, setSlashSelectedIndex] = useState(0);
   const [playerPersonas, setPlayerPersonas] = useState<PlayerPersona[]>([]);
+  const [archivedPlayerPersonas, setArchivedPlayerPersonas] = useState<PlayerPersona[]>([]);
   const [activePlayerPersona, setActivePlayerPersonaState] = useState<PlayerPersona | null>(null);
   const [personaModalMode, setPersonaModalMode] = useState<"list" | "add" | "edit" | null>(null);
   const [personaListConfirmRequired, setPersonaListConfirmRequired] = useState(false);
@@ -1644,15 +1667,32 @@ export function App() {
   }
 
   async function bootstrap() {
-    const [existingSouls, existingSettings, existingConversations, existingArchived] = await Promise.all([
+    const [
+      existingSouls,
+      existingArchivedSouls,
+      existingSettings,
+      existingArchivedSettings,
+      existingConversations,
+      existingArchived,
+      existingPlayerPersonas,
+      existingArchivedPlayerPersonas,
+    ] = await Promise.all([
       listSouls(),
+      listArchivedSouls(),
       listSettings(),
+      listArchivedSettings(),
       listConversations(),
       listArchivedSessions(),
+      listPlayerPersonas(),
+      listArchivedPlayerPersonas(),
     ]);
     setSouls(existingSouls);
+    setArchivedSouls(existingArchivedSouls);
     setSettings(existingSettings);
+    setArchivedSettings(existingArchivedSettings);
     setConversations([...existingConversations, ...existingArchived]);
+    setPlayerPersonas(existingPlayerPersonas);
+    setArchivedPlayerPersonas(existingArchivedPlayerPersonas);
     void loadProviderProfiles();
 
     let activeSetting: SettingSoul;
@@ -1719,8 +1759,17 @@ export function App() {
   }
 
   async function refreshContext(soulId: string, conversationId: string) {
-    const preview = await compileContext(soulId, conversationId);
-    setContext(preview);
+    try {
+      const preview = await compileContext(soulId, conversationId);
+      setContext(preview);
+      return preview;
+    } catch (error) {
+      setContext(null);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      setStatus(`Context unavailable: ${errorMessage}`);
+      logDev("warn", "context", "Context refresh failed", { soulId, conversationId, error: errorMessage });
+      return null;
+    }
   }
 
   async function handleSoulRepair(kind: "world" | "scenario" | "events" | "memories") {
@@ -2139,8 +2188,12 @@ export function App() {
   }
 
   async function refreshPlayerPersonas(conversationId = currentConversationId) {
-    const personas = await listPlayerPersonas();
+    const [personas, archived] = await Promise.all([
+      listPlayerPersonas(),
+      listArchivedPlayerPersonas(),
+    ]);
     setPlayerPersonas(personas);
+    setArchivedPlayerPersonas(archived);
     if (conversationId) {
       const active = await getActivePlayerPersona(conversationId);
       setActivePlayerPersonaState(active);
@@ -2229,6 +2282,45 @@ export function App() {
       await handleSelectPersona(saved.persona_id);
     }
     setPersonaModalMode("list");
+  }
+
+  async function handleArchivePersona(persona: PlayerPersona) {
+    if (persona.is_builtin) {
+      setStatus("Built-in personas stay available.");
+      return;
+    }
+    if (activePlayerPersona?.persona_id === persona.persona_id) {
+      setStatus("Select another persona before archiving the active one.");
+      return;
+    }
+    const confirmed = window.confirm(`Archive player persona ${persona.display_name}? It can be restored later.`);
+    if (!confirmed) return;
+
+    setBusy(true);
+    try {
+      await archivePlayerPersona(persona.persona_id);
+      await refreshPlayerPersonas(personaModalConversationId ?? currentConversationId);
+      setStatus(`Archived persona: ${persona.display_name}`);
+      logDev("warn", "db", "Player persona archived", { personaId: persona.persona_id });
+    } catch (error) {
+      reportError(error, "Persona archive failed", "db");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRestoreArchivedPersona(persona: PlayerPersona) {
+    setBusy(true);
+    try {
+      await restorePlayerPersona(persona.persona_id);
+      await refreshPlayerPersonas(personaModalConversationId ?? currentConversationId);
+      setStatus(`Restored persona: ${persona.display_name}`);
+      logDev("success", "db", "Player persona restored", { personaId: persona.persona_id });
+    } catch (error) {
+      reportError(error, "Persona restore failed", "db");
+    } finally {
+      setBusy(false);
+    }
   }
 
   function personaUiActionForText(text: string) {
@@ -2939,14 +3031,10 @@ export function App() {
       setStatus("Regenerating older turns requires branch rewind and will be added later.");
       return;
     }
-    const assistant = assistantForUserMessage(message);
-    if (assistant) {
-      await executeTurn(message.content, statusLabel, assistant.id, correctionInstruction);
-      return;
-    }
 
     try {
-      await executeTurn(message.content, statusLabel, undefined, correctionInstruction);
+      const assistant = assistantForUserMessage(message);
+      await executeTurn(message.content, statusLabel, assistant?.id, correctionInstruction);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     }
@@ -2988,6 +3076,9 @@ export function App() {
       setMessages(nextMessages);
       await refreshConversations();
       if (soul) {
+        const nextSoul = await getSoul(soul.character_id);
+        setSoul(nextSoul);
+        setCreatorFieldsFromSoul(nextSoul);
         setContext(await compileContext(soul.character_id, message.conversation_id));
       }
       setStatus(
@@ -3011,6 +3102,9 @@ export function App() {
       setMessages(nextMessages);
       await refreshConversations();
       if (soul) {
+        const nextSoul = await getSoul(soul.character_id);
+        setSoul(nextSoul);
+        setCreatorFieldsFromSoul(nextSoul);
         setContext(await compileContext(soul.character_id, currentConversationId));
       }
       const skipped =
@@ -3075,6 +3169,9 @@ export function App() {
       setMessages(result.messages);
       setVariantsByMessage((current) => ({ ...current, [message.id]: result.variants }));
       if (soul) {
+        const nextSoul = await getSoul(soul.character_id);
+        setSoul(nextSoul);
+        setCreatorFieldsFromSoul(nextSoul);
         setContext(await compileContext(soul.character_id, message.conversation_id));
       }
       setStatus(`Selected response variant ${nextIndex + 1} / ${variants.length}`);
@@ -3141,6 +3238,33 @@ export function App() {
       setStatus("Memory consolidated");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCurateRecentMemory(memoryId: string, operation: "pin" | "unpin" | "restore_archived") {
+    if (!soul || !currentConversationId) return;
+    setBusy(true);
+    try {
+      const result = await curateMemory(currentConversationId, soul.character_id, memoryId, operation);
+      setSoul(result.soul);
+      setSouls(await listSouls());
+      await refreshContext(result.soul.character_id, currentConversationId);
+      const label =
+        operation === "pin"
+          ? "Memory pinned"
+          : operation === "unpin"
+            ? "Memory unpinned"
+            : "Memory restored";
+      setStatus(label);
+      logDev("success", "db", label, {
+        memoryId,
+        patchId: result.patch_id,
+        operation: result.operation,
+      });
+    } catch (error) {
+      reportError(error, "Memory curation failed", "db");
     } finally {
       setBusy(false);
     }
@@ -3216,8 +3340,9 @@ export function App() {
     setBusy(true);
     try {
       await deleteSoul(soul.character_id);
-      const remaining = await listSouls();
+      const [remaining, archived] = await Promise.all([listSouls(), listArchivedSouls()]);
       setSouls(remaining);
+      setArchivedSouls(archived);
       await refreshConversations();
       setActiveConversationId(null);
       setSelectedCharacterIds((current) => current.filter((id) => id !== soul.character_id));
@@ -3243,6 +3368,33 @@ export function App() {
       setStatus("Soul archived; selected next local Soul");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRestoreArchivedSoul(soulId: string) {
+    setBusy(true);
+    try {
+      await restoreSoul(soulId);
+      const [active, archived] = await Promise.all([listSouls(), listArchivedSouls()]);
+      setSouls(active);
+      setArchivedSouls(archived);
+      const restored = await getSoul(soulId);
+      setSoul(restored);
+      setSelectedCharacterIds((current) =>
+        current.includes(restored.character_id)
+          ? [restored.character_id, ...current.filter((id) => id !== restored.character_id)]
+          : [restored.character_id, ...current],
+      );
+      setCreatorFieldsFromSoul(restored);
+      setActiveConversationId(null);
+      setMessages([]);
+      setContext(null);
+      setStatus(`Restored character: ${restored.character_name}`);
+      logDev("success", "db", "Character restored", { soulId });
+    } catch (error) {
+      reportError(error, "Character restore failed", "db");
     } finally {
       setBusy(false);
     }
@@ -3277,6 +3429,7 @@ export function App() {
       await archiveSetting(setting.setting_id, activeSettingIds);
       const remaining = await listSettings();
       setSettings(remaining);
+      void refreshArchivedSettings();
 
       if (remaining.length === 0) {
         const nextSetting = await createDefaultSetting("Starter Setting");
@@ -3297,6 +3450,27 @@ export function App() {
       setStatus("Setting archived; selected next local Setting");
     } catch (error) {
       reportError(error, "Setting archive failed", "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRestoreArchivedSetting(settingId: string) {
+    setBusy(true);
+    try {
+      await restoreSetting(settingId);
+      const [active, archived] = await Promise.all([listSettings(), listArchivedSettings()]);
+      setSettings(active);
+      setArchivedSettings(archived);
+      const restored = await getSetting(settingId);
+      setSetting(restored);
+      setEditorFieldsFromSetting(restored);
+      setActiveConversationId(null);
+      setMessages([]);
+      setStatus(`Restored world: ${restored.setting_name}`);
+      logDev("success", "db", "World restored", { settingId });
+    } catch (error) {
+      reportError(error, "World restore failed", "db");
     } finally {
       setBusy(false);
     }
@@ -4309,7 +4483,13 @@ export function App() {
 
     setBusy(true);
     try {
-      const raw = JSON.parse(await file.text());
+      const text = await file.text();
+      let raw: any;
+      if (file.name.endsWith(".md") || !text.trim().startsWith("{")) {
+        raw = parseMarkdownSoul(text, file.name);
+      } else {
+        raw = JSON.parse(text);
+      }
       const importedSoul = await soulFromImport(raw, file.name);
       await upsertSoul(importedSoul);
       setSoul(importedSoul);
@@ -6029,7 +6209,7 @@ export function App() {
             activeMessages.map((message) => {
               const variants = variantsByMessage[message.id] ?? [];
               const selectedIndex = selectedVariantIndex(variants);
-              const canSelectVariant = message.id === latestAssistantMessageId;
+              const canSelectVariant = true;
               const canGenerateFromUser = canGenerateFromUserMessage(message);
               const olderGenerationTitle =
                 "Regenerating older messages requires branch rewind and will be added later.";
@@ -6234,9 +6414,47 @@ export function App() {
                             Edit
                           </button>
                         ) : null}
+                        {!persona.is_builtin ? (
+                          <button
+                            type="button"
+                            onClick={() => void handleArchivePersona(persona)}
+                            disabled={busy || activePlayerPersona?.persona_id === persona.persona_id}
+                            title={
+                              activePlayerPersona?.persona_id === persona.persona_id
+                                ? "Select another persona before archiving this one"
+                                : "Archive persona"
+                            }
+                          >
+                            Archive
+                          </button>
+                        ) : null}
                       </div>
                     </article>
                   ))}
+                  {archivedPlayerPersonas.length > 0 ? (
+                    <section className="compact-list library-list archived-resource-list" aria-label="Archived personas">
+                      <div className="list-section-heading">
+                        <strong>Archived Personas</strong>
+                        <span className="muted">{archivedPlayerPersonas.length}</span>
+                      </div>
+                      {archivedPlayerPersonas.map((persona) => (
+                        <article key={persona.persona_id} className="soul-row archived-resource-row">
+                          <span>{persona.display_name}</span>
+                          <small>{persona.description || persona.persona_id}</small>
+                          <button
+                            type="button"
+                            className="ghost-action"
+                            onClick={() => void handleRestoreArchivedPersona(persona)}
+                            disabled={busy}
+                            title="Restore archived persona"
+                          >
+                            <RefreshCcw size={14} />
+                            <span>Restore</span>
+                          </button>
+                        </article>
+                      ))}
+                    </section>
+                  ) : null}
                   <div className="persona-list-actions">
                     <button type="button" className="persona-add-button" onClick={openPersonaAdd}>
                       Add Persona
@@ -6493,6 +6711,33 @@ export function App() {
             )}
           </section>
 
+          {archivedSettings.length > 0 ? (
+            <section className="compact-list library-list archived-resource-list" aria-label="Archived worlds">
+              <div className="list-section-heading">
+                <strong>Archived Worlds</strong>
+                <span className="muted">{archivedSettings.length}</span>
+              </div>
+              {archivedSettings.map((item) => (
+                <article key={item.setting_id} className="soul-row archived-resource-row">
+                  <span>{item.setting_name}</span>
+                  <small>
+                    {item.turn_counter} turns / {item.location || "No location"}
+                  </small>
+                  <button
+                    type="button"
+                    className="ghost-action"
+                    onClick={() => void handleRestoreArchivedSetting(item.setting_id)}
+                    disabled={busy}
+                    title="Restore archived world"
+                  >
+                    <RefreshCcw size={14} />
+                    <span>Restore</span>
+                  </button>
+                </article>
+              ))}
+            </section>
+          ) : null}
+
           <section className={`collapsible-section ${settingEditorOpen ? "open" : ""}`}>
             <button
               className="section-toggle studio-toggle"
@@ -6588,7 +6833,7 @@ export function App() {
               ref={importInputRef}
               className="hidden-file"
               type="file"
-              accept="application/json,.json,.soul"
+              accept="application/json,.json,.soul,.md,.txt"
               onChange={handleImportSoulFile}
             />
             <button title="New Soul" onClick={handleCreateSoul} disabled={busy}>
@@ -6682,6 +6927,34 @@ export function App() {
               ))
             )}
           </section>
+
+          {archivedSouls.length > 0 ? (
+            <section className="compact-list library-list archived-resource-list" aria-label="Archived characters">
+              <div className="list-section-heading">
+                <strong>Archived Characters</strong>
+                <span className="muted">{archivedSouls.length}</span>
+              </div>
+              {archivedSouls.map((item) => (
+                <article key={item.character_id} className="soul-row archived-resource-row">
+                  <span>{item.character_name}</span>
+                  <small>
+                    {item.core_count} core / {item.recent_count} recent
+                    {item.avatar_image_id ? " / avatar" : " / no avatar"}
+                  </small>
+                  <button
+                    type="button"
+                    className="ghost-action"
+                    onClick={() => void handleRestoreArchivedSoul(item.character_id)}
+                    disabled={busy}
+                    title="Restore archived character"
+                  >
+                    <RefreshCcw size={14} />
+                    <span>Restore</span>
+                  </button>
+                </article>
+              ))}
+            </section>
+          ) : null}
 
           <section className={`collapsible-section ${soulEditorOpen ? "open" : ""}`}>
             <button
@@ -7962,27 +8235,72 @@ export function App() {
 
           <section className="memory-section">
             <h2>Core Memories</h2>
-            {(soul?.memory.core ?? []).slice(0, 4).map((memory) => (
-              <p key={memory}>{memory}</p>
-            ))}
+            {(soul?.memory.core ?? []).length === 0 ? (
+              <p className="muted">No core memories yet.</p>
+            ) : (
+              (soul?.memory.core ?? []).slice(0, 4).map((memory) => (
+                <p key={memory}>{memory}</p>
+              ))
+            )}
           </section>
 
           <section className="memory-section">
             <h2>Schemas</h2>
-            {(soul?.memory.schemas ?? []).map((schema) => (
-              <p key={schema.schema_type}>
-                <strong>{schema.schema_type}</strong>: {schema.summary}
-              </p>
-            ))}
+            {(soul?.memory.schemas ?? []).length === 0 ? (
+              <p className="muted">No schemas consolidated yet.</p>
+            ) : (
+              (soul?.memory.schemas ?? []).map((schema) => (
+                <p key={schema.schema_type}>
+                  <strong>{schema.schema_type}</strong>: {schema.summary}
+                </p>
+              ))
+            )}
           </section>
 
           <section className="memory-section">
-            <h2>Recent</h2>
-            {(soul?.memory.recent ?? []).map((memory) => (
-              <p key={memory.id}>
-                <strong>{memory.tag}</strong> / {memory.salience}: {memory.content}
-              </p>
-            ))}
+            <div className="memory-section-heading">
+              <h2>Recent</h2>
+              <span>{soul?.memory.recent.length ?? 0}</span>
+            </div>
+            {(soul?.memory.recent ?? []).length === 0 ? (
+              <p className="muted">No recent memories yet.</p>
+            ) : (
+              <div className="memory-curation-list">
+                {(soul?.memory.recent ?? []).map((memory) => {
+                  const isPinned = Boolean(memory.is_pinned);
+                  const isArchived = Boolean(memory.archived) || memory.is_active === false;
+                  const operation = isArchived ? "restore_archived" : isPinned ? "unpin" : "pin";
+                  const actionLabel = isArchived ? "Restore" : isPinned ? "Unpin" : "Pin";
+                  return (
+                    <article className={`memory-curation-row ${isPinned ? "pinned" : ""}`} key={memory.id}>
+                      <div className="memory-curation-main">
+                        <div className="memory-curation-title">
+                          <strong>{memory.tag || "memory"}</strong>
+                          {isPinned ? <span className="memory-pill">Pinned</span> : null}
+                          {isArchived ? <span className="memory-pill muted-pill">Archived</span> : null}
+                        </div>
+                        <p>{memory.content}</p>
+                        <div className="memory-curation-meta">
+                          <span>salience {Math.round(memory.salience)}</span>
+                          <span>retrieval {Math.round(memory.retrieval_strength)}</span>
+                          {memory.truth_status ? <span>{memory.truth_status.replace(/_/g, " ")}</span> : null}
+                          {memory.source_type ? <span>{memory.source_type.replace(/_/g, " ")}</span> : null}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="memory-curation-action"
+                        onClick={() => void handleCurateRecentMemory(memory.id, operation)}
+                        disabled={busy || !soul}
+                        title={`${actionLabel} this memory for future retrieval`}
+                      >
+                        {actionLabel}
+                      </button>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
           </section>
         </section>
 
@@ -9237,6 +9555,69 @@ function normalizeWorldDraft(world: WorldDraft) {
 
 function cloneForUi<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function parseMarkdownSoul(text: string, filename: string): any {
+  const lines = text.split(/\r?\n/);
+  let name = filename.replace(/\.[^.]+$/, "");
+  for (const line of lines) {
+    const match = line.match(/^#\s+(.+)$/);
+    if (match) {
+      name = match[1].trim();
+      break;
+    }
+  }
+
+  let currentSection = "";
+  const sections: Record<string, string[]> = {
+    description: [],
+    personality: [],
+    appearance: [],
+    scenario: [],
+    first_message: []
+  };
+
+  for (const line of lines) {
+    if (line.startsWith("# ")) {
+      currentSection = "description";
+      continue;
+    }
+    const headingMatch = line.match(/^##\s+(.+)$/);
+    if (headingMatch) {
+      const heading = headingMatch[1].toLowerCase().trim();
+      if (heading.includes("personality") || heading.includes("psyche") || heading.includes("trait")) {
+        currentSection = "personality";
+      } else if (heading.includes("appearance") || heading.includes("look") || heading.includes("visual")) {
+        currentSection = "appearance";
+      } else if (heading.includes("scenario") || heading.includes("setting") || heading.includes("world")) {
+        currentSection = "scenario";
+      } else if (heading.includes("first") || heading.includes("greeting") || heading.includes("opening") || heading.includes("message") || heading.includes("start")) {
+        currentSection = "first_message";
+      } else if (heading.includes("description") || heading.includes("about") || heading.includes("backstory") || heading.includes("summary")) {
+        currentSection = "description";
+      } else {
+        currentSection = "description";
+      }
+      continue;
+    }
+
+    if (currentSection) {
+      sections[currentSection].push(line);
+    } else {
+      sections.description.push(line);
+    }
+  }
+
+  return {
+    character_name: name,
+    profile: {
+      description: sections.description.join("\n").trim(),
+      personality: sections.personality.join("\n").trim(),
+      appearance: sections.appearance.join("\n").trim(),
+      scenario: sections.scenario.join("\n").trim(),
+      opening_narrator_message: sections.first_message.join("\n").trim(),
+    }
+  };
 }
 
 function formatSnapshotTimestamp(date: Date) {

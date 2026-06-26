@@ -2261,6 +2261,14 @@ pub fn list_player_personas(state: State<'_, AppState>) -> Result<Vec<PlayerPers
 }
 
 #[tauri::command]
+pub fn list_archived_player_personas(
+    state: State<'_, AppState>,
+) -> Result<Vec<PlayerPersona>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_archived_player_personas(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 pub fn get_active_player_persona(
     state: State<'_, AppState>,
     conversation_id: String,
@@ -2884,6 +2892,21 @@ pub fn archive_soul(
     db::archive_soul(&conn, &soul_id).map_err(|err| err.to_string())
 }
 
+/// Permanent hard delete of a character (Soul). Irreversible — takes a safety
+/// backup first. Archive (archive_soul) is the recoverable default; this is the
+/// explicit "purge" path.
+#[tauri::command]
+pub fn purge_soul(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    soul_id: String,
+) -> Result<bool, String> {
+    create_safety_backup(&app, &window, "purge_soul")?;
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::hard_delete_soul_internal(&conn, &soul_id).map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 pub fn restore_soul(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
@@ -2942,6 +2965,24 @@ pub fn archive_setting(
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let active_refs: Vec<&str> = active_or_default_ids.iter().map(|s| s.as_str()).collect();
     db::archive_setting(&conn, &setting_id, &active_refs)
+}
+
+/// Permanent hard delete of a world (Setting). Irreversible — safety backup
+/// first, and refuses to purge the active/default setting.
+#[tauri::command]
+pub fn purge_setting(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    setting_id: String,
+    active_or_default_ids: Vec<String>,
+) -> Result<bool, String> {
+    if active_or_default_ids.contains(&setting_id) {
+        return Err("Cannot purge the active/default setting. Switch settings first.".into());
+    }
+    create_safety_backup(&app, &window, "purge_setting")?;
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::delete_setting_internal(&conn, &setting_id).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -22376,7 +22417,12 @@ mod tests {
         };
 
         let provider = crate::providers::api::ApiProvider::default();
-        let schema = crate::providers::api::evaluator_patch_json_schema();
+        // The ops schema (schema_version/ops/no_op_reason) — NOT the EnginePatch
+        // schema; the repair path validates against EvaluatorStructuredOutputV1.
+        let schema = evaluator_ops_json_schema();
+        // The slow FORM (non-tool-call) stage is opt-in: it adds a large second
+        // call per scene (~5 min on CPU) and isn't validated. Set REPAIR_BENCH_FORM=1.
+        let run_form_stage = std::env::var("REPAIR_BENCH_FORM").is_ok();
         let structured_system = build_structured_evaluator_prompt(&soul, Some(&world));
         let form_system = crate::providers::api::build_state_updater_prompt(&soul, Some(&world));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -22386,17 +22432,25 @@ mod tests {
 
         println!("\n=== repair_bench  model='{model}'  url='{url}' ===");
         for (name, user, narrator) in &scenes {
-            // Stage 1: FORM (non-tool-call) state-update attempt — what the primary
-            // evaluator does; we only show its raw output for inspection.
-            let form_user = format!("User: {user}\nNarrator: {narrator}");
-            let form_started = Instant::now();
-            let form_raw = runtime
-                .block_on(provider.complete_streaming(&settings, &form_system, &form_user, |_| {
-                    Ok(())
-                }))
-                .map(|completion| completion.raw_text)
-                .unwrap_or_else(|err| format!("<form call failed: {err}>"));
-            let form_elapsed = form_started.elapsed();
+            println!("\n--- scene '{name}' ---");
+
+            // Stage 1 (opt-in): FORM (non-tool-call) state-update attempt — what the
+            // primary evaluator does; shown raw for inspection, not validated.
+            if run_form_stage {
+                let form_user = format!("User: {user}\nNarrator: {narrator}");
+                let form_started = Instant::now();
+                let form_raw = runtime
+                    .block_on(provider.complete_streaming(&settings, &form_system, &form_user, |_| {
+                        Ok(())
+                    }))
+                    .map(|completion| completion.raw_text)
+                    .unwrap_or_else(|err| format!("<form call failed: {err}>"));
+                println!(
+                    "  form(non-tool): {:.1}s, {} chars raw",
+                    form_started.elapsed().as_secs_f64(),
+                    form_raw.trim().len()
+                );
+            }
 
             // Stage 2: REPAIR (reextract) — the thing under test. Validated.
             let repair_user = build_reextract_user_message(user, narrator);
@@ -22412,12 +22466,6 @@ mod tests {
             ));
             let elapsed = started.elapsed();
 
-            println!("\n--- scene '{name}' ---");
-            println!(
-                "  form(non-tool): {:.1}s, {} chars raw",
-                form_elapsed.as_secs_f64(),
-                form_raw.trim().len()
-            );
             match result {
                 Err(err) => println!("  repair: CALL FAILED after {:.1}s: {err}", elapsed.as_secs_f64()),
                 Ok(completion) => match compile_evaluator_structured_runtime(
@@ -22435,16 +22483,27 @@ mod tests {
                         completion.raw_text.trim()
                     ),
                     Ok(outcome) => {
+                        let out = &outcome.output;
                         println!(
-                            "  repair: {:.1}s, ops_parsed={} accepted={} rejected={}",
+                            "  repair: {:.1}s | ops_parsed={} | extracted mem={} rel={} obj={} world={} | patch_empty={} | accepted={} rejected={}",
                             elapsed.as_secs_f64(),
                             outcome.structured_ops_count.unwrap_or(0),
+                            out.memory_candidates.len(),
+                            out.relationship_evaluations.len(),
+                            out.object_changes.len(),
+                            out.world_changes.len(),
+                            outcome.conversion.patch.is_empty(),
                             outcome.conversion.accepted_candidate_ids.len(),
                             outcome.conversion.rejected_candidates.len(),
                         );
+                        if let Some(reason) = &out.no_op_reason {
+                            println!("      no_op_reason: {reason}");
+                        }
                         for rejection in &outcome.conversion.rejected_candidates {
                             println!("      rejected {}: {}", rejection.candidate_id, rejection.reason);
                         }
+                        let preview: String = completion.raw_text.trim().chars().take(600).collect();
+                        println!("      raw: {preview}");
                     }
                 },
             }

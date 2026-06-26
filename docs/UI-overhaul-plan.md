@@ -70,45 +70,52 @@ payload inspector, context preview, branch debug, 9 dev commands), Import/Export
 
 ## 3. Target information architecture
 
-Persistent **left nav rail** with five destinations. Each owns one of the four
-jobs; no duplication.
+**No top-level tab bar.** The app is two full-screen destinations you move
+between by *action*, plus a Settings drawer over the top and an in-session Dev
+toggle. Decluttering happens by **relocation**, not tabs: AI/provider settings
+live in the drawer, debug/memory live in in-session Dev mode, and creation lives
+on a separate Editor screen — so Home is automatically clean.
 
 ```
-▶  PLAY      select world + cast, sessions, launch        (Play)
-📚 LIBRARY    create/edit/manage worlds, characters, etc.  (Create/Manage)
-⚙  SETTINGS   AI providers, chat, memory, data, about      (Configure)
-</> DEV MODE  full debug/test/benchmark workspace (toggle)  (Inspect)
-🗨 CHAT       active session view
+HOME (Library)  pick world(1) + characters(n) + session → dive in     [select/play]
+   │  "New / Edit" →  EDITOR        create/edit characters & worlds     [create]
+   │  "Settings"  →  drawer overlay AI providers, chat, data, about     [configure]
+   └  "Dive in"   →  CHAT (session) play; Dev toggle re-skins to matrix [play/inspect]
 ```
 
-### 3.1 PLAY (selection-first; no editors/providers/debug)
+### 3.1 HOME / Library (selection-first; pick & dive in)
+The single entry point. **No editors, no provider forms, no debug.**
 - World picker — choose **exactly one**.
 - Character picker — choose **one or more** (multi-character, built fully).
-  Portrait + name + short description, scannable grid; recognize-your-cast, not
-  a showcase.
+  Portrait + name + short description, scannable grid; recognize-your-cast.
 - Session strip — recent sessions, **Active ⇄ Archived toggle** that filters;
   exposes hard-delete.
-- Quick actions — Import (`.mne`/JSON), Export, **"Get more characters" → web**.
-- Launch — start mode (continue / fresh) + Start.
+- Quick actions — Import (`.mne`/JSON), Export, **"Get more characters" → web**,
+  **New / Edit** (→ Editor), **Settings** (→ drawer).
+- Launch — start mode (continue / fresh) + Start (→ Chat).
 
-### 3.2 LIBRARY (create & manage — off the launcher)
+### 3.2 EDITOR (separate screen — create & manage)
+Reached from Home via "New / Edit", **not** a permanent tab; "Back" returns Home.
 World editor, Character editor + psyche (traits/needs/SDT/trauma/relationship),
-personas, savepoints, archive/restore/**delete** for all entity types, full
-import/export, memory curation entry point.
+personas, savepoints, archive/restore/**delete** for all entity types, memory
+curation. Keeps Home uncluttered.
 
-### 3.3 SETTINGS (full page, replaces the drawer)
-AI Providers (de-duplicated; **shown on first launch** as onboarding) · Chat
-(start mode, magnetic scroll, composer) · Memory (consolidation, curate) · Data
-(import/export, session-data location, backup) · About/disclaimer.
+### 3.3 SETTINGS (drawer — from anywhere)
+A drawer/sidebar, **not** a destination. AI Providers (de-duplicated — the old
+launcher provider card is removed; **shown on first launch** as onboarding) ·
+Chat (start mode, magnetic scroll, composer) · Data (import/export, session-data
+location, backup) · About/disclaimer.
 
-### 3.4 CHAT
+### 3.4 CHAT (session — where you play)
 - **Magnetic-bottom scroll**: follow newest only while pinned to bottom; release
-  on scroll-up; "jump to latest" pill.
+  on scroll-up; "jump to latest" pill. ✅ shipped.
 - Header archive/restore + savepoint/checkpoint actions.
 - A calm pipeline indicator (thinking → narrating → remembering → checking →
-  done) — the tamed promotion of Dev Mode's rail so normal use isn't a black box.
+  done) for normal use.
+- **Dev toggle** flips the session into Dev Mode (§4) — an in-session *mode*,
+  not a separate tab.
 
-### 3.5 DEV MODE (the power surface — see §4)
+### 3.5 DEV MODE (in-session toggle — the power surface — see §4)
 
 ---
 
@@ -152,19 +159,20 @@ Promoted out of dev: the calm pipeline indicator in normal Chat (§3.4).
 - **Phase 0 — Refactor (prerequisite, approved).** Split `App.tsx` into
   `types.ts`, `constants.ts`, `lib/`, `components/`, `views/`, and lift shared
   state into a context/store. Behavior-preserving; typecheck green at every step.
-- **Phase 1 — Nav shell.** Persistent left rail + view router; map existing
-  library/chat into it.
-- **Phase 2 — PLAY redesign.** Selection-first launcher; multi-character picker;
+- **Phase 1 — Screen router.** Home ⇄ Editor ⇄ Chat as full-screen views moved
+  between by action (no tab bar); Settings drawer + in-session Dev toggle.
+  (Revised: an earlier 4-tab rail was scrapped per the simpler IA in §3.)
+- **Phase 2 — HOME redesign.** Selection-first launcher; multi-character picker;
   session strip with working Active/Archived toggle + hard-delete; quick actions
-  incl. web link. Remove provider card from here.
-- **Phase 3 — LIBRARY.** Move editors/psyche/personas here; surface savepoints,
-  character/persona archiving, hard-delete, curateMemory.
-- **Phase 4 — SETTINGS page + first-launch onboarding.** Consolidate drawer +
-  launcher providers into one page.
-- **Phase 5 — CHAT fixes.** Magnetic scroll + jump-to-latest; calm pipeline
+  incl. web link + New/Edit + Settings. Provider card removed from Home.
+- **Phase 3 — EDITOR screen.** Move editors/psyche/personas here; surface
+  savepoints, character/persona archiving, hard-delete, curateMemory.
+- **Phase 4 — SETTINGS drawer + first-launch onboarding.** Consolidate the
+  drawer; remove the duplicate launcher provider card.
+- **Phase 5 — CHAT fixes.** Magnetic scroll + jump-to-latest ✅; calm pipeline
   indicator; savepoint actions.
-- **Phase 6 — DEV MODE.** Build the §4 workspace; retire the old console + drawer
-  DEV tab; pull benchmark/evaluator out of provider settings.
+- **Phase 6 — DEV MODE.** Build the §4 in-session workspace; retire the old
+  console + drawer DEV tab; pull benchmark/evaluator out of provider settings.
 - **Phase 7 — Multi-character backend + visual polish.** Wire true multi-active
   sessions; spacing, typography, empty states, matrix theme finalize.
 
@@ -176,3 +184,8 @@ Promoted out of dev: the calm pipeline indicator in normal Chat (§3.4).
 - "Download web redirection": **outbound link to a site**.
 - Refactor: **split the monolith first** (Phase 0).
 - Mnemosyne provides **no characters**; it's a BYO-character engine/playground.
+- **Aesthetic: dual.** Human surface (Play/Library/Settings/Chat) stays warm and
+  intimate but *elevated* (better depth/hierarchy than the current flat cards) —
+  fits the memory/soul theme and differentiates from dark-neon RP apps. **Full
+  cyberpunk/matrix is reserved for Dev Mode only** (green-on-black, monospace,
+  rigid shapes). The contrast = soul/fiction layer vs engine/machine layer.
