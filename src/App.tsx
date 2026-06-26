@@ -6854,7 +6854,7 @@ export function App() {
               value={draft}
               onChange={(event) => handleDraftChange(event.target.value)}
               onKeyDown={handleComposerKeyDown}
-              placeholder="Type message... Enter to send, Shift+Enter for a new line."
+              placeholder={`Message ${soul?.character_name ?? "Mnemosyne"} — narrate an action or speak. "/" for commands, Enter to send`}
               disabled={busy}
               rows={2}
               aria-autocomplete="list"
