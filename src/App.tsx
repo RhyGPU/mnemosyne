@@ -6160,9 +6160,40 @@ export function App() {
       : currentSessionTitle.startsWith("[Archived] ");
 
     return (
+      <div className="chat-with-sidebar">
+      <aside className="chat-sidebar" aria-label="Sessions">
+        <div className="chat-sidebar-top">
+          <button type="button" className="ghost-action" onClick={() => setView("library")} title="Back to Library">
+            <ArrowLeft size={16} />
+            <span>Library</span>
+          </button>
+          <button type="button" className="ghost-action primary-cta" onClick={() => void handleStartChat()} disabled={busy || !soul} title="Start a new chat">
+            <Sparkles size={16} />
+            <span>New chat</span>
+          </button>
+        </div>
+        <div className="chat-sidebar-list">
+          {visibleConversations.length === 0 ? (
+            <p className="muted chat-sidebar-empty">No sessions yet.</p>
+          ) : (
+            visibleConversations.map((conversation) => (
+              <button
+                key={conversation.conversation_id}
+                type="button"
+                className={`chat-sidebar-item ${conversation.conversation_id === currentConversationId ? "active" : ""}`}
+                onClick={() => void handleSelectConversation(conversation)}
+                disabled={busy}
+              >
+                <span className="chat-sidebar-item-title">{conversation.title || "Untitled"}</span>
+                <small>{conversation.message_count} messages</small>
+              </button>
+            ))
+          )}
+        </div>
+      </aside>
       <main className="chat-only-shell">
         <header className="chat-only-header">
-          <button className="ghost-action" onClick={() => setView("library")}>
+          <button className="ghost-action chat-back-mobile" onClick={() => setView("library")}>
             <ArrowLeft size={18} />
             <span>Library</span>
           </button>
@@ -6652,6 +6683,7 @@ export function App() {
         {settingsDrawerPanel}
         {devConsolePanel}
       </main>
+      </div>
     );
   }
 
