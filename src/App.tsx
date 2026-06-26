@@ -796,6 +796,8 @@ export function App() {
   const devConsoleBodyRef = useRef<HTMLDivElement>(null);
   const chatOnlyBodyRef = useRef<HTMLElement>(null);
   const chatBottomRef = useRef<HTMLDivElement>(null);
+  const isPinnedToBottomRef = useRef(true);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const defaultConversationId = useMemo(
     () =>
       soul && setting
@@ -1191,25 +1193,53 @@ export function App() {
     body.scrollTop = body.scrollHeight;
   }, [devLogs, devConsoleOpen, devConsolePaused]);
 
+  function scrollChatToBottom() {
+    const body = chatOnlyBodyRef.current;
+    if (!body) return;
+    body.scrollTop = body.scrollHeight;
+    chatBottomRef.current?.scrollIntoView({ block: "end" });
+  }
+
+  function handleChatScroll() {
+    const body = chatOnlyBodyRef.current;
+    if (!body) return;
+    const distanceFromBottom = body.scrollHeight - body.scrollTop - body.clientHeight;
+    const pinned = distanceFromBottom <= 80;
+    isPinnedToBottomRef.current = pinned;
+    setShowJumpToLatest((prev) => (prev === !pinned ? prev : !pinned));
+  }
+
+  function jumpToLatest() {
+    isPinnedToBottomRef.current = true;
+    setShowJumpToLatest(false);
+    scrollChatToBottom();
+  }
+
+  // Entering a chat / switching sessions snaps to bottom and re-pins.
   useLayoutEffect(() => {
     if (view !== "chat") return;
     const body = chatOnlyBodyRef.current;
     if (!body) return;
+    isPinnedToBottomRef.current = true;
+    setShowJumpToLatest(false);
     let secondFrame = 0;
-    const scrollToBottom = () => {
-      body.scrollTop = body.scrollHeight;
-      chatBottomRef.current?.scrollIntoView({ block: "end" });
-    };
-    scrollToBottom();
+    scrollChatToBottom();
     const frame = window.requestAnimationFrame(() => {
-      scrollToBottom();
-      secondFrame = window.requestAnimationFrame(scrollToBottom);
+      scrollChatToBottom();
+      secondFrame = window.requestAnimationFrame(scrollChatToBottom);
     });
     return () => {
       window.cancelAnimationFrame(frame);
       window.cancelAnimationFrame(secondFrame);
     };
-  }, [view, currentConversationId, messages.length]);
+  }, [view, currentConversationId]);
+
+  // Magnetic follow: track newest output (incl. streaming) only while pinned.
+  useLayoutEffect(() => {
+    if (view !== "chat") return;
+    if (!isPinnedToBottomRef.current) return;
+    scrollChatToBottom();
+  }, [view, messages]);
 
   useEffect(() => {
     localStorage.setItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY, selectedProviderProfileId);
@@ -6270,8 +6300,8 @@ export function App() {
           </div>
         </header>
 
-        <section className="chat-only-scroll" ref={chatOnlyBodyRef}>
-          <div className="chat-only-body">
+        <section className="chat-only-scroll" ref={chatOnlyBodyRef} onScroll={handleChatScroll}>
+          <div className="chat-only-body" aria-live="polite" aria-atomic="false">
           {activeMessages.length === 0 ? (
             <div className="empty-state">
               <MessageSquareText size={34} />
@@ -6400,6 +6430,12 @@ export function App() {
           )}
           <div ref={chatBottomRef} aria-hidden="true" />
           </div>
+          {showJumpToLatest ? (
+            <button type="button" className="jump-to-latest" onClick={jumpToLatest}>
+              <ChevronDown size={16} />
+              <span>Jump to latest</span>
+            </button>
+          ) : null}
         </section>
 
         {showEvaluatorJobBanner && activeEvaluatorJob ? (

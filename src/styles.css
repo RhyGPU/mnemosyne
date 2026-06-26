@@ -6,6 +6,29 @@
   color: #8a8473;
 }
 
+.jump-to-latest {
+  position: sticky;
+  bottom: 16px;
+  margin: 0 auto;
+  width: fit-content;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: #16201c;
+  color: #f6f4ef;
+  font-weight: 600;
+  font-size: 13px;
+  box-shadow: 0 6px 20px rgba(22, 32, 28, 0.25);
+  cursor: pointer;
+  z-index: 5;
+}
+
+.jump-to-latest:hover {
+  background: #24332c;
+}
+
 .ghost-action.primary-cta {
   background: #1d5e52;
   border-color: #1d5e52;
