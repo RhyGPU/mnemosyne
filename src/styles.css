@@ -6,6 +6,18 @@
   color: #8a8473;
 }
 
+.ghost-action.primary-cta {
+  background: #1d5e52;
+  border-color: #1d5e52;
+  color: #f6f4ef;
+  font-weight: 700;
+}
+
+.ghost-action.primary-cta:hover:not(:disabled) {
+  background: #164a41;
+  border-color: #164a41;
+}
+
 :root {
   color: #16201c;
   background: #f6f4ef;

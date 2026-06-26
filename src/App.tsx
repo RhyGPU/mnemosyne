@@ -200,7 +200,7 @@ const DEV_LOG_LEVELS: DevLogLevel[] = ["info", "warn", "error", "debug", "succes
 type ProviderKind = "Mock" | "API";
 type BenchmarkTurnPhase = "player_generation" | "execute_turn" | "evaluator_wait" | "turn_summary" | "completed";
 type NarrativeMode = "Realistic" | "Reader" | "Active Director" | "GM Simulation" | "Custom";
-type AppView = "library" | "chat";
+type AppView = "library" | "editor" | "chat";
 type ChatStartMode = "continue" | "fresh";
 type DisclaimerMode = "launch" | "manual" | null;
 type SettingsTab = "ai" | "chat" | "library" | "dev";
@@ -6659,19 +6659,31 @@ export function App() {
     <main className="app-shell launcher-shell">
       <header className="launcher-header">
         <div>
-          <span className="eyebrow">Launcher</span>
-          <h1>Choose World, Primary Character, Session</h1>
+          <span className="eyebrow">{view === "editor" ? "Workshop" : "Launcher"}</span>
+          <h1>{view === "editor" ? "Create & Edit Worlds & Characters" : "Choose World, Character, Session"}</h1>
           <p>
             {setting?.setting_name ?? "No world selected"} / {soul?.character_name ?? "No primary character"} /{" "}
             {selectedCharacterCount} selected
           </p>
         </div>
         <div className="launcher-actions">
+          {view === "editor" ? (
+            <button type="button" className="ghost-action" onClick={() => setView("library")}>
+              <ArrowLeft size={16} />
+              <span>Back to Home</span>
+            </button>
+          ) : (
+            <button type="button" className="ghost-action primary-cta" onClick={() => setView("editor")}>
+              <Pencil size={16} />
+              <span>Create / Edit</span>
+            </button>
+          )}
           {settingsDrawerToggle}
           {devConsoleToggle}
         </div>
       </header>
 
+      {view === "library" && (
       <section className="library-grid launcher-grid">
         <section className="workspace-card library-card">
           <header className="panel-header">
@@ -7268,7 +7280,9 @@ export function App() {
           </section>
         </section>
       </section>
+      )}
 
+      {view === "library" && (
       <section className="workspace-card provider-card">
         <header className="panel-header">
           <div>
@@ -7771,7 +7785,9 @@ export function App() {
           ) : null}
         </div>
       </section>
+      )}
 
+      {view === "library" && (
       <section className="workspace-card launch-card">
         <div>
           <span className="eyebrow">Ready</span>
@@ -7912,7 +7928,9 @@ export function App() {
           <span>Start Chat With Primary</span>
         </button>
       </section>
+      )}
 
+      {view === "editor" && (
       <section className="play-grid">
         <aside className="studio-panel">
           <section className="setting-section workspace-card">
@@ -8223,7 +8241,9 @@ export function App() {
           </section>
         </aside>
       </section>
+      )}
 
+      {view === "library" && (
       <section className="insight-grid">
         <section className="workspace-card">
           <header className="panel-header">
@@ -8673,6 +8693,7 @@ export function App() {
             )}
         </footer>
       </section>
+      )}
       <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
       {settingsDrawerPanel}
       {devConsolePanel}
