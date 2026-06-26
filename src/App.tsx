@@ -2838,7 +2838,7 @@ export function App() {
   }
 
   async function handleRunDevCommand(commandName = devCommandName, argsOverride?: Record<string, unknown>) {
-    if (!import.meta.env.DEV || devCommandRunning) return;
+    if (devCommandRunning) return;
     const conversationId =
       typeof argsOverride?.conversationId === "string"
         ? argsOverride.conversationId
@@ -5826,28 +5826,6 @@ export function App() {
               </label>
               <p className="settings-note">Composer shortcut: Enter to send, Shift+Enter for a new line.</p>
             </section>
-            <section className="settings-section">
-              <div className="settings-section-heading">
-                <div>
-                  <span className="eyebrow">Current Chat</span>
-                  <h3>Quick Actions</h3>
-                </div>
-              </div>
-              <div className="settings-action-list">
-                <button type="button" className="ghost-action" onClick={handleRestoreHiddenTurns} disabled={busy || !currentConversationId}>
-                  <RefreshCcw size={16} />
-                  <span>Restore Hidden Turns</span>
-                </button>
-                <button type="button" className="ghost-action" onClick={handleExportVisibleChatLog} disabled={busy || activeMessages.length === 0}>
-                  <FileDown size={16} />
-                  <span>Export Visible Chat</span>
-                </button>
-                <button type="button" className="ghost-action" onClick={handleExportCurrentSessionMne} disabled={busy || !currentConversationId}>
-                  <FileDown size={16} />
-                  <span>Export Session .mne</span>
-                </button>
-              </div>
-            </section>
           </div>
         ) : null}
         {settingsTab === "dev" ? (
@@ -6119,79 +6097,34 @@ export function App() {
           <span>Import as new copy</span>
         </button>
       </div>
-      {import.meta.env.DEV ? (
-        <section className="dev-command-console" aria-label="Dev Command Console">
-          <div className="dev-command-header">
-            <div>
-              <span className="eyebrow">Whitelisted commands</span>
-              <h3>Command Runner</h3>
-            </div>
-            <button
-              type="button"
-              onClick={() =>
-                void handleRunDevCommand("dedupe_active_adjacent_user_messages", {
-                  conversationId: currentConversationId,
-                })
-              }
-              disabled={devCommandRunning || !currentConversationId}
-            >
-              Repair Duplicate Turns
-            </button>
+      <section className="dev-command-console" aria-label="Repair Commands">
+        <div className="dev-command-header">
+          <div>
+            <span className="eyebrow">Session Repair</span>
+            <h3>Command Runner</h3>
           </div>
-          <div className="dev-command-grid">
-            <label>
-              <span>Command</span>
-              <select
-                value={devCommandName}
-                onChange={(event) => {
-                  const nextName = event.target.value as DevCommandName;
-                  setDevCommandName(nextName);
-                  setDevCommandArgs(
-                    DEV_COMMAND_OPTIONS.find((option) => option.name === nextName)?.defaultArgs ??
-                      "{}",
-                  );
-                }}
-              >
-                {DEV_COMMAND_OPTIONS.map((option) => (
-                  <option key={option.name} value={option.name}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>JSON Args</span>
-              <textarea
-                value={devCommandArgs}
-                onChange={(event) => setDevCommandArgs(event.target.value)}
-                spellCheck={false}
-                rows={4}
-              />
-            </label>
+        </div>
+        <div className="dev-labeled-buttons">
+          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("dedupe_active_adjacent_user_messages", {})} disabled={devCommandRunning || !currentConversationId}>[ Repair Duplicate Turns ]</button>
+          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("restore_inactive_messages", {})} disabled={devCommandRunning || !currentConversationId}>[ Restore Hidden Turns ]</button>
+          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("repair_accidental_normal_send_variants", {})} disabled={devCommandRunning || !currentConversationId}>[ Repair Accidental Variants ]</button>
+          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("rebuild_session_from_ledger", {})} disabled={devCommandRunning || !currentConversationId}>[ Rebuild From Ledger ]</button>
+          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("inspect_turn_branch_integrity", {})} disabled={devCommandRunning || !currentConversationId}>[ Inspect Branch Integrity ]</button>
+          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("get_branch_patch_debug", {})} disabled={devCommandRunning || !currentConversationId}>[ Branch Patch Debug ]</button>
+        </div>
+        {devCommandResult ? (
+          <div className="dev-command-result">
+            <span>Result</span>
+            <pre>{devCommandResult}</pre>
           </div>
-          <button
-            className="dev-command-run"
-            type="button"
-            onClick={() => void handleRunDevCommand()}
-            disabled={devCommandRunning || !currentConversationId}
-          >
-            <Play size={14} />
-            <span>{devCommandRunning ? "Running..." : "Run"}</span>
-          </button>
-          {devCommandResult ? (
-            <div className="dev-command-result">
-              <span>Result</span>
-              <pre>{devCommandResult}</pre>
-            </div>
-          ) : null}
-          {devCommandError ? (
-            <div className="dev-command-error">
-              <span>Error</span>
-              <pre>{devCommandError}</pre>
-            </div>
-          ) : null}
-        </section>
-      ) : null}
+        ) : null}
+        {devCommandError ? (
+          <div className="dev-command-error">
+            <span>Error</span>
+            <pre>{devCommandError}</pre>
+          </div>
+        ) : null}
+      </section>
       <div className="dev-console-body" ref={devConsoleBodyRef}>
         {filteredDevLogs.length === 0 ? (
           <p className="dev-console-empty">No logs.</p>
@@ -6436,6 +6369,16 @@ export function App() {
             >
               <FileDown size={16} />
               <span>Session .mne</span>
+            </button>
+            <button
+              className="ghost-action"
+              type="button"
+              title="Export visible chat log as text"
+              onClick={handleExportVisibleChatLog}
+              disabled={busy || activeMessages.length === 0}
+            >
+              <FileDown size={16} />
+              <span>Export Chat</span>
             </button>
             <div className="token-pill">
               {context?.estimated_tokens ?? 0}

@@ -3002,6 +3002,36 @@ button:disabled {
   color: #ffb0b0;
 }
 
+.dev-labeled-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.dev-cmd-btn {
+  appearance: none;
+  border: 1px solid #315247;
+  border-radius: 4px;
+  background: #0f1814;
+  color: #6be39a;
+  padding: 5px 10px;
+  font: 0.72rem/1 "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.dev-cmd-btn:hover:not(:disabled) {
+  background: #1c3b2a;
+  color: #b4f5cc;
+  border-color: #4caf7d;
+}
+
+.dev-cmd-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .dev-console-body {
   flex: 1;
   overflow: auto;
