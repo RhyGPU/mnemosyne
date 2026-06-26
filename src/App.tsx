@@ -804,6 +804,7 @@ export function App() {
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const isPinnedToBottomRef = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [chatMoreMenuOpen, setChatMoreMenuOpen] = useState(false);
   // In-session Dev Mode: a terminal-CLI re-skin of the session (matrix/phosphor).
   const [devModeActive, setDevModeActive] = useState(false);
   const [devTerminalInput, setDevTerminalInput] = useState("");
@@ -6280,12 +6281,19 @@ export function App() {
               <button
                 key={conversation.conversation_id}
                 type="button"
-                className={`chat-sidebar-item ${conversation.conversation_id === currentConversationId ? "active" : ""}`}
+                className={`chat-sidebar-item ${conversation.conversation_id === currentConversationId ? "active" : ""}${conversation.archived_at ? " archived" : ""}`}
                 onClick={() => void handleSelectConversation(conversation)}
                 disabled={busy}
               >
-                <span className="chat-sidebar-item-title">{conversation.title || "Untitled"}</span>
-                <small>{conversation.message_count} messages</small>
+                <div className="chat-sidebar-item-row">
+                  <span className="chat-sidebar-item-title">{conversation.title || "Untitled"}</span>
+                  <time className="chat-sidebar-item-time">{formatRelativeTime(conversation.updated_at)}</time>
+                </div>
+                {conversation.last_message_preview ? (
+                  <span className="chat-sidebar-item-preview">{conversation.last_message_preview}</span>
+                ) : (
+                  <span className="chat-sidebar-item-preview muted">{conversation.message_count} messages</span>
+                )}
               </button>
             ))
           )}
@@ -6298,7 +6306,7 @@ export function App() {
             <span>Library</span>
           </button>
           <SoulAvatar soulName={soul?.character_name ?? "Mnemosyne"} asset={selectedAvatarAsset} />
-          <div>
+          <div className="chat-header-info">
             <span className="eyebrow">
               {setting?.setting_name ?? "Local Setting"} / {provider} / {mode}
             </span>
@@ -6314,72 +6322,52 @@ export function App() {
                 <Pencil size={14} />
               </button>
             </h1>
-            <p>{soul?.character_name ?? "Mnemosyne"}</p>
-            <p className="session-state-label">{sessionContinuityLabel}</p>
+            <p className="session-state-label">{soul?.character_name ?? "Mnemosyne"} · {sessionContinuityLabel}</p>
           </div>
           <div className="chat-top-actions">
-            <button
-              className="ghost-action dev-mode-enter"
-              type="button"
-              title="Enter Dev Mode (terminal + chatlog)"
-              onClick={() => setDevModeActive(true)}
-            >
-              <Terminal size={16} />
-              <span>Dev Mode</span>
-            </button>
-            {isCurrentSessionArchived ? (
+            <div className="chat-more-menu-wrap">
               <button
-                className="ghost-action"
                 type="button"
-                title="Restore session"
-                onClick={() => handleRestoreSession()}
-                disabled={busy}
+                className={`ghost-action chat-more-btn${chatMoreMenuOpen ? " open" : ""}`}
+                title="More actions"
+                onClick={() => setChatMoreMenuOpen((v) => !v)}
               >
-                <RefreshCcw size={16} />
-                <span>Restore Session</span>
+                ···
               </button>
-            ) : (
-              <button
-                className="ghost-action danger"
-                type="button"
-                title="Archive session"
-                onClick={() => handleDeleteChat()}
-                disabled={busy}
-              >
-                <Trash2 size={16} />
-                <span>Archive Session</span>
-              </button>
-            )}
-            <button
-              className="ghost-action"
-              type="button"
-              title="Restore turns hidden by delete/rewind"
-              onClick={handleRestoreHiddenTurns}
-              disabled={busy || !currentConversationId}
-            >
-              <RefreshCcw size={16} />
-              <span>Restore Turns</span>
-            </button>
-            <button
-              className="ghost-action"
-              type="button"
-              title="Export current session checkpoint as .mne"
-              onClick={handleExportCurrentSessionMne}
-              disabled={busy || !currentConversationId}
-            >
-              <FileDown size={16} />
-              <span>Session .mne</span>
-            </button>
-            <button
-              className="ghost-action"
-              type="button"
-              title="Export visible chat log as text"
-              onClick={handleExportVisibleChatLog}
-              disabled={busy || activeMessages.length === 0}
-            >
-              <FileDown size={16} />
-              <span>Export Chat</span>
-            </button>
+              {chatMoreMenuOpen && (
+                <div className="chat-more-menu" role="menu">
+                  <button type="button" className="chat-more-menu-item" onClick={() => { setDevModeActive(true); setChatMoreMenuOpen(false); }}>
+                    <Terminal size={14} />
+                    <span>Dev Mode</span>
+                  </button>
+                  <div className="chat-more-menu-divider" />
+                  {isCurrentSessionArchived ? (
+                    <button type="button" className="chat-more-menu-item" onClick={() => { void handleRestoreSession(); setChatMoreMenuOpen(false); }} disabled={busy}>
+                      <RefreshCcw size={14} />
+                      <span>Restore Session</span>
+                    </button>
+                  ) : (
+                    <button type="button" className="chat-more-menu-item danger" onClick={() => { void handleDeleteChat(); setChatMoreMenuOpen(false); }} disabled={busy}>
+                      <Trash2 size={14} />
+                      <span>Archive Session</span>
+                    </button>
+                  )}
+                  <div className="chat-more-menu-divider" />
+                  <button type="button" className="chat-more-menu-item" onClick={() => { handleRestoreHiddenTurns(); setChatMoreMenuOpen(false); }} disabled={busy || !currentConversationId}>
+                    <RefreshCcw size={14} />
+                    <span>Restore Turns</span>
+                  </button>
+                  <button type="button" className="chat-more-menu-item" onClick={() => { void handleExportCurrentSessionMne(); setChatMoreMenuOpen(false); }} disabled={busy || !currentConversationId}>
+                    <FileDown size={14} />
+                    <span>Session .mne</span>
+                  </button>
+                  <button type="button" className="chat-more-menu-item" onClick={() => { void handleExportVisibleChatLog(); setChatMoreMenuOpen(false); }} disabled={busy || activeMessages.length === 0}>
+                    <FileDown size={14} />
+                    <span>Export Chat</span>
+                  </button>
+                </div>
+              )}
+            </div>
             <div className="token-pill">
               {context?.estimated_tokens ?? 0}
               <span>tok</span>
@@ -6833,7 +6821,7 @@ export function App() {
       <header className="launcher-header">
         <div>
           <span className="eyebrow">{view === "editor" ? "Workshop" : "Launcher"}</span>
-          <h1>{view === "editor" ? "Create & Edit Worlds & Characters" : "Choose World, Character, Session"}</h1>
+          <h1>{view === "editor" ? "Edit Library" : "Choose Scene"}</h1>
           <p>
             {setting?.setting_name ?? "No world selected"} / {soul?.character_name ?? "No primary character"} /{" "}
             {selectedCharacterCount} selected
@@ -8713,6 +8701,16 @@ function sanitizeDevLogDetails(value: unknown): unknown {
       return [key, shouldRedact ? "[redacted]" : sanitizeDevLogDetails(nested)];
     }),
   );
+}
+
+function formatRelativeTime(timestamp: number): string {
+  const ms = timestamp > 1_000_000_000_000 ? timestamp : timestamp * 1000;
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return "just now";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  if (diff < 604_800_000) return `${Math.floor(diff / 86_400_000)}d ago`;
+  return new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
 function formatDevLogTimestamp(timestamp: number) {
