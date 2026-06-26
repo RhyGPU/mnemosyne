@@ -803,6 +803,10 @@ export function App() {
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const isPinnedToBottomRef = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  // In-session Dev Mode: a terminal-CLI re-skin of the session (matrix/phosphor).
+  const [devModeActive, setDevModeActive] = useState(false);
+  const [devTerminalInput, setDevTerminalInput] = useState("");
+  const devStreamRef = useRef<HTMLDivElement>(null);
   const defaultConversationId = useMemo(
     () =>
       soul && setting
@@ -1245,6 +1249,12 @@ export function App() {
     if (!isPinnedToBottomRef.current) return;
     scrollChatToBottom();
   }, [view, messages]);
+
+  useEffect(() => {
+    if (!devModeActive) return;
+    const el = devStreamRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [devModeActive, devLogs, messages]);
 
   useEffect(() => {
     localStorage.setItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY, selectedProviderProfileId);
@@ -2238,6 +2248,38 @@ export function App() {
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     await submitDraft();
+  }
+
+  // Dev Mode terminal: `/chat <msg>` speaks in-character (reuses the real turn
+  // pipeline); other input is treated as a dev command.
+  async function handleDevTerminalSubmit(event: FormEvent) {
+    event.preventDefault();
+    const raw = devTerminalInput.trim();
+    if (!raw) return;
+    setDevTerminalInput("");
+    if (raw === "/chat" || raw.startsWith("/chat ")) {
+      const message = raw.slice("/chat".length).trim();
+      if (!message) {
+        logDev("warn", "app", "/chat needs a message, e.g. /chat I step inside.");
+        return;
+      }
+      if (!soul || busy || stateUpdating) {
+        logDev("warn", "app", "Cannot send right now (busy, updating state, or no character).");
+        return;
+      }
+      logDev("info", "app", "dev /chat dispatched", { message });
+      await executeTurn(message);
+      return;
+    }
+    if (raw === "/clear") {
+      setDevLogs([]);
+      return;
+    }
+    if (raw === "/help") {
+      logDev("info", "app", "commands: /chat <message> · /clear · /help");
+      return;
+    }
+    logDev("warn", "app", `unknown command: ${raw} — type /help`);
   }
 
   function handleDraftChange(value: string) {
@@ -6194,6 +6236,109 @@ export function App() {
       ? (Boolean(currentConversation.archived_at) || currentConversation.title.startsWith("[Archived] "))
       : currentSessionTitle.startsWith("[Archived] ");
 
+    if (devModeActive) {
+      const devStream: Array<
+        | { kind: "chat"; key: string; t: number; role: string; content: string }
+        | { kind: "log"; key: string; t: number; level: string; category: string; message: string }
+      > = [
+        ...activeMessages.map((m) => ({
+          kind: "chat" as const,
+          key: `c${m.id}`,
+          t: m.created_at,
+          role: m.role,
+          content: m.content,
+        })),
+        ...devLogs.map((l) => ({
+          kind: "log" as const,
+          key: `l${l.id}`,
+          t: l.timestamp,
+          level: l.level,
+          category: l.category,
+          message: l.message,
+        })),
+      ].sort((a, b) => a.t - b.t);
+
+      const stageGlyph = (status: string) => {
+        if (status === "failed") return { sym: "[ERR]", cls: "err" };
+        if (status === "warning") return { sym: "[WRN]", cls: "warn" };
+        if (status === "skipped") return { sym: "[--]", cls: "skip" };
+        if (status === "running" || status === "pending" || status === "in_progress")
+          return { sym: "[...]", cls: "run" };
+        return { sym: "[OK]", cls: "ok" };
+      };
+
+      return (
+        <main className="cli-shell">
+          <div className="cli-scanlines" aria-hidden="true" />
+          <header className="cli-header">
+            <span className="cli-brand">root@mnemosyne</span>
+            <span className="cli-path">:~/{(currentSessionTitle || "session").replace(/\s+/g, "_").toLowerCase()}$</span>
+            <span className="cli-spacer" />
+            <button type="button" className="cli-btn" onClick={() => setDevLogs([])}>[ CLEAR ]</button>
+            <button type="button" className="cli-btn" onClick={() => setDevModeActive(false)}>[ EXIT DEV ]</button>
+            <button type="button" className="cli-btn" onClick={() => setView("library")}>[ LIBRARY ]</button>
+          </header>
+          <div className="cli-body">
+            <aside className="cli-rail" aria-label="Pipeline">
+              <div className="cli-rail-title">// PIPELINE</div>
+              {latestPipelineTrace ? (
+                <>
+                  <div className="cli-rail-status">
+                    {latestPipelineTrace.final_status} · {latestPipelineTrace.total_elapsed_ms}ms
+                  </div>
+                  {latestPipelineTrace.stages.map((stage) => {
+                    const { sym, cls } = stageGlyph(stage.status);
+                    return (
+                      <div className={`cli-stage ${cls}`} key={stage.stage_name} title={stage.error_message ?? ""}>
+                        <span className="cli-stage-sym">{sym}</span>
+                        <span className="cli-stage-name">{stage.stage_name}</span>
+                        <span className="cli-stage-ms">{stage.elapsed_ms}ms</span>
+                      </div>
+                    );
+                  })}
+                </>
+              ) : (
+                <div className="cli-rail-empty">awaiting first turn_</div>
+              )}
+            </aside>
+            <section className="cli-stream" ref={devStreamRef} aria-label="Stream">
+              {devStream.length === 0 ? (
+                <div className="cli-line muted">// stream empty — type /chat &lt;message&gt; to begin</div>
+              ) : (
+                devStream.map((item) =>
+                  item.kind === "chat" ? (
+                    <div className="cli-line chatlog" key={item.key}>
+                      <span className="cli-tag">chatlog=</span>
+                      <span className="cli-role">{item.role}:</span>
+                      <span className="cli-text">{item.content}</span>
+                    </div>
+                  ) : (
+                    <div className={`cli-line log ${item.level}`} key={item.key}>
+                      <span className="cli-tag">log=</span>
+                      <span className="cli-cat">[{item.category}]</span>
+                      <span className="cli-text">{item.message}</span>
+                    </div>
+                  ),
+                )
+              )}
+            </section>
+          </div>
+          <form className="cli-input" onSubmit={handleDevTerminalSubmit}>
+            <span className="cli-prompt">root@mnemosyne:~$</span>
+            <input
+              value={devTerminalInput}
+              onChange={(event) => setDevTerminalInput(event.target.value)}
+              placeholder="/chat <message> to speak · /help"
+              spellCheck={false}
+              autoComplete="off"
+              autoFocus
+            />
+            <span className="cli-cursor" aria-hidden="true">█</span>
+          </form>
+        </main>
+      );
+    }
+
     return (
       <div className="chat-with-sidebar">
       <aside className="chat-sidebar" aria-label="Sessions">
@@ -6253,6 +6398,15 @@ export function App() {
             <p className="session-state-label">{sessionContinuityLabel}</p>
           </div>
           <div className="chat-top-actions">
+            <button
+              className="ghost-action dev-mode-enter"
+              type="button"
+              title="Enter Dev Mode (terminal + chatlog)"
+              onClick={() => setDevModeActive(true)}
+            >
+              <Terminal size={16} />
+              <span>Dev Mode</span>
+            </button>
             {isCurrentSessionArchived ? (
               <button
                 className="ghost-action"
