@@ -2532,32 +2532,68 @@ button:disabled {
 .editor-toolbar {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding-bottom: 14px;
-  margin-bottom: 4px;
+  gap: 0;
   border-bottom: 1px solid #e1dacb;
+  background: #f9f7f1;
 }
 
 .editor-action-group {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #eee8db;
+}
+
+.editor-action-group:last-child {
+  border-bottom: none;
 }
 
 .editor-action-label {
-  width: 100%;
-  font-size: 0.66rem;
+  flex-shrink: 0;
+  font-size: 0.64rem;
   font-weight: 900;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: #8a8473;
+  color: #9a8f7e;
+  padding-right: 6px;
+  border-right: 1px solid #d9d3c3;
+  margin-right: 4px;
+  line-height: 1;
+  align-self: center;
+}
+
+.editor-action-group button:not(.ghost-action) {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 3px 9px;
+  border: 1px solid #d9d3c3;
+  border-radius: 6px;
+  background: #fff;
+  color: #16201c;
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.1s, border-color 0.1s;
+}
+
+.editor-action-group button:not(.ghost-action):hover:not(:disabled) {
+  background: #f0f5f2;
+  border-color: #8db7aa;
+}
+
+.editor-action-group button:not(.ghost-action):disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .editor-action-group .ghost-action {
-  min-height: 32px;
-  padding: 0 10px;
-  font-size: 0.74rem;
+  min-height: 28px;
+  padding: 3px 9px;
+  font-size: 0.76rem;
 }
 
 .ghost-action.danger {
