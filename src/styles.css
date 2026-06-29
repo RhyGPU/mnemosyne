@@ -3961,7 +3961,7 @@ button:disabled {
 
 .cli-body {
   display: grid;
-  grid-template-columns: 220px 1fr 320px;
+  grid-template-columns: 220px 1fr 460px;
   flex: 1;
   min-height: 0;
   z-index: 3;
@@ -4016,6 +4016,29 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+.cli-diag-tabs {
+  display: flex;
+  gap: 8px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #164216;
+}
+.cli-diag-tabs .cli-btn.selected {
+  background: #1f521f;
+  color: #d6ffd6;
+  border-color: #2f7d2f;
+}
+/* Embedded full settings/benchmark panels inside the dark CLI side panel:
+   let them flow full-width and tighten spacing so they read in the column. */
+.cli-embedded-settings .settings-section {
+  margin: 0 0 12px;
+}
+.cli-embedded-settings .provider-pass-grid,
+.cli-embedded-settings .settings-grid {
+  grid-template-columns: 1fr;
 }
 .cli-diag-card {
   border: 1px solid #164216;

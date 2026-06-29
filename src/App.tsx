@@ -137,6 +137,7 @@ import {
   sendApiTurn,
   sendMockTurn,
   setActivePlayerPersona,
+  touchConversationAccess,
   updateUserMessage,
   upsertPlayerPersona,
   upsertProviderProfile,
@@ -153,6 +154,8 @@ import {
   hideLatestBenchmarkFailedUserMessage,
   TurnResult,
   runEvaluatorContractTest,
+  runSessionFormEvalBenchmark,
+  SessionFormEvalReport,
   runStructuredEvaluatorDiagnostic,
   StructuredEvaluatorDiagnosticSummary,
   setActiveEvaluatorProfile,
@@ -210,7 +213,8 @@ type NarrativeMode = "Realistic" | "Reader" | "Active Director" | "GM Simulation
 type AppView = "home" | "library" | "editor" | "chat" | "statemap" | "settings";
 type ChatStartMode = "continue" | "fresh";
 type DisclaimerMode = "launch" | "manual" | null;
-type SettingsTab = "ai" | "chat" | "dev";
+// Non-dev settings drawer tabs only. Dev features live in the dev-shell side panel.
+type SettingsTab = "ai" | "chat";
 type DevCommandName =
   | "dedupe_active_adjacent_user_messages"
   | "restore_inactive_messages"
@@ -657,6 +661,11 @@ export function App() {
   const [embeddedModelBusy, setEmbeddedModelBusy] = useState(false);
   const [embeddedModelError, setEmbeddedModelError] = useState<string | null>(null);
   const [retryRepairBusy, setRetryRepairBusy] = useState(false);
+  const [formEvalBusy, setFormEvalBusy] = useState(false);
+  const [formEvalReport, setFormEvalReport] = useState<SessionFormEvalReport | null>(null);
+  // The permanent dev-shell side panel toggles between dev features (default) and
+  // settings, so both are reachable without leaving the session.
+  const [devPanelTab, setDevPanelTab] = useState<"dev" | "settings">("dev");
   // Mirror the path into a ref so the (once-registered) repair listener can
   // auto-start the model without a stale closure.
   const embeddedModelPathRef = useRef(embeddedModelPath);
@@ -3011,7 +3020,8 @@ export function App() {
     if (busy) return;
     setBusy(true);
     try {
-      const conversationSoul = await getSoul(conversation.soul_id);
+      const accessedConversation = await touchConversationAccess(conversation.conversation_id);
+      const conversationSoul = await getSoul(accessedConversation.soul_id);
       setSoul(conversationSoul);
       setSelectedCharacterIds((current) =>
         current.includes(conversationSoul.character_id)
@@ -3019,16 +3029,20 @@ export function App() {
           : [conversationSoul.character_id, ...current],
       );
       setCreatorFieldsFromSoul(conversationSoul);
-      setActiveConversationId(conversation.conversation_id);
-      setCurrentSessionTitle(conversation.title);
+      setActiveConversationId(accessedConversation.conversation_id);
+      setCurrentSessionTitle(accessedConversation.title);
       setSessionContinuityLabel(
-        conversation.source_savepoint_id
+        accessedConversation.source_savepoint_id
           ? "Loaded named Session clone"
           : "Loaded persistent Soul continuity chat",
       );
-      setMessages(await listConversationMessages(conversation.conversation_id));
-      if (conversation.active_evaluator_profile_id) {
-        const updaterProfile = providerProfiles.find((p) => p.id === conversation.active_evaluator_profile_id);
+      setMessages(await listConversationMessages(accessedConversation.conversation_id));
+      setConversations((current) => [
+        accessedConversation,
+        ...current.filter((item) => item.conversation_id !== accessedConversation.conversation_id),
+      ]);
+      if (accessedConversation.active_evaluator_profile_id) {
+        const updaterProfile = providerProfiles.find((p) => p.id === accessedConversation.active_evaluator_profile_id);
         if (updaterProfile) {
           setSelectedStateUpdaterProfileId(updaterProfile.id);
           applyStateUpdaterProviderProfile(updaterProfile);
@@ -3036,20 +3050,36 @@ export function App() {
       } else {
         if (selectedStateUpdaterProfileId) {
           try {
-            await setActiveEvaluatorProfile(conversation.conversation_id, selectedStateUpdaterProfileId);
+            await setActiveEvaluatorProfile(accessedConversation.conversation_id, selectedStateUpdaterProfileId);
           } catch (e) {
             console.error("Failed to set active evaluator profile on conversation select", e);
           }
         }
       }
-      await refreshPlayerPersonas(conversation.conversation_id);
+      await refreshPlayerPersonas(accessedConversation.conversation_id);
       setLastTurnDebug(null);
       setView("chat");
-      setStatus(`Loaded chat: ${conversation.title}`);
+      setStatus(`Loaded chat: ${accessedConversation.title}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleOpenMostRecentChat() {
+    if (busy) return;
+    try {
+      const latestConversations = await listConversations();
+      const latest = latestConversations[0];
+      if (!latest) {
+        setStatus("No chats yet. Start one from Library.");
+        setView("library");
+        return;
+      }
+      await handleSelectConversation(latest);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -3651,6 +3681,38 @@ export function App() {
       model: profile.model,
       base_url: profile.base_url,
     });
+  }
+
+  async function handleSessionFormEvalBenchmark() {
+    const profileId = selectedStateUpdaterProfileId;
+    if (!currentConversationId) {
+      setStatus("Open a session first.");
+      return;
+    }
+    if (!profileId) {
+      setStatus("Select an Evaluator (state updater) provider profile first.");
+      return;
+    }
+    setFormEvalBusy(true);
+    setFormEvalReport(null);
+    setStatus("Running form-eval benchmark on this session (dry-run, nothing applied)…");
+    try {
+      const report = await runSessionFormEvalBenchmark(currentConversationId, profileId);
+      setFormEvalReport(report);
+      setStatus(
+        `Form-eval benchmark: ${report.form_passed}/${report.turns_total} form-valid, ${report.repair_recovered} recovered by repair.`,
+      );
+      logDev("info", "state_updater", "Session form-eval benchmark complete", {
+        turns: report.turns_total,
+        form_passed: report.form_passed,
+        form_failed: report.form_failed,
+        repair_recovered: report.repair_recovered,
+      });
+    } catch (error) {
+      reportError(error, "Session form-eval benchmark failed", "state_updater");
+    } finally {
+      setFormEvalBusy(false);
+    }
   }
 
   async function handleRunContractTest(profileId: string) {
@@ -4866,6 +4928,61 @@ export function App() {
         </span>
       </div>
       <div className="provider-pass-grid">
+        <div className="field" style={{ gridColumn: "1 / -1" }}>
+          <span>Form-Eval Dry-Run (open session)</span>
+          <p className="provider-note">
+            Replays this session's chat log through the non-tool-call FORM evaluator and the
+            repair path, validating each result the way the live system does — but applies
+            nothing to the session. Uses the selected Evaluator profile. Slow on CPU models.
+          </p>
+          <button
+            type="button"
+            className="ghost-action"
+            onClick={() => void handleSessionFormEvalBenchmark()}
+            disabled={formEvalBusy || !currentConversationId}
+          >
+            <span>{formEvalBusy ? "Running form-eval…" : "Run form-eval benchmark on this session"}</span>
+          </button>
+          {formEvalReport && (
+            <div style={{ marginTop: "8px", fontSize: "0.8rem" }}>
+              <div>
+                <strong>{formEvalReport.model}</strong> — {formEvalReport.turns_total} turns ·
+                form-valid {formEvalReport.form_passed} · failed {formEvalReport.form_failed} ·
+                repair-recovered {formEvalReport.repair_recovered}
+              </div>
+              <ul style={{ margin: "4px 0 0", paddingLeft: "1.1rem" }}>
+                {formEvalReport.per_turn.map((turn) => (
+                  <li
+                    key={turn.turn_index}
+                    style={{
+                      color: turn.form_passed
+                        ? "#86efac"
+                        : turn.repair_recovered
+                          ? "#fbbf24"
+                          : "#f87171",
+                    }}
+                  >
+                    turn {turn.turn_index}:{" "}
+                    {turn.form_passed
+                      ? "form OK"
+                      : `form FAIL${
+                          turn.repair_attempted
+                            ? turn.repair_recovered
+                              ? ` → repair recovered (${turn.repair_ops} ops)`
+                              : turn.repair_error
+                                ? ` → repair ERROR: ${turn.repair_error.slice(0, 90)}`
+                                : ` → repair parsed ${turn.repair_ops} ops but committed no state (no-op/under-extraction)`
+                            : ""
+                        }`}
+                    {turn.form_error && !turn.form_passed
+                      ? ` — form: ${turn.form_error.slice(0, 90)}`
+                      : ""}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
         <label className="field">
           <span>Benchmark Mode</span>
           <select
@@ -5487,28 +5604,32 @@ export function App() {
                     <Archive size={16} />
                     <span>Archive Profile</span>
                   </button>
-                  <button
-                    type="button"
-                    className="ghost-action"
-                    onClick={() => void handleRunContractTest(selectedStateUpdaterProfileId)}
-                    disabled={busy || !selectedStateUpdaterProfileId}
-                  >
-                    <Play size={16} />
-                    <span>Run Contract Test</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost-action"
-                    onClick={() => void handleRunStructuredDiagnostic()}
-                    disabled={busy || structuredDiagnosticRunning || (!selectedStateUpdaterProfileId && !selectedProviderProfileId)}
-                  >
-                    <Play size={16} />
-                    <span>Run Structured Evaluator Diagnostic</span>
-                  </button>
+                  {devModeActive && (
+                    <>
+                      <button
+                        type="button"
+                        className="ghost-action"
+                        onClick={() => void handleRunContractTest(selectedStateUpdaterProfileId)}
+                        disabled={busy || !selectedStateUpdaterProfileId}
+                      >
+                        <Play size={16} />
+                        <span>Run Contract Test</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-action"
+                        onClick={() => void handleRunStructuredDiagnostic()}
+                        disabled={busy || structuredDiagnosticRunning || (!selectedStateUpdaterProfileId && !selectedProviderProfileId)}
+                      >
+                        <Play size={16} />
+                        <span>Run Structured Evaluator Diagnostic</span>
+                      </button>
+                    </>
+                  )}
                 </div>
               </>
             )}
-            {useNarratorProviderForUpdater && (
+            {useNarratorProviderForUpdater && devModeActive && (
               <div className="button-row">
                 <button
                   type="button"
@@ -5774,7 +5895,7 @@ export function App() {
   const settingsContent = (
       <div className="settings-drawer-main">
       <nav className="settings-drawer-tabs" aria-label="Settings categories">
-        {(["ai", "chat", "dev"] as SettingsTab[]).map((tab) => (
+        {(["ai", "chat"] as SettingsTab[]).map((tab) => (
           <button
             key={tab}
             type="button"
@@ -5782,14 +5903,8 @@ export function App() {
             onClick={() => setSettingsTab(tab)}
             title={tab.toUpperCase()}
           >
-            {tab === "ai" ? (
-              <Sparkles size={18} />
-            ) : tab === "chat" ? (
-              <MessageSquareText size={18} />
-            ) : (
-              <Terminal size={18} />
-            )}
-            <span>{tab === "ai" ? "AI" : tab === "chat" ? "Chat" : "Dev"}</span>
+            {tab === "ai" ? <Sparkles size={18} /> : <MessageSquareText size={18} />}
+            <span>{tab === "ai" ? "AI" : "Chat"}</span>
           </button>
         ))}
       </nav>
@@ -5837,75 +5952,6 @@ export function App() {
                 <span>Show archived sessions by default</span>
               </label>
               <p className="settings-note">Composer shortcut: Enter to send, Shift+Enter for a new line.</p>
-            </section>
-          </div>
-        ) : null}
-        {settingsTab === "dev" ? (
-          <div className="settings-tab-panel">
-            <section className="settings-section">
-              <div className="settings-section-heading">
-                <div>
-                  <span className="eyebrow">Diagnostics</span>
-                  <h3>Dev Console Defaults</h3>
-                </div>
-              </div>
-              <div className="settings-grid">
-                <label className="field">
-                  <span>Level Filter</span>
-                  <select
-                    value={devLogLevelFilter}
-                    onChange={(event) => setDevLogLevelFilter(event.target.value as DevLogLevel | "all")}
-                  >
-                    <option value="all">All</option>
-                    {DEV_LOG_LEVELS.map((level) => (
-                      <option key={level} value={level}>
-                        {level}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="field">
-                  <span>Category Filter</span>
-                  <select
-                    value={devLogCategoryFilter}
-                    onChange={(event) => setDevLogCategoryFilter(event.target.value as DevLogCategory | "all")}
-                  >
-                    <option value="all">All</option>
-                    {DEV_LOG_CATEGORIES.map((category) => (
-                      <option key={category} value={category}>
-                        {category}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={devConsolePaused}
-                  onChange={(event) => setDevConsolePaused(event.target.checked)}
-                />
-                <span>Pause Dev Console scroll by default</span>
-              </label>
-              <div className="settings-action-list">
-                <button
-                  type="button"
-                  className="ghost-action"
-                  onClick={() => {
-                    setView("chat");
-                    setDevModeActive(true);
-                    setSettingsDrawerOpen(false);
-                  }}
-                  disabled={!currentConversationId}
-                >
-                  <Terminal size={16} />
-                  <span>Open Dev Mode</span>
-                </button>
-                <button type="button" className="ghost-action" onClick={handleExportLlmPayloadHistory} disabled={busy || !currentConversationId}>
-                  <FileDown size={16} />
-                  <span>Export Payload History</span>
-                </button>
-              </div>
             </section>
           </div>
         ) : null}
@@ -6197,7 +6243,7 @@ export function App() {
         <Database size={18} aria-hidden="true" />
         <span>Home</span>
       </button>
-      <button type="button" className={`app-rail-item${view === "chat" ? " is-active" : ""}`} onClick={() => setView("chat")}>
+      <button type="button" className={`app-rail-item${view === "chat" ? " is-active" : ""}`} onClick={() => void handleOpenMostRecentChat()}>
         <Play size={18} aria-hidden="true" />
         <span>Play</span>
       </button>
@@ -6280,7 +6326,7 @@ export function App() {
             <span className="cli-brand">root@mnemosyne</span>
             <span className="cli-path">:~/{(currentSessionTitle || "session").replace(/\s+/g, "_").toLowerCase()}$</span>
             <span className="cli-spacer" />
-            <button type="button" className="cli-btn" onClick={() => setDevLogs([])}>[ CLEAR ]</button>
+            <button type="button" className="cli-btn" onClick={() => setDevPanelTab(devPanelTab === "settings" ? "dev" : "settings")}>[ {devPanelTab === "settings" ? "DEV PANEL" : "SETTINGS"} ]</button>
             <button type="button" className="cli-btn" onClick={() => setDevModeActive(false)}>[ EXIT DEV ]</button>
             <button type="button" className="cli-btn" onClick={() => setView("library")}>[ LIBRARY ]</button>
           </header>
@@ -6328,7 +6374,27 @@ export function App() {
                 )
               )}
             </section>
-            <aside className="cli-diagnostics" aria-label="Advanced diagnostics">
+            <aside className="cli-diagnostics" aria-label="Dev and settings panel">
+              <div className="cli-diag-tabs">
+                <button
+                  type="button"
+                  className={`cli-btn${devPanelTab === "dev" ? " selected" : ""}`}
+                  onClick={() => setDevPanelTab("dev")}
+                >
+                  [ DEV ]
+                </button>
+                <button
+                  type="button"
+                  className={`cli-btn${devPanelTab === "settings" ? " selected" : ""}`}
+                  onClick={() => setDevPanelTab("settings")}
+                >
+                  [ SETTINGS ]
+                </button>
+              </div>
+              {devPanelTab === "settings" ? (
+                <div className="cli-embedded-settings">{providerSettingsPanel}</div>
+              ) : (
+                <>
               <section className="cli-diag-card">
                 <div className="cli-diag-title">// MEMORY CYCLE</div>
                 <dl className="cli-diag-grid">
@@ -6367,12 +6433,32 @@ export function App() {
               <section className="cli-diag-card danger">
                 <div className="cli-diag-title">// DESTRUCTIVE REPAIR</div>
                 <div className="cli-diag-actions grid">
-                  <button type="button" className="cli-mini-btn" onClick={() => void handleSoulRepair("world")} disabled={busy || !soul}>[ CLEAR WORLD ]</button>
-                  <button type="button" className="cli-mini-btn" onClick={() => void handleSoulRepair("scenario")} disabled={busy || !soul}>[ CLEAR SCENARIO ]</button>
-                  <button type="button" className="cli-mini-btn" onClick={() => void handleSoulRepair("events")} disabled={busy || !soul}>[ CLEAR EVENTS ]</button>
-                  <button type="button" className="cli-mini-btn danger" onClick={() => void handleSoulRepair("memories")} disabled={busy || !soul}>[ CLEAR MEMORIES ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => { if (window.confirm("Clear WORLD state? This permanently deletes it and cannot be undone.")) void handleSoulRepair("world"); }} disabled={busy || !soul}>[ CLEAR WORLD ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => { if (window.confirm("Clear SCENARIO? This permanently deletes it and cannot be undone.")) void handleSoulRepair("scenario"); }} disabled={busy || !soul}>[ CLEAR SCENARIO ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => { if (window.confirm("Clear EVENTS? This permanently deletes them and cannot be undone.")) void handleSoulRepair("events"); }} disabled={busy || !soul}>[ CLEAR EVENTS ]</button>
+                  <button type="button" className="cli-mini-btn danger" onClick={() => { if (window.confirm("Clear MEMORIES? This permanently deletes them and cannot be undone.")) void handleSoulRepair("memories"); }} disabled={busy || !soul}>[ CLEAR MEMORIES ]</button>
                 </div>
               </section>
+              <section className="cli-diag-card">
+                <div className="cli-diag-title">// EVALUATOR CHECK</div>
+                <div className="cli-diag-actions">
+                  <button
+                    type="button"
+                    className="cli-mini-btn"
+                    onClick={() => {
+                      if (selectedStateUpdaterProfileId)
+                        void handleRunContractTest(selectedStateUpdaterProfileId);
+                      else setStatus("Select an Evaluator profile in the Settings tab first.");
+                    }}
+                    disabled={busy}
+                  >
+                    [ CONTRACT TEST ]
+                  </button>
+                </div>
+              </section>
+              <div className="cli-embedded-settings">{benchmarkRunnerPanel}</div>
+                </>
+              )}
             </aside>
           </div>
           <form className="cli-input" onSubmit={handleDevTerminalSubmit}>
@@ -8643,7 +8729,7 @@ function loadStoredChatStartMode(): ChatStartMode {
 function loadStoredSettingsTab(): SettingsTab {
   try {
     const raw = localStorage.getItem(SETTINGS_DRAWER_TAB_STORAGE_KEY);
-    return raw === "ai" || raw === "chat" || raw === "dev" ? raw : "ai";
+    return raw === "ai" || raw === "chat" ? raw : "ai";
   } catch {
     return "ai";
   }

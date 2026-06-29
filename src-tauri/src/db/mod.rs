@@ -1715,6 +1715,20 @@ pub fn rename_conversation(
     get_conversation_summary(conn, conversation_id)
 }
 
+pub fn touch_conversation_access(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<ConversationSummary> {
+    let affected = conn.execute(
+        "UPDATE conversations SET updated_at = ?1 WHERE id = ?2 AND archived_at IS NULL",
+        params![now_ts(), conversation_id],
+    )?;
+    if affected == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    get_conversation_summary(conn, conversation_id)
+}
+
 pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<ConversationSummary>> {
     let mut stmt = conn.prepare(
         "

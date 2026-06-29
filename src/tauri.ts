@@ -998,8 +998,26 @@ export function listSoulsDebug(): Promise<SoulSummary[]> {
 
 export function listConversations(): Promise<ConversationSummary[]> {
   return invokeOrPreview("list_conversations", {}, () =>
-    browserConversations.map(summarizePreviewConversation),
+    [...browserConversations]
+      .filter((conversation) => !(conversation as any).archived_at)
+      .sort((a, b) => b.updated_at - a.updated_at || b.created_at - a.created_at)
+      .map(summarizePreviewConversation),
   );
+}
+
+export function touchConversationAccess(conversationId: string): Promise<ConversationSummary> {
+  return invokeOrPreview("touch_conversation_access", { conversationId }, () => {
+    const conversation = browserConversations.find((item) => item.conversation_id === conversationId);
+    if (!conversation || (conversation as any).archived_at) {
+      throw new Error(`Conversation not found: ${conversationId}`);
+    }
+    conversation.updated_at = Math.floor(Date.now() / 1000);
+    browserConversations = [
+      conversation,
+      ...browserConversations.filter((item) => item.conversation_id !== conversationId),
+    ];
+    return summarizePreviewConversation(conversation);
+  });
 }
 
 export function listSessionStateHub(): Promise<SessionStateHubItem[]> {
@@ -1771,6 +1789,42 @@ export function runEvaluatorContractTest(profileId: string): Promise<EvaluatorCo
       evaluator_compatibility_status_label: "untested"
     };
   });
+}
+
+export type SessionFormEvalTurn = {
+  turn_index: number;
+  user_excerpt: string;
+  form_passed: boolean;
+  form_error: string | null;
+  repair_attempted: boolean;
+  repair_ops: number;
+  repair_recovered: boolean;
+  repair_error: string | null;
+};
+
+export type SessionFormEvalReport = {
+  conversation_id: string;
+  model: string;
+  turns_total: number;
+  form_passed: number;
+  form_failed: number;
+  repair_recovered: number;
+  per_turn: SessionFormEvalTurn[];
+};
+
+/** Dev-mode: replay the open session's chat log through the FORM evaluator + repair,
+ * dry-run validated (nothing applied). */
+export function runSessionFormEvalBenchmark(
+  conversationId: string,
+  profileId: string,
+): Promise<SessionFormEvalReport> {
+  return invokeOrPreview(
+    "run_session_form_eval_benchmark",
+    { conversationId, profileId },
+    () => {
+      throw new Error("Session form-eval benchmark requires the Tauri runtime.");
+    },
+  );
 }
 
 export type StructuredEvaluatorDiagnosticRun = {
