@@ -1715,6 +1715,20 @@ pub fn rename_conversation(
     get_conversation_summary(conn, conversation_id)
 }
 
+pub fn touch_conversation_access(
+    conn: &Connection,
+    conversation_id: &str,
+) -> rusqlite::Result<ConversationSummary> {
+    let affected = conn.execute(
+        "UPDATE conversations SET updated_at = ?1 WHERE id = ?2 AND archived_at IS NULL",
+        params![now_ts(), conversation_id],
+    )?;
+    if affected == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    get_conversation_summary(conn, conversation_id)
+}
+
 pub fn list_conversations(conn: &Connection) -> rusqlite::Result<Vec<ConversationSummary>> {
     let mut stmt = conn.prepare(
         "
@@ -1884,6 +1898,19 @@ pub fn list_player_personas(conn: &Connection) -> rusqlite::Result<Vec<PlayerPer
         personas.push(row?);
     }
     Ok(personas)
+}
+
+pub fn list_archived_player_personas(conn: &Connection) -> rusqlite::Result<Vec<PlayerPersona>> {
+    let mut stmt = conn.prepare(
+        "
+        SELECT persona_id, display_name, description, gender_code, pronouns, appearance, voice_style, boundaries, notes, is_archived, created_at, updated_at
+        FROM player_personas
+        WHERE is_archived = 1
+        ORDER BY updated_at DESC, display_name COLLATE NOCASE ASC
+        ",
+    )?;
+    let rows = stmt.query_map([], player_persona_from_row)?;
+    rows.collect()
 }
 
 pub fn get_player_persona(
@@ -5574,7 +5601,13 @@ mod tests {
             .expect("list")
             .iter()
             .any(|persona| persona.persona_id == "persona_jun"));
+        let archived = list_archived_player_personas(&conn).expect("list archived");
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].persona_id, "persona_jun");
         assert!(restore_player_persona(&conn, "persona_jun").expect("restore custom"));
+        assert!(list_archived_player_personas(&conn)
+            .expect("list archived after restore")
+            .is_empty());
         assert!(list_player_personas(&conn)
             .expect("list restored")
             .iter()

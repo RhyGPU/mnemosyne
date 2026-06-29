@@ -19,3 +19,7 @@ src-tauri/state_engine/Cargo.lock
 models/
 *.llamafile
 *.gguf
+
+# UX v2 verification build artifacts (delete scratch/v2out manually)
+scratch/v2out/
+scratch/v2test.*

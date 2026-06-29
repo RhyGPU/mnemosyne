@@ -91,6 +91,7 @@ const NO_LLM_PAYLOAD_LOGS_MESSAGE: &str = "No LLM payload logs found for this co
 const FULL_CHAT_TOKEN_BUDGET: usize = 6_000;
 const NARRATOR_BRIEF_TARGET_TOKENS: usize = 2_500;
 const STATE_UPDATER_TARGET_TOKENS: usize = 1_600;
+const STATE_MAP_RECENT_SESSION_LIMIT: usize = 5;
 const DEFAULT_EVALUATOR_TIMEOUT_MS: u64 = 25_000;
 const DEFAULT_STRUCTURED_EVALUATOR_TIMEOUT_MS: u64 = 90_000;
 const DEFAULT_DIAGNOSTIC_EVALUATOR_TIMEOUT_MS: u64 = 60_000;
@@ -494,6 +495,112 @@ pub struct SessionStartResult {
     pub soul: Soul,
     pub conversation: ConversationSummary,
     pub messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionStateHubItem {
+    pub conversation: ConversationSummary,
+    pub soul_name: String,
+    pub setting_name: String,
+    pub location: String,
+    pub time_elapsed: String,
+    pub current_scene: String,
+    pub focus: String,
+    pub turn_counter: u64,
+    pub memory_count: usize,
+    pub core_memory_count: usize,
+    pub recent_memory_count: usize,
+    pub schema_count: usize,
+    pub relationship_count: usize,
+    pub positive_relationship_count: usize,
+    pub object_count: usize,
+    pub event_count: usize,
+    pub active_plot_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapSceneItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub soul_name: String,
+    pub setting_name: String,
+    pub turn_counter: u64,
+    pub location: String,
+    pub time_elapsed: String,
+    pub current_scene: String,
+    pub focus: String,
+    pub last_user_action: String,
+    pub pressure_point: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapCharacterItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub name: String,
+    pub role: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapRelationshipItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub soul_name: String,
+    pub target: String,
+    pub love_type: String,
+    pub trust: f32,
+    pub affection: f32,
+    pub intimacy: f32,
+    pub fear: f32,
+    pub desire: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapObjectItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub name: String,
+    pub kind: String,
+    pub owner: String,
+    pub location: String,
+    pub status: String,
+    pub summary: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapTimelineItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub turn_counter: u64,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapMemoryItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub soul_name: String,
+    pub content: String,
+    pub tag: String,
+    pub source_turn: Option<i64>,
+    pub confidence: Option<f32>,
+    pub truth_status: String,
+    pub source_type: String,
+    pub is_pinned: bool,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionStateMap {
+    pub sessions: Vec<SessionStateHubItem>,
+    pub scenes: Vec<StateMapSceneItem>,
+    pub characters: Vec<StateMapCharacterItem>,
+    pub relationships: Vec<StateMapRelationshipItem>,
+    pub objects: Vec<StateMapObjectItem>,
+    pub timeline: Vec<StateMapTimelineItem>,
+    pub memories: Vec<StateMapMemoryItem>,
 }
 
 #[derive(Debug, Clone)]
@@ -2241,6 +2348,288 @@ pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation
     db::list_conversations(&conn).map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+pub fn touch_conversation_access(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<ConversationSummary, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::touch_conversation_access(&conn, &conversation_id).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_session_state_hub(state: State<'_, AppState>) -> Result<Vec<SessionStateHubItem>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let mut conversations = db::list_conversations(&conn).map_err(|err| err.to_string())?;
+    conversations.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    conversations.truncate(STATE_MAP_RECENT_SESSION_LIMIT);
+    let mut items = Vec::with_capacity(conversations.len());
+
+    for conversation in conversations {
+        let branch = match db::get_active_session_branch(&conn, &conversation.conversation_id) {
+            Ok(branch) => branch,
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        let rebuilt = db::rebuild_session_state(&conn, &conversation.conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+        let soul = rebuilt.soul;
+        let world = rebuilt.session_world;
+        let positive_relationship_count = soul
+            .relationships
+            .values()
+            .filter(|relationship| {
+                relationship.trust > 35.0
+                    || relationship.affection > 35.0
+                    || relationship.intimacy > 35.0
+                    || relationship.comfort > 35.0
+                    || relationship.desire > 35.0
+            })
+            .count();
+        let memory_count = soul.memory.core.len() + soul.memory.recent.len() + soul.memory.schemas.len();
+        items.push(SessionStateHubItem {
+            conversation,
+            soul_name: soul.character_name,
+            setting_name: world.setting_name,
+            location: world.location,
+            time_elapsed: world.time_elapsed,
+            current_scene: world.scene_state.current_scene,
+            focus: world.scene_state.focus,
+            turn_counter: soul.turn_counter,
+            memory_count,
+            core_memory_count: soul.memory.core.len(),
+            recent_memory_count: soul.memory.recent.len(),
+            schema_count: soul.memory.schemas.len(),
+            relationship_count: soul.relationships.len(),
+            positive_relationship_count,
+            object_count: world.object_states.len().max(world.key_objects.len()),
+            event_count: world.recent_event_records.len().max(world.recent_events.len()),
+            active_plot_count: world.active_plots.len(),
+        });
+    }
+
+    Ok(items)
+}
+
+#[tauri::command]
+pub fn list_session_state_map(state: State<'_, AppState>) -> Result<SessionStateMap, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let mut conversations = db::list_conversations(&conn).map_err(|err| err.to_string())?;
+    conversations.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    conversations.truncate(STATE_MAP_RECENT_SESSION_LIMIT);
+    let mut sessions = Vec::with_capacity(conversations.len());
+    let mut scenes = Vec::new();
+    let mut characters = Vec::new();
+    let mut relationships = Vec::new();
+    let mut objects = Vec::new();
+    let mut timeline = Vec::new();
+    let mut memories = Vec::new();
+
+    for conversation in conversations {
+        let branch = match db::get_active_session_branch(&conn, &conversation.conversation_id) {
+            Ok(branch) => branch,
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        let rebuilt = db::rebuild_session_state(&conn, &conversation.conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+        let soul = rebuilt.soul;
+        let world = rebuilt.session_world;
+        let session_id = conversation.conversation_id.clone();
+        let session_title = if conversation.title.trim().is_empty() {
+            "Untitled session".to_string()
+        } else {
+            conversation.title.clone()
+        };
+        let soul_name = soul.character_name.clone();
+        let positive_relationship_count = soul
+            .relationships
+            .values()
+            .filter(|relationship| {
+                relationship.trust > 35.0
+                    || relationship.affection > 35.0
+                    || relationship.intimacy > 35.0
+                    || relationship.comfort > 35.0
+                    || relationship.desire > 35.0
+            })
+            .count();
+        let memory_count = soul.memory.core.len() + soul.memory.recent.len() + soul.memory.schemas.len();
+
+        scenes.push(StateMapSceneItem {
+            session_id: session_id.clone(),
+            session_title: session_title.clone(),
+            soul_name: soul_name.clone(),
+            setting_name: world.setting_name.clone(),
+            turn_counter: soul.turn_counter,
+            location: world.location.clone(),
+            time_elapsed: world.time_elapsed.clone(),
+            current_scene: world.scene_state.current_scene.clone(),
+            focus: world.scene_state.focus.clone(),
+            last_user_action: world.scene_state.last_user_action.clone(),
+            pressure_point: world.scene_state.pressure_point.clone(),
+        });
+
+        characters.push(StateMapCharacterItem {
+            session_id: session_id.clone(),
+            session_title: session_title.clone(),
+            name: soul_name.clone(),
+            role: soul.soul_kind.clone(),
+            detail: format!(
+                "phase {} / resolve {} / openness {}",
+                soul.trauma.phase, soul.global.resolve, soul.global.openness
+            ),
+        });
+
+        for (target, relationship) in &soul.relationships {
+            characters.push(StateMapCharacterItem {
+                session_id: session_id.clone(),
+                session_title: session_title.clone(),
+                name: target.clone(),
+                role: if relationship.love_type.trim().is_empty() {
+                    "relationship".to_string()
+                } else {
+                    relationship.love_type.clone()
+                },
+                detail: format!(
+                    "trust {} / fear {} / affection {}",
+                    relationship.trust, relationship.fear, relationship.affection
+                ),
+            });
+            relationships.push(StateMapRelationshipItem {
+                session_id: session_id.clone(),
+                session_title: session_title.clone(),
+                soul_name: soul_name.clone(),
+                target: target.clone(),
+                love_type: relationship.love_type.clone(),
+                trust: relationship.trust,
+                affection: relationship.affection,
+                intimacy: relationship.intimacy,
+                fear: relationship.fear,
+                desire: relationship.desire,
+            });
+        }
+
+        for object in &world.object_states {
+            let summary = object
+                .contents_summary
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| object.last_observed_state.clone());
+            objects.push(StateMapObjectItem {
+                session_id: session_id.clone(),
+                session_title: session_title.clone(),
+                name: object.object_id.clone(),
+                kind: object.object_kind.clone(),
+                owner: object.owner_entity_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                location: object.location.clone(),
+                status: object.status.clone(),
+                summary,
+                confidence: object.confidence,
+            });
+        }
+        for object in &world.key_objects {
+            if !objects.iter().any(|item| item.session_id == session_id && item.name == *object) {
+                objects.push(StateMapObjectItem {
+                    session_id: session_id.clone(),
+                    session_title: session_title.clone(),
+                    name: object.clone(),
+                    kind: "key_object".to_string(),
+                    owner: "unknown".to_string(),
+                    location: world.location.clone(),
+                    status: "tracked".to_string(),
+                    summary: object.clone(),
+                    confidence: 1.0,
+                });
+            }
+        }
+
+        if world.recent_event_records.is_empty() {
+            for event in &world.recent_events {
+                timeline.push(StateMapTimelineItem {
+                    session_id: session_id.clone(),
+                    session_title: session_title.clone(),
+                    turn_counter: soul.turn_counter,
+                    content: event.clone(),
+                });
+            }
+        } else {
+            for event in &world.recent_event_records {
+                if event.is_active {
+                    timeline.push(StateMapTimelineItem {
+                        session_id: session_id.clone(),
+                        session_title: session_title.clone(),
+                        turn_counter: soul.turn_counter,
+                        content: event.content.clone(),
+                    });
+                }
+            }
+        }
+
+        for memory in &soul.memory.recent {
+            memories.push(StateMapMemoryItem {
+                session_id: session_id.clone(),
+                session_title: session_title.clone(),
+                soul_name: soul_name.clone(),
+                content: memory.content.clone(),
+                tag: memory.tag.clone(),
+                source_turn: memory.source_message_id,
+                confidence: memory.confidence,
+                truth_status: memory.truth_status.as_label().to_string(),
+                source_type: memory.source_type.as_label().to_string(),
+                is_pinned: memory.is_pinned,
+                is_active: memory.is_active,
+            });
+        }
+        for memory in &soul.memory.core {
+            memories.push(StateMapMemoryItem {
+                session_id: session_id.clone(),
+                session_title: session_title.clone(),
+                soul_name: soul_name.clone(),
+                content: memory.clone(),
+                tag: "core".to_string(),
+                source_turn: None,
+                confidence: None,
+                truth_status: "persistent_core".to_string(),
+                source_type: "persistent_core".to_string(),
+                is_pinned: false,
+                is_active: true,
+            });
+        }
+
+        sessions.push(SessionStateHubItem {
+            conversation,
+            soul_name,
+            setting_name: world.setting_name,
+            location: world.location,
+            time_elapsed: world.time_elapsed,
+            current_scene: world.scene_state.current_scene,
+            focus: world.scene_state.focus,
+            turn_counter: soul.turn_counter,
+            memory_count,
+            core_memory_count: soul.memory.core.len(),
+            recent_memory_count: soul.memory.recent.len(),
+            schema_count: soul.memory.schemas.len(),
+            relationship_count: soul.relationships.len(),
+            positive_relationship_count,
+            object_count: world.object_states.len().max(world.key_objects.len()),
+            event_count: world.recent_event_records.len().max(world.recent_events.len()),
+            active_plot_count: world.active_plots.len(),
+        });
+    }
+
+    memories.sort_by_key(|memory| (!memory.is_pinned, !memory.is_active));
+
+    Ok(SessionStateMap {
+        sessions,
+        scenes,
+        characters,
+        relationships,
+        objects,
+        timeline,
+        memories,
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlayerPersonaInput {
     pub persona_id: Option<String>,
@@ -2258,6 +2647,14 @@ pub struct PlayerPersonaInput {
 pub fn list_player_personas(state: State<'_, AppState>) -> Result<Vec<PlayerPersona>, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::list_player_personas(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_archived_player_personas(
+    state: State<'_, AppState>,
+) -> Result<Vec<PlayerPersona>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::list_archived_player_personas(&conn).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -2884,6 +3281,21 @@ pub fn archive_soul(
     db::archive_soul(&conn, &soul_id).map_err(|err| err.to_string())
 }
 
+/// Permanent hard delete of a character (Soul). Irreversible — takes a safety
+/// backup first. Archive (archive_soul) is the recoverable default; this is the
+/// explicit "purge" path.
+#[tauri::command]
+pub fn purge_soul(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    soul_id: String,
+) -> Result<bool, String> {
+    create_safety_backup(&app, &window, "purge_soul")?;
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::hard_delete_soul_internal(&conn, &soul_id).map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 pub fn restore_soul(state: State<'_, AppState>, soul_id: String) -> Result<bool, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
@@ -2942,6 +3354,24 @@ pub fn archive_setting(
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     let active_refs: Vec<&str> = active_or_default_ids.iter().map(|s| s.as_str()).collect();
     db::archive_setting(&conn, &setting_id, &active_refs)
+}
+
+/// Permanent hard delete of a world (Setting). Irreversible — safety backup
+/// first, and refuses to purge the active/default setting.
+#[tauri::command]
+pub fn purge_setting(
+    app: AppHandle,
+    window: Window,
+    state: State<'_, AppState>,
+    setting_id: String,
+    active_or_default_ids: Vec<String>,
+) -> Result<bool, String> {
+    if active_or_default_ids.contains(&setting_id) {
+        return Err("Cannot purge the active/default setting. Switch settings first.".into());
+    }
+    create_safety_backup(&app, &window, "purge_setting")?;
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::delete_setting_internal(&conn, &setting_id).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -6283,6 +6713,246 @@ pub async fn run_evaluator_contract_test(
     let _ = db::upsert_provider_profile(&conn, &updated_profile);
 
     Ok(report)
+}
+
+/// One turn's result in the session form-eval benchmark.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionFormEvalTurn {
+    pub turn_index: usize,
+    pub user_excerpt: String,
+    /// The FORM eval output passed the system's ingestion/validation contract.
+    pub form_passed: bool,
+    pub form_error: Option<String>,
+    /// Repair was attempted (only when form validation failed).
+    pub repair_attempted: bool,
+    pub repair_ops: usize,
+    /// Repair produced a non-empty engine patch (recovered state) on dry-run.
+    pub repair_recovered: bool,
+    pub repair_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionFormEvalReport {
+    pub conversation_id: String,
+    pub model: String,
+    pub turns_total: usize,
+    pub form_passed: usize,
+    pub form_failed: usize,
+    pub repair_recovered: usize,
+    pub per_turn: Vec<SessionFormEvalTurn>,
+}
+
+/// Dev-mode benchmark: replay the OPEN session's chat log through the non-tool-call
+/// FORM evaluator and the repair path, validating each result the way the live
+/// system does (parse + compile + `validate_evaluator_contract`) but WITHOUT ever
+/// applying anything to the ledger. For form turns that fail validation, it runs
+/// the repair (reextract) and reports whether it would have recovered the state.
+/// The reusable core (per-turn form eval over a log) also backs a future
+/// user-mode "re-eval selected chats". Nothing here is committed.
+#[tauri::command]
+pub async fn run_session_form_eval_benchmark(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    profile_id: String,
+) -> Result<SessionFormEvalReport, String> {
+    let profile = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::get_provider_profile(&conn, &profile_id).map_err(|err| err.to_string())?
+    };
+
+    // FORM contract settings (force the non-tool-call path, like the contract
+    // test). Local endpoints get the generous timeout — CPU form-prompt eval is
+    // slow and the default 25s would always time out.
+    let mut form_settings = ApiProviderSettings {
+        base_url: profile.base_url.clone(),
+        api_key: profile.api_key.clone(),
+        model: profile.model.clone(),
+        system_prompt: profile.system_prompt.clone(),
+        evaluator_mode: Some(EVALUATOR_MODE_FORM_V1.into()),
+        evaluator_timeout_mode: Some("finite".into()),
+        structured_evaluator_max_retries: Some(1),
+        ..ApiProviderSettings::default()
+    };
+    if is_loopback_endpoint(&form_settings.base_url) {
+        form_settings.evaluator_timeout_ms = Some(LOCAL_REPAIR_TIMEOUT_MS);
+    }
+
+    // Repair settings: structured ops, pinned for a local endpoint.
+    let mut repair_settings = form_settings.clone();
+    repair_settings.evaluator_mode = Some(EVALUATOR_MODE_STRUCTURED_V1.into());
+    if is_loopback_endpoint(&repair_settings.base_url) {
+        repair_settings.structured_evaluator_transport = Some("json_schema".into());
+        repair_settings.structured_evaluator_policy = Some("allow_fallback".into());
+        repair_settings.structured_evaluator_timeout_ms = Some(LOCAL_REPAIR_TIMEOUT_MS);
+        repair_settings.evaluator_timeout_ms = Some(LOCAL_REPAIR_TIMEOUT_MS);
+    }
+
+    // Load the session's current soul/world and its user→narrator turns. We use
+    // the current rebuilt state as context for every turn (a dev-benchmark
+    // simplification — it tests JSON validity/recovery, not exact historical state).
+    let (soul, session_world, turns) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let branch = db::get_active_session_branch(&conn, &conversation_id)
+            .map_err(|err| err.to_string())?;
+        let rebuilt = db::rebuild_session_state(&conn, &conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+        let messages =
+            db::list_messages(&conn, &conversation_id, 10_000).map_err(|err| err.to_string())?;
+        let mut turns: Vec<(String, String)> = Vec::new();
+        let mut pending_user: Option<String> = None;
+        for message in messages.iter().filter(|message| message.status == "active") {
+            match message.role.as_str() {
+                "user" => pending_user = Some(message.content.clone()),
+                "assistant" => {
+                    if let Some(user_text) = pending_user.take() {
+                        turns.push((user_text, strip_hidden_state_blocks(&message.content)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        (rebuilt.soul, rebuilt.session_world, turns)
+    };
+
+    let provider = ApiProvider::default();
+    let structured_system = build_structured_evaluator_prompt(&soul, Some(&session_world));
+    // v1 uses default player aliases; the future selected-chats feature can resolve
+    // the real persona per session.
+    let player_id = "preset_male";
+    let player_name = "Male Persona";
+
+    let mut per_turn = Vec::new();
+    let (mut form_passed, mut form_failed, mut repair_recovered) = (0usize, 0usize, 0usize);
+
+    for (index, (user, narrator)) in turns.iter().enumerate() {
+        let mut turn = SessionFormEvalTurn {
+            turn_index: index,
+            user_excerpt: user.chars().take(80).collect(),
+            form_passed: false,
+            form_error: None,
+            repair_attempted: false,
+            repair_ops: 0,
+            repair_recovered: false,
+            repair_error: None,
+        };
+
+        let system = build_evaluator_form_prompt_compact_with_player_persona(
+            &soul,
+            Some(&session_world),
+            user,
+            narrator,
+            player_id,
+            player_name,
+        );
+        let context = format!("User: {user}\nNarrator: {narrator}");
+        let user_message =
+            build_evaluator_user_message(user, narrator, &context, Some(&session_world), None, None);
+
+        let form_raw = match complete_evaluator_with_config(&provider, &form_settings, &system, &user_message).await {
+            Err(err) => {
+                turn.form_error = Some(format!("form call failed: {err}"));
+                None
+            }
+            Ok(completion) => Some(completion.raw_text),
+        };
+
+        // Mirror the LIVE ingestion (parse + raw_repair salvage + compile), NOT the
+        // stricter contract validator. "Taken by the system" = it produced durable
+        // state with no rejected rows; otherwise it's a form failure to repair.
+        let needs_repair = if let Some(raw) = form_raw.as_deref() {
+            let spec = build_eval_form_spec_with_player_persona(
+                &soul,
+                Some(&session_world),
+                user,
+                narrator,
+                8,
+                player_id,
+                player_name,
+            );
+            match compile_evaluator_form_runtime(raw, spec, &soul, &session_world, user, narrator, None)
+            {
+                Err(err) => {
+                    turn.form_error = Some(format!("form ingest failed: {err}"));
+                    form_failed += 1;
+                    true
+                }
+                Ok(form_outcome) => {
+                    let rejected = form_outcome.form_rejected_rows.len();
+                    if !form_outcome.conversion.patch.is_empty() && rejected == 0 {
+                        turn.form_passed = true;
+                        form_passed += 1;
+                        false
+                    } else {
+                        turn.form_error = Some(if rejected > 0 {
+                            format!(
+                                "{rejected} form row(s) rejected: {}",
+                                form_outcome
+                                    .form_rejected_rows
+                                    .first()
+                                    .map(|row| row.reason.clone())
+                                    .unwrap_or_default()
+                            )
+                        } else {
+                            "form produced no durable state (empty patch)".into()
+                        });
+                        form_failed += 1;
+                        true
+                    }
+                }
+            }
+        } else {
+            form_failed += 1;
+            true
+        };
+
+        if needs_repair {
+            turn.repair_attempted = true;
+            let repair_user = build_reextract_user_message(user, narrator);
+            match provider
+                .complete_structured_prompt(
+                    &repair_settings,
+                    &structured_system,
+                    &repair_user,
+                    0.3,
+                    Some(Duration::from_millis(LOCAL_REPAIR_TIMEOUT_MS)),
+                    EVALUATOR_OPS_SCHEMA_NAME,
+                    &evaluator_ops_json_schema(),
+                )
+                .await
+            {
+                Err(err) => turn.repair_error = Some(format!("repair call failed: {err}")),
+                Ok(repair_completion) => match compile_evaluator_structured_runtime(
+                    &repair_completion.raw_text,
+                    Some(StructuredEnforcement::JsonSchema),
+                    &soul,
+                    &session_world,
+                    user,
+                    narrator,
+                    None,
+                ) {
+                    Err(err) => turn.repair_error = Some(err),
+                    Ok(outcome) => {
+                        turn.repair_ops = outcome.structured_ops_count.unwrap_or(0);
+                        turn.repair_recovered = !outcome.conversion.patch.is_empty();
+                        if turn.repair_recovered {
+                            repair_recovered += 1;
+                        }
+                    }
+                },
+            }
+        }
+        per_turn.push(turn);
+    }
+
+    Ok(SessionFormEvalReport {
+        conversation_id,
+        model: form_settings.model.clone(),
+        turns_total: turns.len(),
+        form_passed,
+        form_failed,
+        repair_recovered,
+        per_turn,
+    })
 }
 
 #[tauri::command]
@@ -20259,7 +20929,7 @@ fn sanitize_state_updater_patch(
                     .push("Establish the first scene".into());
                 world_patch
                     .active_plot_resolve
-                    .push("Establish the first scene ??Aurora is alone, expecting company, or has just let someone in.".into());
+                    .push("Establish the first scene - Aurora is alone, expecting company, or has just let someone in.".into());
                 world_patch.active_plot_add.push(plot.into());
             }
         }
@@ -22376,7 +23046,12 @@ mod tests {
         };
 
         let provider = crate::providers::api::ApiProvider::default();
-        let schema = crate::providers::api::evaluator_patch_json_schema();
+        // The ops schema (schema_version/ops/no_op_reason) — NOT the EnginePatch
+        // schema; the repair path validates against EvaluatorStructuredOutputV1.
+        let schema = evaluator_ops_json_schema();
+        // The slow FORM (non-tool-call) stage is opt-in: it adds a large second
+        // call per scene (~5 min on CPU) and isn't validated. Set REPAIR_BENCH_FORM=1.
+        let run_form_stage = std::env::var("REPAIR_BENCH_FORM").is_ok();
         let structured_system = build_structured_evaluator_prompt(&soul, Some(&world));
         let form_system = crate::providers::api::build_state_updater_prompt(&soul, Some(&world));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -22386,17 +23061,25 @@ mod tests {
 
         println!("\n=== repair_bench  model='{model}'  url='{url}' ===");
         for (name, user, narrator) in &scenes {
-            // Stage 1: FORM (non-tool-call) state-update attempt — what the primary
-            // evaluator does; we only show its raw output for inspection.
-            let form_user = format!("User: {user}\nNarrator: {narrator}");
-            let form_started = Instant::now();
-            let form_raw = runtime
-                .block_on(provider.complete_streaming(&settings, &form_system, &form_user, |_| {
-                    Ok(())
-                }))
-                .map(|completion| completion.raw_text)
-                .unwrap_or_else(|err| format!("<form call failed: {err}>"));
-            let form_elapsed = form_started.elapsed();
+            println!("\n--- scene '{name}' ---");
+
+            // Stage 1 (opt-in): FORM (non-tool-call) state-update attempt — what the
+            // primary evaluator does; shown raw for inspection, not validated.
+            if run_form_stage {
+                let form_user = format!("User: {user}\nNarrator: {narrator}");
+                let form_started = Instant::now();
+                let form_raw = runtime
+                    .block_on(provider.complete_streaming(&settings, &form_system, &form_user, |_| {
+                        Ok(())
+                    }))
+                    .map(|completion| completion.raw_text)
+                    .unwrap_or_else(|err| format!("<form call failed: {err}>"));
+                println!(
+                    "  form(non-tool): {:.1}s, {} chars raw",
+                    form_started.elapsed().as_secs_f64(),
+                    form_raw.trim().len()
+                );
+            }
 
             // Stage 2: REPAIR (reextract) — the thing under test. Validated.
             let repair_user = build_reextract_user_message(user, narrator);
@@ -22412,12 +23095,6 @@ mod tests {
             ));
             let elapsed = started.elapsed();
 
-            println!("\n--- scene '{name}' ---");
-            println!(
-                "  form(non-tool): {:.1}s, {} chars raw",
-                form_elapsed.as_secs_f64(),
-                form_raw.trim().len()
-            );
             match result {
                 Err(err) => println!("  repair: CALL FAILED after {:.1}s: {err}", elapsed.as_secs_f64()),
                 Ok(completion) => match compile_evaluator_structured_runtime(
@@ -22435,16 +23112,27 @@ mod tests {
                         completion.raw_text.trim()
                     ),
                     Ok(outcome) => {
+                        let out = &outcome.output;
                         println!(
-                            "  repair: {:.1}s, ops_parsed={} accepted={} rejected={}",
+                            "  repair: {:.1}s | ops_parsed={} | extracted mem={} rel={} obj={} world={} | patch_empty={} | accepted={} rejected={}",
                             elapsed.as_secs_f64(),
                             outcome.structured_ops_count.unwrap_or(0),
+                            out.memory_candidates.len(),
+                            out.relationship_evaluations.len(),
+                            out.object_changes.len(),
+                            out.world_changes.len(),
+                            outcome.conversion.patch.is_empty(),
                             outcome.conversion.accepted_candidate_ids.len(),
                             outcome.conversion.rejected_candidates.len(),
                         );
+                        if let Some(reason) = &out.no_op_reason {
+                            println!("      no_op_reason: {reason}");
+                        }
                         for rejection in &outcome.conversion.rejected_candidates {
                             println!("      rejected {}: {}", rejection.candidate_id, rejection.reason);
                         }
+                        let preview: String = completion.raw_text.trim().chars().take(600).collect();
+                        println!("      raw: {preview}");
                     }
                 },
             }

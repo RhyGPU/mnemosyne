@@ -40,6 +40,9 @@ export type RecentMemory = {
     | "verified_engine"
     | "actual_system_event"
     | "unknown";
+  is_pinned?: boolean;
+  is_active?: boolean;
+  archived?: boolean;
   architecture_verified?: boolean;
 };
 
@@ -179,6 +182,104 @@ export type ConversationSummary = {
   archived_at?: number | null;
   active_evaluator_profile_id?: string | null;
   is_benchmark?: boolean;
+};
+
+export type SessionStateHubItem = {
+  conversation: ConversationSummary;
+  soul_name: string;
+  setting_name: string;
+  location: string;
+  time_elapsed: string;
+  current_scene: string;
+  focus: string;
+  turn_counter: number;
+  memory_count: number;
+  core_memory_count: number;
+  recent_memory_count: number;
+  schema_count: number;
+  relationship_count: number;
+  positive_relationship_count: number;
+  object_count: number;
+  event_count: number;
+  active_plot_count: number;
+};
+
+export type StateMapSceneItem = {
+  session_id: string;
+  session_title: string;
+  soul_name: string;
+  setting_name: string;
+  turn_counter: number;
+  location: string;
+  time_elapsed: string;
+  current_scene: string;
+  focus: string;
+  last_user_action: string;
+  pressure_point: string;
+};
+
+export type StateMapCharacterItem = {
+  session_id: string;
+  session_title: string;
+  name: string;
+  role: string;
+  detail: string;
+};
+
+export type StateMapRelationshipItem = {
+  session_id: string;
+  session_title: string;
+  soul_name: string;
+  target: string;
+  love_type: string;
+  trust: number;
+  affection: number;
+  intimacy: number;
+  fear: number;
+  desire: number;
+};
+
+export type StateMapObjectItem = {
+  session_id: string;
+  session_title: string;
+  name: string;
+  kind: string;
+  owner: string;
+  location: string;
+  status: string;
+  summary: string;
+  confidence: number;
+};
+
+export type StateMapTimelineItem = {
+  session_id: string;
+  session_title: string;
+  turn_counter: number;
+  content: string;
+};
+
+export type StateMapMemoryItem = {
+  session_id: string;
+  session_title: string;
+  soul_name: string;
+  content: string;
+  tag: string;
+  source_turn: number | null;
+  confidence: number | null;
+  truth_status: string;
+  source_type: string;
+  is_pinned: boolean;
+  is_active: boolean;
+};
+
+export type SessionStateMap = {
+  sessions: SessionStateHubItem[];
+  scenes: StateMapSceneItem[];
+  characters: StateMapCharacterItem[];
+  relationships: StateMapRelationshipItem[];
+  objects: StateMapObjectItem[];
+  timeline: StateMapTimelineItem[];
+  memories: StateMapMemoryItem[];
 };
 
 export type PlayerPersona = {
@@ -897,13 +998,126 @@ export function listSoulsDebug(): Promise<SoulSummary[]> {
 
 export function listConversations(): Promise<ConversationSummary[]> {
   return invokeOrPreview("list_conversations", {}, () =>
-    browserConversations.map(summarizePreviewConversation),
+    [...browserConversations]
+      .filter((conversation) => !(conversation as any).archived_at)
+      .sort((a, b) => b.updated_at - a.updated_at || b.created_at - a.created_at)
+      .map(summarizePreviewConversation),
   );
+}
+
+export function touchConversationAccess(conversationId: string): Promise<ConversationSummary> {
+  return invokeOrPreview("touch_conversation_access", { conversationId }, () => {
+    const conversation = browserConversations.find((item) => item.conversation_id === conversationId);
+    if (!conversation || (conversation as any).archived_at) {
+      throw new Error(`Conversation not found: ${conversationId}`);
+    }
+    conversation.updated_at = Math.floor(Date.now() / 1000);
+    browserConversations = [
+      conversation,
+      ...browserConversations.filter((item) => item.conversation_id !== conversationId),
+    ];
+    return summarizePreviewConversation(conversation);
+  });
+}
+
+export function listSessionStateHub(): Promise<SessionStateHubItem[]> {
+  return invokeOrPreview("list_session_state_hub", {}, () =>
+    browserConversations.map((conversation) => {
+      const summary = summarizePreviewConversation(conversation);
+      const soul = browserSouls.find((item) => item.character_id === summary.soul_id);
+      const setting = browserSettings.find((item) => item.setting_id === summary.source_setting_id);
+      const world = soul?.world as (WorldState & { scene_state?: { current_scene?: string; focus?: string }; object_states?: unknown[] }) | undefined;
+      const relationships = soul ? Object.values(soul.relationships ?? {}) : [];
+      return {
+        conversation: summary,
+        soul_name: soul?.character_name ?? "Unknown soul",
+        setting_name: setting?.setting_name ?? "Unknown setting",
+        location: world?.location ?? "",
+        time_elapsed: world?.time_elapsed ?? "",
+        current_scene: world?.scene_state?.current_scene ?? "",
+        focus: world?.scene_state?.focus ?? "",
+        turn_counter: soul?.turn_counter ?? summary.message_count,
+        memory_count: (soul?.memory.core.length ?? 0) + (soul?.memory.recent.length ?? 0) + (soul?.memory.schemas.length ?? 0),
+        core_memory_count: soul?.memory.core.length ?? 0,
+        recent_memory_count: soul?.memory.recent.length ?? 0,
+        schema_count: soul?.memory.schemas.length ?? 0,
+        relationship_count: relationships.length,
+        positive_relationship_count: relationships.filter(
+          (relationship) =>
+            relationship.trust > 35 ||
+            relationship.affection > 35 ||
+            relationship.intimacy > 35 ||
+            relationship.desire > 35,
+        ).length,
+        object_count: Math.max(world?.key_objects.length ?? 0, world?.object_states?.length ?? 0),
+        event_count: world?.recent_events.length ?? 0,
+        active_plot_count: world?.active_plots.length ?? 0,
+      };
+    }),
+  );
+}
+
+export function listSessionStateMap(): Promise<SessionStateMap> {
+  return invokeOrPreview("list_session_state_map", {}, async () => {
+    const sessions = await listSessionStateHub();
+    return {
+      sessions,
+      scenes: sessions.map((item) => ({
+        session_id: item.conversation.conversation_id,
+        session_title: item.conversation.title || "Untitled session",
+        soul_name: item.soul_name,
+        setting_name: item.setting_name,
+        turn_counter: item.turn_counter,
+        location: item.location,
+        time_elapsed: item.time_elapsed,
+        current_scene: item.current_scene,
+        focus: item.focus,
+        last_user_action: item.conversation.last_message_preview ?? "",
+        pressure_point: item.focus,
+      })),
+      characters: sessions.map((item) => ({
+        session_id: item.conversation.conversation_id,
+        session_title: item.conversation.title || "Untitled session",
+        name: item.soul_name,
+        role: "session soul",
+        detail: `${item.memory_count} memories / ${item.relationship_count} relationships`,
+      })),
+      relationships: [],
+      objects: [],
+      timeline: sessions
+        .filter((item) => item.conversation.last_message_preview)
+        .map((item) => ({
+          session_id: item.conversation.conversation_id,
+          session_title: item.conversation.title || "Untitled session",
+          turn_counter: item.turn_counter,
+          content: item.conversation.last_message_preview ?? "",
+        })),
+      memories: sessions.map((item) => ({
+        session_id: item.conversation.conversation_id,
+        session_title: item.conversation.title || "Untitled session",
+        soul_name: item.soul_name,
+        content: item.current_scene || item.focus || item.conversation.last_message_preview || "No memory preview yet.",
+        tag: "session",
+        source_turn: null,
+        confidence: null,
+        truth_status: "preview",
+        source_type: "preview",
+        is_pinned: false,
+        is_active: true,
+      })),
+    };
+  });
 }
 
 export function listPlayerPersonas(): Promise<PlayerPersona[]> {
   return invokeOrPreview("list_player_personas", {}, () =>
     [...BUILT_IN_PLAYER_PERSONAS, ...browserPlayerPersonas.filter((persona) => !persona.is_archived)],
+  );
+}
+
+export function listArchivedPlayerPersonas(): Promise<PlayerPersona[]> {
+  return invokeOrPreview("list_archived_player_personas", {}, () =>
+    browserPlayerPersonas.filter((persona) => persona.is_archived),
   );
 }
 
@@ -1206,6 +1420,15 @@ export function archiveSoul(soulId: string): Promise<boolean> {
   });
 }
 
+export function purgeSoul(soulId: string): Promise<boolean> {
+  return invokeOrPreview("purge_soul", { soulId }, () => {
+    const index = browserSouls.findIndex((item) => item.character_id === soulId);
+    if (index === -1) return false;
+    browserSouls.splice(index, 1);
+    return true;
+  });
+}
+
 export function restoreSoul(soulId: string): Promise<boolean> {
   return invokeOrPreview("restore_soul", { soulId }, () => {
     const soul = browserSouls.find((item) => item.character_id === soulId);
@@ -1256,6 +1479,18 @@ export function archiveSetting(settingId: string, activeOrDefaultIds: string[]):
       return Promise.resolve(true);
     }
     return Promise.resolve(false);
+  });
+}
+
+export function purgeSetting(settingId: string, activeOrDefaultIds: string[]): Promise<boolean> {
+  return invokeOrPreview("purge_setting", { settingId, activeOrDefaultIds }, () => {
+    if (activeOrDefaultIds.includes(settingId)) {
+      return Promise.reject(new Error("Cannot purge the active/default setting. Switch settings first."));
+    }
+    const index = browserSettings.findIndex((item) => item.setting_id === settingId);
+    if (index === -1) return Promise.resolve(false);
+    browserSettings.splice(index, 1);
+    return Promise.resolve(true);
   });
 }
 
@@ -1554,6 +1789,42 @@ export function runEvaluatorContractTest(profileId: string): Promise<EvaluatorCo
       evaluator_compatibility_status_label: "untested"
     };
   });
+}
+
+export type SessionFormEvalTurn = {
+  turn_index: number;
+  user_excerpt: string;
+  form_passed: boolean;
+  form_error: string | null;
+  repair_attempted: boolean;
+  repair_ops: number;
+  repair_recovered: boolean;
+  repair_error: string | null;
+};
+
+export type SessionFormEvalReport = {
+  conversation_id: string;
+  model: string;
+  turns_total: number;
+  form_passed: number;
+  form_failed: number;
+  repair_recovered: number;
+  per_turn: SessionFormEvalTurn[];
+};
+
+/** Dev-mode: replay the open session's chat log through the FORM evaluator + repair,
+ * dry-run validated (nothing applied). */
+export function runSessionFormEvalBenchmark(
+  conversationId: string,
+  profileId: string,
+): Promise<SessionFormEvalReport> {
+  return invokeOrPreview(
+    "run_session_form_eval_benchmark",
+    { conversationId, profileId },
+    () => {
+      throw new Error("Session form-eval benchmark requires the Tauri runtime.");
+    },
+  );
 }
 
 export type StructuredEvaluatorDiagnosticRun = {
