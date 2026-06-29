@@ -10,6 +10,8 @@ import {
   FileUp,
   Image as ImageIcon,
   MessageSquareText,
+  PanelLeftClose,
+  PanelLeftOpen,
   Pencil,
   Play,
   RefreshCcw,
@@ -51,6 +53,8 @@ import {
   ProviderProfile,
   SettingSoul,
   SettingSummary,
+  SessionStateHubItem,
+  SessionStateMap,
   Soul,
   SoulSummary,
   TurnDebug,
@@ -99,6 +103,8 @@ import {
   previewMneImport,
   importMneAsNew,
   listConversations,
+  listSessionStateHub,
+  listSessionStateMap,
   listArchivedSessions,
   openSessionDataLocation,
   listProviderProfiles,
@@ -201,7 +207,7 @@ const DEV_LOG_LEVELS: DevLogLevel[] = ["info", "warn", "error", "debug", "succes
 type ProviderKind = "Mock" | "API";
 type BenchmarkTurnPhase = "player_generation" | "execute_turn" | "evaluator_wait" | "turn_summary" | "completed";
 type NarrativeMode = "Realistic" | "Reader" | "Active Director" | "GM Simulation" | "Custom";
-type AppView = "library" | "editor" | "chat";
+type AppView = "home" | "library" | "editor" | "chat" | "statemap" | "settings";
 type ChatStartMode = "continue" | "fresh";
 type DisclaimerMode = "launch" | "manual" | null;
 type SettingsTab = "ai" | "chat" | "dev";
@@ -293,7 +299,7 @@ type BenchmarkLiveContext = {
   playerProfileId: string;
   playerGoal: string;
   /** Opposing/user side uses the traditional RP engine (full chat, no memory)
-   * instead of the player simulator — the comparison-benchmark control. */
+   * instead of the player simulator - the comparison-benchmark control. */
   traditionalOpponent: boolean;
   settings: BenchmarkSettings;
   narratorSettings: ApiProviderSettings;
@@ -504,6 +510,18 @@ export function App() {
   const [settings, setSettings] = useState<SettingSummary[]>([]);
   const [archivedSettings, setArchivedSettings] = useState<SettingSummary[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [sessionStateHub, setSessionStateHub] = useState<SessionStateHubItem[]>([]);
+  const [sessionStateMap, setSessionStateMap] = useState<SessionStateMap | null>(null);
+  async function refreshSessionStateHub() {
+    try {
+      const [hub, map] = await Promise.all([listSessionStateHub(), listSessionStateMap()]);
+      setSessionStateHub(hub);
+      setSessionStateMap(map);
+    } catch (error) {
+      console.error(error);
+      logDev("warn", "db", "Failed to load State Map hub", { error: String(error) });
+    }
+  }
   async function refreshConversations() {
     try {
       const [active, archived] = await Promise.all([
@@ -517,6 +535,7 @@ export function App() {
         setConversations(await listConversations());
       } catch (_) {}
     }
+    await refreshSessionStateHub();
   }
   async function refreshArchivedSettings() {
     try {
@@ -618,7 +637,7 @@ export function App() {
   const [selectedStateUpdaterProfileId, setSelectedStateUpdaterProfileId] = useState(() =>
     localStorage.getItem(UPDATER_PROVIDER_PROFILE_STORAGE_KEY) ?? "",
   );
-  // The light, local repair model — its own provider slot, separate from the
+  // The light, local repair model has its own provider slot, separate from the
   // narrator and the (smart) evaluator. Empty = fall back to the evaluator's
   // settings (and, once shipped, the embedded local model).
   const [selectedRepairProfileId, setSelectedRepairProfileId] = useState(() =>
@@ -702,11 +721,13 @@ export function App() {
     localStorage.setItem(STRUCTURED_EVALUATOR_TRANSPORT_STORAGE_KEY, transport);
   };
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
-  const [view, setView] = useState<AppView>("library");
+  const [view, setView] = useState<AppView>("home"); // v2 overhaul: rail-driven views
+  const [railCollapsed, setRailCollapsed] = useState(false);
   const [chatStartMode, setChatStartMode] = useState<ChatStartMode>(loadStoredChatStartMode);
   const [sessionContinuityLabel, setSessionContinuityLabel] = useState("New Session starts from the selected Soul snapshot");
   const [currentSessionTitle, setCurrentSessionTitle] = useState("New Session");
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [stateMapDetailConversationId, setStateMapDetailConversationId] = useState<string | null>(null);
   const [selectedCharacterIds, setSelectedCharacterIds] = useState<string[]>([]);
   const [selectedAvatarAsset, setSelectedAvatarAsset] = useState<ImageAsset | null>(null);
   const [draftAvatarAsset, setDraftAvatarAsset] = useState<ImageAsset | null>(null);
@@ -721,9 +742,7 @@ export function App() {
   >(null);
   const [payloadCopied, setPayloadCopied] = useState(false);
   const [exportFeedback, setExportFeedback] = useState("");
-  const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(() =>
-    loadStoredBoolean(SETTINGS_DRAWER_OPEN_STORAGE_KEY, false),
-  );
+  const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>(loadStoredSettingsTab);
   const [devConsoleOpen, setDevConsoleOpen] = useState(false);
   const [latestPipelineTrace, setLatestPipelineTrace] = useState<TurnPipelineTrace | null>(null);
@@ -919,7 +938,7 @@ export function App() {
     try {
       const status = await startEmbeddedRepairModel(embeddedModelPath.trim(), 8080, null);
       setEmbeddedModel(status);
-      setStatus("Embedded repair model starting…");
+      setStatus("Embedded repair model starting...");
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       setEmbeddedModelError(detail);
@@ -947,7 +966,7 @@ export function App() {
 
   // Re-run local repair (re-extraction) on every turn of the current session,
   // using the configured repair endpoint. Lets the user recover state that was
-  // dropped when repair was unavailable — without re-running the whole benchmark.
+  // dropped when repair was unavailable without re-running the whole benchmark.
   async function handleRetrySessionRepair() {
     const settings = repairSettingsRef.current;
     const conversationId = currentConversationId;
@@ -1012,7 +1031,7 @@ export function App() {
         }
         if (status?.ready) return true;
         // CRITICAL: only spawn when nothing is running. A running-but-not-ready
-        // model is loading or just busy under load — and start_embedded_repair_model
+        // model is loading or just busy under load, and start_embedded_repair_model
         // KILLS the existing instance first. Restarting a busy model mid-repair is a
         // death spiral on slow CPUs (a /health timeout during generation looks like
         // "not ready", we kill it, the in-flight repair hits a dead port). So if it's
@@ -1022,7 +1041,7 @@ export function App() {
           if (!path) return false;
           try {
             await startEmbeddedRepairModel(path, 8080, null);
-            setStatus("Starting local repair model…");
+            setStatus("Starting local repair model...");
           } catch (error) {
             setEmbeddedModelError(error instanceof Error ? error.message : String(error));
             return false;
@@ -1063,7 +1082,7 @@ export function App() {
       if (!isReextract && !payload.failed_ops?.length) return;
       const settings = repairSettingsRef.current;
       if (!settings) return;
-      // If repair targets the local model, verify it's actually reachable first —
+      // If repair targets the local model, verify it's actually reachable first ??
       // otherwise the call silently connection-refuses and state is dropped. Tell
       // the user to fix it in Settings instead of failing invisibly.
       const targetsLocalModel = /\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)/i.test(settings.base_url ?? "");
@@ -1284,10 +1303,6 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(CUSTOM_NARRATOR_PROMPT_STORAGE_KEY, apiSettings.system_prompt);
   }, [apiSettings.system_prompt]);
-
-  useEffect(() => {
-    localStorage.setItem(SETTINGS_DRAWER_OPEN_STORAGE_KEY, settingsDrawerOpen ? "true" : "false");
-  }, [settingsDrawerOpen]);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_DRAWER_TAB_STORAGE_KEY, settingsTab);
@@ -1811,7 +1826,6 @@ export function App() {
         const firstLaunchSeen = localStorage.getItem(SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY) === "true";
         if (!firstLaunchSeen) {
           setSettingsTab("ai");
-          setSettingsDrawerOpen(true);
           localStorage.setItem(SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY, "true");
         }
         return;
@@ -2278,10 +2292,10 @@ export function App() {
       return;
     }
     if (raw === "/help") {
-      logDev("info", "app", "commands: /chat <message> · /clear · /help");
+      logDev("info", "app", "commands: /chat <message> - /clear - /help");
       return;
     }
-    logDev("warn", "app", `unknown command: ${raw} — type /help`);
+    logDev("warn", "app", `unknown command: ${raw} - type /help`);
   }
 
   function handleDraftChange(value: string) {
@@ -3039,6 +3053,13 @@ export function App() {
     }
   }
 
+  async function handleInspectStateMapSession(conversation: ConversationSummary) {
+    await handleSelectConversation(conversation);
+    setStateMapDetailConversationId(conversation.conversation_id);
+    setView("statemap");
+    void refreshSessionStateHub();
+  }
+
   async function handleAvatarImageSelected(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -3790,7 +3811,7 @@ export function App() {
   // The only optional deviations are:
   //   - "Wait for evaluator each turn": runs the evaluator as a tracked
   //     BACKGROUND job (so the evaluator banner stays live), and the loop waits
-  //     on that job before the next turn — keeping per-turn commit ordering.
+  //     on that job before the next turn, keeping per-turn commit ordering.
   //   - "Strict Tool Evaluator": opt-in probe that pins the evaluator to
   //     structured tool-calling. OFF (default for faithful repro) = your exact
   //     chat evaluator settings flow through untouched.
@@ -3798,7 +3819,7 @@ export function App() {
     const waitOverride: Partial<ApiProviderSettings> = settings.wait_for_evaluator_each_turn
       ? {
           // Background so a job row is created and `evaluator_job_status_changed`
-          // events fire → the tracker UI updates. The loop (waitForBenchmark-
+          // events fire, the tracker UI updates. The loop (waitForBenchmark-
           // EvaluatorJob) blocks on the job before capturing the turn summary
           // and the next message, so state is committed in order.
           evaluator_background_enabled: true,
@@ -3822,7 +3843,7 @@ export function App() {
   }
 
   // Wait between live benchmark turns until the background evaluator has
-  // committed — EVENT-DRIVEN: resolves the instant the job's completion event
+  // committed. EVENT-DRIVEN: resolves the instant the job's completion event
   // arrives (no poll lag), which is why this is much faster than the old 700ms
   // polling loop. A slow 3s poll is kept in case an event is missed. The job's
   // configured timeout is authoritative; in no-app-timeout mode Stop remains
@@ -3888,11 +3909,11 @@ export function App() {
     setBenchmarkError(null);
     setStatus("Preparing live benchmark session...");
     // Auto-start the local repair model if it's configured but not up, and wait
-    // for it to be ready before running turns — so repair has a live endpoint
+    // for it to be ready before running turns so repair has a live endpoint
     // instead of silently connection-refusing. Non-fatal: if it won't start, we
     // warn and run anyway (the scorecard reports local_repair_unavailable).
     if (embeddedModelPath.trim()) {
-      setStatus("Ensuring local repair model is up…");
+      setStatus("Ensuring local repair model is up...");
       // Single shared implementation (also used by the repair listener): starts
       // the model if needed and waits for it to actually answer before turn 1.
       const localReady = await ensureLocalRepairModelReady(120000);
@@ -4006,7 +4027,7 @@ export function App() {
     let phase: BenchmarkTurnPhase = "player_generation";
     try {
       const opponentLabel = ctx.traditionalOpponent ? "Traditional RP" : "AI player";
-      setStatus(`${turnLabel}: ${opponentLabel} thinking…`);
+      setStatus(`${turnLabel}: ${opponentLabel} thinking...`);
       const generate = ctx.traditionalOpponent
         ? generateTraditionalRpMessage
         : generateBenchmarkPlayerMessage;
@@ -4031,7 +4052,7 @@ export function App() {
         benchmarkLiveUpdaterOverride(ctx.settings),
         { rethrowErrors: true },
       );
-      // Stop may have aborted the narrator mid-stream — don't record a partial
+      // Stop may have aborted the narrator mid-stream, so don't record a partial
       // turn; bail and let the effect finalize what actually completed.
       if (benchmarkStopRef.current) {
         benchmarkTurnInFlightRef.current = false;
@@ -4927,7 +4948,7 @@ export function App() {
           onChange={(event) => setBenchmarkStrictToolEvaluator(event.target.checked)}
           disabled={benchmarkRunning}
         />
-        <span>Strict Tool Evaluator (diagnostic probe — overrides your chat evaluator settings)</span>
+        <span>Strict Tool Evaluator (diagnostic probe - overrides your chat evaluator settings)</span>
       </label>
       <label className="toggle-row">
         <input
@@ -4945,7 +4966,7 @@ export function App() {
           onChange={(event) => setBenchmarkTraditionalOpponent(event.target.checked)}
           disabled={benchmarkRunning}
         />
-        <span>Traditional RP opponent (full chat, no memory — comparison)</span>
+        <span>Traditional RP opponent (full chat, no memory - comparison)</span>
       </label>
       <div className="button-row">
         <button
@@ -5143,7 +5164,7 @@ export function App() {
                     <option key={m} value={m} />
                   ))}
                 </datalist>
-                <small className="field-hint">{knownModels.length} saved · type a new id and it’s remembered</small>
+                <small className="field-hint">{knownModels.length} saved - type a new id and it's remembered</small>
               </label>
               <label className="field">
                 <span>Narrator Timeout (seconds)</span>
@@ -5302,7 +5323,7 @@ export function App() {
                   onChange={(event) => updateStructuredEvaluatorTransport(event.target.value)}
                   disabled={busy}
                 >
-                  <option value="auto">Auto ??tool calls first, then JSON schema</option>
+                  <option value="auto">Auto - tool calls first, then JSON schema</option>
                   <option value="tool_call">Tool calls (require real function calls)</option>
                   <option value="json_schema">JSON schema (response_format)</option>
                   <option value="json_object">JSON object</option>
@@ -5316,9 +5337,9 @@ export function App() {
                   onChange={(event) => updateEvaluatorExecutionMode(event.target.value)}
                   disabled={busy}
                 >
-                  <option value="balanced">Balanced ??evaluate every turn</option>
-                  <option value="fast">Fast ??skip dialogue-only turns, catch up later</option>
-                  <option value="long_context">Long Context ??evaluate every turn</option>
+                  <option value="balanced">Balanced - evaluate every turn</option>
+                  <option value="fast">Fast - skip dialogue-only turns, catch up later</option>
+                  <option value="long_context">Long Context - evaluate every turn</option>
                 </select>
               </label>
             </div>
@@ -5511,8 +5532,8 @@ export function App() {
                         ? "PASS"
                         : "FAIL"}
                     </strong>{" "}
-                    {structuredDiagnosticResult.provider_model} · enforcement{" "}
-                    {structuredDiagnosticResult.structured_enforcement_per_run.join(", ") || "none"} · fallback{" "}
+                    {structuredDiagnosticResult.provider_model} - enforcement{" "}
+                    {structuredDiagnosticResult.structured_enforcement_per_run.join(", ") || "none"} - fallback{" "}
                     {structuredDiagnosticResult.fallback_paths.map((path) => path.join(" > ")).join(" | ") || "none"}
                     <br />
                     Payload: {structuredDiagnosticResult.payload_history_path}
@@ -5589,7 +5610,7 @@ export function App() {
                   {embeddedModel.running
                     ? embeddedModel.ready
                       ? "Embedded model running"
-                      : "Starting…"
+                      : "Starting..."
                     : "Start embedded model"}
                 </span>
               </button>
@@ -5606,18 +5627,18 @@ export function App() {
                 className="ghost-action"
                 onClick={() => void handleRetrySessionRepair()}
                 disabled={retryRepairBusy}
-                title="Re-run local repair (re-extraction) on every turn of the current session — recovers state that was dropped when repair was unavailable, without re-running the benchmark."
+                title="Re-run local repair (re-extraction) on every turn of the current session - recovers state that was dropped when repair was unavailable, without re-running the benchmark."
               >
-                <span>{retryRepairBusy ? "Retrying repair…" : "Retry repair on session"}</span>
+                <span>{retryRepairBusy ? "Retrying repair..." : "Retry repair on session"}</span>
               </button>
             </div>
             <p className="provider-note">
               {embeddedModel.ready
-                ? `Embedded model ready at ${embeddedModel.url} — repair uses it automatically when no profile is selected above.`
+                ? `Embedded model ready at ${embeddedModel.url} - repair uses it automatically when no profile is selected above.`
                 : embeddedModel.running
-                  ? "Embedded model loading… large models can take a minute."
+                  ? "Embedded model loading - large models can take a minute."
                   : "Drop a single-file llamafile in your project, put its full path above, and Start. Repair will use it automatically."}
-              {embeddedModelError ? ` — ${embeddedModelError}` : ""}
+              {embeddedModelError ? ` - ${embeddedModelError}` : ""}
             </p>
             <p className="provider-note">
               Pick a saved local/light profile above to point repair at your own endpoint instead.
@@ -5750,17 +5771,7 @@ export function App() {
       <span>Settings</span>
     </button>
   );
-  const settingsDrawerPanel = settingsDrawerOpen ? (
-    <aside className="settings-drawer-panel" aria-label="Settings">
-      <header className="settings-drawer-header">
-        <div>
-          <span className="eyebrow">Preferences</span>
-          <h2>Settings</h2>
-        </div>
-        <button type="button" onClick={() => setSettingsDrawerOpen(false)}>
-          Close
-        </button>
-      </header>
+  const settingsContent = (
       <div className="settings-drawer-main">
       <nav className="settings-drawer-tabs" aria-label="Settings categories">
         {(["ai", "chat", "dev"] as SettingsTab[]).map((tab) => (
@@ -5881,12 +5892,14 @@ export function App() {
                   type="button"
                   className="ghost-action"
                   onClick={() => {
-                    setDevConsoleOpen(true);
+                    setView("chat");
+                    setDevModeActive(true);
                     setSettingsDrawerOpen(false);
                   }}
+                  disabled={!currentConversationId}
                 >
                   <Terminal size={16} />
-                  <span>Open Dev Console</span>
+                  <span>Open Dev Mode</span>
                 </button>
                 <button type="button" className="ghost-action" onClick={handleExportLlmPayloadHistory} disabled={busy || !currentConversationId}>
                   <FileDown size={16} />
@@ -5898,6 +5911,19 @@ export function App() {
         ) : null}
       </div>
       </div>
+  );
+  const settingsDrawerPanel = settingsDrawerOpen ? (
+    <aside className="settings-drawer-panel" aria-label="Settings">
+      <header className="settings-drawer-header">
+        <div>
+          <span className="eyebrow">Preferences</span>
+          <h2>Settings</h2>
+        </div>
+        <button type="button" onClick={() => setSettingsDrawerOpen(false)}>
+          Close
+        </button>
+      </header>
+      {settingsContent}
     </aside>
   ) : null;
   const devConsoleToggle = (
@@ -6151,11 +6177,70 @@ export function App() {
     return disclaimerScreen;
   }
 
+  const railShellClass = railCollapsed ? " rail-collapsed" : "";
+  const railNav = (
+    <nav className={`app-rail${railShellClass}`} aria-label="Primary navigation">
+      <div className="app-rail-brand" title="Mnemosyne">
+        <strong>Mnemosyne</strong>
+        <span>the narrator writes / the state map remembers</span>
+      </div>
+      <button
+        type="button"
+        className="app-rail-collapse"
+        onClick={() => setRailCollapsed((collapsed) => !collapsed)}
+        title={railCollapsed ? "Expand navigation" : "Collapse navigation"}
+        aria-label={railCollapsed ? "Expand navigation" : "Collapse navigation"}
+      >
+        {railCollapsed ? <PanelLeftOpen size={16} aria-hidden="true" /> : <PanelLeftClose size={16} aria-hidden="true" />}
+      </button>
+      <button type="button" className={`app-rail-item${view === "home" ? " is-active" : ""}`} onClick={() => setView("home")}>
+        <Database size={18} aria-hidden="true" />
+        <span>Home</span>
+      </button>
+      <button type="button" className={`app-rail-item${view === "chat" ? " is-active" : ""}`} onClick={() => setView("chat")}>
+        <Play size={18} aria-hidden="true" />
+        <span>Play</span>
+      </button>
+      <button type="button" className={`app-rail-item${view === "statemap" ? " is-active" : ""}`} onClick={() => { setView("statemap"); void refreshSessionStateHub(); }}>
+        <Brain size={18} aria-hidden="true" />
+        <span>State Map</span>
+      </button>
+      <button type="button" className={`app-rail-item${view === "editor" || view === "library" ? " is-active" : ""}`} onClick={() => setView("library")}>
+        <FolderOpen size={18} aria-hidden="true" />
+        <span>Library</span>
+      </button>
+      <button type="button" className={`app-rail-item${view === "settings" ? " is-active" : ""}`} onClick={() => { setSettingsDrawerOpen(false); setView("settings"); }}>
+        <Clipboard size={18} aria-hidden="true" />
+        <span>Settings</span>
+      </button>
+      <div className="app-rail-spacer" />
+      <div className="app-rail-engine" aria-label="Engine status">
+        <span>Engine</span>
+        <dl>
+          <div><dt>Narrator</dt><dd>{apiSettings.model || "No model"}</dd></div>
+          <div><dt>Evaluator</dt><dd>{effectiveStateUpdaterSettings.evaluator_mode ?? "form"}</dd></div>
+          <div><dt>Mode</dt><dd>{mode}</dd></div>
+        </dl>
+      </div>
+    </nav>
+  );
+
   if (view === "chat") {
     const currentConversation = conversations.find((c) => c.conversation_id === currentConversationId);
     const isCurrentSessionArchived = currentConversation
       ? (Boolean(currentConversation.archived_at) || currentConversation.title.startsWith("[Archived] "))
       : currentSessionTitle.startsWith("[Archived] ");
+    const defaultPipelineStages = [
+      { stage_name: "Input queued", status: "ready", elapsed_ms: 0 },
+      { stage_name: "Narrator", status: "waiting", elapsed_ms: 0 },
+      { stage_name: "Evaluator", status: "waiting", elapsed_ms: 0 },
+      { stage_name: "Repair pass", status: "waiting", elapsed_ms: 0 },
+      { stage_name: "State map", status: "waiting", elapsed_ms: 0 },
+    ];
+    const pipelineSteps = latestPipelineTrace?.stages.length ? latestPipelineTrace.stages : defaultPipelineStages;
+    const pipelineSummary = latestPipelineTrace
+      ? `${latestPipelineTrace.final_status} / ${latestPipelineTrace.total_elapsed_ms}ms`
+      : "Idle / awaiting input";
 
     if (devModeActive) {
       const devStream: Array<
@@ -6205,7 +6290,7 @@ export function App() {
               {latestPipelineTrace ? (
                 <>
                   <div className="cli-rail-status">
-                    {latestPipelineTrace.final_status} · {latestPipelineTrace.total_elapsed_ms}ms
+                    {latestPipelineTrace.final_status} - {latestPipelineTrace.total_elapsed_ms}ms
                   </div>
                   {latestPipelineTrace.stages.map((stage) => {
                     const { sym, cls } = stageGlyph(stage.status);
@@ -6224,7 +6309,7 @@ export function App() {
             </aside>
             <section className="cli-stream" ref={devStreamRef} aria-label="Stream">
               {devStream.length === 0 ? (
-                <div className="cli-line muted">// stream empty — type /chat &lt;message&gt; to begin</div>
+                <div className="cli-line muted">// stream empty - type /chat &lt;message&gt; to begin</div>
               ) : (
                 devStream.map((item) =>
                   item.kind === "chat" ? (
@@ -6243,60 +6328,97 @@ export function App() {
                 )
               )}
             </section>
+            <aside className="cli-diagnostics" aria-label="Advanced diagnostics">
+              <section className="cli-diag-card">
+                <div className="cli-diag-title">// MEMORY CYCLE</div>
+                <dl className="cli-diag-grid">
+                  <div><dt>core</dt><dd>{soul?.memory.core.length ?? 0}</dd></div>
+                  <div><dt>recent</dt><dd>{soul?.memory.recent.length ?? 0}</dd></div>
+                  <div><dt>schemas</dt><dd>{soul?.memory.schemas.length ?? 0}</dd></div>
+                  <div><dt>turns</dt><dd>{turnsSinceConsolidation}</dd></div>
+                  <div><dt>context</dt><dd>{context?.truncated ? "truncated" : context ? "within budget" : "no payload"}</dd></div>
+                  <div><dt>tokens</dt><dd>{context?.estimated_tokens ?? 0}</dd></div>
+                </dl>
+              </section>
+              <section className="cli-diag-card">
+                <div className="cli-diag-title">// API DEBUG</div>
+                <dl className="cli-diag-grid">
+                  <div><dt>provider</dt><dd>{provider}</dd></div>
+                  <div><dt>mode</dt><dd>{mode}</dd></div>
+                  <div><dt>model</dt><dd>{apiSettings.model || "none"}</dd></div>
+                  <div><dt>evaluator</dt><dd>{effectiveStateUpdaterSettings.evaluator_mode ?? "form"}</dd></div>
+                  <div><dt>transport</dt><dd>{structuredEvaluatorTransport}</dd></div>
+                  <div><dt>fallback</dt><dd>{effectiveStateUpdaterSettings.structured_evaluator_policy ?? "prefer"}</dd></div>
+                </dl>
+              </section>
+              <section className="cli-diag-card">
+                <div className="cli-diag-title">// LLM PAYLOAD</div>
+                <dl className="cli-diag-grid">
+                  <div><dt>system</dt><dd>{llmPayload?.estimated_tokens.system ?? 0}</dd></div>
+                  <div><dt>context</dt><dd>{llmPayload?.estimated_tokens.context ?? 0}</dd></div>
+                  <div><dt>user</dt><dd>{llmPayload?.estimated_tokens.user ?? 0}</dd></div>
+                  <div><dt>total</dt><dd>{llmPayload?.estimated_tokens.total ?? 0}</dd></div>
+                </dl>
+                <div className="cli-diag-actions">
+                  <button type="button" className="cli-mini-btn" onClick={handleCopyLlmPayload} disabled={!llmPayload}>[ COPY PAYLOAD ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={handleExportLlmPayloadHistory} disabled={busy || !currentConversationId}>[ EXPORT HISTORY ]</button>
+                </div>
+              </section>
+              <section className="cli-diag-card danger">
+                <div className="cli-diag-title">// DESTRUCTIVE REPAIR</div>
+                <div className="cli-diag-actions grid">
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleSoulRepair("world")} disabled={busy || !soul}>[ CLEAR WORLD ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleSoulRepair("scenario")} disabled={busy || !soul}>[ CLEAR SCENARIO ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleSoulRepair("events")} disabled={busy || !soul}>[ CLEAR EVENTS ]</button>
+                  <button type="button" className="cli-mini-btn danger" onClick={() => void handleSoulRepair("memories")} disabled={busy || !soul}>[ CLEAR MEMORIES ]</button>
+                </div>
+              </section>
+            </aside>
           </div>
           <form className="cli-input" onSubmit={handleDevTerminalSubmit}>
             <span className="cli-prompt">root@mnemosyne:~$</span>
             <input
               value={devTerminalInput}
               onChange={(event) => setDevTerminalInput(event.target.value)}
-              placeholder="/chat <message> to speak · /help"
+              placeholder="/chat <message> to speak - /help"
               spellCheck={false}
               autoComplete="off"
               autoFocus
             />
-            <span className="cli-cursor" aria-hidden="true">█</span>
+            <span className="cli-cursor" aria-hidden="true">|</span>
           </form>
         </main>
       );
     }
 
     return (
-      <div className="chat-with-sidebar">
-      <aside className="chat-sidebar" aria-label="Sessions">
-        <div className="chat-sidebar-top">
-          <button type="button" className="ghost-action" onClick={() => setView("library")} title="Back to Library">
-            <ArrowLeft size={16} />
-            <span>Library</span>
-          </button>
-          <button type="button" className="ghost-action primary-cta" onClick={() => void handleStartChat()} disabled={busy || !soul} title="Start a new chat">
-            <Sparkles size={16} />
-            <span>New chat</span>
-          </button>
-        </div>
-        <div className="chat-sidebar-list">
-          {visibleConversations.length === 0 ? (
-            <p className="muted chat-sidebar-empty">No sessions yet.</p>
-          ) : (
-            visibleConversations.map((conversation) => (
-              <button
-                key={conversation.conversation_id}
-                type="button"
-                className={`chat-sidebar-item ${conversation.conversation_id === currentConversationId ? "active" : ""}${conversation.archived_at ? " archived" : ""}`}
-                onClick={() => void handleSelectConversation(conversation)}
-                disabled={busy}
-              >
-                <div className="chat-sidebar-item-row">
-                  <span className="chat-sidebar-item-title">{conversation.title || "Untitled"}</span>
-                  <time className="chat-sidebar-item-time">{formatRelativeTime(conversation.updated_at)}</time>
-                </div>
-                {conversation.last_message_preview ? (
-                  <span className="chat-sidebar-item-preview">{conversation.last_message_preview}</span>
-                ) : (
-                  <span className="chat-sidebar-item-preview muted">{conversation.message_count} messages</span>
-                )}
-              </button>
-            ))
-          )}
+      <div className={`chat-with-sidebar${railShellClass}`}>
+      {railNav}
+      <aside className="chat-pipeline-rail" aria-label="Turn pipeline">
+        <div className="rail-progress-card">
+          <div className="rail-progress-head">
+            <span>Turn pipeline</span>
+            <strong>{pipelineSummary}</strong>
+          </div>
+          <ol className="rail-progress-list">
+            {pipelineSteps.map((stage, index) => {
+              const isCompleted = ["completed", "ok", "success"].includes(stage.status);
+              const isRunning = ["running", "pending", "in_progress", "ready"].includes(stage.status);
+              const isFailed = stage.status === "failed" || stage.status === "error";
+              const stateClass = isFailed ? "is-error" : isCompleted ? "is-done" : isRunning ? "is-active" : "is-waiting";
+              return (
+                <li key={`${stage.stage_name}-${index}`} className={`rail-progress-step ${stateClass}`}>
+                  <span className="rail-progress-node" aria-hidden="true" />
+                  <span className="rail-progress-copy">
+                    <span className="rail-progress-name">{stage.stage_name}</span>
+                    <span className="rail-progress-meta">
+                      {latestPipelineTrace ? `${stage.status} / ${stage.elapsed_ms}ms` : index === 0 ? "Ready to send" : "Waiting"}
+                    </span>
+                  </span>
+                </li>
+              );
+            })}
+          </ol>
         </div>
       </aside>
       <main className="chat-only-shell">
@@ -6322,7 +6444,7 @@ export function App() {
                 <Pencil size={14} />
               </button>
             </h1>
-            <p className="session-state-label">{soul?.character_name ?? "Mnemosyne"} · {sessionContinuityLabel}</p>
+            <p className="session-state-label">{soul?.character_name ?? "Mnemosyne"} - {sessionContinuityLabel}</p>
           </div>
           <div className="chat-top-actions">
             <div className="chat-more-menu-wrap">
@@ -6332,7 +6454,7 @@ export function App() {
                 title="More actions"
                 onClick={() => setChatMoreMenuOpen((v) => !v)}
               >
-                ···
+                ...
               </button>
               {chatMoreMenuOpen && (
                 <div className="chat-more-menu" role="menu">
@@ -6373,7 +6495,17 @@ export function App() {
               <span>tok</span>
             </div>
             {settingsDrawerToggle}
-            {devConsoleToggle}
+            <button
+              type="button"
+              className="dev-mode-toggle"
+              onClick={() => setDevModeActive(true)}
+              disabled={!currentConversationId}
+              title="Enter terminal Dev Mode"
+            >
+              <Terminal size={16} />
+              <span>Dev Mode</span>
+              <strong>{devLogs.length}</strong>
+            </button>
           </div>
         </header>
 
@@ -6388,9 +6520,9 @@ export function App() {
                 relationships as the story unfolds.
               </p>
               <ul className="chat-empty-hints">
-                <li><code>*you step inside, still damp from the rain*</code> — narrate an action</li>
-                <li><code>/ooc &lt;message&gt;</code> — talk out of character</li>
-                <li><code>/help</code> — list every command</li>
+                <li><code>*you step inside, still damp from the rain*</code> - narrate an action</li>
+                <li><code>/ooc &lt;message&gt;</code> - talk out of character</li>
+                <li><code>/help</code> - list every command</li>
               </ul>
             </div>
           ) : (
@@ -6760,7 +6892,7 @@ export function App() {
               value={draft}
               onChange={(event) => handleDraftChange(event.target.value)}
               onKeyDown={handleComposerKeyDown}
-              placeholder={`Message ${soul?.character_name ?? "Mnemosyne"} — narrate an action or speak. "/" for commands, Enter to send`}
+              placeholder={`Message ${soul?.character_name ?? "Mnemosyne"} - narrate an action or speak. "/" for commands, Enter to send`}
               disabled={busy}
               rows={2}
               aria-autocomplete="list"
@@ -6810,14 +6942,489 @@ export function App() {
         </form>
         <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
         {settingsDrawerPanel}
-        {devConsolePanel}
       </main>
       </div>
     );
   }
 
+  if (view === "home") {
+    const playedSoulIds = new Set(conversations.map((conversation) => conversation.soul_id));
+    const recent = [...conversations]
+      .filter((conversation) => !conversation.archived_at)
+      .sort((a, b) => b.updated_at - a.updated_at)
+      .slice(0, 8);
+    const hero = recent[0] ?? null;
+    const heroSoul = hero ? souls.find((s) => s.character_id === hero.soul_id) ?? null : null;
+    const recentStrip = recent.slice(hero ? 1 : 0, hero ? 4 : 3);
+    const soulName = (id: string) =>
+      souls.find((s) => s.character_id === id)?.character_name ?? "Unknown soul";
+    const initialOf = (id: string) => (soulName(id).charAt(0) || "?").toUpperCase();
+    const recommended = souls
+      .filter((s) => !s.archived_at && !playedSoulIds.has(s.character_id))
+      .slice(0, 6);
+
+    return (
+      <main className={`app-shell home-shell${railShellClass}`}>
+        {railNav}
+        <header className="home-header">
+          <div>
+            <span className="eyebrow">Home</span>
+            <h1>Your living worlds</h1>
+          </div>
+        </header>
+
+        <div className="home-layout">
+          <div className="home-main">
+            {hero && (
+              <div className="home-hero">
+                <div className="home-hero-head">
+                  <div className="home-hero-avatar">{initialOf(hero.soul_id)}</div>
+                  <div>
+                    <div className="home-hero-kicker">Continue - {formatRelativeTime(hero.updated_at)}</div>
+                    <h2 className="home-hero-title">{hero.title || "Untitled"}</h2>
+                  </div>
+                </div>
+                <p className="home-hero-preview">{hero.last_message_preview ?? `${hero.message_count} messages in this session`}</p>
+                <div className="home-hero-foot">
+                  <button type="button" className="ghost-action primary-cta" onClick={() => void handleSelectConversation(hero)} disabled={busy}>
+                    <Play size={15} aria-hidden="true" />
+                    <span>Resume - {hero.message_count} messages</span>
+                  </button>
+                  <div className="home-hero-stats">
+                    <div className="home-hero-stat"><b>{(heroSoul?.core_count ?? 0) + (heroSoul?.recent_count ?? 0)}</b><span>memories</span></div>
+                    <div className="home-hero-stat"><b>{heroSoul?.core_count ?? 0}</b><span>core</span></div>
+                    <div className="home-hero-stat"><b>{heroSoul?.recent_count ?? 0}</b><span>recent</span></div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="home-feature-row">
+              <section className="home-feature-panel">
+                <div className="home-section-label">Recommended <span className="home-side-note">never played</span></div>
+                {recommended.length === 0 ? (
+                  <p className="home-side-empty">Every soul already has a session.</p>
+                ) : (
+                  <div className="home-feature-list">
+                    {recommended.slice(0, 3).map((s) => (
+                      <button
+                        key={s.character_id}
+                        type="button"
+                        className="home-feature-item"
+                        onClick={() => {
+                          void handleSelectSoul(s.character_id);
+                          setView("library");
+                        }}
+                        disabled={busy}
+                      >
+                        <span className="home-feature-avatar">{(s.character_name.charAt(0) || "?").toUpperCase()}</span>
+                        <span>
+                          <strong>{s.character_name}</strong>
+                          <small>{s.core_count} core / {s.recent_count} recent</small>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </section>
+              <section className="home-feature-panel">
+                <div className="home-section-label">Best rated</div>
+                <div className="home-rating-placeholder">
+                  <strong>Ratings will surface here.</strong>
+                  <span>Once the engine tracks ratings, this becomes the fast path back to your strongest worlds.</span>
+                </div>
+              </section>
+            </div>
+
+            <section className="home-recent-strip" aria-label="Most recent sessions">
+              <div className="home-section-label">Most recent</div>
+              <div className="home-recent-list">
+                {recentStrip.length === 0 ? (
+                  <p className="muted">No sessions yet - start one from the Library.</p>
+                ) : (
+                  recentStrip.map((conversation) => (
+                    <button
+                      key={conversation.conversation_id}
+                      type="button"
+                      className="home-recent-item"
+                      onClick={() => void handleSelectConversation(conversation)}
+                      disabled={busy}
+                    >
+                      <span className="home-recent-avatar">{initialOf(conversation.soul_id)}</span>
+                      <span className="home-recent-copy">
+                        <strong>{conversation.title || "Untitled"}</strong>
+                        <small>{soulName(conversation.soul_id)} / {formatRelativeTime(conversation.updated_at)}</small>
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            </section>
+          </div>
+
+          <aside className="home-side">
+            <div className="home-side-panel home-turn-panel">
+              <div className="home-side-title">How a turn works</div>
+              <div className="home-turn">
+                <div><span className="home-turn-n">01</span><span><b>Narrator</b> writes the visible prose.</span></div>
+                <div><span className="home-turn-n">02</span><span><b>Evaluator</b> extracts schema-checked state patches.</span></div>
+                <div><span className="home-turn-n">03</span><span>The <b>state map</b> updates - nothing re-sent next turn.</span></div>
+              </div>
+            </div>
+            <div className="home-side-panel">
+              <div className="home-side-title">Waiting on you</div>
+              <p className="home-side-empty">Souls whose feelings toward you run high - needs per-soul relationship stats in the soul list.</p>
+            </div>
+          </aside>
+        </div>
+      </main>
+    );
+  }
+
+  if (view === "statemap") {
+    const stateMap = sessionStateMap;
+    const featuredMemory = stateMap?.memories.find((memory) => memory.is_pinned)
+      ?? stateMap?.memories.find((memory) => memory.is_active)
+      ?? stateMap?.memories[0]
+      ?? null;
+    const latestScene = stateMap?.scenes[0] ?? null;
+    const relKeys: Array<[string, "trust" | "affection" | "intimacy" | "fear" | "desire"]> = [
+      ["Trust", "trust"],
+      ["Affection", "affection"],
+      ["Intimacy", "intimacy"],
+      ["Fear", "fear"],
+      ["Desire", "desire"],
+    ];
+    return (
+      <main className={`app-shell statemap-shell${railShellClass}`}>
+        {railNav}
+        <header className="launcher-header">
+          <div>
+            <span className="eyebrow">State Map / recent sessions</span>
+            <h1>What the engine believes is true</h1>
+          </div>
+          <div className="launcher-actions">
+            <button type="button" className="ghost-action" onClick={() => void refreshSessionStateHub()} disabled={busy}>
+              <RefreshCcw size={16} aria-hidden="true" />
+              <span>Refresh</span>
+            </button>
+          </div>
+        </header>
+
+        {stateMap && stateMap.sessions.length > 0 ? (
+          <>
+            <section className="statemap-detail-heading">
+              <div>
+                <span className="eyebrow">Compiled from the {stateMap.sessions.length} most recent active {stateMap.sessions.length === 1 ? "session" : "sessions"}</span>
+              </div>
+              <button type="button" className="ghost-action" onClick={() => setView("chat")}>
+                <Play size={16} aria-hidden="true" />
+                <span>Back to Play</span>
+              </button>
+            </section>
+
+            <div className="statemap-grid statemap-dashboard">
+              <section className="statemap-panel statemap-scene-panel">
+                <h2 className="statemap-panel-title"><span className="statemap-dot warm" /> Scene state <span className="statemap-count">{stateMap.scenes.length} sessions</span></h2>
+                {latestScene ? (
+                  <dl className="statemap-fields">
+                    <div><dt>Latest location</dt><dd>{latestScene.location || "Unknown"}</dd></div>
+                    <div><dt>Latest time</dt><dd>{latestScene.time_elapsed || "Unknown"}</dd></div>
+                    <div><dt>Current focus</dt><dd>{latestScene.focus || latestScene.current_scene || "No focus captured yet."}</dd></div>
+                    <div><dt>Pressure</dt><dd>{latestScene.pressure_point || "No pressure point captured yet."}</dd></div>
+                  </dl>
+                ) : null}
+                {stateMap.scenes.length > 0 && (
+                  <ul className="statemap-source-list">
+                    {stateMap.scenes.map((scene) => (
+                      <li key={scene.session_id}>
+                        <strong>{scene.session_title}</strong>
+                        <span>{scene.current_scene || scene.focus || scene.location || "No scene state yet."}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </section>
+
+              <section className="statemap-panel statemap-characters-panel">
+                <h2 className="statemap-panel-title"><span className="statemap-dot cool" /> Characters <span className="statemap-count">who knows what</span></h2>
+                <div className="statemap-character-list">
+                  {stateMap.characters.slice(0, 8).map((character, index) => (
+                    <div key={`${character.session_id}-${character.name}-${index}`} className="statemap-character-row">
+                      <span className={`statemap-character-avatar${index > 0 ? " muted" : ""}`}>{(character.name.charAt(0) || "?").toUpperCase()}</span>
+                      <span>
+                        <strong>{character.name}</strong>
+                        <small>{character.role || "entity"} / {character.session_title}</small>
+                        <em>{character.detail}</em>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              <section className="statemap-panel statemap-relationships-panel">
+                <h2 className="statemap-panel-title"><span className="statemap-dot green" /> Relationships <span className="statemap-count">{stateMap.relationships.length}</span></h2>
+                {stateMap.relationships.length === 0 ? (
+                  <p className="statemap-note">No relationships tracked yet.</p>
+                ) : (
+                  <div className="statemap-rels">
+                    {stateMap.relationships.map((r, index) => (
+                      <div key={`${r.session_id}-${r.target}-${index}`} className="statemap-rel">
+                        <div className="statemap-rel-name">{r.soul_name} {"->"} {r.target} <span className="statemap-rel-label">{r.session_title} / {r.love_type || "relationship"}</span></div>
+                        <div className="statemap-rel-bars">
+                          {relKeys.map(([k, key]) => {
+                            const v = r[key];
+                            return (
+                              <div key={k} className="statemap-rel-bar">
+                                <span className="statemap-rel-bar-k">{k}</span>
+                                <span className="statemap-rel-bar-track">
+                                  <span className="statemap-rel-bar-fill" style={{ left: v >= 0 ? "50%" : `${50 - Math.abs(v) / 2}%`, width: `${Math.abs(v) / 2}%` }} />
+                                </span>
+                                <span className="statemap-rel-bar-v">{v > 0 ? "+" : ""}{v}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+
+              <section className="statemap-panel statemap-objects-panel">
+                <h2 className="statemap-panel-title"><span className="statemap-dot gold" /> Objects <span className="statemap-count">identity / owner / status</span></h2>
+                {stateMap.objects.length > 0 ? (
+                  <ul className="statemap-object-list">
+                    {stateMap.objects.slice(0, 8).map((object, i) => (
+                      <li key={`${object.session_id}-${object.name}-${i}`}>
+                        <strong>{object.name}</strong>
+                        <span>{object.session_title} / {object.owner} / {object.status || object.kind}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="statemap-note">No tracked objects.</p>
+                )}
+              </section>
+
+              <section className="statemap-panel statemap-timeline-panel">
+                <h2 className="statemap-panel-title"><span className="statemap-dot violet" /> Timeline <span className="statemap-count">recent events</span></h2>
+                {stateMap.timeline.length > 0 ? (
+                  <ol className="statemap-timeline-list">
+                    {stateMap.timeline.slice(-8).map((event, i) => (
+                      <li key={`${event.session_id}-${i}`}>
+                        <span>{event.turn_counter}</span>
+                        <strong>{event.content}</strong>
+                        <small>{event.session_title}</small>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="statemap-note">No recent events.</p>
+                )}
+              </section>
+
+              <section className="statemap-panel statemap-memory-panel">
+                <h2 className="statemap-panel-title"><span className="statemap-dot cool" /> Memory Inspector <span className="statemap-count">every memory traces to the turn that created it</span></h2>
+                {stateMap.memories.length === 0 ? (
+                  <p className="statemap-note">No memories yet.</p>
+                ) : (
+                  <div className="statemap-memory-layout">
+                    <div className="statemap-memory-stack">
+                      {stateMap.memories.slice(0, 8).map((m, index) => (
+                        <article key={`${m.session_id}-${index}`} className={`statemap-mem-card${m.is_pinned ? " pinned" : ""}`}>
+                          <span className="statemap-mem-kind">{m.tag || "memory"}</span>
+                          <strong>{m.content}</strong>
+                          <small>{m.session_title} / {m.source_turn ? `turn ${m.source_turn}` : m.source_type} / {m.truth_status}</small>
+                        </article>
+                      ))}
+                    </div>
+                    <aside className="statemap-provenance">
+                      <div className="statemap-subhead">Provenance</div>
+                      <strong>{featuredMemory?.content || "No memory selected."}</strong>
+                      <dl className="statemap-fields">
+                        <div><dt>Session</dt><dd>{featuredMemory?.session_title ?? "unknown"}</dd></div>
+                        <div><dt>Source turn</dt><dd>{featuredMemory?.source_turn ?? "unknown"}</dd></div>
+                        <div><dt>Confidence</dt><dd>{featuredMemory?.confidence ?? "unknown"}</dd></div>
+                        <div><dt>Truth status</dt><dd>{featuredMemory?.truth_status ?? "tracked"}</dd></div>
+                        <div><dt>State</dt><dd>{featuredMemory?.is_pinned ? "Pinned" : featuredMemory?.is_active ? "Active" : "Stored"}</dd></div>
+                      </dl>
+                    </aside>
+                  </div>
+                )}
+              </section>
+            </div>
+          </>
+        ) : (
+          <p className="muted statemap-empty">No active sessions yet. Start one from the Library to populate the State Map.</p>
+        )}
+      </main>
+    );
+  }
+
+  if ((view as string) === "__statemap_legacy") {
+    const world = soul?.world ?? setting?.world ?? null;
+    const rels = soul ? Object.entries(soul.relationships) : [];
+    const relKeys: Array<[string, "trust" | "affection" | "intimacy" | "fear" | "desire"]> = [
+      ["Trust", "trust"],
+      ["Affection", "affection"],
+      ["Intimacy", "intimacy"],
+      ["Fear", "fear"],
+      ["Desire", "desire"],
+    ];
+    return (
+      <main className={`app-shell statemap-shell${railShellClass}`}>
+        {railNav}
+        <header className="launcher-header">
+          <div>
+            <span className="eyebrow">State Map{soul ? ` - ${soul.character_name}` : ""}</span>
+            <h1>What the engine believes is true</h1>
+          </div>
+          <button type="button" className="ghost-action" onClick={() => setView("chat")}>
+            <Play size={16} aria-hidden="true" />
+            <span>Back to Play</span>
+          </button>
+        </header>
+        {!soul ? (
+          <p className="muted statemap-empty">No active soul loaded. Open a session from Home to see its live state.</p>
+        ) : (
+          <div className="statemap-grid">
+            <section className="statemap-panel">
+              <h2 className="statemap-panel-title">Scene <span className="statemap-count">turn {soul.turn_counter}</span></h2>
+              <dl className="statemap-fields">
+                <div><dt>Location</dt><dd>{world?.location ?? "-"}</dd></div>
+                <div><dt>Time</dt><dd>{world?.time_elapsed ?? "-"}</dd></div>
+              </dl>
+              {world && world.active_plots.length > 0 && (
+                <>
+                  <div className="statemap-subhead">Active plots</div>
+                  <ul className="statemap-list">{world.active_plots.map((p, i) => <li key={i}>{p}</li>)}</ul>
+                </>
+              )}
+            </section>
+
+            <section className="statemap-panel">
+              <h2 className="statemap-panel-title">Character state</h2>
+              <dl className="statemap-fields">
+                <div><dt>Fear baseline</dt><dd>{soul.global.fear_baseline}</dd></div>
+                <div><dt>Resolve</dt><dd>{soul.global.resolve}</dd></div>
+                <div><dt>Shame</dt><dd>{soul.global.shame}</dd></div>
+                <div><dt>Openness</dt><dd>{soul.global.openness}</dd></div>
+                <div><dt>Trauma phase</dt><dd>{soul.trauma.phase} / 4</dd></div>
+              </dl>
+            </section>
+
+            <section className="statemap-panel statemap-panel-wide">
+              <h2 className="statemap-panel-title">Relationships <span className="statemap-count">{rels.length}</span></h2>
+              {rels.length === 0 ? (
+                <p className="statemap-note">No relationships tracked yet.</p>
+              ) : (
+                <div className="statemap-rels">
+                  {rels.map(([target, r]) => (
+                    <div key={target} className="statemap-rel">
+                      <div className="statemap-rel-name">{target} <span className="statemap-rel-label">{r.love_type}</span></div>
+                      <div className="statemap-rel-bars">
+                        {relKeys.map(([k, key]) => {
+                          const v = r[key];
+                          return (
+                            <div key={k} className="statemap-rel-bar">
+                              <span className="statemap-rel-bar-k">{k}</span>
+                              <span className="statemap-rel-bar-track">
+                                <span className="statemap-rel-bar-fill" style={{ left: v >= 0 ? "50%" : `${50 - Math.abs(v) / 2}%`, width: `${Math.abs(v) / 2}%` }} />
+                              </span>
+                              <span className="statemap-rel-bar-v">{v > 0 ? "+" : ""}{v}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+
+            <section className="statemap-panel">
+              <h2 className="statemap-panel-title">Objects <span className="statemap-count">{world?.key_objects.length ?? 0}</span></h2>
+              {world && world.key_objects.length > 0 ? (
+                <ul className="statemap-list">{world.key_objects.map((o, i) => <li key={i}>{o}</li>)}</ul>
+              ) : (
+                <p className="statemap-note">No tracked objects.</p>
+              )}
+            </section>
+
+            <section className="statemap-panel">
+              <h2 className="statemap-panel-title">Timeline <span className="statemap-count">{world?.recent_events.length ?? 0}</span></h2>
+              {world && world.recent_events.length > 0 ? (
+                <ul className="statemap-list">{world.recent_events.map((e, i) => <li key={i}>{e}</li>)}</ul>
+              ) : (
+                <p className="statemap-note">No recent events.</p>
+              )}
+            </section>
+
+            <section className="statemap-panel statemap-panel-wide">
+              <h2 className="statemap-panel-title">
+                Memory <span className="statemap-count">{soul.memory.core.length} core - {soul.memory.recent.length} recent - {soul.memory.schemas.length} schemas</span>
+              </h2>
+              {soul.memory.core.length === 0 && soul.memory.recent.length === 0 && soul.memory.schemas.length === 0 ? (
+                <p className="statemap-note">No memories yet.</p>
+              ) : (
+                <>
+                  {soul.memory.core.length > 0 && (
+                    <>
+                      <div className="statemap-subhead">Core</div>
+                      <ul className="statemap-list">{soul.memory.core.map((m, i) => <li key={i}>{m}</li>)}</ul>
+                    </>
+                  )}
+                  {soul.memory.recent.length > 0 && (
+                    <>
+                      <div className="statemap-subhead">Recent</div>
+                      <ul className="statemap-mem-list">
+                        {soul.memory.recent.map((m) => (
+                          <li key={m.id} className="statemap-mem">
+                            <span className="statemap-mem-text">{m.content}</span>
+                            <span className="statemap-mem-meta">{m.tag} - salience {m.salience.toFixed(2)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                  {soul.memory.schemas.length > 0 && (
+                    <>
+                      <div className="statemap-subhead">Schemas</div>
+                      <ul className="statemap-list">
+                        {soul.memory.schemas.map((s, i) => (
+                          <li key={s.schema_id ?? i}>{s.summary} <span className="statemap-mem-meta">x{s.count}</span></li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                </>
+              )}
+            </section>
+          </div>
+        )}
+      </main>
+    );
+  }
+
+  if (view === "settings") {
+    return (
+      <main className={`app-shell settings-page${railShellClass}`}>
+        {railNav}
+        <header className="launcher-header">
+          <div>
+            <span className="eyebrow">Settings</span>
+            <h1>Engine &amp; providers</h1>
+          </div>
+        </header>
+        <div className="settings-page-body">{settingsContent}</div>
+      </main>
+    );
+  }
+
   return (
-    <main className="app-shell launcher-shell">
+    <main className={`app-shell launcher-shell${railShellClass}`}>
+      {railNav}
       <header className="launcher-header">
         <div>
           <span className="eyebrow">{view === "editor" ? "Workshop" : "Launcher"}</span>
@@ -6839,8 +7446,6 @@ export function App() {
               <span>Create / Edit</span>
             </button>
           )}
-          {settingsDrawerToggle}
-          {devConsoleToggle}
         </div>
       </header>
 
@@ -6925,7 +7530,7 @@ export function App() {
           <section className="character-grid" aria-label="Saved characters">
             {souls.length === 0 ? (
               <div className="grid-empty">
-                <p className="muted">No characters yet — Mnemosyne ships with none; bring your own.</p>
+                <p className="muted">No characters yet - Mnemosyne ships with none; bring your own.</p>
                 <button type="button" className="ghost-action primary-cta" onClick={() => { void handleCreateSoul(); setView("editor"); }} disabled={busy}>
                   <Sparkles size={16} />
                   <span>Create your first character</span>
@@ -7443,8 +8048,8 @@ export function App() {
                             ? "PASS"
                             : "FAIL"}
                         </strong>{" "}
-                        {structuredDiagnosticResult.provider_model} · enforcement{" "}
-                        {structuredDiagnosticResult.structured_enforcement_per_run.join(", ") || "none"} · fallback{" "}
+                        {structuredDiagnosticResult.provider_model} - enforcement{" "}
+                        {structuredDiagnosticResult.structured_enforcement_per_run.join(", ") || "none"} - fallback{" "}
                         {structuredDiagnosticResult.fallback_paths.map((path) => path.join(" > ")).join(" | ") || "none"}
                         <br />
                         Payload: {structuredDiagnosticResult.payload_history_path}
@@ -7675,7 +8280,7 @@ export function App() {
             <button type="button" title="Export Character + World as Scenario .mne" onClick={handleExportScenarioMne} disabled={!soul || !setting || busy}><FileDown size={16} /><span>Scenario</span></button>
             <button type="button" title="Run consolidation (Sleep)" onClick={handleConsolidate} disabled={!soul || busy}><RefreshCcw size={16} /><span>Sleep</span></button>
             <button type="button" className="ghost-action danger" title="Archive Character" onClick={handleDeleteSoul} disabled={!soul || busy}><Archive size={16} /><span>Archive</span></button>
-            <button type="button" className="ghost-action purge" title="Hard-delete Character — permanent" onClick={handlePurgeSoul} disabled={!soul || busy}><Trash2 size={16} /><span>Purge</span></button>
+            <button type="button" className="ghost-action purge" title="Hard-delete Character - permanent" onClick={handlePurgeSoul} disabled={!soul || busy}><Trash2 size={16} /><span>Purge</span></button>
           </div>
         </div>
         <aside className="studio-panel">
@@ -7989,460 +8594,7 @@ export function App() {
       </section>
       )}
 
-      {view === "library" && (
-      <section className="insight-grid">
-        <section className="workspace-card">
-          <header className="panel-header">
-            <div>
-              <span className="eyebrow">State</span>
-              <h2>Memory</h2>
-            </div>
-            <Brain aria-hidden="true" />
-          </header>
-
-          <section className="stat-grid" aria-label="Relationship stats">
-            <Stat label="Trust" value={relationship?.trust ?? 0} />
-            <Stat label="Affection" value={relationship?.affection ?? 0} />
-            <Stat label="Fear" value={relationship?.fear ?? 0} />
-            <Stat label="Turns" value={soul?.turn_counter ?? 0} />
-            <Stat label="Since Sleep" value={turnsSinceConsolidation} />
-            <Stat label="Schemas" value={soul?.memory.schemas.length ?? 0} />
-          </section>
-
-          <section className="diagnostics-section">
-            <h2>Memory Cycle</h2>
-            <div className="cycle-meter" aria-label="Consolidation progress">
-              <div>
-              <strong>{turnsSinceConsolidation}</strong>
-              <span>/ {CONSOLIDATION_INTERVAL_TURNS} turns</span>
-            </div>
-            <div className="cycle-bar">
-              <span style={{ width: `${consolidationProgress}%` }} />
-            </div>
-          </div>
-          <dl className="diagnostic-grid">
-            <div>
-              <dt>Next sleep</dt>
-              <dd>{turnsUntilConsolidation === 0 ? "Ready" : `${turnsUntilConsolidation} turns`}</dd>
-            </div>
-            <div>
-              <dt>Core</dt>
-              <dd>{soul?.memory.core.length ?? 0}</dd>
-            </div>
-            <div>
-              <dt>Recent</dt>
-              <dd>{soul?.memory.recent.length ?? 0}</dd>
-            </div>
-            <div>
-              <dt>Context</dt>
-              <dd>{context?.truncated ? "Trimmed" : "Within budget"}</dd>
-            </div>
-            </dl>
-          </section>
-
-          <section className="memory-section">
-            <h2>Core Memories</h2>
-            {(soul?.memory.core ?? []).length === 0 ? (
-              <p className="muted">No core memories yet.</p>
-            ) : (
-              (soul?.memory.core ?? []).slice(0, 4).map((memory) => (
-                <p key={memory}>{memory}</p>
-              ))
-            )}
-          </section>
-
-          <section className="memory-section">
-            <h2>Schemas</h2>
-            {(soul?.memory.schemas ?? []).length === 0 ? (
-              <p className="muted">No schemas consolidated yet.</p>
-            ) : (
-              (soul?.memory.schemas ?? []).map((schema) => (
-                <p key={schema.schema_type}>
-                  <strong>{schema.schema_type}</strong>: {schema.summary}
-                </p>
-              ))
-            )}
-          </section>
-
-          <section className="memory-section">
-            <div className="memory-section-heading">
-              <h2>Recent</h2>
-              <span>{soul?.memory.recent.length ?? 0}</span>
-            </div>
-            {(soul?.memory.recent ?? []).length === 0 ? (
-              <p className="muted">No recent memories yet.</p>
-            ) : (
-              <div className="memory-curation-list">
-                {(soul?.memory.recent ?? []).map((memory) => {
-                  const isPinned = Boolean(memory.is_pinned);
-                  const isArchived = Boolean(memory.archived) || memory.is_active === false;
-                  const operation = isArchived ? "restore_archived" : isPinned ? "unpin" : "pin";
-                  const actionLabel = isArchived ? "Restore" : isPinned ? "Unpin" : "Pin";
-                  return (
-                    <article className={`memory-curation-row ${isPinned ? "pinned" : ""}`} key={memory.id}>
-                      <div className="memory-curation-main">
-                        <div className="memory-curation-title">
-                          <strong>{memory.tag || "memory"}</strong>
-                          {isPinned ? <span className="memory-pill">Pinned</span> : null}
-                          {isArchived ? <span className="memory-pill muted-pill">Archived</span> : null}
-                        </div>
-                        <p>{memory.content}</p>
-                        <div className="memory-curation-meta">
-                          <span>salience {Math.round(memory.salience)}</span>
-                          <span>retrieval {Math.round(memory.retrieval_strength)}</span>
-                          {memory.truth_status ? <span>{memory.truth_status.replace(/_/g, " ")}</span> : null}
-                          {memory.source_type ? <span>{memory.source_type.replace(/_/g, " ")}</span> : null}
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        className="memory-curation-action"
-                        onClick={() => void handleCurateRecentMemory(memory.id, operation)}
-                        disabled={busy || !soul}
-                        title={`${actionLabel} this memory for future retrieval`}
-                      >
-                        {actionLabel}
-                      </button>
-                    </article>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        </section>
-
-        <section className="workspace-card">
-          <section className="diagnostics-section api-debug-section">
-            <h2>API Debug</h2>
-            <dl className="diagnostic-grid">
-              <div>
-                <dt>Provider</dt>
-                <dd>{lastTurnDebug?.provider ?? provider}</dd>
-              </div>
-              <div>
-                <dt>Hidden</dt>
-                <dd>
-                  {lastTurnDebug
-                    ? lastTurnDebug.hidden_state_found
-                      ? "Parsed"
-                      : "Missing"
-                    : "No turn"}
-                </dd>
-              </div>
-              <div>
-                <dt>Fallback</dt>
-                <dd>{lastTurnDebug?.fallback_hidden_state_generated ? "Generated" : "No"}</dd>
-              </div>
-              <div>
-                <dt>Narration</dt>
-                <dd>{lastTurnDebug?.narrator_response_saved ? "Saved" : "No turn"}</dd>
-              </div>
-              <div>
-                <dt>Updater</dt>
-                <dd>{lastTurnDebug?.state_updater_status ?? "-"}</dd>
-              </div>
-              <div>
-                <dt>Anti-Replay</dt>
-                <dd>
-                  {lastTurnDebug
-                    ? lastTurnDebug.replay_detected
-                      ? `Triggered (${lastTurnDebug.replay_score.toFixed(2)})`
-                      : `Passed (${lastTurnDebug.replay_score.toFixed(2)})`
-                    : "-"}
-                </dd>
-              </div>
-              <div>
-                <dt>Replay Reason</dt>
-                <dd>{lastTurnDebug?.replay_reason ?? "-"}</dd>
-              </div>
-              <div>
-                <dt>Output Guard</dt>
-                <dd>{lastTurnDebug?.output_contract_warning ?? "-"}</dd>
-              </div>
-              <div>
-                <dt>Tag</dt>
-                <dd>{lastTurnDebug?.tag ?? "-"}</dd>
-              </div>
-              <div>
-                <dt>Trust</dt>
-                <dd>{formatDebugDelta(lastTurnDebug?.trust_delta)}</dd>
-              </div>
-              <div>
-                <dt>Affection</dt>
-                <dd>{formatDebugDelta(lastTurnDebug?.affection_delta)}</dd>
-              </div>
-              <div>
-                <dt>Location</dt>
-                <dd>{lastTurnDebug?.new_location ?? "-"}</dd>
-              </div>
-              <div>
-                <dt>Present</dt>
-                <dd>{lastTurnDebug?.present_characters.join(", ") || "-"}</dd>
-              </div>
-            </dl>
-          </section>
-
-          <section className="context-preview payload-inspector">
-            <div className="payload-header">
-              <h2>LLM Payload Inspector</h2>
-              <div className="payload-actions">
-                {payloadCopied ? <span className="copy-feedback">Payload copied</span> : null}
-                {exportFeedback ? <span className="export-feedback">{exportFeedback}</span> : null}
-                <button
-                  className="ghost-action"
-                  title="Copy LLM Payload"
-                  onClick={handleCopyLlmPayload}
-                  disabled={!llmPayload}
-                >
-                  <Clipboard size={16} />
-                  <span>{payloadCopied ? "Copied!" : "Copy LLM Payload"}</span>
-                </button>
-                <button
-                  className="ghost-action"
-                  title="Export Visible Chat Log"
-                  onClick={handleExportVisibleChatLog}
-                  disabled={busy || activeMessages.length === 0}
-                >
-                  <FileDown size={16} />
-                  <span>Export Visible Chat Log</span>
-                </button>
-                <button
-                  className="ghost-action"
-                  title="Export LLM Payload History"
-                  onClick={handleExportLlmPayloadHistory}
-                  disabled={busy}
-                >
-                  <FileDown size={16} />
-                  <span>Export Payload History</span>
-                </button>
-              </div>
-            </div>
-            <dl className="diagnostic-grid payload-grid">
-              <div>
-                <dt>Provider</dt>
-                <dd>{llmPayload?.provider ?? provider}</dd>
-              </div>
-              <div>
-                <dt>Mode</dt>
-                <dd>{llmPayload?.mode ?? mode}</dd>
-              </div>
-              <div>
-                <dt>Custom Prompt</dt>
-                <dd>
-                  {llmPayload?.custom_prompt_status ??
-                    (mode === "Custom" ? (apiSettings.system_prompt.trim() ? "included" : "empty") : "inactive")}
-                </dd>
-              </div>
-              <div>
-                <dt>Context Mode</dt>
-                <dd>{llmPayload?.context_mode === "full_chat" ? "Full Chat" : "Mnemosyne Brief"}</dd>
-              </div>
-              <div>
-                <dt>Payload Trim</dt>
-                <dd>{llmPayload?.truncated ? "Trimmed" : "Within budget"}</dd>
-              </div>
-              <div>
-                <dt>Model</dt>
-                <dd>{llmPayload?.model || "-"}</dd>
-              </div>
-              <div>
-                <dt>Base URL</dt>
-                <dd>{llmPayload?.base_url || "-"}</dd>
-              </div>
-              <div>
-                <dt>System Tokens</dt>
-                <dd>{llmPayload?.estimated_tokens.system ?? 0}</dd>
-              </div>
-              <div>
-                <dt>Context Tokens</dt>
-                <dd>{llmPayload?.estimated_tokens.context ?? 0}</dd>
-              </div>
-              <div>
-                <dt>User Tokens</dt>
-                <dd>{llmPayload?.estimated_tokens.user ?? 0}</dd>
-              </div>
-              <div>
-                <dt>Total Tokens</dt>
-                <dd>{llmPayload?.estimated_tokens.total ?? 0}</dd>
-              </div>
-            </dl>
-            <h3>System Message</h3>
-            <pre>{llmPayload?.system_message ?? "No LLM payload compiled yet."}</pre>
-            <h3>Context, already included inside System Message</h3>
-            <pre>{llmPayload?.context ?? "No context compiled yet."}</pre>
-            {llmPayload?.memory_slot_debug?.length ? (
-              <>
-                <h3>Memory Slot Debug</h3>
-                <pre>
-                  {llmPayload.memory_slot_debug
-                    .filter((trace) => trace.action === "selected")
-                    .map(
-                      (trace) =>
-                        `${trace.slot}: ${trace.memory_id} / ${trace.reason} / score ${Math.round(trace.final_score)} / ${trace.source_type} / ${trace.truth_status}`,
-                    )
-                    .join("\n")}
-                </pre>
-              </>
-            ) : null}
-            {llmPayload?.context_mode === "full_chat" ? (
-              <>
-                <h3>Full Chat Messages Sent</h3>
-                <pre>{llmPayload.messages.map((message) => `${message.role}: ${message.content}`).join("\n\n")}</pre>
-              </>
-            ) : null}
-            <h3>Current User Message</h3>
-            <pre>{llmPayload?.user_message || "No current user message."}</pre>
-          </section>
-
-          <section className="context-preview">
-            <h2>Context</h2>
-            <dl className="diagnostic-grid context-source-grid">
-              <div>
-                <dt>WORLD SNAPSHOT source</dt>
-                <dd>session_world / setting.world, legacy soul.world fallback only</dd>
-              </div>
-              <div>
-                <dt>CHARACTER SNAPSHOT source</dt>
-                <dd>soul.profile/global/trauma/arousal</dd>
-              </div>
-              <div>
-                <dt>MEMORY SLOTS source</dt>
-                <dd>soul.memory, slot-scored by entity/plot/source/truth</dd>
-              </div>
-              <div>
-                <dt>RELATIONSHIPS source</dt>
-                <dd>soul.relationships</dd>
-              </div>
-              <div>
-                <dt>LATEST EXCHANGE source</dt>
-                <dd>visible conversation messages</dd>
-              </div>
-            </dl>
-            <div className="repair-actions" aria-label="Debug repair tools">
-              <button className="ghost-action" type="button" onClick={() => handleSoulRepair("world")} disabled={busy || !soul}>
-                <Trash2 size={16} />
-                <span>Clear World State</span>
-              </button>
-              <button className="ghost-action" type="button" onClick={() => handleSoulRepair("scenario")} disabled={busy || !soul}>
-                <Trash2 size={16} />
-                <span>Clear Scenario</span>
-              </button>
-              <button className="ghost-action" type="button" onClick={() => handleSoulRepair("events")} disabled={busy || !soul}>
-                <Trash2 size={16} />
-                <span>Clear Recent Events</span>
-              </button>
-              <button className="ghost-action danger" type="button" onClick={() => handleSoulRepair("memories")} disabled={busy || !soul}>
-                <Trash2 size={16} />
-                <span>Clear Memories</span>
-              </button>
-            </div>
-            <pre>{context?.text ?? "No context compiled yet."}</pre>
-          </section>
-        </section>
-
-        {providerAlert && (
-          <div
-            role="alert"
-            style={{
-              position: "fixed",
-              top: "12px",
-              left: "50%",
-              transform: "translateX(-50%)",
-              zIndex: 1000,
-              maxWidth: "640px",
-              width: "calc(100% - 32px)",
-              background: "#7f1d1d",
-              color: "#fee2e2",
-              border: "1px solid #ef4444",
-              borderRadius: "8px",
-              padding: "10px 14px",
-              boxShadow: "0 6px 24px rgba(0,0,0,0.35)",
-              display: "flex",
-              alignItems: "flex-start",
-              gap: "10px",
-            }}
-          >
-            <div style={{ flex: 1 }}>
-              <strong style={{ display: "block", marginBottom: "2px" }}>
-                {providerAlert.title}
-              </strong>
-              <span style={{ fontSize: "0.85rem", opacity: 0.95 }}>
-                {providerAlert.hint ?? "Open Settings to fix this."}
-                {providerAlert.detail ? (
-                  <span style={{ display: "block", marginTop: "4px", opacity: 0.8, fontSize: "0.78rem" }}>
-                    {providerAlert.detail}
-                  </span>
-                ) : null}
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => setProviderAlert(null)}
-              aria-label="Dismiss"
-              style={{
-                background: "none",
-                border: "none",
-                color: "#fee2e2",
-                cursor: "pointer",
-                fontSize: "1.1rem",
-                lineHeight: 1,
-                padding: "0 2px",
-              }}
-            >
-              ×
-            </button>
-          </div>
-        )}
-
-        <footer className="status-line">
-          <span>{status}</span>
-          {latestPipelineTrace &&
-            (status.toLowerCase().includes("skipped") || status.toLowerCase().includes("failed")) && (
-              <>
-                {latestPipelineTrace.failing_stage ? (
-                  <span
-                    className="status-stage-tag"
-                    style={{ marginLeft: "10px", color: "#f87171", fontWeight: "bold" }}
-                  >
-                    (Failing Stage: {latestPipelineTrace.failing_stage})
-                  </span>
-                ) : (
-                  (() => {
-                    const warningStage = latestPipelineTrace.stages.find((s) => s.status === "warning");
-                    return warningStage ? (
-                      <span
-                        className="status-stage-tag"
-                        style={{ marginLeft: "10px", color: "#fbbf24", fontWeight: "bold" }}
-                      >
-                        (Warning Stage: {warningStage.stage_name})
-                      </span>
-                    ) : null;
-                  })()
-                )}
-                <button
-                  type="button"
-                  style={{
-                    marginLeft: "8px",
-                    padding: "2px 6px",
-                    fontSize: "11px",
-                    border: "1px solid #4b5563",
-                    background: "none",
-                    color: "#9ca3af",
-                    cursor: "pointer",
-                    borderRadius: "3px",
-                  }}
-                  onClick={() => setDevConsoleOpen(true)}
-                >
-                  Open trace
-                </button>
-              </>
-            )}
-        </footer>
-      </section>
-      )}
       <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
-      {settingsDrawerPanel}
-      {devConsolePanel}
     </main>
   );
 }

@@ -91,6 +91,7 @@ const NO_LLM_PAYLOAD_LOGS_MESSAGE: &str = "No LLM payload logs found for this co
 const FULL_CHAT_TOKEN_BUDGET: usize = 6_000;
 const NARRATOR_BRIEF_TARGET_TOKENS: usize = 2_500;
 const STATE_UPDATER_TARGET_TOKENS: usize = 1_600;
+const STATE_MAP_RECENT_SESSION_LIMIT: usize = 5;
 const DEFAULT_EVALUATOR_TIMEOUT_MS: u64 = 25_000;
 const DEFAULT_STRUCTURED_EVALUATOR_TIMEOUT_MS: u64 = 90_000;
 const DEFAULT_DIAGNOSTIC_EVALUATOR_TIMEOUT_MS: u64 = 60_000;
@@ -494,6 +495,112 @@ pub struct SessionStartResult {
     pub soul: Soul,
     pub conversation: ConversationSummary,
     pub messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionStateHubItem {
+    pub conversation: ConversationSummary,
+    pub soul_name: String,
+    pub setting_name: String,
+    pub location: String,
+    pub time_elapsed: String,
+    pub current_scene: String,
+    pub focus: String,
+    pub turn_counter: u64,
+    pub memory_count: usize,
+    pub core_memory_count: usize,
+    pub recent_memory_count: usize,
+    pub schema_count: usize,
+    pub relationship_count: usize,
+    pub positive_relationship_count: usize,
+    pub object_count: usize,
+    pub event_count: usize,
+    pub active_plot_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapSceneItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub soul_name: String,
+    pub setting_name: String,
+    pub turn_counter: u64,
+    pub location: String,
+    pub time_elapsed: String,
+    pub current_scene: String,
+    pub focus: String,
+    pub last_user_action: String,
+    pub pressure_point: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapCharacterItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub name: String,
+    pub role: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapRelationshipItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub soul_name: String,
+    pub target: String,
+    pub love_type: String,
+    pub trust: f32,
+    pub affection: f32,
+    pub intimacy: f32,
+    pub fear: f32,
+    pub desire: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapObjectItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub name: String,
+    pub kind: String,
+    pub owner: String,
+    pub location: String,
+    pub status: String,
+    pub summary: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapTimelineItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub turn_counter: u64,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateMapMemoryItem {
+    pub session_id: String,
+    pub session_title: String,
+    pub soul_name: String,
+    pub content: String,
+    pub tag: String,
+    pub source_turn: Option<i64>,
+    pub confidence: Option<f32>,
+    pub truth_status: String,
+    pub source_type: String,
+    pub is_pinned: bool,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionStateMap {
+    pub sessions: Vec<SessionStateHubItem>,
+    pub scenes: Vec<StateMapSceneItem>,
+    pub characters: Vec<StateMapCharacterItem>,
+    pub relationships: Vec<StateMapRelationshipItem>,
+    pub objects: Vec<StateMapObjectItem>,
+    pub timeline: Vec<StateMapTimelineItem>,
+    pub memories: Vec<StateMapMemoryItem>,
 }
 
 #[derive(Debug, Clone)]
@@ -2239,6 +2346,279 @@ pub fn list_souls_debug(state: State<'_, AppState>) -> Result<Vec<SoulSummary>, 
 pub fn list_conversations(state: State<'_, AppState>) -> Result<Vec<ConversationSummary>, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
     db::list_conversations(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn list_session_state_hub(state: State<'_, AppState>) -> Result<Vec<SessionStateHubItem>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let mut conversations = db::list_conversations(&conn).map_err(|err| err.to_string())?;
+    conversations.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    conversations.truncate(STATE_MAP_RECENT_SESSION_LIMIT);
+    let mut items = Vec::with_capacity(conversations.len());
+
+    for conversation in conversations {
+        let branch = match db::get_active_session_branch(&conn, &conversation.conversation_id) {
+            Ok(branch) => branch,
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        let rebuilt = db::rebuild_session_state(&conn, &conversation.conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+        let soul = rebuilt.soul;
+        let world = rebuilt.session_world;
+        let positive_relationship_count = soul
+            .relationships
+            .values()
+            .filter(|relationship| {
+                relationship.trust > 35.0
+                    || relationship.affection > 35.0
+                    || relationship.intimacy > 35.0
+                    || relationship.comfort > 35.0
+                    || relationship.desire > 35.0
+            })
+            .count();
+        let memory_count = soul.memory.core.len() + soul.memory.recent.len() + soul.memory.schemas.len();
+        items.push(SessionStateHubItem {
+            conversation,
+            soul_name: soul.character_name,
+            setting_name: world.setting_name,
+            location: world.location,
+            time_elapsed: world.time_elapsed,
+            current_scene: world.scene_state.current_scene,
+            focus: world.scene_state.focus,
+            turn_counter: soul.turn_counter,
+            memory_count,
+            core_memory_count: soul.memory.core.len(),
+            recent_memory_count: soul.memory.recent.len(),
+            schema_count: soul.memory.schemas.len(),
+            relationship_count: soul.relationships.len(),
+            positive_relationship_count,
+            object_count: world.object_states.len().max(world.key_objects.len()),
+            event_count: world.recent_event_records.len().max(world.recent_events.len()),
+            active_plot_count: world.active_plots.len(),
+        });
+    }
+
+    Ok(items)
+}
+
+#[tauri::command]
+pub fn list_session_state_map(state: State<'_, AppState>) -> Result<SessionStateMap, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let mut conversations = db::list_conversations(&conn).map_err(|err| err.to_string())?;
+    conversations.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    conversations.truncate(STATE_MAP_RECENT_SESSION_LIMIT);
+    let mut sessions = Vec::with_capacity(conversations.len());
+    let mut scenes = Vec::new();
+    let mut characters = Vec::new();
+    let mut relationships = Vec::new();
+    let mut objects = Vec::new();
+    let mut timeline = Vec::new();
+    let mut memories = Vec::new();
+
+    for conversation in conversations {
+        let branch = match db::get_active_session_branch(&conn, &conversation.conversation_id) {
+            Ok(branch) => branch,
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(err) => return Err(err.to_string()),
+        };
+        let rebuilt = db::rebuild_session_state(&conn, &conversation.conversation_id, &branch.branch_id)
+            .map_err(|err| err.to_string())?;
+        let soul = rebuilt.soul;
+        let world = rebuilt.session_world;
+        let session_id = conversation.conversation_id.clone();
+        let session_title = if conversation.title.trim().is_empty() {
+            "Untitled session".to_string()
+        } else {
+            conversation.title.clone()
+        };
+        let soul_name = soul.character_name.clone();
+        let positive_relationship_count = soul
+            .relationships
+            .values()
+            .filter(|relationship| {
+                relationship.trust > 35.0
+                    || relationship.affection > 35.0
+                    || relationship.intimacy > 35.0
+                    || relationship.comfort > 35.0
+                    || relationship.desire > 35.0
+            })
+            .count();
+        let memory_count = soul.memory.core.len() + soul.memory.recent.len() + soul.memory.schemas.len();
+
+        scenes.push(StateMapSceneItem {
+            session_id: session_id.clone(),
+            session_title: session_title.clone(),
+            soul_name: soul_name.clone(),
+            setting_name: world.setting_name.clone(),
+            turn_counter: soul.turn_counter,
+            location: world.location.clone(),
+            time_elapsed: world.time_elapsed.clone(),
+            current_scene: world.scene_state.current_scene.clone(),
+            focus: world.scene_state.focus.clone(),
+            last_user_action: world.scene_state.last_user_action.clone(),
+            pressure_point: world.scene_state.pressure_point.clone(),
+        });
+
+        characters.push(StateMapCharacterItem {
+            session_id: session_id.clone(),
+            session_title: session_title.clone(),
+            name: soul_name.clone(),
+            role: soul.soul_kind.clone(),
+            detail: format!(
+                "phase {} / resolve {} / openness {}",
+                soul.trauma.phase, soul.global.resolve, soul.global.openness
+            ),
+        });
+
+        for (target, relationship) in &soul.relationships {
+            characters.push(StateMapCharacterItem {
+                session_id: session_id.clone(),
+                session_title: session_title.clone(),
+                name: target.clone(),
+                role: if relationship.love_type.trim().is_empty() {
+                    "relationship".to_string()
+                } else {
+                    relationship.love_type.clone()
+                },
+                detail: format!(
+                    "trust {} / fear {} / affection {}",
+                    relationship.trust, relationship.fear, relationship.affection
+                ),
+            });
+            relationships.push(StateMapRelationshipItem {
+                session_id: session_id.clone(),
+                session_title: session_title.clone(),
+                soul_name: soul_name.clone(),
+                target: target.clone(),
+                love_type: relationship.love_type.clone(),
+                trust: relationship.trust,
+                affection: relationship.affection,
+                intimacy: relationship.intimacy,
+                fear: relationship.fear,
+                desire: relationship.desire,
+            });
+        }
+
+        for object in &world.object_states {
+            let summary = object
+                .contents_summary
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| object.last_observed_state.clone());
+            objects.push(StateMapObjectItem {
+                session_id: session_id.clone(),
+                session_title: session_title.clone(),
+                name: object.object_id.clone(),
+                kind: object.object_kind.clone(),
+                owner: object.owner_entity_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                location: object.location.clone(),
+                status: object.status.clone(),
+                summary,
+                confidence: object.confidence,
+            });
+        }
+        for object in &world.key_objects {
+            if !objects.iter().any(|item| item.session_id == session_id && item.name == *object) {
+                objects.push(StateMapObjectItem {
+                    session_id: session_id.clone(),
+                    session_title: session_title.clone(),
+                    name: object.clone(),
+                    kind: "key_object".to_string(),
+                    owner: "unknown".to_string(),
+                    location: world.location.clone(),
+                    status: "tracked".to_string(),
+                    summary: object.clone(),
+                    confidence: 1.0,
+                });
+            }
+        }
+
+        if world.recent_event_records.is_empty() {
+            for event in &world.recent_events {
+                timeline.push(StateMapTimelineItem {
+                    session_id: session_id.clone(),
+                    session_title: session_title.clone(),
+                    turn_counter: soul.turn_counter,
+                    content: event.clone(),
+                });
+            }
+        } else {
+            for event in &world.recent_event_records {
+                if event.is_active {
+                    timeline.push(StateMapTimelineItem {
+                        session_id: session_id.clone(),
+                        session_title: session_title.clone(),
+                        turn_counter: soul.turn_counter,
+                        content: event.content.clone(),
+                    });
+                }
+            }
+        }
+
+        for memory in &soul.memory.recent {
+            memories.push(StateMapMemoryItem {
+                session_id: session_id.clone(),
+                session_title: session_title.clone(),
+                soul_name: soul_name.clone(),
+                content: memory.content.clone(),
+                tag: memory.tag.clone(),
+                source_turn: memory.source_message_id,
+                confidence: memory.confidence,
+                truth_status: memory.truth_status.as_label().to_string(),
+                source_type: memory.source_type.as_label().to_string(),
+                is_pinned: memory.is_pinned,
+                is_active: memory.is_active,
+            });
+        }
+        for memory in &soul.memory.core {
+            memories.push(StateMapMemoryItem {
+                session_id: session_id.clone(),
+                session_title: session_title.clone(),
+                soul_name: soul_name.clone(),
+                content: memory.clone(),
+                tag: "core".to_string(),
+                source_turn: None,
+                confidence: None,
+                truth_status: "persistent_core".to_string(),
+                source_type: "persistent_core".to_string(),
+                is_pinned: false,
+                is_active: true,
+            });
+        }
+
+        sessions.push(SessionStateHubItem {
+            conversation,
+            soul_name,
+            setting_name: world.setting_name,
+            location: world.location,
+            time_elapsed: world.time_elapsed,
+            current_scene: world.scene_state.current_scene,
+            focus: world.scene_state.focus,
+            turn_counter: soul.turn_counter,
+            memory_count,
+            core_memory_count: soul.memory.core.len(),
+            recent_memory_count: soul.memory.recent.len(),
+            schema_count: soul.memory.schemas.len(),
+            relationship_count: soul.relationships.len(),
+            positive_relationship_count,
+            object_count: world.object_states.len().max(world.key_objects.len()),
+            event_count: world.recent_event_records.len().max(world.recent_events.len()),
+            active_plot_count: world.active_plots.len(),
+        });
+    }
+
+    memories.sort_by_key(|memory| (!memory.is_pinned, !memory.is_active));
+
+    Ok(SessionStateMap {
+        sessions,
+        scenes,
+        characters,
+        relationships,
+        objects,
+        timeline,
+        memories,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -20300,7 +20680,7 @@ fn sanitize_state_updater_patch(
                     .push("Establish the first scene".into());
                 world_patch
                     .active_plot_resolve
-                    .push("Establish the first scene ??Aurora is alone, expecting company, or has just let someone in.".into());
+                    .push("Establish the first scene - Aurora is alone, expecting company, or has just let someone in.".into());
                 world_patch.active_plot_add.push(plot.into());
             }
         }

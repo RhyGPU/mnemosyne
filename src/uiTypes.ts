@@ -16,7 +16,7 @@ export type BenchmarkTurnPhase =
   | "turn_summary"
   | "completed";
 export type NarrativeMode = "Realistic" | "Reader" | "Active Director" | "GM Simulation" | "Custom";
-export type AppView = "library" | "editor" | "chat";
+export type AppView = "home" | "library" | "editor" | "chat" | "statemap" | "settings";
 export type ChatStartMode = "continue" | "fresh";
 export type DisclaimerMode = "launch" | "manual" | null;
 export type SettingsTab = "ai" | "chat" | "library" | "dev";

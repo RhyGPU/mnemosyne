@@ -184,6 +184,104 @@ export type ConversationSummary = {
   is_benchmark?: boolean;
 };
 
+export type SessionStateHubItem = {
+  conversation: ConversationSummary;
+  soul_name: string;
+  setting_name: string;
+  location: string;
+  time_elapsed: string;
+  current_scene: string;
+  focus: string;
+  turn_counter: number;
+  memory_count: number;
+  core_memory_count: number;
+  recent_memory_count: number;
+  schema_count: number;
+  relationship_count: number;
+  positive_relationship_count: number;
+  object_count: number;
+  event_count: number;
+  active_plot_count: number;
+};
+
+export type StateMapSceneItem = {
+  session_id: string;
+  session_title: string;
+  soul_name: string;
+  setting_name: string;
+  turn_counter: number;
+  location: string;
+  time_elapsed: string;
+  current_scene: string;
+  focus: string;
+  last_user_action: string;
+  pressure_point: string;
+};
+
+export type StateMapCharacterItem = {
+  session_id: string;
+  session_title: string;
+  name: string;
+  role: string;
+  detail: string;
+};
+
+export type StateMapRelationshipItem = {
+  session_id: string;
+  session_title: string;
+  soul_name: string;
+  target: string;
+  love_type: string;
+  trust: number;
+  affection: number;
+  intimacy: number;
+  fear: number;
+  desire: number;
+};
+
+export type StateMapObjectItem = {
+  session_id: string;
+  session_title: string;
+  name: string;
+  kind: string;
+  owner: string;
+  location: string;
+  status: string;
+  summary: string;
+  confidence: number;
+};
+
+export type StateMapTimelineItem = {
+  session_id: string;
+  session_title: string;
+  turn_counter: number;
+  content: string;
+};
+
+export type StateMapMemoryItem = {
+  session_id: string;
+  session_title: string;
+  soul_name: string;
+  content: string;
+  tag: string;
+  source_turn: number | null;
+  confidence: number | null;
+  truth_status: string;
+  source_type: string;
+  is_pinned: boolean;
+  is_active: boolean;
+};
+
+export type SessionStateMap = {
+  sessions: SessionStateHubItem[];
+  scenes: StateMapSceneItem[];
+  characters: StateMapCharacterItem[];
+  relationships: StateMapRelationshipItem[];
+  objects: StateMapObjectItem[];
+  timeline: StateMapTimelineItem[];
+  memories: StateMapMemoryItem[];
+};
+
 export type PlayerPersona = {
   persona_id: string;
   display_name: string;
@@ -902,6 +1000,95 @@ export function listConversations(): Promise<ConversationSummary[]> {
   return invokeOrPreview("list_conversations", {}, () =>
     browserConversations.map(summarizePreviewConversation),
   );
+}
+
+export function listSessionStateHub(): Promise<SessionStateHubItem[]> {
+  return invokeOrPreview("list_session_state_hub", {}, () =>
+    browserConversations.map((conversation) => {
+      const summary = summarizePreviewConversation(conversation);
+      const soul = browserSouls.find((item) => item.character_id === summary.soul_id);
+      const setting = browserSettings.find((item) => item.setting_id === summary.source_setting_id);
+      const world = soul?.world as (WorldState & { scene_state?: { current_scene?: string; focus?: string }; object_states?: unknown[] }) | undefined;
+      const relationships = soul ? Object.values(soul.relationships ?? {}) : [];
+      return {
+        conversation: summary,
+        soul_name: soul?.character_name ?? "Unknown soul",
+        setting_name: setting?.setting_name ?? "Unknown setting",
+        location: world?.location ?? "",
+        time_elapsed: world?.time_elapsed ?? "",
+        current_scene: world?.scene_state?.current_scene ?? "",
+        focus: world?.scene_state?.focus ?? "",
+        turn_counter: soul?.turn_counter ?? summary.message_count,
+        memory_count: (soul?.memory.core.length ?? 0) + (soul?.memory.recent.length ?? 0) + (soul?.memory.schemas.length ?? 0),
+        core_memory_count: soul?.memory.core.length ?? 0,
+        recent_memory_count: soul?.memory.recent.length ?? 0,
+        schema_count: soul?.memory.schemas.length ?? 0,
+        relationship_count: relationships.length,
+        positive_relationship_count: relationships.filter(
+          (relationship) =>
+            relationship.trust > 35 ||
+            relationship.affection > 35 ||
+            relationship.intimacy > 35 ||
+            relationship.desire > 35,
+        ).length,
+        object_count: Math.max(world?.key_objects.length ?? 0, world?.object_states?.length ?? 0),
+        event_count: world?.recent_events.length ?? 0,
+        active_plot_count: world?.active_plots.length ?? 0,
+      };
+    }),
+  );
+}
+
+export function listSessionStateMap(): Promise<SessionStateMap> {
+  return invokeOrPreview("list_session_state_map", {}, async () => {
+    const sessions = await listSessionStateHub();
+    return {
+      sessions,
+      scenes: sessions.map((item) => ({
+        session_id: item.conversation.conversation_id,
+        session_title: item.conversation.title || "Untitled session",
+        soul_name: item.soul_name,
+        setting_name: item.setting_name,
+        turn_counter: item.turn_counter,
+        location: item.location,
+        time_elapsed: item.time_elapsed,
+        current_scene: item.current_scene,
+        focus: item.focus,
+        last_user_action: item.conversation.last_message_preview ?? "",
+        pressure_point: item.focus,
+      })),
+      characters: sessions.map((item) => ({
+        session_id: item.conversation.conversation_id,
+        session_title: item.conversation.title || "Untitled session",
+        name: item.soul_name,
+        role: "session soul",
+        detail: `${item.memory_count} memories / ${item.relationship_count} relationships`,
+      })),
+      relationships: [],
+      objects: [],
+      timeline: sessions
+        .filter((item) => item.conversation.last_message_preview)
+        .map((item) => ({
+          session_id: item.conversation.conversation_id,
+          session_title: item.conversation.title || "Untitled session",
+          turn_counter: item.turn_counter,
+          content: item.conversation.last_message_preview ?? "",
+        })),
+      memories: sessions.map((item) => ({
+        session_id: item.conversation.conversation_id,
+        session_title: item.conversation.title || "Untitled session",
+        soul_name: item.soul_name,
+        content: item.current_scene || item.focus || item.conversation.last_message_preview || "No memory preview yet.",
+        tag: "session",
+        source_turn: null,
+        confidence: null,
+        truth_status: "preview",
+        source_type: "preview",
+        is_pinned: false,
+        is_active: true,
+      })),
+    };
+  });
 }
 
 export function listPlayerPersonas(): Promise<PlayerPersona[]> {

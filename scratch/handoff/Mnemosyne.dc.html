@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:#1a1714;}
+  ::-webkit-scrollbar{width:10px;height:10px;}
+  ::-webkit-scrollbar-thumb{background:#3a322a;border-radius:6px;border:2px solid #1a1714;}
+  ::-webkit-scrollbar-track{background:transparent;}
+  textarea{font-family:"Spectral",Georgia,serif;}
+  @keyframes mneIn{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
+  @keyframes blink{0%,50%{opacity:1;}50.01%,100%{opacity:0;}}
+</style>
+</helmet>
+
+<div style="height:100vh;display:flex;background:#1a1714;color:#ece4d8;font-family:'IBM Plex Sans',system-ui,sans-serif;overflow:hidden;">
+
+  <!-- ===== NAV RAIL ===== -->
+  <aside style="width:238px;flex:none;background:#1d1916;border-right:1px solid #2e2822;display:flex;flex-direction:column;padding:22px 16px;">
+    <div style="padding:4px 8px 22px;">
+      <div style="font:600 21px 'Spectral',serif;letter-spacing:.01em;color:#ece4d8;">Mnemosyne</div>
+      <div style="font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;letter-spacing:.04em;margin-top:5px;">the narrator writes · the state map remembers</div>
+    </div>
+
+    <nav style="display:flex;flex-direction:column;gap:4px;">
+      <button onClick="{{ goHome }}" style="{{ nav.home }}">
+        <svg width="17" height="17" viewBox="0 0 17 17" fill="none"><rect x="1.5" y="2.5" width="14" height="4.5" rx="1.4" stroke="currentColor" stroke-width="1.4"/><rect x="1.5" y="10" width="14" height="4.5" rx="1.4" stroke="currentColor" stroke-width="1.4"/></svg>
+        Campaigns
+      </button>
+      <button onClick="{{ goPlay }}" style="{{ nav.play }}">
+        <svg width="17" height="17" viewBox="0 0 17 17" fill="none"><polygon points="4,2.5 14,8.5 4,14.5" fill="currentColor"/></svg>
+        Play
+      </button>
+      <button onClick="{{ goMap }}" style="{{ nav.map }}">
+        <svg width="17" height="17" viewBox="0 0 17 17" fill="none"><circle cx="4" cy="4" r="2.3" stroke="currentColor" stroke-width="1.4"/><circle cx="13" cy="5.5" r="2.3" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="13" r="2.3" stroke="currentColor" stroke-width="1.4"/><line x1="5.5" y1="5.5" x2="11" y2="7" stroke="currentColor" stroke-width="1.3"/><line x1="6.5" y1="11.5" x2="11.5" y2="7.3" stroke="currentColor" stroke-width="1.3"/></svg>
+        State Map
+      </button>
+      <button onClick="{{ goChars }}" style="{{ nav.chars }}">
+        <svg width="17" height="17" viewBox="0 0 17 17" fill="none"><circle cx="8.5" cy="6" r="3" stroke="currentColor" stroke-width="1.4"/><path d="M3 14.5c0-3 2.5-4.5 5.5-4.5s5.5 1.5 5.5 4.5" stroke="currentColor" stroke-width="1.4"/></svg>
+        Characters
+      </button>
+      <button onClick="{{ goSettings }}" style="{{ nav.settings }}">
+        <svg width="17" height="17" viewBox="0 0 17 17" fill="none"><line x1="2.5" y1="4.5" x2="14.5" y2="4.5" stroke="currentColor" stroke-width="1.4"/><circle cx="6" cy="4.5" r="1.8" fill="#1d1916" stroke="currentColor" stroke-width="1.4"/><line x1="2.5" y1="12.5" x2="14.5" y2="12.5" stroke="currentColor" stroke-width="1.4"/><circle cx="11" cy="12.5" r="1.8" fill="#1d1916" stroke="currentColor" stroke-width="1.4"/></svg>
+        Settings
+      </button>
+    </nav>
+
+    <div style="margin-top:auto;border-top:1px solid #2e2822;padding-top:16px;">
+      <div style="font:500 10px 'IBM Plex Mono',monospace;letter-spacing:.13em;text-transform:uppercase;color:#7d6f5e;margin-bottom:11px;">Engine</div>
+      <div style="display:flex;flex-direction:column;gap:7px;font-size:12px;color:#9a8f7e;">
+        <div style="display:flex;justify-content:space-between;"><span>Narrator</span><span style="color:#c4b8a6;">Claude</span></div>
+        <div style="display:flex;justify-content:space-between;"><span>Evaluator</span><span style="color:#c4b8a6;">Fast strict</span></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;"><span>Mode</span><span style="color:#e7c3a3;font-weight:500;">Balanced</span></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:7px;margin-top:13px;font:400 11px 'IBM Plex Mono',monospace;color:#8fb98a;">
+        <span style="width:6px;height:6px;border-radius:50%;background:#8fb98a;"></span>schema-enforced · json_schema
+      </div>
+    </div>
+  </aside>
+
+  <!-- ===== MAIN ===== -->
+  <main style="flex:1;overflow-y:auto;">
+
+    <!-- ========== HOME ========== -->
+    <sc-if value="{{ isHome }}" hint-placeholder-val="{{ true }}">
+    <div style="padding:36px 44px 60px;max-width:1240px;margin:0 auto;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:30px;">
+        <div>
+          <div style="font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">Campaigns</div>
+          <h1 style="font:600 30px 'Spectral',serif;margin:0;color:#ece4d8;">Your living worlds</h1>
+        </div>
+        <div style="display:flex;gap:10px;">
+          <button style="padding:10px 16px;border-radius:10px;border:1px solid #3a322a;background:transparent;color:#c4b8a6;font:500 13px 'IBM Plex Sans';cursor:pointer;">Import .mne</button>
+          <button style="padding:10px 18px;border-radius:10px;border:none;background:#d98a5a;color:#1a1714;font:600 13px 'IBM Plex Sans';cursor:pointer;">New campaign</button>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 340px;gap:22px;align-items:start;">
+        <div>
+          <!-- HERO / CONTINUE -->
+          <div style="background:linear-gradient(135deg,#262019,#211d19);border:1px solid #3a322a;border-radius:18px;padding:26px;margin-bottom:24px;position:relative;overflow:hidden;">
+            <div style="display:flex;align-items:center;gap:14px;margin-bottom:16px;">
+              <div style="width:52px;height:52px;border-radius:13px;display:flex;align-items:center;justify-content:center;font:600 22px 'Spectral',serif;color:#1a1714;background:#d98a5a;">{{ hero.initial }}</div>
+              <div>
+                <div style="font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:#d98a5a;margin-bottom:4px;">Continue · {{ hero.last }}</div>
+                <div style="font:600 23px 'Spectral',serif;color:#ece4d8;">{{ hero.title }}</div>
+              </div>
+            </div>
+            <p style="font:400 17px/1.6 'Spectral',serif;color:#c7bba8;margin:0 0 22px;max-width:560px;">{{ hero.scene }}</p>
+            <div style="display:flex;align-items:center;gap:26px;flex-wrap:wrap;">
+              <button onClick="{{ heroOpen }}" style="display:flex;align-items:center;gap:10px;padding:12px 22px;border-radius:11px;border:none;background:#d98a5a;color:#1a1714;font:600 14px 'IBM Plex Sans';cursor:pointer;">
+                <svg width="13" height="13" viewBox="0 0 13 13"><polygon points="2,1 12,6.5 2,12" fill="#1a1714"/></svg>
+                Resume — turn {{ hero.turns }}
+              </button>
+              <div style="display:flex;gap:24px;">
+                <div><div style="font:600 19px 'Spectral',serif;color:#ece4d8;">{{ hero.stats.memories }}</div><div style="font:400 11px 'IBM Plex Mono',monospace;color:#8a7d6c;text-transform:uppercase;letter-spacing:.08em;">memories</div></div>
+                <div><div style="font:600 19px 'Spectral',serif;color:#ece4d8;">{{ hero.stats.rels }}</div><div style="font:400 11px 'IBM Plex Mono',monospace;color:#8a7d6c;text-transform:uppercase;letter-spacing:.08em;">relationships</div></div>
+                <div><div style="font:600 19px 'Spectral',serif;color:#cf7a6a;">{{ hero.stats.tensions }}</div><div style="font:400 11px 'IBM Plex Mono',monospace;color:#8a7d6c;text-transform:uppercase;letter-spacing:.08em;">open tensions</div></div>
+                <div><div style="font:600 19px 'Spectral',serif;color:#ece4d8;">{{ hero.stats.chars }}</div><div style="font:400 11px 'IBM Plex Mono',monospace;color:#8a7d6c;text-transform:uppercase;letter-spacing:.08em;">characters</div></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- CAMPAIGN GRID -->
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+            <sc-for list="{{ campaigns }}" as="c" hint-placeholder-count="4">
+              <button onClick="{{ c.onOpen }}" style="text-align:left;cursor:pointer;background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:19px;display:flex;flex-direction:column;gap:14px;transition:border-color .15s;" style-hover="border-color:#4a3f33;">
+                <div style="height:3px;border-radius:2px;width:46px;" style="{{ c.barStyle }}"></div>
+                <div style="display:flex;gap:13px;align-items:center;">
+                  <div style="{{ c.avStyle }}">{{ c.initial }}</div>
+                  <div style="min-width:0;">
+                    <div style="font:600 16px 'Spectral',serif;color:#ece4d8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ c.title }}</div>
+                    <div style="font:400 12px 'IBM Plex Mono',monospace;color:#8a7d6c;margin-top:3px;">{{ c.genre }}</div>
+                  </div>
+                </div>
+                <div style="font:400 13.5px/1.5 'Spectral',serif;color:#a99d8b;min-height:60px;">{{ c.scene }}</div>
+                <div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #2a241e;padding-top:12px;">
+                  <div style="display:flex;align-items:center;gap:13px;font:400 11.5px 'IBM Plex Mono',monospace;color:#8a7d6c;">
+                    <span style="color:#c4b8a6;">{{ c.turns }} turns</span>
+                    <span style="display:flex;align-items:center;gap:6px;"><span style="{{ c.dotStyle }}"></span>{{ c.mode }}</span>
+                  </div>
+                  <div style="font:400 11.5px 'IBM Plex Mono',monospace;color:#7d6f5e;">{{ c.last }}</div>
+                </div>
+              </button>
+            </sc-for>
+          </div>
+        </div>
+
+        <!-- RIGHT COLUMN -->
+        <div style="display:flex;flex-direction:column;gap:18px;position:sticky;top:0;">
+          <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:20px;">
+            <div style="font:500 10px 'IBM Plex Mono',monospace;letter-spacing:.13em;text-transform:uppercase;color:#8a7d6c;margin-bottom:14px;">Recently remembered</div>
+            <div style="display:flex;flex-direction:column;gap:14px;">
+              <sc-for list="{{ recent }}" as="r" hint-placeholder-count="3">
+                <div style="display:flex;gap:11px;">
+                  <div style="width:6px;height:6px;border-radius:50%;background:#7fa9c9;margin-top:7px;flex:none;"></div>
+                  <div>
+                    <div style="font:400 14px/1.5 'Spectral',serif;color:#d8cdbb;">{{ r.text }}</div>
+                    <div style="font:400 10.5px 'IBM Plex Mono',monospace;color:#7d6f5e;margin-top:5px;letter-spacing:.05em;">turn {{ r.turn }} · {{ r.tag }} · {{ r.conf }} confidence</div>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+
+          <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:20px;">
+            <div style="font:500 10px 'IBM Plex Mono',monospace;letter-spacing:.13em;text-transform:uppercase;color:#8a7d6c;margin-bottom:14px;">How a turn works</div>
+            <div style="display:flex;flex-direction:column;gap:12px;">
+              <div style="display:flex;gap:11px;align-items:flex-start;"><span style="font:500 11px 'IBM Plex Mono',monospace;color:#d98a5a;margin-top:1px;">01</span><span style="font:400 13.5px/1.5 'Spectral',serif;color:#a99d8b;"><b style="color:#d8cdbb;font-weight:600;">Narrator</b> writes the visible prose.</span></div>
+              <div style="display:flex;gap:11px;align-items:flex-start;"><span style="font:500 11px 'IBM Plex Mono',monospace;color:#7fa9c9;margin-top:1px;">02</span><span style="font:400 13.5px/1.5 'Spectral',serif;color:#a99d8b;"><b style="color:#d8cdbb;font-weight:600;">Evaluator</b> extracts schema-checked state patches.</span></div>
+              <div style="display:flex;gap:11px;align-items:flex-start;"><span style="font:500 11px 'IBM Plex Mono',monospace;color:#8fb98a;margin-top:1px;">03</span><span style="font:400 13.5px/1.5 'Spectral',serif;color:#a99d8b;">The <b style="color:#d8cdbb;font-weight:600;">state map</b> updates — nothing re-sent next turn.</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- ========== PLAY ========== -->
+    <sc-if value="{{ isPlayNormal }}" hint-placeholder-val="{{ true }}">
+    <div style="display:flex;height:100vh;">
+      <!-- transcript column -->
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0;">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:20px 34px;border-bottom:1px solid #2e2822;flex:none;">
+          <div>
+            <div style="font:600 18px 'Spectral',serif;color:#ece4d8;">{{ camp.title }}</div>
+            <div style="font:400 12px 'IBM Plex Mono',monospace;color:#8a7d6c;margin-top:3px;">{{ camp.world }} · turn {{ camp.turns }} · {{ camp.mode }} mode</div>
+          </div>
+          <div style="display:flex;gap:9px;">
+            <button onClick="{{ toggleDev }}" style="padding:8px 14px;border-radius:9px;border:1px solid #2f5a2f;background:rgba(51,255,0,.06);color:#7dc46b;font:500 12.5px 'JetBrains Mono','IBM Plex Mono',monospace;cursor:pointer;display:flex;align-items:center;gap:7px;" style-hover="background:rgba(51,255,0,.12);color:#9be88a;">&gt;_ Dev mode</button>
+            <button style="padding:8px 14px;border-radius:9px;border:1px solid #3a322a;background:transparent;color:#c4b8a6;font:500 12.5px 'IBM Plex Sans';cursor:pointer;">Regenerate</button>
+            <button onClick="{{ toggleVariants }}" style="padding:8px 14px;border-radius:9px;border:1px solid #3a322a;background:transparent;color:#c4b8a6;font:500 12.5px 'IBM Plex Sans';cursor:pointer;">Variants</button>
+            <button onClick="{{ saveCheckpoint }}" style="padding:8px 14px;border-radius:9px;border:1px solid #3a322a;background:transparent;color:#c4b8a6;font:500 12.5px 'IBM Plex Sans';cursor:pointer;">Checkpoint</button>
+          </div>
+        </div>
+
+        <div style="flex:1;overflow-y:auto;padding:34px 44px;">
+          <div style="max-width:680px;margin:0 auto;">
+            <sc-for list="{{ transcript }}" as="msg" hint-placeholder-count="4">
+              <div style="margin-bottom:30px;">
+                <div style="{{ msg.meta }}">{{ msg.who }} · turn {{ msg.turn }}</div>
+                <div style="{{ msg.body }}">{{ msg.text }}</div>
+                <sc-if value="{{ msg.hasCaptured }}" hint-placeholder-val="{{ true }}">
+                  <div style="display:inline-flex;align-items:center;gap:10px;margin-top:13px;padding:7px 13px;border-radius:9px;background:rgba(127,169,201,.08);border:1px solid rgba(127,169,201,.22);">
+                    <svg width="9" height="9" viewBox="0 0 9 9"><polygon points="4.5,0 9,4.5 4.5,9 0,4.5" fill="#7fa9c9"/></svg>
+                    <span style="font:500 11.5px 'IBM Plex Mono',monospace;color:#9cc0d8;">evaluator captured · {{ msg.capturedText }}</span>
+                    <span onClick="{{ goMap }}" style="font:500 11.5px 'IBM Plex Sans';color:#7fa9c9;cursor:pointer;border-left:1px solid rgba(127,169,201,.3);padding-left:10px;">view in State Map</span>
+                  </div>
+                </sc-if>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+
+        <!-- composer -->
+        <div style="flex:none;padding:18px 44px 24px;border-top:1px solid #2e2822;">
+          <div style="max-width:680px;margin:0 auto;">
+            <div style="background:#211d19;border:1px solid #3a322a;border-radius:14px;padding:6px 6px 6px 16px;display:flex;align-items:flex-end;gap:10px;">
+              <textarea value="{{ composer }}" onInput="{{ setComposer }}" onKeyDown="{{ onComposerKey }}" rows="2" placeholder="Write Aurora’s next move…" style="flex:1;resize:none;background:transparent;border:none;outline:none;color:#e7ddce;font:400 16px/1.6 'Spectral',serif;padding:10px 0;"></textarea>
+              <button onClick="{{ send }}" style="flex:none;padding:11px 20px;border-radius:10px;border:none;background:#d98a5a;color:#1a1714;font:600 13.5px 'IBM Plex Sans';cursor:pointer;">Send</button>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-top:9px;font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;">
+              <span>⌘⏎ to send · narrator + evaluator run in two passes</span>
+              <span>prompt 2.1k · out 480 tok · ~$0.004 / turn</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- variants drawer -->
+      <sc-if value="{{ showVariants }}" hint-placeholder-val="{{ false }}">
+      <aside style="width:380px;flex:none;border-left:1px solid #2e2822;background:#1d1916;overflow-y:auto;padding:26px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+          <span style="font:600 15px 'IBM Plex Sans';color:#ece4d8;">Narrator variants</span>
+          <button onClick="{{ toggleVariants }}" style="font:500 12px 'IBM Plex Sans';color:#8a7d6c;background:none;border:none;cursor:pointer;" style-hover="color:#c4b8a6;">close ×</button>
+        </div>
+        <div style="font:400 13px/1.5 'Spectral',serif;color:#8a7d6c;margin-bottom:20px;">Two alternative takes on the last turn. Pick one to append it to the session.</div>
+        <div style="display:flex;flex-direction:column;gap:16px;">
+          <sc-for list="{{ variantsList }}" as="v" hint-placeholder-count="2">
+            <div style="background:#211d19;border:1px solid #2e2822;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:14px;">
+              <span style="font:500 10.5px 'IBM Plex Mono',monospace;color:#d98a5a;letter-spacing:.1em;text-transform:uppercase;">{{ v.label }}</span>
+              <div style="font:400 15.5px/1.65 'Spectral',serif;color:#d8cdbb;">{{ v.text }}</div>
+              <button onClick="{{ v.onPick }}" style="align-self:flex-start;padding:8px 16px;border-radius:8px;border:1px solid #3a322a;background:transparent;color:#c4b8a6;font:500 12px 'IBM Plex Sans';cursor:pointer;" style-hover="border-color:#d98a5a;color:#e7c3a3;">Use this →</button>
+            </div>
+          </sc-for>
+        </div>
+      </aside>
+      </sc-if>
+    </div>
+    <sc-if value="{{ hasCheckpointToast }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;bottom:90px;right:32px;padding:11px 20px;border-radius:11px;background:#1e3a1e;border:1px solid #4a8a4a;color:#9be88a;font:500 13px 'IBM Plex Mono',monospace;z-index:200;pointer-events:none;box-shadow:0 4px 24px rgba(0,0,0,.5);">✓ {{ checkpointToast }}</div>
+    </sc-if>
+    </sc-if>
+    <!-- ========== DEV TERMINAL ========== -->
+    <sc-if value="{{ isDevTerminal }}" hint-placeholder-val="{{ true }}">
+    <div style="position:relative;height:100vh;background:#0a0a0a;color:#33ff00;font-family:'JetBrains Mono','IBM Plex Mono',monospace;overflow:hidden;display:flex;">
+      <div style="position:absolute;inset:0;pointer-events:none;z-index:5;background:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0px,rgba(0,0,0,0) 2px,rgba(0,0,0,.22) 3px,rgba(0,0,0,0) 4px);"></div>
+      <div style="position:absolute;inset:0;pointer-events:none;z-index:5;background:radial-gradient(ellipse at center,rgba(0,0,0,0) 58%,rgba(0,0,0,.5) 100%);"></div>
+
+      <!-- PIPELINE RAIL -->
+      <aside style="width:290px;flex:none;border-right:1px solid #1f521f;padding:20px 18px;display:flex;flex-direction:column;position:relative;z-index:6;">
+        <div style="border:1px solid #1f521f;padding:11px 13px;margin-bottom:20px;">
+          <div style="font-size:15px;font-weight:700;letter-spacing:.26em;text-shadow:0 0 6px rgba(51,255,0,.5);">MNEMOSYNE</div>
+          <div style="font-size:10.5px;color:#2f8f2f;margin-top:4px;letter-spacing:.12em;">// STATE ENGINE · DEV</div>
+        </div>
+
+        <div style="font-size:10.5px;color:#2f8f2f;letter-spacing:.18em;margin-bottom:9px;">TURN PIPELINE</div>
+        <div style="font-size:12px;margin-bottom:5px;color:#33ff00;text-shadow:0 0 5px rgba(51,255,0,.4);">[{{ progressBar }}]</div>
+        <div style="font-size:10.5px;color:#2f8f2f;margin-bottom:20px;letter-spacing:.04em;">{{ progressLabel }}</div>
+
+        <div style="display:flex;flex-direction:column;gap:10px;">
+          <sc-for list="{{ pipeRows }}" as="p" hint-placeholder-count="8">
+            <div style="display:flex;align-items:flex-start;gap:10px;{{ p.rowStyle }}">
+              <span style="{{ p.glyphStyle }}">{{ p.glyph }}</span>
+              <div style="min-width:0;">
+                <div style="{{ p.labelStyle }}">{{ p.label }}</div>
+                <div style="font-size:10px;color:#2a6a2a;margin-top:1px;">{{ p.detail }}</div>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="margin-top:auto;border-top:1px dashed #1f521f;padding-top:13px;font-size:10px;color:#2a6a2a;line-height:2;">
+          <div><span style="color:#33ff00;">✓</span> done&nbsp;&nbsp;<span style="color:#ffb000;">◐</span> running</div>
+          <div><span style="color:#ff3333;">▲</span> error / paused&nbsp;&nbsp;<span style="color:#1f521f;">·</span> queued</div>
+        </div>
+      </aside>
+
+      <!-- TERMINAL -->
+      <div style="flex:1;display:flex;flex-direction:column;min-width:0;position:relative;z-index:6;">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 22px;border-bottom:1px solid #1f521f;">
+          <span style="font-size:12px;color:#2f8f2f;letter-spacing:.04em;">mnemosyne // the ashgate conspiracy — <span style="color:#33ff00;text-shadow:0 0 6px rgba(51,255,0,.5);">DEV SESSION</span></span>
+          <button onClick="{{ toggleDev }}" style="background:transparent;border:1px solid #1f521f;color:#33ff00;font-family:inherit;font-size:11.5px;padding:6px 12px;cursor:pointer;letter-spacing:.08em;" style-hover="background:#33ff00;color:#0a0a0a;">[ EXIT DEV ]</button>
+        </div>
+
+        <div ref="{{ setStreamRef }}" style="flex:1;overflow-y:auto;padding:18px 22px;font-size:13px;line-height:1.65;">
+          <sc-for list="{{ streamLines }}" as="ln" hint-placeholder-count="6">
+            <div style="{{ ln.wrap }}"><span style="{{ ln.prefixStyle }}">{{ ln.prefix }}</span><span style="{{ ln.textStyle }}">{{ ln.text }}</span></div>
+          </sc-for>
+        </div>
+
+        <div style="border-top:1px solid #1f521f;padding:14px 22px 8px;display:flex;align-items:center;">
+          <span style="font-size:13px;color:#ffb000;white-space:nowrap;text-shadow:0 0 5px rgba(255,176,0,.3);">{{ prompt }}&nbsp;</span>
+          <input value="{{ termInput }}" onInput="{{ setTermInput }}" onKeyDown="{{ onTermKey }}" spellcheck="false" autocomplete="off" style="flex:1;background:transparent;border:none;outline:none;color:#33ff00;font-family:inherit;font-size:13px;caret-color:#33ff00;" />
+          <span style="width:9px;height:16px;background:#33ff00;animation:blink 1s step-end infinite;flex:none;box-shadow:0 0 6px rgba(51,255,0,.5);"></span>
+        </div>
+        <div style="padding:0 22px 14px;font-size:10.5px;color:#2a6a2a;letter-spacing:.02em;">/chat &lt;text&gt; speaks in-scene · everything else runs as a command · try: help · status · pipeline · clear · exit</div>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- ========== STATE MAP ========== -->
+    <sc-if value="{{ isMap }}" hint-placeholder-val="{{ true }}">
+    <div style="padding:32px 40px 60px;max-width:1320px;margin:0 auto;">
+      <div style="margin-bottom:26px;">
+        <div style="font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">State Map · {{ camp.title }}</div>
+        <h1 style="font:600 28px 'Spectral',serif;margin:0;color:#ece4d8;">What the engine believes is true</h1>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start;margin-bottom:18px;">
+        <!-- SCENE -->
+        <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:20px;">
+          <div onClick="{{ tScene }}" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;margin-bottom:14px;">
+            <span style="font:600 14px 'IBM Plex Sans';color:#ece4d8;display:flex;align-items:center;gap:9px;"><span style="width:8px;height:8px;border-radius:50%;background:#d98a5a;"></span>Scene State</span>
+            <span style="font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;">{{ scene.time }}</span>
+          </div>
+          <sc-if value="{{ panels.scene }}" hint-placeholder-val="{{ true }}">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:13px;">
+            <div><div style="font:500 9.5px 'IBM Plex Mono',monospace;color:#7d6f5e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Location</div><div style="font:400 13.5px/1.4 'Spectral',serif;color:#d8cdbb;">{{ scene.location }}</div></div>
+            <div><div style="font:500 9.5px 'IBM Plex Mono',monospace;color:#7d6f5e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Positions</div><div style="font:400 13.5px/1.4 'Spectral',serif;color:#d8cdbb;">{{ scene.positions }}</div></div>
+            <div><div style="font:500 9.5px 'IBM Plex Mono',monospace;color:#7d6f5e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Room state</div><div style="font:400 13.5px/1.4 'Spectral',serif;color:#d8cdbb;">{{ scene.room }}</div></div>
+            <div><div style="font:500 9.5px 'IBM Plex Mono',monospace;color:#7d6f5e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Active object</div><div style="font:400 13.5px/1.4 'Spectral',serif;color:#d8cdbb;">{{ scene.object }}</div></div>
+            <div style="grid-column:1/3;border-top:1px solid #2a241e;padding-top:12px;"><div style="font:500 9.5px 'IBM Plex Mono',monospace;color:#cf7a6a;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;">Last concrete action</div><div style="font:400 13.5px/1.4 'Spectral',serif;color:#d8cdbb;">{{ scene.last }}</div></div>
+          </div>
+          </sc-if>
+        </div>
+
+        <!-- CHARACTERS -->
+        <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:20px;">
+          <div onClick="{{ tChars }}" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;margin-bottom:14px;">
+            <span style="font:600 14px 'IBM Plex Sans';color:#ece4d8;display:flex;align-items:center;gap:9px;"><span style="width:8px;height:8px;border-radius:50%;background:#7fa9c9;"></span>Characters</span>
+            <span style="font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;">who knows what</span>
+          </div>
+          <sc-if value="{{ panels.chars }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex;flex-direction:column;gap:13px;">
+            <sc-for list="{{ characters }}" as="ch" hint-placeholder-count="3">
+              <div style="display:flex;gap:12px;">
+                <div style="width:34px;height:34px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;font:600 14px 'Spectral',serif;color:#1a1714;background:{{ ch.color }};">{{ ch.initial }}</div>
+                <div style="min-width:0;">
+                  <div style="font:600 14px 'Spectral',serif;color:#ece4d8;">{{ ch.name }}</div>
+                  <div style="font:400 11px 'IBM Plex Mono',monospace;color:#8a7d6c;margin-bottom:5px;">{{ ch.role }}</div>
+                  <div style="font:400 12.5px/1.45 'Spectral',serif;color:#a99d8b;"><span style="color:#8fb98a;">knows</span> — {{ ch.knows }}</div>
+                  <div style="font:400 12.5px/1.45 'Spectral',serif;color:#a99d8b;"><span style="color:#c9a26a;">misbelieves</span> — {{ ch.misbelieves }}</div>
+                </div>
+              </div>
+            </sc-for>
+          </div>
+          </sc-if>
+        </div>
+
+        <!-- RELATIONSHIPS -->
+        <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:20px;">
+          <div onClick="{{ tRels }}" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;margin-bottom:14px;">
+            <span style="font:600 14px 'IBM Plex Sans';color:#ece4d8;display:flex;align-items:center;gap:9px;"><span style="width:8px;height:8px;border-radius:50%;background:#8fb98a;"></span>Relationships</span>
+            <span style="font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;">Aurora → …</span>
+          </div>
+          <sc-if value="{{ panels.rels }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex;flex-direction:column;gap:16px;">
+            <sc-for list="{{ rels }}" as="r" hint-placeholder-count="2">
+              <div>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                  <span style="font:600 13.5px 'Spectral',serif;color:#e7ddce;">{{ r.target }}</span>
+                  <span style="{{ r.chipStyle }}">{{ r.change }}</span>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:8px;">
+                  <sc-for list="{{ r.dims }}" as="d" hint-placeholder-count="3">
+                    <div style="display:flex;align-items:center;gap:10px;">
+                      <span style="width:62px;flex:none;font:400 11px 'IBM Plex Mono',monospace;color:#8a7d6c;">{{ d.k }}</span>
+                      <div style="flex:1;height:6px;border-radius:3px;background:#2a241e;position:relative;"><div style="position:absolute;top:0;bottom:0;width:1px;left:50%;background:#4a3f33;"></div><div style="position:absolute;top:0;bottom:0;border-radius:3px;{{ d.fill }}"></div></div>
+                      <span style="width:34px;text-align:right;font:400 11px 'IBM Plex Mono',monospace;color:#c4b8a6;">{{ d.num }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+                <div style="font:400 11px/1.4 'IBM Plex Mono',monospace;color:#7d6f5e;margin-top:9px;">{{ r.event }}</div>
+              </div>
+            </sc-for>
+          </div>
+          </sc-if>
+        </div>
+
+        <!-- OBJECTS + TIMELINE stacked -->
+        <div style="display:flex;flex-direction:column;gap:18px;">
+          <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:20px;">
+            <div onClick="{{ tObjects }}" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;margin-bottom:14px;">
+              <span style="font:600 14px 'IBM Plex Sans';color:#ece4d8;display:flex;align-items:center;gap:9px;"><span style="width:8px;height:8px;border-radius:50%;background:#c9a26a;"></span>Objects</span>
+              <span style="font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;">identity · owner · status</span>
+            </div>
+            <sc-if value="{{ panels.objects }}" hint-placeholder-val="{{ true }}">
+            <div style="display:flex;flex-direction:column;gap:11px;">
+              <sc-for list="{{ objects }}" as="o" hint-placeholder-count="3">
+                <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2a241e;padding-bottom:11px;">
+                  <div><div style="font:600 13.5px 'Spectral',serif;color:#e7ddce;">{{ o.name }}</div><div style="font:400 11px 'IBM Plex Mono',monospace;color:#8a7d6c;margin-top:2px;">{{ o.owner }} · {{ o.loc }}</div></div>
+                  <span style="font:500 10.5px 'IBM Plex Mono',monospace;color:#c9a26a;padding:3px 9px;border-radius:6px;background:rgba(201,162,106,.13);">{{ o.status }}</span>
+                </div>
+              </sc-for>
+            </div>
+            </sc-if>
+          </div>
+
+          <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:20px;">
+            <div onClick="{{ tTimeline }}" style="display:flex;justify-content:space-between;align-items:center;cursor:pointer;margin-bottom:14px;">
+              <span style="font:600 14px 'IBM Plex Sans';color:#ece4d8;display:flex;align-items:center;gap:9px;"><span style="width:8px;height:8px;border-radius:50%;background:#b98ab9;"></span>Timeline</span>
+              <span style="font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;">recent events</span>
+            </div>
+            <sc-if value="{{ panels.timeline }}" hint-placeholder-val="{{ true }}">
+            <div style="display:flex;flex-direction:column;">
+              <sc-for list="{{ timeline }}" as="t" hint-placeholder-count="4">
+                <div style="display:flex;gap:13px;padding-bottom:13px;">
+                  <div style="font:500 11px 'IBM Plex Mono',monospace;color:#8a7d6c;width:34px;flex:none;text-align:right;padding-top:1px;">{{ t.turn }}</div>
+                  <div style="font:400 13.5px/1.45 'Spectral',serif;color:#d8cdbb;border-left:1px solid #3a322a;padding-left:14px;">{{ t.label }}</div>
+                </div>
+              </sc-for>
+            </div>
+            </sc-if>
+          </div>
+        </div>
+      </div>
+
+      <!-- MEMORY INSPECTOR -->
+      <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:22px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;">
+          <span style="font:600 15px 'IBM Plex Sans';color:#ece4d8;display:flex;align-items:center;gap:9px;"><span style="width:8px;height:8px;border-radius:50%;background:#7fa9c9;"></span>Memory Inspector</span>
+          <span style="font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;">every memory traces to the turn that created it</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 320px;gap:20px;align-items:start;">
+          <div style="display:flex;flex-direction:column;gap:11px;">
+            <sc-for list="{{ memories }}" as="m" hint-placeholder-count="5">
+              <button onClick="{{ m.onSelect }}" style="{{ m.cardStyle }}">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:8px;">
+                  <span style="{{ m.tagStyle }}">{{ m.tag }}</span>
+                  <span style="{{ m.truthStyle }}">{{ m.truthLabel }}</span>
+                </div>
+                <div style="{{ m.textStyle }}">{{ m.text }}</div>
+                <div style="font:400 10.5px 'IBM Plex Mono',monospace;color:#7d6f5e;letter-spacing:.04em;">turn {{ m.turn }} · {{ m.conf }} confidence</div>
+              </button>
+            </sc-for>
+          </div>
+
+          <!-- provenance panel -->
+          <div style="position:sticky;top:0;background:#1d1916;border:1px solid #2e2822;border-radius:13px;padding:18px;">
+            <div style="font:500 10px 'IBM Plex Mono',monospace;letter-spacing:.13em;text-transform:uppercase;color:#8a7d6c;margin-bottom:13px;">Provenance</div>
+            <div style="font:400 15.5px/1.55 'Spectral',serif;color:#e7ddce;margin-bottom:16px;">{{ selectedMemory.text }}</div>
+            <div style="display:flex;flex-direction:column;gap:11px;font-size:12.5px;">
+              <div style="display:flex;justify-content:space-between;"><span style="color:#8a7d6c;">Source turn</span><span style="color:#c4b8a6;font-family:'IBM Plex Mono',monospace;">turn {{ selectedMemory.turn }}</span></div>
+              <div style="display:flex;justify-content:space-between;"><span style="color:#8a7d6c;">Confidence</span><span style="color:#c4b8a6;font-family:'IBM Plex Mono',monospace;">{{ selectedMemory.conf }}</span></div>
+              <div style="display:flex;justify-content:space-between;align-items:center;"><span style="color:#8a7d6c;">Truth status</span><span style="{{ selectedMemory.truthStyle }}">{{ selectedMemory.truthLabel }}</span></div>
+            </div>
+            <div style="border-top:1px solid #2a241e;margin-top:15px;padding-top:14px;">
+              <div style="font:500 10px 'IBM Plex Mono',monospace;color:#7d6f5e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Evidence quote</div>
+              <div style="font:400 13.5px/1.5 'Spectral',serif;font-style:italic;color:#b6aa98;padding-left:12px;border-left:2px solid #4a3f33;">{{ selectedMemory.evidence }}</div>
+            </div>
+            <div style="display:flex;gap:9px;margin-top:18px;">
+              <button onClick="{{ selectedMemory.onPin }}" style="flex:1;padding:9px;border-radius:9px;border:1px solid #3a322a;background:transparent;color:#d8b46a;font:500 12px 'IBM Plex Sans';cursor:pointer;">{{ selectedMemory.pinLabel }}</button>
+              <button onClick="{{ selectedMemory.onInvalidate }}" style="flex:1;padding:9px;border-radius:9px;border:1px solid #3a322a;background:transparent;color:#cf7a6a;font:500 12px 'IBM Plex Sans';cursor:pointer;">{{ selectedMemory.invLabel }}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- ========== CHARACTERS ========== -->
+    <sc-if value="{{ isCharWorld }}" hint-placeholder-val="{{ true }}">
+    <div style="padding:32px 44px 60px;max-width:1240px;margin:0 auto;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:24px;">
+        <div>
+          <div style="font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">Characters &amp; Worlds</div>
+          <h1 style="font:600 28px 'Spectral',serif;margin:0;color:#ece4d8;">Your cast &amp; worlds</h1>
+        </div>
+        <div style="display:flex;gap:10px;">
+          <button onClick="{{ goNewChar }}" style="padding:10px 16px;border-radius:10px;border:1px solid #3a322a;background:transparent;color:#c4b8a6;font:500 13px 'IBM Plex Sans';cursor:pointer;">+ New character</button>
+          <button onClick="{{ goNewWorld }}" style="padding:10px 18px;border-radius:10px;border:none;background:#d98a5a;color:#1a1714;font:600 13px 'IBM Plex Sans';cursor:pointer;">+ New world</button>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:4px;margin-bottom:26px;background:#211d19;padding:5px;border-radius:12px;border:1px solid #2e2822;width:fit-content;">
+        <button onClick="{{ goSessions }}" style="{{ cvSessions }}">Sessions</button>
+        <button onClick="{{ goWorlds }}" style="{{ cvWorlds }}">Worlds</button>
+        <button onClick="{{ goCharsList }}" style="{{ cvChars }}">Characters</button>
+      </div>
+
+      <sc-if value="{{ isCharSessions }}" hint-placeholder-val="{{ true }}">
+      <div style="display:flex;flex-direction:column;gap:12px;">
+        <sc-for list="{{ sessionsList }}" as="s" hint-placeholder-count="4">
+        <div style="background:#211d19;border:1px solid #2e2822;border-radius:14px;padding:18px 22px;display:flex;align-items:center;gap:18px;">
+          <div style="display:flex;gap:9px;flex:none;flex-wrap:wrap;">
+            <span style="padding:4px 10px;border-radius:20px;font:500 11px 'IBM Plex Mono',monospace;background:rgba(217,138,90,.1);color:#d8a06a;border:1px solid rgba(217,138,90,.2);">{{ s.worldName }}</span>
+            <span style="padding:4px 10px;border-radius:20px;font:500 11px 'IBM Plex Mono',monospace;background:rgba(196,184,166,.07);color:#9a8f7e;border:1px solid #2e2822;">{{ s.charName }}</span>
+          </div>
+          <div style="flex:1;min-width:0;">
+            <div style="font:600 16px 'Spectral',serif;color:#ece4d8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ s.name }}</div>
+            <div style="font:400 11.5px 'IBM Plex Mono',monospace;color:#7d6f5e;margin-top:3px;">{{ s.turns }} turns · last played {{ s.last }}</div>
+          </div>
+          <button onClick="{{ s.onResume }}" style="flex:none;padding:9px 18px;border-radius:9px;border:1px solid #3a322a;background:transparent;color:#c4b8a6;font:500 12.5px 'IBM Plex Sans';cursor:pointer;" style-hover="border-color:#d98a5a;color:#e7c3a3;">Resume →</button>
+        </div>
+        </sc-for>
+        <button onClick="{{ goNewWorld }}" style="text-align:center;padding:18px;border-radius:14px;border:1.5px dashed #3a322a;background:transparent;color:#7d6f5e;font:500 13px 'IBM Plex Sans';cursor:pointer;" style-hover="border-color:#d98a5a;color:#c4b8a6;">+ Start a new session</button>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isCharWorlds }}" hint-placeholder-val="{{ false }}">
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;">
+        <sc-for list="{{ worldsList }}" as="w" hint-placeholder-count="4">
+        <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:20px;display:flex;flex-direction:column;gap:13px;">
+          <div style="height:3px;border-radius:2px;background:{{ w.accent }};opacity:.85;"></div>
+          <div>
+            <div style="font:600 18px 'Spectral',serif;color:#ece4d8;">{{ w.name }}</div>
+            <div style="font:400 11px 'IBM Plex Mono',monospace;color:#8a7d6c;margin-top:3px;">{{ w.genre }}</div>
+          </div>
+          <div style="font:400 14px/1.5 'Spectral',serif;color:#a99d8b;flex:1;">{{ w.desc }}</div>
+          <div style="font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;border-top:1px solid #2a241e;padding-top:12px;">{{ w.sessCount }} sessions · {{ w.charCount }} characters</div>
+        </div>
+        </sc-for>
+        <button onClick="{{ goNewWorld }}" style="border-radius:15px;border:1.5px dashed #3a322a;background:transparent;color:#7d6f5e;font:500 13px 'IBM Plex Sans';cursor:pointer;padding:40px 20px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;" style-hover="border-color:#d98a5a;color:#c4b8a6;"><span style="font-size:28px;color:#4a3f33;">+</span><span>New world</span></button>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isCharChars }}" hint-placeholder-val="{{ false }}">
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px;">
+        <sc-for list="{{ charsList }}" as="ch" hint-placeholder-count="3">
+        <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:20px;display:flex;flex-direction:column;gap:12px;">
+          <div style="display:flex;align-items:center;gap:13px;">
+            <div style="width:44px;height:44px;border-radius:12px;flex:none;display:flex;align-items:center;justify-content:center;font:600 19px 'Spectral',serif;color:#1a1714;background:{{ ch.color }};">{{ ch.initial }}</div>
+            <div style="min-width:0;">
+              <div style="font:600 16px 'Spectral',serif;color:#ece4d8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ ch.name }}</div>
+              <div style="font:400 11px 'IBM Plex Mono',monospace;color:#8a7d6c;margin-top:2px;">{{ ch.role }}</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <span style="padding:3px 10px;border-radius:20px;font:500 10.5px 'IBM Plex Mono',monospace;background:rgba(196,184,166,.07);color:#9a8f7e;border:1px solid #2e2822;">{{ ch.worldName }}</span>
+            <span style="padding:3px 10px;border-radius:20px;font:500 10.5px 'IBM Plex Mono',monospace;background:rgba(217,138,90,.08);color:#c9a26a;border:1px solid rgba(217,138,90,.2);">{{ ch.preset }}</span>
+          </div>
+        </div>
+        </sc-for>
+        <button onClick="{{ goNewChar }}" style="border-radius:15px;border:1.5px dashed #3a322a;background:transparent;color:#7d6f5e;font:500 13px 'IBM Plex Sans';cursor:pointer;padding:40px 20px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;" style-hover="border-color:#d98a5a;color:#c4b8a6;"><span style="font-size:28px;color:#4a3f33;">+</span><span>New character</span></button>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isCharNewWorld }}" hint-placeholder-val="{{ false }}">
+      <div style="max-width:680px;">
+        <button onClick="{{ goWorlds }}" style="font:500 12.5px 'IBM Plex Sans';color:#9a8f7e;background:none;border:none;cursor:pointer;margin-bottom:20px;padding:0;">← Back to worlds</button>
+        <div style="background:#211d19;border:1px solid #2e2822;border-radius:16px;padding:28px;display:flex;flex-direction:column;gap:20px;">
+          <div style="font:600 20px 'Spectral',serif;color:#ece4d8;">Create a world</div>
+          <div>
+            <label style="display:block;font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">World name</label>
+            <input value="{{ newWorldForm.name }}" onInput="{{ onNWNameInput }}" placeholder="e.g. The Sunken Archives" style="width:100%;padding:12px 16px;border-radius:10px;border:1px solid #3a322a;background:#1a1714;color:#ece4d8;font:400 16px 'Spectral',serif;outline:none;" />
+          </div>
+          <div>
+            <label style="display:block;font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">Genre</label>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <sc-for list="{{ nwGenreChips }}" as="g" hint-placeholder-count="4">
+                <button onClick="{{ g.onPick }}" style="{{ g.style }}">{{ g.g }}</button>
+              </sc-for>
+            </div>
+          </div>
+          <div>
+            <label style="display:block;font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">Setting description</label>
+            <textarea value="{{ newWorldForm.desc }}" onInput="{{ onNWDescInput }}" rows="3" placeholder="One paragraph — the world’s atmosphere, rules, tensions." style="width:100%;padding:12px 16px;border-radius:10px;border:1px solid #3a322a;background:#1a1714;color:#ece4d8;font:400 15px/1.6 'Spectral',serif;resize:vertical;outline:none;"></textarea>
+          </div>
+          <button onClick="{{ submitNewWorld }}" style="align-self:flex-start;padding:12px 24px;border-radius:11px;border:none;background:#d98a5a;color:#1a1714;font:600 14px 'IBM Plex Sans';cursor:pointer;">Create world →</button>
+        </div>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isCharNewChar }}" hint-placeholder-val="{{ false }}">
+      <div style="max-width:680px;">
+        <button onClick="{{ goCharsList }}" style="font:500 12.5px 'IBM Plex Sans';color:#9a8f7e;background:none;border:none;cursor:pointer;margin-bottom:20px;padding:0;">← Back to characters</button>
+        <div style="background:#211d19;border:1px solid #2e2822;border-radius:16px;padding:28px;display:flex;flex-direction:column;gap:20px;">
+          <div style="font:600 20px 'Spectral',serif;color:#ece4d8;">Create a character</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+            <div>
+              <label style="display:block;font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">Name</label>
+              <input value="{{ newCharForm.name }}" onInput="{{ onNCNameInput }}" placeholder="e.g. Elias Voss" style="width:100%;padding:12px 16px;border-radius:10px;border:1px solid #3a322a;background:#1a1714;color:#ece4d8;font:400 16px 'Spectral',serif;outline:none;" />
+            </div>
+            <div>
+              <label style="display:block;font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">Role</label>
+              <input value="{{ newCharForm.role }}" onInput="{{ onNCRoleInput }}" placeholder="e.g. Archivist, smuggler" style="width:100%;padding:12px 16px;border-radius:10px;border:1px solid #3a322a;background:#1a1714;color:#ece4d8;font:400 16px 'Spectral',serif;outline:none;" />
+            </div>
+          </div>
+          <div>
+            <label style="display:block;font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">World</label>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <sc-for list="{{ worldPickChips }}" as="wp" hint-placeholder-count="4">
+                <button onClick="{{ wp.onPick }}" style="{{ wp.style }}">{{ wp.name }}</button>
+              </sc-for>
+            </div>
+          </div>
+          <div>
+            <label style="display:block;font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.1em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">Soul preset — initial disposition</label>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <sc-for list="{{ charPresetChips }}" as="cp" hint-placeholder-count="4">
+                <button onClick="{{ cp.onPick }}" style="{{ cp.style }}">{{ cp.name }}</button>
+              </sc-for>
+            </div>
+          </div>
+          <button onClick="{{ submitNewChar }}" style="align-self:flex-start;padding:12px 24px;border-radius:11px;border:none;background:#d98a5a;color:#1a1714;font:600 14px 'IBM Plex Sans';cursor:pointer;">Create character →</button>
+        </div>
+      </div>
+      </sc-if>
+
+    </div>
+    </sc-if>
+
+    <!-- ========== SETTINGS ========== -->
+    <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ true }}">
+    <div style="padding:32px 44px 60px;max-width:840px;margin:0 auto;">
+      <div style="font:500 11px 'IBM Plex Mono',monospace;letter-spacing:.14em;text-transform:uppercase;color:#8a7d6c;margin-bottom:8px;">Settings</div>
+      <h1 style="font:600 28px 'Spectral',serif;margin:0 0 26px;color:#ece4d8;">Engine &amp; providers</h1>
+
+      <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:22px;margin-bottom:18px;">
+        <div style="font:600 14px 'IBM Plex Sans';color:#ece4d8;margin-bottom:4px;">Models</div>
+        <div style="font:400 12.5px 'IBM Plex Sans';color:#8a7d6c;margin-bottom:18px;">Narrator and evaluator run as separate, swappable OpenAI-compatible providers.</div>
+        <div style="display:flex;flex-direction:column;gap:14px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2a241e;padding-bottom:14px;">
+            <div><div style="font:500 13.5px 'Spectral',serif;color:#e7ddce;">Narrator model</div><div style="font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;margin-top:3px;">writes the visible prose · literary</div></div>
+            <span style="font:500 12px 'IBM Plex Mono',monospace;color:#d98a5a;padding:6px 12px;border-radius:8px;background:rgba(217,138,90,.12);">Claude · literary</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div><div style="font:500 13.5px 'Spectral',serif;color:#e7ddce;">Evaluator model</div><div style="font:400 11px 'IBM Plex Mono',monospace;color:#7d6f5e;margin-top:3px;">extracts schema-checked patches · cheap, strict</div></div>
+            <span style="font:500 12px 'IBM Plex Mono',monospace;color:#7fa9c9;padding:6px 12px;border-radius:8px;background:rgba(127,169,201,.12);">Fast strict · json_schema</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:22px;margin-bottom:18px;">
+        <div style="font:600 14px 'IBM Plex Sans';color:#ece4d8;margin-bottom:4px;">Evaluator execution mode</div>
+        <div style="font:400 12.5px 'IBM Plex Sans';color:#8a7d6c;margin-bottom:18px;">Trade cost against extraction depth. Fast skips low-significance turns.</div>
+        <div style="display:flex;gap:12px;">
+          <div style="flex:1;border:1px solid #3a322a;border-radius:12px;padding:15px;"><div style="font:600 13.5px 'IBM Plex Sans';color:#c4b8a6;">Fast</div><div style="font:400 12px/1.4 'Spectral',serif;color:#8a7d6c;margin-top:5px;">Significant turns only, with scene-boundary catch-up.</div></div>
+          <div style="flex:1;border:1.5px solid #d98a5a;border-radius:12px;padding:15px;background:rgba(217,138,90,.07);"><div style="font:600 13.5px 'IBM Plex Sans';color:#e7c3a3;">Balanced · active</div><div style="font:400 12px/1.4 'Spectral',serif;color:#a99d8b;margin-top:5px;">Every turn, cheap schema-compatible model.</div></div>
+          <div style="flex:1;border:1px solid #3a322a;border-radius:12px;padding:15px;"><div style="font:600 13.5px 'IBM Plex Sans';color:#c4b8a6;">Long Context</div><div style="font:400 12px/1.4 'Spectral',serif;color:#8a7d6c;margin-top:5px;">Richer extraction, larger memory budget.</div></div>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
+        <div style="background:#211d19;border:1px solid #2e2822;border-radius:15px;padding:22px;">
+          <div style="font:600 14px 'IBM Plex Sans';color:#ece4d8;margin-bottom:14px;">Session</div>
+          <div style="display:flex;flex-direction:column;gap:11px;">
+            <button style="text-align:left;padding:11px 14px;border-radius:10px;border:1px solid #3a322a;background:transparent;color:#c4b8a6;font:500 13px 'IBM Plex Sans';cursor:pointer;">Export session · .mne bundle</button>
+            <button style="text-align:left;padding:11px 14px;border-radius:10px;border:1px solid #3a322a;background:transparent;color:#c4b8a6;font:500 13px 'IBM Plex Sans';cursor:pointer;">Import &amp; validate .mne</button>
+            <button style="text-align:left;padding:11px 14px;border-radius:10px;border:1px solid #3a322a;background:transparent;color:#c4b8a6;font:500 13px 'IBM Plex Sans';cursor:pointer;">Export visible chat log</button>
+          </div>
+        </div>
+        <div style="border:1px solid #2f5a2f;border-radius:15px;padding:22px;background:#0d120d;">
+          <div style="display:flex;align-items:center;gap:9px;margin-bottom:6px;"><span style="font:700 13px 'JetBrains Mono',monospace;color:#33ff00;text-shadow:0 0 6px rgba(51,255,0,.4);">&gt;_</span><span style="font:600 14px 'IBM Plex Sans';color:#9be88a;">Dev mode</span></div>
+          <div style="font:400 12.5px/1.5 'Spectral',serif;color:#6fae6a;margin-bottom:16px;">Developer tools now run <i>inside</i> the play session. Dev mode turns the chat into a live log + terminal — pipeline trace, system logs, payload history, and a command line. Benchmarks and tests run here, not in settings.</div>
+          <div style="display:flex;flex-direction:column;gap:9px;font:400 11.5px 'JetBrains Mono',monospace;color:#3f8f3f;margin-bottom:18px;">
+            <div><span style="color:#33ff00;">✓</span> per-cycle pipeline + token / cost trace</div>
+            <div><span style="color:#33ff00;">✓</span> interleaved system log &amp; chat log</div>
+            <div><span style="color:#33ff00;">✓</span> command line: /chat, status, eval, pipeline…</div>
+          </div>
+          <button onClick="{{ enterDevSession }}" style="width:100%;text-align:left;padding:11px 14px;border-radius:10px;border:1px solid #2f5a2f;background:rgba(51,255,0,.06);color:#9be88a;font:500 13px 'JetBrains Mono',monospace;cursor:pointer;" style-hover="background:rgba(51,255,0,.13);">[ enter dev session ]</button>
+        </div>
+      </div>
+
+      <div style="margin-top:24px;padding:16px 18px;border-radius:12px;border:1px solid #4a3a2a;background:rgba(201,162,106,.06);font:400 12.5px/1.5 'Spectral',serif;color:#b6aa98;">
+        <b style="color:#c9a26a;font-weight:600;">Alpha.</b> Memory isolation, persistence, and long-session stability are still being tested. Do not enter private or sensitive information while testing.
+      </div>
+    </div>
+    </sc-if>
+
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1280,&quot;height&quot;:860}}">
+class Component extends DCLogic {
+  state = {
+    view: 'home',
+    activeCampaign: 'ashgate',
+    panels: { scene: true, chars: true, rels: true, objects: true, timeline: true, tensions: true },
+    composer: '',
+    lastTurn: 45,
+    extra: [],
+    memories: [
+      { id: 'm1', text: 'Aurora hides a second forged seal set in the hollow base of the desk lamp.', turn: 46, conf: 'high', truth: 'pinned', tag: 'object', evidence: '"...tucked the spare seals into the hollow of the lamp’s foot."' },
+      { id: 'm2', text: 'Inspector Crow suspects the customs ledger was altered but cannot yet prove it.', turn: 45, conf: 'med', truth: 'active', tag: 'belief', evidence: '"These dates don’t agree with the harbor master’s book."' },
+      { id: 'm3', text: 'A Sereth merchant barge cleared the gate the same night, uninspected.', turn: 45, conf: 'high', truth: 'active', tag: 'event', evidence: '"...a Sereth barge cleared the gate without inspection."' },
+      { id: 'm4', text: 'The barge’s real cargo was people, not the silk on the manifest.', turn: 43, conf: 'high', truth: 'active', tag: 'secret', evidence: '"She counted the breathing in the hold and stopped at thirty."' },
+      { id: 'm5', text: 'Aurora is loyal to Lady Sereth.', turn: 12, conf: 'low', truth: 'invalidated', tag: 'relationship', evidence: 'Superseded turn 43 — the payment bought silence, not loyalty.' },
+    ],
+    selectedMemoryId: 'm1',
+    soulPreset: 'Trusting Friend',
+    showVariants: false,
+    checkpoints: [],
+    checkpointToast: null,
+    charView: 'sessions',
+    newWorldForm: { name: '', genre: 'Political Intrigue', desc: '' },
+    newCharForm: { name: '', role: '', worldId: 'ashgate-city', preset: 'Trusting Friend' },
+    devMode: false,
+    termInput: '',
+    stream: [],
+    progress: 0,
+    cycleActive: false,
+    pipeline: [
+      { key: 'send', label: 'SEND', detail: 'queue user message', status: 'wait' },
+      { key: 'context', label: 'CONTEXT', detail: 'compile brief', status: 'wait' },
+      { key: 'narrator', label: 'NARRATOR', detail: 'claude · stream', status: 'wait' },
+      { key: 'guard', label: 'GUARD', detail: 'anti-replay · contract', status: 'wait' },
+      { key: 'eval', label: 'EVALUATOR', detail: 'fast-strict · json_schema', status: 'wait' },
+      { key: 'patch', label: 'PATCH', detail: 'apply ops', status: 'wait' },
+      { key: 'repair', label: 'REPAIR', detail: 'if needed', status: 'wait' },
+      { key: 'commit', label: 'COMMIT', detail: 'ledger write', status: 'wait' },
+    ],
+  };
+
+  campaigns = [
+    { id: 'ashgate', title: 'The Ashgate Conspiracy', genre: 'Political Intrigue', world: 'Ashgate, the drowned harbor', primary: 'Aurora Schwarz', initial: 'A', turns: 47, mode: 'Balanced', last: '12 minutes ago', accent: '#d98a5a', heat: 'high',
+      scene: 'Rain on the customs-house roof. Aurora waits for Inspector Crow to look up from the forged ledger — one answer away from the truth.',
+      stats: { memories: 218, rels: 9, tensions: 3, chars: 5 } },
+    { id: 'wolves', title: 'Wolves of the Pale', genre: 'Survival · Party', world: 'The Pale, a frozen frontier', primary: 'Party of three', initial: 'W', turns: 112, mode: 'Long Context', last: 'yesterday', accent: '#7fa9c9', heat: 'med',
+      scene: 'Firewood is down to a day. The watch rotation is fraying, and someone swears they saw tracks circle back toward the camp.',
+      stats: { memories: 540, rels: 14, tensions: 5, chars: 7 } },
+    { id: 'lighthouse', title: 'The Lighthouse Keeper', genre: 'Relationship', world: 'A coastal light, off-season', primary: 'Mara Vane', initial: 'M', turns: 23, mode: 'Fast', last: '3 days ago', accent: '#c9a26a', heat: 'low',
+      scene: 'The lamp is lit and the fog is in. Neither of them has mentioned the letter still sitting unopened on the table.',
+      stats: { memories: 96, rels: 2, tensions: 1, chars: 2 } },
+    { id: 'embergard', title: 'Embergard Falls', genre: 'Alt-History War', world: 'The Embergard front, late campaign', primary: 'Cmdr. Reyes', initial: 'E', turns: 78, mode: 'Long Context', last: 'last week', accent: '#b98a8a', heat: 'high',
+      scene: 'Two divisions are out of contact. The relief column is a day late and the only bridge across the Ember is mined.',
+      stats: { memories: 402, rels: 11, tensions: 6, chars: 9 } },
+  ];
+
+  baseTranscript = [
+    { role: 'narrator', turn: 44, text: 'The customs house smells of wet rope and lamp oil. Inspector Crow turns the ledger toward the lamplight, one finger tracing the column of seals you forged three nights ago. "These dates," he says, not looking up. "They don’t agree with the harbor master’s book."' },
+    { role: 'user', turn: 45, text: 'I lean against the doorframe and let the silence stretch a beat too long. "Harbor masters drink," I say. "Books wander."' },
+    { role: 'narrator', turn: 45, text: 'Crow’s mouth thins. He sets the pen down with the care of a man choosing not to reach for something else. "They do," he allows. "And yet yours wandered the same night a Sereth barge cleared the gate without inspection." He finally looks at you, and the lamp throws his shadow long across the seals. "Convince me that’s coincidence."', captured: { memories: 2, rels: 1, objects: 1, scene: true } },
+  ];
+
+  narratorPool = [
+    { text: 'Crow watches your hands, not your face — the habit of a man who has been lied to by better faces than yours. "I don’t need the whole truth tonight," he says quietly. "Just the shape of it." Outside, the gate-bell sounds once, and you both pretend not to hear how late it is for a bell.',
+      captured: { memories: 1, rels: 1, objects: 0, scene: true }, memory: 'Crow signals he will accept a partial admission rather than press for everything.', evidence: '"I don’t need the whole truth tonight — just the shape of it."', tag: 'belief' },
+    { text: 'He closes the ledger with a soft, final sound and rests his palm flat on the cover. "Whatever House Sereth paid you," he says, "it isn’t worth what they shipped. I think you already know that." The lamp gutters. For the first time, his voice carries no accusation — only the weight of a man offering you a door.',
+      captured: { memories: 2, rels: 1, objects: 1, scene: true }, memory: 'Crow believes Aurora already knows the barge cargo was worse than smuggling.', evidence: '"It isn’t worth what they shipped — I think you already know that."', tag: 'belief' },
+  ];
+
+  presets = {
+    'Stranger': { global: { fear_baseline: 35, resolve: 40, shame: 35, openness: 35 }, maslow: [70, 55, 35, 35, 20], sdt: [55, 45, 25], trauma: { phase: 1, hypervigilance: 30, flashbacks: 15, numbing: 20, avoidance: 35 }, relationship: { trust: 0, affection: 0, intimacy: 0, fear: 20, desire: 0 } },
+    'Traumatized Survivor': { global: { fear_baseline: 75, resolve: 55, shame: 60, openness: 25 }, maslow: [45, 20, 25, 20, 10], sdt: [25, 30, 15], trauma: { phase: 2, hypervigilance: 80, flashbacks: 65, numbing: 55, avoidance: 70 }, relationship: { trust: -35, affection: -5, intimacy: 0, fear: 70, desire: -10 } },
+    'Trusting Friend': { global: { fear_baseline: 20, resolve: 55, shame: 25, openness: 70 }, maslow: [75, 70, 80, 60, 35], sdt: [70, 60, 75], trauma: { phase: 3, hypervigilance: 20, flashbacks: 10, numbing: 15, avoidance: 20 }, relationship: { trust: 55, affection: 60, intimacy: 35, fear: 5, desire: 10 } },
+    'Devoted Partner': { global: { fear_baseline: 15, resolve: 65, shame: 20, openness: 80 }, maslow: [80, 75, 90, 70, 45], sdt: [75, 65, 90], trauma: { phase: 4, hypervigilance: 15, flashbacks: 5, numbing: 10, avoidance: 10 }, relationship: { trust: 85, affection: 90, intimacy: 85, fear: 0, desire: 75 } },
+    'Hostile Rival': { global: { fear_baseline: 45, resolve: 80, shame: 20, openness: 10 }, maslow: [70, 60, 15, 55, 25], sdt: [80, 70, 10], trauma: { phase: 1, hypervigilance: 55, flashbacks: 10, numbing: 35, avoidance: 60 }, relationship: { trust: -80, affection: -65, intimacy: -50, fear: 45, desire: -30 } },
+  };
+
+  scene = {
+    location: 'Ashgate Customs House — night, rain on the roof',
+    time: 'Turn 45 · late, after the gate-bell',
+    participants: 'Aurora Schwarz (you) · Inspector Valen Crow',
+    positions: 'Aurora at the doorway; Crow seated at the ledger desk, the lamp between them',
+    room: 'Front door ajar; the strongroom behind Crow is locked',
+    object: 'The altered customs ledger, open on the desk',
+    misread: 'Crow believes the forgery covered smuggled silk — not people',
+    question: 'Will Aurora give up the Sereth barge, or take the weight herself?',
+    last: 'Crow demanded Aurora explain the matching dates',
+  };
+
+  characters = [
+    { name: 'Aurora Schwarz', role: 'You · informant, forger', initial: 'A', color: '#d98a5a', knows: 'Sereth ordered the barge; the real cargo was people, not silk', misbelieves: '—' },
+    { name: 'Inspector Valen Crow', role: 'Customs investigator', initial: 'C', color: '#7fa9c9', knows: 'The forged seals and the harbor book disagree', misbelieves: 'Thinks the barge carried untaxed silk' },
+    { name: 'Lady Sereth', role: 'Merchant House head · offscreen', initial: 'S', color: '#b98a8a', knows: 'Aurora can place her at the gate', misbelieves: 'Believes Aurora has been paid into silence' },
+  ];
+
+  rels = [
+    { target: 'Inspector Crow', dims: [{ k: 'Trust', v: -15 }, { k: 'Fear', v: 35 }, { k: 'Affection', v: -5 }], change: '+12 fear', dir: 'up', event: 'Crow tied the seals to the Sereth barge · turn 45' },
+    { target: 'Lady Sereth', dims: [{ k: 'Trust', v: -40 }, { k: 'Fear', v: 20 }, { k: 'Affection', v: -30 }], change: '−10 trust', dir: 'down', event: 'Learned the cargo was people · turn 43' },
+  ];
+
+  objects = [
+    { name: 'Altered customs ledger', owner: 'Customs House', loc: 'Open on Crow’s desk', status: 'Evidence' },
+    { name: 'Forged seal set', owner: 'Aurora', loc: 'Hidden in the lamp base', status: 'Concealed' },
+    { name: 'Sereth barge manifest', owner: 'Lady Sereth', loc: 'Unknown', status: 'Missing' },
+  ];
+
+  timeline = [
+    { turn: '43', kind: 'event', label: 'Aurora learned the barge cargo was people' },
+    { turn: '44', kind: 'event', label: 'Crow opened the ledger under lamplight' },
+    { turn: '45', kind: 'event', label: 'Crow linked the forged seals to the Sereth barge' },
+    { turn: 'now', kind: 'tension', label: 'Crow is one honest answer away from the truth' },
+  ];
+
+  tensions = [
+    { title: 'Crow is closing in on the forgery', heat: 'high', since: 'since turn 44' },
+    { title: 'The real cargo — people — is still unspoken', heat: 'high', since: 'since turn 43' },
+    { title: 'Aurora owes Sereth nothing but fears her reach', heat: 'med', since: 'since turn 43' },
+  ];
+
+  recent = [
+    { text: 'Aurora keeps a second seal set hidden in the lamp base.', turn: 46, tag: 'object', conf: 'high' },
+    { text: 'Crow suspects the ledger was altered but can’t prove it.', turn: 45, tag: 'belief', conf: 'med' },
+    { text: 'Lady Sereth paid for Aurora’s silence, not her loyalty.', turn: 43, tag: 'relationship', conf: 'high' },
+  ];
+
+  worlds = [
+    { id: 'ashgate-city', name: 'Ashgate', genre: 'Political Intrigue', accent: '#d98a5a', desc: 'A drowned harbor city ruled by merchant houses and inspectors. Rain, forgeries, and old debts.' },
+    { id: 'the-pale', name: 'The Pale', genre: 'Survival · Party', accent: '#7fa9c9', desc: 'A frozen frontier outpost. Firewood politics, watch rotations, tracks that circle back.' },
+    { id: 'coastal-light', name: 'The Lighthouse', genre: 'Relationship', accent: '#c9a26a', desc: 'A coastal lighthouse, off-season. Two people and one letter neither has opened.' },
+    { id: 'embergard', name: 'Embergard', genre: 'Alt-History War', accent: '#b98ab9', desc: 'A contested front, late campaign. Two divisions out of contact; one bridge left.' },
+  ];
+  allCharacters = [
+    { id: 'aurora', name: 'Aurora Schwarz', worldId: 'ashgate-city', role: 'Informant · forger', preset: 'Trusting Friend', initial: 'A', color: '#d98a5a' },
+    { id: 'mara', name: 'Mara Vane', worldId: 'coastal-light', role: 'Lighthouse keeper', preset: 'Devoted Partner', initial: 'M', color: '#c9a26a' },
+    { id: 'reyes', name: 'Cmdr. Reyes', worldId: 'embergard', role: 'Field commander', preset: 'Hostile Rival', initial: 'R', color: '#b98ab9' },
+  ];
+  allSessions = [
+    { id: 'ash-1', worldId: 'ashgate-city', charId: 'aurora', name: 'The Ashgate Conspiracy', turns: 47, last: '12 min ago' },
+    { id: 'pale-1', worldId: 'the-pale', charId: null, name: 'Wolves of the Pale', turns: 112, last: 'yesterday' },
+    { id: 'light-1', worldId: 'coastal-light', charId: 'mara', name: 'The Lighthouse Keeper', turns: 23, last: '3 days ago' },
+    { id: 'ember-1', worldId: 'embergard', charId: 'reyes', name: 'Embergard Falls', turns: 78, last: 'last week' },
+  ];
+  variantResponses = [
+    { label: 'Clinical', text: 'Crow doesn\'t respond. He lifts the lamp, angling the light down the seals column, and you watch his reflection in the window: jaw set, breath steady. When he finally speaks it\'s quieter. "Tell me about the barge," he says. Just that.' },
+    { label: 'Literary', text: 'He almost smiles. "Harbor masters drink," he repeats back, voice flat. "Books wander." He closes the ledger and folds his hands on top of it. "So does trust." The rain has eased. In the quiet you can hear the gate-bell chain tapping the post outside.' },
+  ];
+
+  go = (view) => this.setState({ view });
+  openCampaign = (id) => this.setState({ view: 'play', activeCampaign: id });
+  togglePanel = (k) => this.setState(s => ({ panels: { ...s.panels, [k]: !s.panels[k] } }));
+  setComposer = (e) => this.setState({ composer: e.target.value });
+  pickPreset = (name) => this.setState({ soulPreset: name });
+  toggleVariants = () => this.setState(s => ({ showVariants: !s.showVariants }));
+  pickVariant = (idx) => {
+    const text = this.variantResponses[idx].text;
+    const nt = this.state.lastTurn;
+    this.setState(s => ({ showVariants: false, extra: [...s.extra, { role: 'narrator', turn: nt, text, captured: null }] }));
+  };
+  saveCheckpoint = () => {
+    const cp = { id: 'cp' + Date.now(), name: 'Turn ' + this.state.lastTurn + ' — ' + this.scene.location.split('—')[0].trim(), turn: this.state.lastTurn };
+    setTimeout(() => this.setState({ checkpointToast: null }), 2800);
+    this.setState(s => ({ checkpoints: [cp, ...s.checkpoints], checkpointToast: cp.name }));
+  };
+  setCharView = (v) => this.setState({ charView: v });
+  onNWNameInput = (e) => this.setState(s => ({ newWorldForm: { ...s.newWorldForm, name: e.target.value } }));
+  onNWDescInput = (e) => this.setState(s => ({ newWorldForm: { ...s.newWorldForm, desc: e.target.value } }));
+  onNCNameInput = (e) => this.setState(s => ({ newCharForm: { ...s.newCharForm, name: e.target.value } }));
+  onNCRoleInput = (e) => this.setState(s => ({ newCharForm: { ...s.newCharForm, role: e.target.value } }));
+  submitNewWorld = () => {
+    const f = this.state.newWorldForm;
+    if (!f.name.trim()) return;
+    this.worlds.push({ id: 'w' + Date.now(), name: f.name, genre: f.genre, accent: '#9a8f7e', desc: f.desc });
+    this.setState({ newWorldForm: { name: '', genre: 'Political Intrigue', desc: '' }, charView: 'worlds' });
+  };
+  submitNewChar = () => {
+    const f = this.state.newCharForm;
+    if (!f.name.trim()) return;
+    this.allCharacters.push({ id: 'c' + Date.now(), name: f.name, worldId: f.worldId, role: f.role, preset: f.preset, initial: f.name[0].toUpperCase(), color: '#9a8f7e' });
+    this.setState({ newCharForm: { name: '', role: '', worldId: 'ashgate-city', preset: 'Trusting Friend' }, charView: 'characters' });
+  };
+  selectMemory = (id) => this.setState({ selectedMemoryId: id });
+  pinMemory = (id) => this.setState(s => ({ memories: s.memories.map(m => m.id === id ? { ...m, truth: m.truth === 'pinned' ? 'active' : 'pinned' } : m) }));
+  invalidateMemory = (id) => this.setState(s => ({ memories: s.memories.map(m => m.id === id ? { ...m, truth: m.truth === 'invalidated' ? 'active' : 'invalidated' } : m) }));
+
+  send = () => {
+    const t = this.state.composer.trim();
+    if (!t) return;
+    const nt = this.state.lastTurn + 1;
+    const narCount = this.state.extra.filter(x => x.role === 'narrator').length;
+    const nar = this.narratorPool[narCount % this.narratorPool.length];
+    const mem = { id: 'mx' + nt, text: nar.memory, turn: nt, conf: 'med', truth: 'active', tag: nar.tag, evidence: nar.evidence };
+    this.setState(s => ({
+      composer: '', lastTurn: nt,
+      extra: [...s.extra, { role: 'user', turn: nt, text: t }, { role: 'narrator', turn: nt, text: nar.text, captured: nar.captured }],
+      memories: [mem, ...s.memories],
+      selectedMemoryId: mem.id,
+    }));
+  };
+
+  onComposerKey = (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) this.send(); };
+
+  // ===== DEV MODE / TERMINAL =====
+  devNarIdx = 0;
+  timers = [];
+  clearTimers() { (this.timers || []).forEach(t => clearTimeout(t)); this.timers = []; }
+  componentWillUnmount() { this.clearTimers(); }
+  componentDidUpdate() { if (this.streamEl) this.streamEl.scrollTop = this.streamEl.scrollHeight; }
+  setStreamRef = (el) => { this.streamEl = el; if (el) el.scrollTop = el.scrollHeight; };
+  setTermInput = (e) => this.setState({ termInput: e.target.value });
+
+  freshPipeline() {
+    return [
+      { key: 'send', label: 'SEND', detail: 'queue user message', status: 'wait' },
+      { key: 'context', label: 'CONTEXT', detail: 'compile brief', status: 'wait' },
+      { key: 'narrator', label: 'NARRATOR', detail: 'claude · stream', status: 'wait' },
+      { key: 'guard', label: 'GUARD', detail: 'anti-replay · contract', status: 'wait' },
+      { key: 'eval', label: 'EVALUATOR', detail: 'fast-strict · json_schema', status: 'wait' },
+      { key: 'patch', label: 'PATCH', detail: 'apply ops', status: 'wait' },
+      { key: 'repair', label: 'REPAIR', detail: 'if needed', status: 'wait' },
+      { key: 'commit', label: 'COMMIT', detail: 'ledger write', status: 'wait' },
+    ];
+  }
+
+  toggleDev = () => {
+    const on = !this.state.devMode;
+    if (on && this.state.stream.length === 0) {
+      const seed = [
+        { type: 'log', level: 'ok', text: 'mnemosyne state-engine v0.4.1-alpha · dev session attached' },
+        { type: 'log', level: '', text: 'provider narrator=claude · evaluator=fast-strict · mode=balanced' },
+        { type: 'log', level: '', text: 'loaded session // the ashgate conspiracy · turn 45 · 218 memories' },
+        ...this.baseTranscript.map(m => ({ type: 'chat', who: m.role === 'narrator' ? 'narrator' : 'you', text: m.text, turn: m.turn })),
+        { type: 'log', level: 'ok', text: 'ready · /chat <text> to act in-scene · type help for commands' },
+      ];
+      this.setState({ devMode: on, stream: seed });
+    } else this.setState({ devMode: on });
+  };
+  enterDevSession = () => { this.setState({ view: 'play' }); if (!this.state.devMode) this.toggleDev(); };
+
+  step(key, status) { this.setState(s => ({ pipeline: s.pipeline.map(p => p.key === key ? { ...p, status } : p) })); }
+  plog(level, text) { this.setState(s => ({ stream: [...s.stream, { type: 'log', level, text }] })); }
+  pchat(who, text, turn) { this.setState(s => ({ stream: [...s.stream, { type: 'chat', who, text, turn }] })); }
+  prog(v) { this.setState({ progress: v }); }
+
+  runCycle = (userText) => {
+    if (this.state.cycleActive) return;
+    this.clearTimers();
+    const nt = this.state.lastTurn + 1;
+    const nar = this.narratorPool[this.devNarIdx % this.narratorPool.length];
+    this.devNarIdx++;
+    this.setState(s => ({ cycleActive: true, progress: 0, pipeline: this.freshPipeline(), stream: [...s.stream, { type: 'chat', who: 'you', text: userText, turn: nt }] }));
+    const seq = [
+      [150, () => { this.step('send', 'done'); this.plog('ok', 'user message queued · turn ' + nt); this.prog(12); }],
+      [500, () => { this.step('context', 'run'); this.plog('', 'compiling context — brief mode'); }],
+      [950, () => { this.step('context', 'done'); this.plog('ok', 'context compiled · 2.1k tok · 7 memories · 2 relationships'); this.prog(30); }],
+      [1250, () => { this.step('narrator', 'run'); this.plog('', 'POST /v1/chat/completions → claude'); this.plog('', 'narrator streaming…'); this.prog(48); }],
+      [2150, () => { this.step('narrator', 'done'); this.pchat('narrator', nar.text, nt); this.plog('ok', 'narrator complete · 480 tok'); this.prog(62); }],
+      [2400, () => { this.step('guard', 'done'); this.plog('ok', 'anti-replay OK · output-contract OK'); this.prog(70); }],
+      [2700, () => { this.step('eval', 'run'); this.plog('', 'evaluator fast-strict · enforcing json_schema'); this.prog(80); }],
+      [3350, () => {
+        this.step('eval', 'done'); this.plog('ok', 'patch parsed · 4 operations');
+        this.step('patch', 'done'); this.plog('ok', 'applied — 2 memory · 1 relationship · 1 scene'); this.prog(92);
+        const mem = { id: 'mx' + nt, text: nar.memory, turn: nt, conf: 'med', truth: 'active', tag: nar.tag, evidence: nar.evidence };
+        this.setState(s => ({ memories: [mem, ...s.memories] }));
+      }],
+      [3650, () => { this.step('repair', 'done'); this.plog('ok', 'repair: not needed'); this.prog(97); }],
+      [3900, () => { this.step('commit', 'done'); this.plog('ok', 'ledger write OK · materialized state updated · turn ' + nt); this.prog(100); this.setState({ cycleActive: false, lastTurn: nt }); }],
+    ];
+    this.timers = seq.map(([t, fn]) => setTimeout(fn, t));
+  };
+
+  submitTerm = () => {
+    const raw = this.state.termInput;
+    if (!raw.trim()) return;
+    this.setState({ termInput: '' });
+    if (/^\/chat\b/.test(raw)) { const msg = raw.replace(/^\/chat\s*/, ''); if (msg.trim()) this.runCycle(msg.trim()); else this.plog('err', 'usage: /chat <text>'); return; }
+    this.runCommand(raw);
+  };
+  onTermKey = (e) => { if (e.key === 'Enter') { e.preventDefault(); this.submitTerm(); } };
+
+  runCommand(raw) {
+    const cmd = raw.trim();
+    const word = cmd.split(/\s+/)[0].toLowerCase();
+    const L = (level, text) => ({ type: 'log', level, text });
+    const push = (lines) => this.setState(s => ({ stream: [...s.stream, { type: 'cmd', text: cmd }, ...lines] }));
+    if (word === 'help' || word === '?' || word === '/help') return push([
+      L('', 'commands —'),
+      L('', '  /chat <text>   act in-scene (sends to narrator + evaluator)'),
+      L('', '  status         provider + session state'),
+      L('', '  pipeline       last turn pipeline trace'),
+      L('', '  memory         recent extracted memories'),
+      L('', '  eval           re-run evaluator on last turn'),
+      L('', '  clear          clear the console'),
+      L('', '  exit           leave dev mode'),
+    ]);
+    if (word === 'status') return push([
+      L('ok', 'session // the ashgate conspiracy · turn ' + this.state.lastTurn),
+      L('', 'narrator   claude · literary'),
+      L('', 'evaluator  fast-strict · json_schema · balanced'),
+      L('', 'state      218 memories · 9 relationships · 3 open tensions'),
+    ]);
+    if (word === 'pipeline') return push(this.state.pipeline.map(p => L(p.status === 'done' ? 'ok' : p.status === 'err' ? 'err' : '', (p.label + '           ').slice(0, 11) + p.status + ' · ' + p.detail)));
+    if (word === 'memory' || word === 'mem') return push(this.state.memories.slice(0, 5).map(m => L(m.truth === 'invalidated' ? 'err' : 'ok', 't' + m.turn + ' [' + m.tag + '] ' + m.text)));
+    if (word === 'eval') return push([L('', 'evaluator fast-strict · re-extracting last turn…'), L('ok', 'no new patches · state already consistent')]);
+    if (word === 'whoami') return push([L('', 'operator@mnemosyne · local-first')]);
+    if (word === 'clear' || word === 'cls') return this.setState({ stream: [L('ok', 'console cleared · type help for commands')] });
+    if (word === 'exit' || word === 'dev') return this.setState(s => ({ stream: [...s.stream, { type: 'cmd', text: cmd }], devMode: false }));
+    return push([L('err', 'command not found: ' + word + ' — type help')]);
+  }
+
+  charTabStyle = (v) => { const a = this.state.charView === v; return 'padding:9px 16px;border-radius:9px;border:none;font:500 13px "IBM Plex Sans",sans-serif;cursor:pointer;background:' + (a ? '#322a22' : 'transparent') + ';color:' + (a ? '#ece4d8' : '#9a8f7e') + ';transition:all .15s;'; };
+  bar01(label, val) { const v = Math.max(0, Math.min(100, val)); return { label, val: v, fill: 'width:' + v + '%;background:#9cb6c9;' }; }
+  barSigned(label, v) {
+    const val = Math.max(-100, Math.min(100, v)); const w = Math.abs(val) / 2; const left = val >= 0 ? 50 : 50 - w;
+    const color = val >= 0 ? '#8fb98a' : '#cf7a6a';
+    return { label, num: (val > 0 ? '+' : '') + val, fill: 'left:' + left + '%;width:' + w + '%;background:' + color + ';' };
+  }
+
+  navStyle(key) {
+    const active = this.state.view === key;
+    const base = 'display:flex;align-items:center;gap:12px;width:100%;padding:10px 13px;border:none;border-radius:10px;font:500 14px "IBM Plex Sans",system-ui,sans-serif;cursor:pointer;text-align:left;transition:background .15s,color .15s;';
+    return base + (active
+      ? 'background:#322a22;color:#ece4d8;box-shadow:inset 2px 0 0 #d98a5a;'
+      : 'background:transparent;color:#9a8f7e;box-shadow:none;');
+  }
+
+  renderVals() {
+    const s = this.state;
+    const camp = this.campaigns.find(c => c.id === s.activeCampaign) || this.campaigns[0];
+    const hero = this.campaigns[0];
+
+    const campaigns = this.campaigns.map(c => ({
+      ...c,
+      isHigh: c.heat === 'high', isMed: c.heat === 'med', isLow: c.heat === 'low',
+      onOpen: () => this.openCampaign(c.id),
+      dotStyle: 'width:7px;height:7px;border-radius:50%;background:' + (c.heat === 'high' ? '#cf7a6a' : c.heat === 'med' ? '#d8b46a' : '#8fb98a') + ';',
+      barStyle: 'height:3px;border-radius:2px;width:100%;background:' + c.accent + ';opacity:.85;',
+      avStyle: 'width:42px;height:42px;border-radius:11px;flex:none;display:flex;align-items:center;justify-content:center;font:600 17px "Spectral",serif;color:#1a1714;background:' + c.accent + ';',
+    }));
+
+    const transcript = this.baseTranscript.concat(s.extra).map(m => {
+      const isNar = m.role === 'narrator';
+      const cap = m.captured;
+      const capText = cap ? [cap.memories ? cap.memories + (cap.memories === 1 ? ' memory' : ' memories') : null, cap.rels ? cap.rels + (cap.rels === 1 ? ' relationship' : ' relationships') : null, cap.objects ? cap.objects + (cap.objects === 1 ? ' object' : ' objects') : null, cap.scene ? 'scene updated' : null].filter(Boolean).join('  ·  ') : '';
+      return {
+        ...m, isNar, isUser: !isNar, hasCaptured: !!cap, capturedText: capText,
+        who: isNar ? 'Narrator' : 'You · Aurora',
+        meta: 'font:500 10.5px "IBM Plex Mono",monospace;letter-spacing:.13em;text-transform:uppercase;margin-bottom:9px;color:' + (isNar ? '#d98a5a' : '#8a7d6c') + ';',
+        body: isNar
+          ? 'font:400 18px/1.72 "Spectral",Georgia,serif;color:#e7ddce;'
+          : 'font:400 17px/1.7 "Spectral",Georgia,serif;color:#c4b8a6;font-style:italic;padding-left:16px;border-left:2px solid #4a3f33;',
+      };
+    });
+
+    const p = this.presets[s.soulPreset];
+    const maslowLabels = ['Physiological', 'Safety', 'Belonging', 'Esteem', 'Self-actualization'];
+    const sdtLabels = ['Autonomy', 'Competence', 'Relatedness'];
+    const globalBars = [this.bar01('Fear baseline', p.global.fear_baseline), this.bar01('Resolve', p.global.resolve), this.bar01('Shame', p.global.shame), this.bar01('Openness', p.global.openness)];
+    const maslowBars = p.maslow.map((v, i) => this.bar01(maslowLabels[i], v));
+    const sdtBars = p.sdt.map((v, i) => this.bar01(sdtLabels[i], v));
+    const traumaBars = [this.bar01('Hypervigilance', p.trauma.hypervigilance), this.bar01('Flashbacks', p.trauma.flashbacks), this.bar01('Numbing', p.trauma.numbing), this.bar01('Avoidance', p.trauma.avoidance)];
+    const relBars = [this.barSigned('Trust', p.relationship.trust), this.barSigned('Affection', p.relationship.affection), this.barSigned('Intimacy', p.relationship.intimacy), this.barSigned('Fear', p.relationship.fear), this.barSigned('Desire', p.relationship.desire)];
+    const presetChips = Object.keys(this.presets).map(name => ({
+      name, onPick: () => this.pickPreset(name),
+      style: 'padding:7px 13px;border-radius:20px;font:500 12.5px "IBM Plex Sans",sans-serif;cursor:pointer;transition:all .15s;border:1px solid ' + (s.soulPreset === name ? '#d98a5a' : '#3a322a') + ';background:' + (s.soulPreset === name ? 'rgba(217,138,90,.14)' : 'transparent') + ';color:' + (s.soulPreset === name ? '#e7c3a3' : '#9a8f7e') + ';',
+    }));
+
+    const rels = this.rels.map(r => ({
+      ...r,
+      dims: r.dims.map(d => { const b = this.barSigned(d.k, d.v); return { k: d.k, num: b.num, fill: b.fill }; }),
+      chipStyle: 'font:500 11px "IBM Plex Mono",monospace;padding:3px 9px;border-radius:6px;background:' + (r.dir === 'up' ? 'rgba(207,122,106,.14)' : 'rgba(143,185,138,.14)') + ';color:' + (r.dir === 'up' ? '#cf7a6a' : '#8fb98a') + ';',
+    }));
+
+    const tagColor = { object: '#9cc0d8', belief: '#c9a26a', event: '#9cb6c9', secret: '#b98ab9', relationship: '#8fb98a' };
+    const memories = s.memories.map(m => ({
+      ...m,
+      selected: m.id === s.selectedMemoryId,
+      isPinned: m.truth === 'pinned', isInvalid: m.truth === 'invalidated', isActive: m.truth === 'active',
+      onSelect: () => this.selectMemory(m.id), onPin: () => this.pinMemory(m.id), onInvalidate: () => this.invalidateMemory(m.id),
+      cardStyle: 'text-align:left;width:100%;cursor:pointer;border-radius:12px;padding:15px 17px;transition:all .15s;border:1px solid ' + (m.id === s.selectedMemoryId ? '#6f8597' : '#2e2822') + ';background:' + (m.id === s.selectedMemoryId ? 'rgba(127,169,201,.07)' : '#211d19') + ';opacity:' + (m.truth === 'invalidated' ? '.55' : '1') + ';',
+      textStyle: 'font:400 15px/1.55 "Spectral",serif;color:#e7ddce;margin-bottom:10px;' + (m.truth === 'invalidated' ? 'text-decoration:line-through;text-decoration-color:#7d6f5e;' : ''),
+      tagStyle: 'font:500 10px "IBM Plex Mono",monospace;letter-spacing:.1em;text-transform:uppercase;color:' + (tagColor[m.tag] || '#9a8f7e') + ';',
+      truthLabel: m.truth === 'pinned' ? 'Pinned' : m.truth === 'invalidated' ? 'Invalidated' : 'Active',
+      truthStyle: 'font:500 10.5px "IBM Plex Mono",monospace;padding:3px 9px;border-radius:6px;background:' + (m.truth === 'pinned' ? 'rgba(216,180,106,.16)' : m.truth === 'invalidated' ? 'rgba(125,111,94,.16)' : 'rgba(156,182,201,.12)') + ';color:' + (m.truth === 'pinned' ? '#d8b46a' : m.truth === 'invalidated' ? '#9a8f7e' : '#9cb6c9') + ';',
+      pinLabel: m.truth === 'pinned' ? 'Unpin' : 'Pin',
+      invLabel: m.truth === 'invalidated' ? 'Restore' : 'Invalidate',
+    }));
+    const selectedMemory = memories.find(m => m.selected) || memories[0];
+
+    // dev terminal
+    const stMap = { done: { g: '✓', gc: '#33ff00', lc: '#33ff00', op: '1' }, run: { g: '◐', gc: '#ffb000', lc: '#ffb000', op: '1' }, err: { g: '▲', gc: '#ff3333', lc: '#ff6b6b', op: '1' }, wait: { g: '·', gc: '#1f521f', lc: '#2a6a2a', op: '.6' } };
+    const pipeRows = s.pipeline.map(p => { const st = stMap[p.status] || stMap.wait; return { label: p.label, detail: p.detail, glyph: st.g, glyphStyle: 'width:14px;flex:none;text-align:center;font-size:13px;color:' + st.gc + (p.status === 'done' ? ';text-shadow:0 0 6px rgba(51,255,0,.5)' : '') + ';', labelStyle: 'font-size:12.5px;letter-spacing:.08em;color:' + st.lc + ';', rowStyle: 'opacity:' + st.op + ';' }; });
+    const filled = Math.round(s.progress / 100 * 24);
+    const progressBar = '|'.repeat(filled) + '.'.repeat(24 - filled);
+    const progressLabel = s.cycleActive ? ('RUNNING · ' + s.progress + '%') : (s.progress >= 100 ? 'CYCLE COMPLETE · 100%' : 'IDLE · awaiting input');
+    const streamLines = s.stream.map(it => {
+      if (it.type === 'chat') {
+        const nar = it.who === 'narrator';
+        return {
+          wrap: 'margin:8px 0;padding:3px 0 4px 12px;border-left:2px solid ' + (nar ? '#33ff00' : '#ffb000') + ';',
+          prefix: (nar ? '▌ NARRATOR · t' + it.turn : '▌ YOU · t' + it.turn),
+          prefixStyle: 'display:block;font-size:11px;letter-spacing:.13em;margin-bottom:3px;color:' + (nar ? '#33ff00' : '#ffb000') + ';text-shadow:0 0 6px ' + (nar ? 'rgba(51,255,0,.4)' : 'rgba(255,176,0,.3)') + ';',
+          text: it.text, textStyle: 'font-size:13.5px;line-height:1.6;color:' + (nar ? '#86ff79' : '#ffd486') + ';',
+        };
+      }
+      if (it.type === 'cmd') return { wrap: 'margin:3px 0;', prefix: 'mnemosyne@ashgate:~$ ', prefixStyle: 'color:#ffb000;', text: it.text, textStyle: 'color:#33ff00;' };
+      const lv = it.level;
+      const tag = lv === 'ok' ? '[ ok ] ' : lv === 'err' ? '[err!] ' : '[ ·· ] ';
+      const tc = lv === 'ok' ? '#33ff00' : lv === 'err' ? '#ff3333' : '#2f8f2f';
+      const xc = lv === 'err' ? '#ff6b6b' : '#46a046';
+      return { wrap: 'margin:1px 0;display:flex;', prefix: tag, prefixStyle: 'color:' + tc + ';white-space:pre;flex:none;', text: it.text, textStyle: 'color:' + xc + ';' };
+    });
+
+    return {
+      isHome: s.view === 'home', isPlayNormal: s.view === 'play' && !s.devMode, isDevTerminal: s.view === 'play' && s.devMode, isMap: s.view === 'map', isCharWorld: s.view === 'chars', isSettings: s.view === 'settings',
+      nav: { home: this.navStyle('home'), play: this.navStyle('play'), map: this.navStyle('map'), chars: this.navStyle('chars'), settings: this.navStyle('settings') },
+      goHome: () => this.go('home'), goPlay: () => this.go('play'), goMap: () => this.go('map'), goChars: () => this.go('chars'), goSettings: () => this.go('settings'),
+      campaigns, hero, heroOpen: () => this.openCampaign('ashgate'),
+      camp,
+      transcript, composer: s.composer, setComposer: this.setComposer, send: this.send, onComposerKey: this.onComposerKey,
+      scene: this.scene, characters: this.characters, rels, objects: this.objects, timeline: this.timeline, tensions: this.tensions, recent: this.recent,
+      panels: s.panels, tScene: () => this.togglePanel('scene'), tChars: () => this.togglePanel('chars'), tRels: () => this.togglePanel('rels'), tObjects: () => this.togglePanel('objects'), tTimeline: () => this.togglePanel('timeline'), tTensions: () => this.togglePanel('tensions'),
+      memories, selectedMemory,
+      soulPreset: s.soulPreset, globalBars, maslowBars, sdtBars, traumaBars, relBars, presetChips,
+      traumaPhase: 'Phase ' + p.trauma.phase + ' / 4',
+      devMode: s.devMode, termInput: s.termInput, setTermInput: this.setTermInput, onTermKey: this.onTermKey,
+      toggleDev: this.toggleDev, enterDevSession: this.enterDevSession, setStreamRef: this.setStreamRef,
+      streamLines, pipeRows, progressBar, progressLabel, prompt: 'mnemosyne@ashgate:~$',
+      showVariants: s.showVariants, toggleVariants: this.toggleVariants,
+      variantsList: this.variantResponses.map((v, i) => ({ ...v, onPick: () => this.pickVariant(i) })),
+      saveCheckpoint: this.saveCheckpoint, checkpointToast: s.checkpointToast, hasCheckpointToast: !!s.checkpointToast,
+      isCharSessions: s.charView === 'sessions', isCharWorlds: s.charView === 'worlds', isCharChars: s.charView === 'characters', isCharNewWorld: s.charView === 'new-world', isCharNewChar: s.charView === 'new-char',
+      cvSessions: this.charTabStyle('sessions'), cvWorlds: this.charTabStyle('worlds'), cvChars: this.charTabStyle('characters'), cvNewWorld: this.charTabStyle('new-world'), cvNewChar: this.charTabStyle('new-char'),
+      goSessions: () => this.setCharView('sessions'), goWorlds: () => this.setCharView('worlds'), goCharsList: () => this.setCharView('characters'), goNewWorld: () => this.setCharView('new-world'), goNewChar: () => this.setCharView('new-char'),
+      sessionsList: this.allSessions.map(sess => { const wd = this.worlds.find(w => w.id === sess.worldId) || {}; const ch = this.allCharacters.find(c => c.id === sess.charId) || null; return { ...sess, worldName: wd.name || '—', worldAccent: wd.accent || '#7d6f5e', charName: ch ? ch.name : 'Party', charInitial: ch ? ch.initial : '·', charColor: ch ? ch.color : '#7d6f5e', onResume: () => this.setState({ view: 'play' }) }; }),
+      worldsList: this.worlds.map(w => ({ ...w, sessCount: this.allSessions.filter(x => x.worldId === w.id).length, charCount: this.allCharacters.filter(x => x.worldId === w.id).length })),
+      charsList: this.allCharacters.map(ch => { const wd = this.worlds.find(w => w.id === ch.worldId) || {}; return { ...ch, worldName: wd.name || '—', worldAccent: wd.accent || '#7d6f5e' }; }),
+      newWorldForm: s.newWorldForm, newCharForm: s.newCharForm,
+      onNWNameInput: this.onNWNameInput, onNWDescInput: this.onNWDescInput, onNCNameInput: this.onNCNameInput, onNCRoleInput: this.onNCRoleInput,
+      submitNewWorld: this.submitNewWorld, submitNewChar: this.submitNewChar,
+      nwGenreChips: ['Political Intrigue','Relationship','Survival · Party','Alt-History War','Fantasy','D&D Adventure'].map(g => ({ g, style: 'padding:6px 12px;border-radius:16px;font:500 12px "IBM Plex Sans",sans-serif;cursor:pointer;border:1px solid ' + (s.newWorldForm.genre === g ? '#d98a5a' : '#3a322a') + ';background:' + (s.newWorldForm.genre === g ? 'rgba(217,138,90,.14)' : 'transparent') + ';color:' + (s.newWorldForm.genre === g ? '#e7c3a3' : '#9a8f7e') + ';', onPick: () => this.setState(st => ({ newWorldForm: { ...st.newWorldForm, genre: g } })) })),
+      charPresetChips: Object.keys(this.presets).map(nm => ({ name: nm, onPick: () => this.setState(st => ({ newCharForm: { ...st.newCharForm, preset: nm } })), style: 'padding:6px 12px;border-radius:16px;font:500 12px "IBM Plex Sans",sans-serif;cursor:pointer;border:1px solid ' + (s.newCharForm.preset === nm ? '#d98a5a' : '#3a322a') + ';background:' + (s.newCharForm.preset === nm ? 'rgba(217,138,90,.14)' : 'transparent') + ';color:' + (s.newCharForm.preset === nm ? '#e7c3a3' : '#9a8f7e') + ';' })),
+      worldPickChips: this.worlds.map(w => ({ name: w.name, id: w.id, onPick: () => this.setState(st => ({ newCharForm: { ...st.newCharForm, worldId: w.id } })), style: 'padding:6px 12px;border-radius:16px;font:500 12px "IBM Plex Sans",sans-serif;cursor:pointer;border:1px solid ' + (s.newCharForm.worldId === w.id ? '#d98a5a' : '#3a322a') + ';background:' + (s.newCharForm.worldId === w.id ? 'rgba(217,138,90,.14)' : 'transparent') + ';color:' + (s.newCharForm.worldId === w.id ? '#e7c3a3' : '#9a8f7e') + ';' })),
+    };
+  }
+}
+</script>
+</body>
+</html>

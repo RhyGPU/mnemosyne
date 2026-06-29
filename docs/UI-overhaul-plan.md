@@ -70,18 +70,31 @@ payload inspector, context preview, branch debug, 9 dev commands), Import/Export
 
 ## 3. Target information architecture
 
-**No top-level tab bar.** The app is two full-screen destinations you move
-between by *action*, plus a Settings drawer over the top and an in-session Dev
-toggle. Decluttering happens by **relocation**, not tabs: AI/provider settings
-live in the drawer, debug/memory live in in-session Dev mode, and creation lives
-on a separate Editor screen — so Home is automatically clean.
+**Revised 2026-06-27 — persistent nav rail.** The earlier "no tab bar /
+action-only" IA is **superseded**. The original tabs were scrapped because *those*
+tabs were redundant (e.g. a Dev tab duplicating in-session Dev) — not because rail
+navigation is bad. The handoff-mock's rail uses **meaningful, non-redundant**
+destinations, so we adopt a persistent left **nav rail**. It shows on the
+document/management surfaces and **collapses/hides during full-immersion Play and
+Dev Mode** so the story and the machine room stay full-bleed. Decluttering still
+happens by **relocation** (providers → drawer, debug/memory → Dev Mode), now plus
+clear rail destinations.
 
 ```
-HOME (Library)  pick world(1) + characters(n) + session → dive in     [select/play]
-   │  "New / Edit" →  EDITOR        create/edit characters & worlds     [create]
-   │  "Settings"  →  drawer overlay AI providers, chat, data, about     [configure]
-   └  "Dive in"   →  CHAT (session) play; Dev toggle re-skins to matrix [play/inspect]
+┌───────────┐
+│ ▣ Home    │  campaigns / resume · recent + recommended         [global]
+│ ▷ Play    │  active session transcript — Book register          [session]
+│ ◈ State   │  Soul + World, mode-censored (redactions / blanks)  [session]
+│ ◰ Library │  characters · worlds · personas — create / manage   [global]
+│ ⚙ Settings│  providers · chat · data · about (opens drawer)     [overlay]
+└───────────┘  rail hides during full-immersion Play & Dev
+   Dev toggle (in session) → terminal machine layer; NOT a rail item
 ```
+
+Session context: **Play** and **State Map** light up only with an active session;
+**Home** and **Library** are always available. Register mapping (see
+`UI-theme-direction.md`): Home / State Map / Library = Editorial paper · Play =
+Book paper · Dev = Terminal. "Editor" from the old plan is absorbed into **Library**.
 
 ### 3.1 HOME / Library (selection-first; pick & dive in)
 The single entry point. **No editors, no provider forms, no debug.**
@@ -116,6 +129,21 @@ location, backup) · About/disclaimer.
   not a separate tab.
 
 ### 3.5 DEV MODE (in-session toggle — the power surface — see §4)
+
+### 3.6 STATE MAP (player-facing — the killer-feature showcase) — NEW 2026-06-27
+A full page like the handoff mock (Scene · Characters[knows/misbelieves] ·
+Relationships · Objects · Timeline · Memory Inspector with provenance), in the
+**Editorial** register. **Mode-censored** by the active narrative mode (Bible §17):
+- **Realistic → omit** sensitive rows entirely (no trace a secret exists).
+- **Reader → redact** with reveal-on-tap (black redaction bars are the feature).
+- **God → plaintext** (full dramatic irony).
+- **Ownership flips the rule:** the *player's own* character's knows/misbelieves
+  stays hidden (don't spoil your own blind spot); NPC misbeliefs are shown as the
+  dramatic irony reader/god mode is *for*.
+
+This is the **player** view of state — it sells "the character remembers / has
+changed." The **raw** inspector (unredacted modules, scoring, patch logs, context
+preview) stays in **Dev Mode** (§4). Same data, two faces: dossier vs machine.
 
 ---
 
@@ -159,9 +187,13 @@ Promoted out of dev: the calm pipeline indicator in normal Chat (§3.4).
 - **Phase 0 — Refactor (prerequisite, approved).** Split `App.tsx` into
   `types.ts`, `constants.ts`, `lib/`, `components/`, `views/`, and lift shared
   state into a context/store. Behavior-preserving; typecheck green at every step.
-- **Phase 1 — Screen router.** Home ⇄ Editor ⇄ Chat as full-screen views moved
-  between by action (no tab bar); Settings drawer + in-session Dev toggle.
-  (Revised: an earlier 4-tab rail was scrapped per the simpler IA in §3.)
+- **Phase 1 — Screen router + nav rail.** Persistent left rail (Home · Play ·
+  State Map · Library · Settings) that hides during full-immersion Play and Dev;
+  Settings drawer + in-session Dev toggle. (Revised 2026-06-27: the rail is back,
+  with *meaningful* destinations — the earlier scrap was about redundant tabs, not
+  rail nav itself. See §3.)
+- **Phase 1b — State Map page (§3.6).** Player-facing, mode-censored Soul + World
+  state with redaction/blanks; raw inspector stays in Dev Mode.
 - **Phase 2 — HOME redesign.** Selection-first launcher; multi-character picker;
   session strip with working Active/Archived toggle + hard-delete; quick actions
   incl. web link + New/Edit + Settings. Provider card removed from Home.
@@ -179,6 +211,13 @@ Promoted out of dev: the calm pipeline indicator in normal Chat (§3.4).
 ---
 
 ## 6. Settled decisions
+- **Navigation: persistent nav rail** (revised 2026-06-27, supersedes "no tab
+  bar"). Destinations Home · Play · State Map · Library · Settings; rail hides
+  during full-immersion Play and Dev Mode. Old scrap was about redundant tabs.
+- **State Map is a player-facing page** (§3.6), mode-censored via narrative modes
+  (redaction/blanks); raw inspector stays in Dev Mode.
+- **Theme: Book (Play) + Editorial-lite (documents) + Terminal (Dev)** — see
+  `UI-theme-direction.md`. Human surface is paper/e-ink, *not* dark-warm.
 - Multi-character: **build fully** (picker is multi-select; backend gains true
   multi-active sessions — Phase 7).
 - "Download web redirection": **outbound link to a site**.

@@ -51,6 +51,8 @@ pub fn run() {
             commands::list_souls,
             commands::list_souls_debug,
             commands::list_conversations,
+            commands::list_session_state_hub,
+            commands::list_session_state_map,
             commands::list_player_personas,
             commands::list_archived_player_personas,
             commands::get_active_player_persona,
