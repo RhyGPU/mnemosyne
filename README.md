@@ -1,16 +1,32 @@
 # Mnemosyne
 
-Mnemosyne is an AGPL-licensed local-first campaign brain for persistent AI roleplay and long-form story creation. It is not meant to be only a better chat frontend, JanitorAI clone, or SillyTavern alternative. The product goal is a universal RP state map: a living graph of characters, relationships, objects, locations, events, factions, secrets, unresolved tensions, and continuity facts that can support many styles of roleplay through one underlying architecture.
+Mnemosyne is an AGPL-licensed local-first campaign brain / AI roleplay continuity engine for persistent characters and long-form story creation. It separates character memory, world state, prompt context, and debugging traces so an LLM narrator can write without being asked to remember everything by itself.
 
-Mnemosyne combines a React/Tauri UI with a Rust state engine that manages character Souls, world continuity, memory scoring, context compilation, evaluator patches, and state updates outside the LLM.
+It is not meant to be only a better chat frontend, JanitorAI clone, or SillyTavern alternative. The product goal is a universal RP state map: a living graph of characters, relationships, objects, locations, events, factions, secrets, unresolved tensions, and continuity facts that can support many styles of roleplay through one underlying architecture.
 
 The core design principle is simple:
 
 > The narrator writes. The state map remembers.
 
+Mnemosyne combines a React/Tauri UI with a Rust state engine that manages character Souls, world continuity, memory scoring, context compilation, evaluator patches, persistence, and debug traces outside the LLM.
+
 That state map should eventually support character RP, relationship RP, D&D-style party adventures, multi-user campaigns, political intrigue, survival/base-building stories, and alternate-history war games without rebuilding the engine around each genre.
 
 Mnemosyne is currently a working alpha. The main narrator, memory, state, and persistence pipeline exists, but the project is not yet a polished public release.
+
+## Links
+
+- Portfolio case study: [https://rhygpu.dev/projects/mnemosyne/](https://rhygpu.dev/projects/mnemosyne/)
+- Development journal: [https://rhygpu.dev/devlog/](https://rhygpu.dev/devlog/)
+- Portfolio site: [https://rhygpu.dev/](https://rhygpu.dev/)
+
+## For Readers
+
+Use the portfolio case study for the high-level technical overview, screenshots, and project framing.
+
+Use the development journal for design history: what broke, what changed, and why the architecture moved toward memory/state separation, payload inspection, fresh-session boundaries, and prompt cleanup.
+
+Use this README for developer-facing repo context: setup, current implementation state, architecture notes, alpha limitations, roadmap, and local development commands.
 
 ## Current Status
 
