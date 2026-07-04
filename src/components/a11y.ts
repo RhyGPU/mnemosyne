@@ -24,7 +24,11 @@ export function focusFirstElement(container: HTMLElement | null) {
 export function trapTabKey(event: Pick<KeyboardEvent, "key" | "shiftKey" | "preventDefault">, container: HTMLElement | null) {
   if (event.key !== "Tab") return;
   const focusables = getFocusableElements(container);
-  if (focusables.length <= 1) return;
+  if (focusables.length <= 1) {
+    event.preventDefault();
+    focusables[0]?.focus();
+    return;
+  }
   const first = focusables[0];
   const last = focusables[focusables.length - 1];
   if (event.shiftKey && document.activeElement === first) {
@@ -61,22 +65,10 @@ export function useModalBehavior({
       }
       trapTabKey(event, panelRef.current);
     };
-    const handleKeyUp = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && closeOnEscape) {
-        event.preventDefault();
-        onClose();
-      }
-    };
     document.addEventListener("keydown", handleKeyDown, true);
-    document.addEventListener("keyup", handleKeyUp, true);
-    window.addEventListener("keydown", handleKeyDown, true);
-    window.addEventListener("keyup", handleKeyUp, true);
     return () => {
       window.cancelAnimationFrame(frame);
       document.removeEventListener("keydown", handleKeyDown, true);
-      document.removeEventListener("keyup", handleKeyUp, true);
-      window.removeEventListener("keydown", handleKeyDown, true);
-      window.removeEventListener("keyup", handleKeyUp, true);
       if (restoreFocus) previouslyFocused?.focus();
     };
   }, [active, closeOnEscape, onClose, panelRef, restoreFocus]);

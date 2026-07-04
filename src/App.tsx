@@ -231,7 +231,7 @@ type AppView = "home" | "library" | "editor" | "chat" | "statemap" | "settings";
 type ChatStartMode = "continue" | "fresh";
 type DisclaimerMode = "launch" | "manual" | null;
 // Non-dev settings drawer tabs only. Dev features live in the dev-shell side panel.
-type SettingsTab = "ai" | "chat" | "data" | "about";
+type SettingsTab = "ai" | "data" | "about";
 type DevCommandName =
   | "dedupe_active_adjacent_user_messages"
   | "restore_inactive_messages"
@@ -806,6 +806,7 @@ export function App() {
   // the AI-vs-AI exchange streams into the real chat instead of running headless.
   const [benchmarkLiveActive, setBenchmarkLiveActive] = useState(false);
   const [benchmarkTurnsRemaining, setBenchmarkTurnsRemaining] = useState(0);
+  const [benchmarkLivePhase, setBenchmarkLivePhase] = useState<BenchmarkTurnPhase | "idle" | "preparing" | "finalizing" | "stopping" | "failed">("idle");
   const benchmarkCtxRef = useRef<BenchmarkLiveContext | null>(null);
   const benchmarkTurnInFlightRef = useRef(false);
   const benchmarkStopRef = useRef(false);
@@ -1385,7 +1386,7 @@ export function App() {
     const menu = chatMoreMenuRef.current;
     const focusItems = () => getFocusableElements(menu).filter((element) => element.getAttribute("role") === "menuitem");
     window.requestAnimationFrame(() => focusItems()[0]?.focus());
-    const handleOutsideEvent = (event: Event) => {
+    const handleOutsideEvent = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
       if (chatMoreMenuRef.current?.contains(target) || chatMoreButtonRef.current?.contains(target)) return;
@@ -1416,19 +1417,9 @@ export function App() {
       }
     };
     document.addEventListener("pointerdown", handleOutsideEvent, true);
-    document.addEventListener("mousedown", handleOutsideEvent, true);
-    document.addEventListener("click", handleOutsideEvent, true);
-    window.addEventListener("pointerdown", handleOutsideEvent, true);
-    window.addEventListener("mousedown", handleOutsideEvent, true);
-    window.addEventListener("click", handleOutsideEvent, true);
     document.addEventListener("keydown", handleKeyDown, true);
     return () => {
       document.removeEventListener("pointerdown", handleOutsideEvent, true);
-      document.removeEventListener("mousedown", handleOutsideEvent, true);
-      document.removeEventListener("click", handleOutsideEvent, true);
-      window.removeEventListener("pointerdown", handleOutsideEvent, true);
-      window.removeEventListener("mousedown", handleOutsideEvent, true);
-      window.removeEventListener("click", handleOutsideEvent, true);
       document.removeEventListener("keydown", handleKeyDown, true);
     };
   }, [chatMoreMenuOpen]);
@@ -3962,6 +3953,7 @@ export function App() {
     setBenchmarkRunning(true);
     setBenchmarkResult(null);
     setBenchmarkError(null);
+    setBenchmarkLivePhase("preparing");
     setStatus("Running benchmark...");
     try {
       const summary = await runBenchmark(
@@ -3996,6 +3988,7 @@ export function App() {
       reportError(error, "Benchmark failed", "app");
     } finally {
       setBenchmarkRunning(false);
+      setBenchmarkLivePhase("idle");
     }
   }
 
@@ -4100,6 +4093,7 @@ export function App() {
     setBenchmarkRunning(true);
     setBenchmarkResult(null);
     setBenchmarkError(null);
+    setBenchmarkLivePhase("preparing");
     setStatus("Preparing live benchmark session...");
     // Auto-start the local repair model if it's configured but not up, and wait
     // for it to be ready before running turns so repair has a live endpoint
@@ -4161,6 +4155,7 @@ export function App() {
       await refreshContext(soul.character_id, init.conversation_id);
       setBenchmarkTurnsRemaining(settingsPayload.turn_count);
       setBenchmarkLiveActive(true);
+      setBenchmarkLivePhase("player_generation");
       setStatus(`Live benchmark running: 0/${settingsPayload.turn_count} turns`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4169,6 +4164,7 @@ export function App() {
       setStatus(`Benchmark failed: ${message}`);
       reportError(error, "Benchmark failed", "app");
       setBenchmarkRunning(false);
+      setBenchmarkLivePhase("failed");
     }
   }
 
@@ -4220,6 +4216,7 @@ export function App() {
     let phase: BenchmarkTurnPhase = "player_generation";
     try {
       const opponentLabel = ctx.traditionalOpponent ? "Traditional RP" : "AI player";
+      setBenchmarkLivePhase("player_generation");
       setStatus(`${turnLabel}: ${opponentLabel} thinking...`);
       const generate = ctx.traditionalOpponent
         ? generateTraditionalRpMessage
@@ -4237,6 +4234,7 @@ export function App() {
       }
       // Send as a visible user turn; the narrator streams its reply live.
       phase = "execute_turn";
+      setBenchmarkLivePhase("execute_turn");
       const result = await executeTurn(
         playerText,
         turnLabel,
@@ -4264,6 +4262,7 @@ export function App() {
         result.debug.state_updater_status.startsWith("background_")
       ) {
         phase = "evaluator_wait";
+        setBenchmarkLivePhase("evaluator_wait");
         setStatus(`${turnLabel}: waiting for evaluator...`);
         const evaluatorJob = await waitForBenchmarkEvaluatorJob(ctx.conversationId);
         if (benchmarkStopRef.current) {
@@ -4279,6 +4278,7 @@ export function App() {
         }
       }
       phase = "turn_summary";
+      setBenchmarkLivePhase("turn_summary");
       const summary = await benchmarkTurnSummary(
         ctx.conversationId,
         turnIndex,
@@ -4291,6 +4291,7 @@ export function App() {
       ctx.completedTurns += 1;
       ctx.nextTurnIndex = turnIndex + 1;
       phase = "completed";
+      setBenchmarkLivePhase("completed");
       setBenchmarkTurnsRemaining((remaining) => remaining - 1);
       setStatus(`Live benchmark running: ${ctx.completedTurns}/${ctx.settings.turn_count} turns`);
     } catch (error) {
@@ -4379,6 +4380,7 @@ export function App() {
       }
       benchmarkStopRef.current = true;
       setBenchmarkTurnsRemaining(0);
+      setBenchmarkLivePhase("failed");
       logDev("warn", "app", "Live benchmark turn failed", {
         conversation_id: ctx.conversationId,
         turn_index: turnIndex,
@@ -4395,6 +4397,7 @@ export function App() {
     if (!ctx) return;
     benchmarkTurnInFlightRef.current = true;
     setBenchmarkLiveActive(false);
+    setBenchmarkLivePhase("finalizing");
     setStatus("Finalizing benchmark...");
     try {
       const summary = await finalizeBenchmark(
@@ -4438,12 +4441,14 @@ export function App() {
       benchmarkStopRef.current = false;
       benchmarkTurnInFlightRef.current = false;
       setBenchmarkRunning(false);
+      setBenchmarkLivePhase("idle");
     }
   }
 
   function handleStopBenchmark() {
     if (!benchmarkLiveActive) return;
     benchmarkStopRef.current = true;
+    setBenchmarkLivePhase("stopping");
     setBenchmarkTurnsRemaining(0);
     // Abort any in-flight narrator stream so Stop takes effect immediately
     // rather than waiting out the current turn's network call. (A player-line
@@ -5953,16 +5958,16 @@ export function App() {
       <span>Settings</span>
     </button>
   );
-  const chatSettingsPanel = (
+  const dataSettingsPanel = (
     <div className="settings-tab-panel">
       <section className="settings-section">
         <div className="settings-section-heading">
           <div>
             <span className="eyebrow">Sessions</span>
-            <h3>Chat Defaults</h3>
+            <h3>Session Defaults</h3>
           </div>
         </div>
-        <div className="chat-start-options settings-radio-group" role="radiogroup" aria-label="Default chat start mode">
+        <div className="chat-start-options settings-radio-group" role="radiogroup" aria-label="Default session start mode">
           <label>
             <input
               type="radio"
@@ -5994,12 +5999,7 @@ export function App() {
           />
           <span>Show archived sessions by default</span>
         </label>
-        <p className="settings-note">Composer shortcut: Enter to send, Shift+Enter for a new line.</p>
       </section>
-    </div>
-  );
-  const dataSettingsPanel = (
-    <div className="settings-tab-panel">
       <section className="settings-section">
         <div className="settings-section-heading">
           <div>
@@ -6039,14 +6039,11 @@ export function App() {
   const activeSettingsPanel =
     settingsTab === "ai"
       ? providerSettingsPanel
-      : settingsTab === "chat"
-        ? chatSettingsPanel
-        : settingsTab === "data"
-          ? dataSettingsPanel
-          : aboutSettingsPanel;
+      : settingsTab === "data"
+        ? dataSettingsPanel
+        : aboutSettingsPanel;
   const settingsCategoryItems: Array<{ id: SettingsTab; label: string; icon: JSX.Element }> = [
     { id: "ai", label: "AI", icon: <Sparkles size={18} /> },
-    { id: "chat", label: "Chat", icon: <MessageSquareText size={18} /> },
     { id: "data", label: "Data", icon: <FolderOpen size={18} /> },
     { id: "about", label: "About", icon: <Clipboard size={18} /> },
   ];
@@ -6201,10 +6198,100 @@ export function App() {
           return { sym: "[...]", cls: "run" };
         return { sym: "[OK]", cls: "ok" };
       };
+      const benchmarkCtx = benchmarkCtxRef.current;
+      const benchmarkRows = benchmarkCtx?.perTurn ?? benchmarkResult?.per_turn ?? [];
+      const benchmarkRequested =
+        benchmarkCtx?.settings.turn_count ?? benchmarkResult?.turn_count_requested ?? benchmarkTurnCount;
+      const benchmarkCompleted = benchmarkCtx?.completedTurns ?? benchmarkResult?.turn_count_completed ?? 0;
+      const benchmarkSucceeded = benchmarkRows.filter(
+        (turn) => turn.stage === "completed" && turn.narrator_response_present && !turn.narrator_error,
+      ).length;
+      const benchmarkFailed = benchmarkRows.filter(
+        (turn) => turn.stage !== "completed" || Boolean(turn.narrator_error),
+      ).length;
+      const benchmarkCurrentTurn = benchmarkLiveActive
+        ? Math.min(benchmarkRequested, benchmarkCompleted + (benchmarkTurnInFlightRef.current ? 1 : 0))
+        : benchmarkCompleted;
+      const benchmarkProgressPct =
+        benchmarkRequested > 0 ? Math.min(100, Math.round((benchmarkCompleted / benchmarkRequested) * 100)) : 0;
+      const backgroundJobs = [
+        {
+          key: "benchmark",
+          active: benchmarkRunning,
+          label: "benchmark",
+          detail: benchmarkLiveActive
+            ? `${benchmarkLivePhase} ${benchmarkCurrentTurn}/${benchmarkRequested}`
+            : benchmarkRunning
+              ? `${benchmarkType} running`
+              : benchmarkResult
+                ? `${benchmarkResult.scorecard.pass ? "pass" : "fail"} ${benchmarkResult.turn_count_completed}/${benchmarkResult.turn_count_requested}`
+                : "idle",
+          cls: benchmarkError || benchmarkLivePhase === "failed" ? "err" : benchmarkRunning ? "run" : benchmarkResult?.scorecard.pass ? "ok" : "skip",
+        },
+        {
+          key: "form-eval",
+          active: formEvalBusy || Boolean(formEvalReport),
+          label: "form-eval",
+          detail: formEvalBusy
+            ? "running"
+            : formEvalReport
+              ? `${formEvalReport.form_passed}/${formEvalReport.turns_total} pass, ${formEvalReport.form_failed} fail`
+              : "idle",
+          cls: formEvalBusy ? "run" : formEvalReport?.form_failed ? "warn" : formEvalReport ? "ok" : "skip",
+        },
+        {
+          key: "evaluator",
+          active: activeEvaluatorJobIsLive || Boolean(activeEvaluatorJob),
+          label: "evaluator",
+          detail: activeEvaluatorJob
+            ? `${activeEvaluatorJob.status}${activeEvaluatorJob.elapsed_ms ? ` ${activeEvaluatorJob.elapsed_ms}ms` : ""}`
+            : "idle",
+          cls: activeEvaluatorJob?.status === "failed" ? "err" : activeEvaluatorJobIsLive ? "run" : activeEvaluatorJob ? "ok" : "skip",
+        },
+        {
+          key: "state",
+          active: stateUpdating,
+          label: "state",
+          detail: stateUpdating ? "updating" : "idle",
+          cls: stateUpdating ? "run" : "skip",
+        },
+      ].filter((job) => job.active);
 
       const devPipelineRail = (
             <aside className="cli-rail" aria-label="Pipeline">
-              <div className="cli-rail-title">// PIPELINE</div>
+              <div className="cli-rail-title">// JOBS</div>
+              {backgroundJobs.length ? (
+                <div className="cli-job-list">
+                  {backgroundJobs.map((job) => (
+                    <div className={`cli-job ${job.cls}`} key={job.key}>
+                      <span>{job.label}</span>
+                      <strong>{job.detail}</strong>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="cli-rail-empty">no background jobs_</div>
+              )}
+
+              <div className="cli-rail-title">// BENCHMARK</div>
+              <div className="cli-benchmark-meter" aria-label="Benchmark progress">
+                <div className="cli-meter-line">
+                  <span>{benchmarkRunning ? benchmarkLivePhase : benchmarkResult ? "complete" : "idle"}</span>
+                  <strong>{benchmarkCurrentTurn}/{benchmarkRequested}</strong>
+                </div>
+                <div className="cli-meter-track">
+                  <span style={{ width: `${benchmarkProgressPct}%` }} />
+                </div>
+                <div className="cli-meter-grid">
+                  <span>ok {benchmarkSucceeded}</span>
+                  <span>fail {benchmarkFailed}</span>
+                  <span>left {benchmarkRunning ? benchmarkTurnsRemaining : Math.max(0, benchmarkRequested - benchmarkCompleted)}</span>
+                  <span>{benchmarkStopRef.current ? "stopping" : benchmarkRunning ? "running" : "ready"}</span>
+                </div>
+                {benchmarkError ? <div className="cli-rail-error">{benchmarkError}</div> : null}
+              </div>
+
+              <div className="cli-rail-title">// LAST TURN PIPELINE</div>
               {latestPipelineTrace ? (
                 <>
                   <div className="cli-rail-status">
@@ -8465,7 +8552,10 @@ function loadStoredChatStartMode(): ChatStartMode {
 function loadStoredSettingsTab(): SettingsTab {
   try {
     const raw = localStorage.getItem(SETTINGS_DRAWER_TAB_STORAGE_KEY);
-    return raw === "ai" || raw === "chat" || raw === "data" || raw === "about" ? raw : "ai";
+    if (raw === "chat") {
+      return "data";
+    }
+    return raw === "ai" || raw === "data" || raw === "about" ? raw : "ai";
   } catch {
     return "ai";
   }

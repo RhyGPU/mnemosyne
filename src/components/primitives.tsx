@@ -65,15 +65,11 @@ export function ImagePreviewModal({
       className="image-preview-backdrop"
       role="dialog"
       aria-modal="true"
-      onClick={onClose}
-      onMouseDown={onClose}
       onPointerDown={onClose}
     >
       <section
         className="image-preview-modal"
         ref={modalRef}
-        onClick={(event) => event.stopPropagation()}
-        onMouseDown={(event) => event.stopPropagation()}
         onPointerDown={(event) => event.stopPropagation()}
       >
         <button type="button" className="image-preview-close" onClick={onClose} aria-label="Close image preview">

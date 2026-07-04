@@ -52,12 +52,6 @@ export function AppDialog({
     <div
       className={`app-dialog-backdrop${dialog.terminal ? " terminal" : ""}`}
       role="presentation"
-      onClick={() => {
-        if (!dialog.destructive) resolveCancel();
-      }}
-      onMouseDown={() => {
-        if (!dialog.destructive) resolveCancel();
-      }}
       onPointerDown={() => {
         if (!dialog.destructive) resolveCancel();
       }}
@@ -69,8 +63,6 @@ export function AppDialog({
         aria-modal="true"
         aria-labelledby="app-dialog-title"
         onSubmit={handleSubmit}
-        onClick={(event) => event.stopPropagation()}
-        onMouseDown={(event) => event.stopPropagation()}
         onPointerDown={(event) => event.stopPropagation()}
       >
         <header>

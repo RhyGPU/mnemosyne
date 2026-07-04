@@ -51,8 +51,6 @@ export function PersonaModal({
     <section
       className="persona-modal-backdrop"
       role="presentation"
-      onClick={onBackdropClose}
-      onMouseDown={onBackdropClose}
       onPointerDown={onBackdropClose}
     >
       <div
@@ -61,8 +59,6 @@ export function PersonaModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="persona-modal-title"
-        onClick={(event) => event.stopPropagation()}
-        onMouseDown={(event) => event.stopPropagation()}
         onPointerDown={(event) => event.stopPropagation()}
       >
         <header>
