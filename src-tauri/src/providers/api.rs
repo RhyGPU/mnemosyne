@@ -330,6 +330,12 @@ pub struct ApiProviderSettings {
     /// Max one-shot repair retries for evaluator_structured_v1 tool-call
     /// failures. Missing means one retry.
     pub structured_evaluator_max_retries: Option<u32>,
+    /// Internal (set by the repair path, never the UI): structured calls use the
+    /// REPAIR ops schema — `ops` requires at least one entry and the `no_op`
+    /// escape is removed — because repair only fires on turns already known to
+    /// contain durable change, and small models otherwise punt into no_op.
+    #[serde(default)]
+    pub structured_require_ops: Option<bool>,
     pub wait_for_evaluator_before_next_turn: Option<bool>,
     pub allow_send_with_stale_state: Option<bool>,
     pub evaluator_background_enabled: Option<bool>,

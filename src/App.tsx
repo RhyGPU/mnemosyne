@@ -1,6 +1,7 @@
 import {
   Archive,
   ArrowLeft,
+  ArrowRight,
   Brain,
   ChevronDown,
   Clipboard,
@@ -8,6 +9,7 @@ import {
   FileDown,
   FolderOpen,
   FileUp,
+  Home,
   Image as ImageIcon,
   MessageSquareText,
   PanelLeftClose,
@@ -16,6 +18,7 @@ import {
   Play,
   RefreshCcw,
   Save,
+  Settings as SettingsIcon,
   Sparkles,
   Square,
   Terminal,
@@ -93,7 +96,6 @@ import {
   getLatestEvaluatorJob,
   getSetting,
   getImageAsset,
-  getImageAssetDataUrl,
   getActivePlayerPersona,
   getSoul,
   inspectTurnBranchIntegrity,
@@ -167,6 +169,25 @@ import {
   embeddedRepairModelStatus,
   EmbeddedModelStatus,
 } from "./tauri";
+import {
+  AssetImage,
+  DisclaimerScreen,
+  ImagePreviewModal,
+  RangeField,
+  SoulAvatar,
+  Stat,
+} from "./components/primitives";
+import { AppDialog, AppDialogResult, AppDialogState } from "./components/dialogs";
+import { ChatMoreMenu } from "./components/chat/ChatMoreMenu";
+import { ChatPipelineRail } from "./components/chat/ChatPipelineRail";
+import { PersonaModal } from "./components/chat/PersonaModal";
+import { ChatView } from "./components/views/ChatView";
+import { DevModeShell } from "./components/views/DevModeShell";
+import { HomeView } from "./components/views/HomeView";
+import { LibraryView } from "./components/views/LibraryView";
+import { SettingsPageView } from "./components/views/SettingsPageView";
+import { StateMapView } from "./components/views/StateMapView";
+import { getFocusableElements, useModalBehavior } from "./components/a11y";
 
 const DEFAULT_CONVERSATION_ID = "local-mock";
 const CONSOLIDATION_INTERVAL_TURNS = 10;
@@ -187,9 +208,6 @@ const SHOW_ARCHIVED_SESSIONS_STORAGE_KEY = "mnemosyne:show_archived_sessions";
 const EVALUATOR_EXECUTION_MODE_STORAGE_KEY = "mnemosyne:evaluator_execution_mode";
 const STRUCTURED_EVALUATOR_TRANSPORT_STORAGE_KEY = "mnemosyne:structured_evaluator_transport";
 const SESSIONS_PER_PAGE = 10;
-const DEV_CONSOLE_PAUSED_STORAGE_KEY = "mnemosyne:dev_console_paused";
-const DEV_LOG_LEVEL_FILTER_STORAGE_KEY = "mnemosyne:dev_log_level_filter";
-const DEV_LOG_CATEGORY_FILTER_STORAGE_KEY = "mnemosyne:dev_log_category_filter";
 const DISCLAIMER_STORAGE_KEY = "mnemosyne_disclaimer_accepted_v1";
 const DISCLAIMER_VERSION = 1;
 const DEV_LOG_LIMIT = 1000;
@@ -206,7 +224,6 @@ const DEV_LOG_CATEGORIES: DevLogCategory[] = [
   "warning",
   "success",
 ];
-const DEV_LOG_LEVELS: DevLogLevel[] = ["info", "warn", "error", "debug", "success"];
 type ProviderKind = "Mock" | "API";
 type BenchmarkTurnPhase = "player_generation" | "execute_turn" | "evaluator_wait" | "turn_summary" | "completed";
 type NarrativeMode = "Realistic" | "Reader" | "Active Director" | "GM Simulation" | "Custom";
@@ -214,7 +231,7 @@ type AppView = "home" | "library" | "editor" | "chat" | "statemap" | "settings";
 type ChatStartMode = "continue" | "fresh";
 type DisclaimerMode = "launch" | "manual" | null;
 // Non-dev settings drawer tabs only. Dev features live in the dev-shell side panel.
-type SettingsTab = "ai" | "chat";
+type SettingsTab = "ai" | "chat" | "data" | "about";
 type DevCommandName =
   | "dedupe_active_adjacent_user_messages"
   | "restore_inactive_messages"
@@ -665,7 +682,9 @@ export function App() {
   const [formEvalReport, setFormEvalReport] = useState<SessionFormEvalReport | null>(null);
   // The permanent dev-shell side panel toggles between dev features (default) and
   // settings, so both are reachable without leaving the session.
-  const [devPanelTab, setDevPanelTab] = useState<"dev" | "settings">("dev");
+  const [devPanelTab, setDevPanelTab] = useState<"dev" | "settings" | "benchmarks">("dev");
+  const [appDialog, setAppDialog] = useState<AppDialogState | null>(null);
+  const appDialogResolverRef = useRef<((result: AppDialogResult) => void) | null>(null);
   // Mirror the path into a ref so the (once-registered) repair listener can
   // auto-start the model without a stale closure.
   const embeddedModelPathRef = useRef(embeddedModelPath);
@@ -753,21 +772,8 @@ export function App() {
   const [exportFeedback, setExportFeedback] = useState("");
   const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>(loadStoredSettingsTab);
-  const [devConsoleOpen, setDevConsoleOpen] = useState(false);
   const [latestPipelineTrace, setLatestPipelineTrace] = useState<TurnPipelineTrace | null>(null);
   const [devLogs, setDevLogs] = useState<DevLogEntry[]>([]);
-  const [devConsolePaused, setDevConsolePaused] = useState(() =>
-    loadStoredBoolean(DEV_CONSOLE_PAUSED_STORAGE_KEY, false),
-  );
-  const [devLogLevelFilter, setDevLogLevelFilter] = useState<DevLogLevel | "all">(
-    loadStoredDevLogLevelFilter,
-  );
-  const [devLogCategoryFilter, setDevLogCategoryFilter] = useState<DevLogCategory | "all">(
-    loadStoredDevLogCategoryFilter,
-  );
-  const [devCommandName, setDevCommandName] = useState<DevCommandName>(
-    "dedupe_active_adjacent_user_messages",
-  );
   const [devCommandArgs, setDevCommandArgs] = useState("{}");
   const [devCommandRunning, setDevCommandRunning] = useState(false);
   const [devCommandResult, setDevCommandResult] = useState<string | null>(null);
@@ -806,6 +812,46 @@ export function App() {
   // Latest evaluator/repair endpoint settings, kept fresh so the background
   // op-repair listener (registered once) always uses current config.
   const repairSettingsRef = useRef<ApiProviderSettings | null>(null);
+  function openAppDialog(dialog: AppDialogState): Promise<AppDialogResult> {
+    return new Promise((resolve) => {
+      appDialogResolverRef.current = resolve;
+      setAppDialog(dialog);
+    });
+  }
+  function resolveAppDialog(result: AppDialogResult) {
+    const resolver = appDialogResolverRef.current;
+    appDialogResolverRef.current = null;
+    setAppDialog(null);
+    resolver?.(result);
+  }
+  async function alertDialog(title: string, message?: string, terminal = false) {
+    await openAppDialog({ mode: "alert", title, message, terminal });
+  }
+  async function confirmDialog(title: string, message?: string, destructive = false, terminal = false) {
+    return (await openAppDialog({
+      mode: "confirm",
+      title,
+      message,
+      destructive,
+      terminal,
+      confirmLabel: destructive ? "Confirm" : "Continue",
+    })) === true;
+  }
+  async function promptDialog(
+    title: string,
+    defaultValue = "",
+    options: { message?: string; textarea?: boolean; placeholder?: string; confirmLabel?: string } = {},
+  ) {
+    const result = await openAppDialog({
+      mode: options.textarea ? "textarea" : "prompt",
+      title,
+      message: options.message,
+      defaultValue,
+      placeholder: options.placeholder,
+      confirmLabel: options.confirmLabel,
+    });
+    return typeof result === "string" ? result : null;
+  }
   const [disclaimerMode, setDisclaimerMode] = useState<DisclaimerMode>(() =>
     hasAcceptedDisclaimerVersion() ? null : "launch",
   );
@@ -827,12 +873,14 @@ export function App() {
   const generationAbortRef = useRef<AbortController | null>(null);
   const generationIdRef = useRef(0);
   const activeGenerationRef = useRef<ActiveGeneration | null>(null);
-  const devConsoleBodyRef = useRef<HTMLDivElement>(null);
   const chatOnlyBodyRef = useRef<HTMLElement>(null);
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const isPinnedToBottomRef = useRef(true);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [chatMoreMenuOpen, setChatMoreMenuOpen] = useState(false);
+  const chatMoreMenuRef = useRef<HTMLDivElement | null>(null);
+  const chatMoreButtonRef = useRef<HTMLButtonElement | null>(null);
+  const personaModalRef = useRef<HTMLDivElement | null>(null);
   // In-session Dev Mode: a terminal-CLI re-skin of the session (matrix/phosphor).
   const [devModeActive, setDevModeActive] = useState(false);
   const [devTerminalInput, setDevTerminalInput] = useState("");
@@ -1225,13 +1273,6 @@ export function App() {
     };
   }, [providerProfiles]);
 
-  useEffect(() => {
-    if (!devConsoleOpen || devConsolePaused) return;
-    const body = devConsoleBodyRef.current;
-    if (!body) return;
-    body.scrollTop = body.scrollHeight;
-  }, [devLogs, devConsoleOpen, devConsolePaused]);
-
   function scrollChatToBottom() {
     const body = chatOnlyBodyRef.current;
     if (!body) return;
@@ -1333,17 +1374,64 @@ export function App() {
     setSessionListPage((page) => Math.min(page, sessionListTotalPages));
   }, [sessionListTotalPages]);
 
-  useEffect(() => {
-    localStorage.setItem(DEV_CONSOLE_PAUSED_STORAGE_KEY, devConsolePaused ? "true" : "false");
-  }, [devConsolePaused]);
+  useModalBehavior({
+    active: Boolean(personaModalMode),
+    onClose: closePersonaModal,
+    panelRef: personaModalRef,
+  });
 
   useEffect(() => {
-    localStorage.setItem(DEV_LOG_LEVEL_FILTER_STORAGE_KEY, devLogLevelFilter);
-  }, [devLogLevelFilter]);
-
-  useEffect(() => {
-    localStorage.setItem(DEV_LOG_CATEGORY_FILTER_STORAGE_KEY, devLogCategoryFilter);
-  }, [devLogCategoryFilter]);
+    if (!chatMoreMenuOpen) return;
+    const menu = chatMoreMenuRef.current;
+    const focusItems = () => getFocusableElements(menu).filter((element) => element.getAttribute("role") === "menuitem");
+    window.requestAnimationFrame(() => focusItems()[0]?.focus());
+    const handleOutsideEvent = (event: Event) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (chatMoreMenuRef.current?.contains(target) || chatMoreButtonRef.current?.contains(target)) return;
+      setChatMoreMenuOpen(false);
+    };
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setChatMoreMenuOpen(false);
+        chatMoreButtonRef.current?.focus();
+        return;
+      }
+      const items = focusItems();
+      if (!items.length) return;
+      const currentIndex = Math.max(0, items.findIndex((item) => item === document.activeElement));
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        items[(currentIndex + 1) % items.length]?.focus();
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        items[(currentIndex - 1 + items.length) % items.length]?.focus();
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        items[0]?.focus();
+      } else if (event.key === "End") {
+        event.preventDefault();
+        items[items.length - 1]?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", handleOutsideEvent, true);
+    document.addEventListener("mousedown", handleOutsideEvent, true);
+    document.addEventListener("click", handleOutsideEvent, true);
+    window.addEventListener("pointerdown", handleOutsideEvent, true);
+    window.addEventListener("mousedown", handleOutsideEvent, true);
+    window.addEventListener("click", handleOutsideEvent, true);
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", handleOutsideEvent, true);
+      document.removeEventListener("mousedown", handleOutsideEvent, true);
+      document.removeEventListener("click", handleOutsideEvent, true);
+      window.removeEventListener("pointerdown", handleOutsideEvent, true);
+      window.removeEventListener("mousedown", handleOutsideEvent, true);
+      window.removeEventListener("click", handleOutsideEvent, true);
+      document.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [chatMoreMenuOpen]);
 
   useEffect(() => {
     if (!soul || view !== "chat") return;
@@ -1881,7 +1969,12 @@ export function App() {
       events: "clear recent events",
       memories: "clear memories",
     } as const;
-    const confirmed = window.confirm(`Debug repair: ${labels[kind]} for ${soul.character_name}?`);
+    const confirmed = await confirmDialog(
+      "Debug repair",
+      `${labels[kind]} for ${soul.character_name}?`,
+      true,
+      devModeActive,
+    );
     if (!confirmed) return;
     setBusy(true);
     try {
@@ -2426,7 +2519,11 @@ export function App() {
       setStatus("Select another persona before archiving the active one.");
       return;
     }
-    const confirmed = window.confirm(`Archive player persona ${persona.display_name}? It can be restored later.`);
+    const confirmed = await confirmDialog(
+      "Archive player persona",
+      `Archive ${persona.display_name}? It can be restored later.`,
+      true,
+    );
     if (!confirmed) return;
 
     setBusy(true);
@@ -2551,44 +2648,23 @@ export function App() {
     window.setTimeout(() => setPayloadCopied(false), 1800);
   }
 
-  async function handleCopyDevLogs() {
-    await navigator.clipboard.writeText(formatDevLogs(devLogs));
-    setStatus("Dev Console logs copied");
-    logDev("info", "app", "Dev Console logs copied", { entries: devLogs.length });
-  }
-
-  function handleClearDevLogs() {
-    setDevLogs([]);
-    setStatus("Dev Console cleared");
-  }
-
-  function handleExportDevLogs() {
-    const content = formatDevLogs(devLogs);
-    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `mnemosyne-dev-console-${Date.now()}.log`;
-    link.click();
-    URL.revokeObjectURL(url);
-    setStatus("Dev Console logs exported");
-    logDev("info", "app", "Dev Console logs exported", { entries: devLogs.length });
-  }
-
   async function handleValidateMne() {
-    const path = window.prompt("Enter absolute path to the .mne file to validate:");
+    const path = await promptDialog("Validate .mne bundle", "", {
+      message: "Enter absolute path to the .mne file to validate.",
+      placeholder: "C:\\path\\to\\bundle.mne",
+    });
     if (!path) return;
     try {
       setStatus("Validating bundle...");
       const report = await validateMneBundle(path);
       logDev("info", "app", "MNE Validation Report", report);
       if (report.valid) {
-        window.alert(`Bundle is VALID!\n\nSoul: ${report.summary.soul_name || "N/A"}\nWorld: ${report.summary.world_name || "N/A"}\nMessages: ${report.summary.message_count}\nMemories: ${report.summary.memory_count}\nRelationships: ${report.summary.relationship_count}`);
+        await alertDialog("Bundle is valid", `Soul: ${report.summary.soul_name || "N/A"}\nWorld: ${report.summary.world_name || "N/A"}\nMessages: ${report.summary.message_count}\nMemories: ${report.summary.memory_count}\nRelationships: ${report.summary.relationship_count}`);
       } else {
-        window.alert(`Bundle is INVALID!\n\nErrors:\n${report.errors.join("\n")}`);
+        await alertDialog("Bundle is invalid", `Errors:\n${report.errors.join("\n")}`);
       }
     } catch (err: any) {
-      window.alert(`Validation Error: ${err}`);
+      await alertDialog("Validation error", String(err));
       logDev("error", "app", "MNE Validation Failed", { error: err.toString() });
     } finally {
       setStatus("");
@@ -2596,15 +2672,18 @@ export function App() {
   }
 
   async function handlePreviewMne() {
-    const path = window.prompt("Enter absolute path to the .mne file to preview:");
+    const path = await promptDialog("Preview .mne bundle", "", {
+      message: "Enter absolute path to the .mne file to preview.",
+      placeholder: "C:\\path\\to\\bundle.mne",
+    });
     if (!path) return;
     try {
       setStatus("Previewing bundle...");
       const report = await previewMneImport(path);
       logDev("info", "app", "MNE Preview Report", report);
-      window.alert(`MNE Preview:\n\nSoul: ${report.summary.soul_name || "N/A"} (${report.summary.soul_id || "N/A"})\nWorld: ${report.summary.world_name || "N/A"} (${report.summary.world_id || "N/A"})\nMessages: ${report.summary.message_count}\nMemories: ${report.summary.memory_count}\nObject States: ${report.summary.object_state_count}\nRelationships: ${report.summary.relationship_count}\nPayload Logs: ${report.summary.payload_log_count}`);
+      await alertDialog("MNE preview", `Soul: ${report.summary.soul_name || "N/A"} (${report.summary.soul_id || "N/A"})\nWorld: ${report.summary.world_name || "N/A"} (${report.summary.world_id || "N/A"})\nMessages: ${report.summary.message_count}\nMemories: ${report.summary.memory_count}\nObject States: ${report.summary.object_state_count}\nRelationships: ${report.summary.relationship_count}\nPayload Logs: ${report.summary.payload_log_count}`);
     } catch (err: any) {
-      window.alert(`Preview Error: ${err}`);
+      await alertDialog("Preview error", String(err));
       logDev("error", "app", "MNE Preview Failed", { error: err.toString() });
     } finally {
       setStatus("");
@@ -2612,17 +2691,20 @@ export function App() {
   }
 
   async function handleImportMneAsNew() {
-    const path = window.prompt("Enter absolute path to the .mne file to import as new copy:");
+    const path = await promptDialog("Import .mne as new copy", "", {
+      message: "Enter absolute path to the .mne file to import as a new copy.",
+      placeholder: "C:\\path\\to\\bundle.mne",
+    });
     if (!path) return;
     try {
       setStatus("Importing bundle...");
       const result = await importMneAsNew(path);
       logDev("info", "app", "MNE Import Result", result);
-      window.alert(`Import Successful!\n\nSummary: ${result.summary}\nRemapped IDs count: ${Object.keys(result.remapped_ids).length}`);
+      await alertDialog("Import successful", `Summary: ${result.summary}\nRemapped IDs count: ${Object.keys(result.remapped_ids).length}`);
       setSouls(await listSouls());
       await refreshConversations();
     } catch (err: any) {
-      window.alert(`Import Error: ${err}`);
+      await alertDialog("Import error", String(err));
       logDev("error", "app", "MNE Import Failed", { error: err.toString() });
     } finally {
       setStatus("");
@@ -2861,7 +2943,7 @@ export function App() {
     }
   }
 
-  async function handleRunDevCommand(commandName = devCommandName, argsOverride?: Record<string, unknown>) {
+  async function handleRunDevCommand(commandName: DevCommandName, argsOverride?: Record<string, unknown>) {
     if (devCommandRunning) return;
     const conversationId =
       typeof argsOverride?.conversationId === "string"
@@ -2892,7 +2974,7 @@ export function App() {
           : null;
       setStatus(
         commandName === "run_benchmark" && benchmarkPassed !== null
-          ? `${benchmarkPassed ? "PASS" : "FAIL"} benchmark from Dev Console`
+          ? `${benchmarkPassed ? "PASS" : "FAIL"} benchmark from Dev Mode`
           : `Dev command complete: ${commandName}`,
       );
       logDev("success", "app", "Dev command complete", {
@@ -2986,7 +3068,10 @@ export function App() {
 
   async function handleRenameCurrentSession() {
     if (busy || !currentConversationId) return;
-    const nextTitle = window.prompt("Session title", currentSessionTitle);
+    const nextTitle = await promptDialog("Rename session", currentSessionTitle, {
+      placeholder: "Session title",
+      confirmLabel: "Rename",
+    });
     if (nextTitle === null) return;
     const trimmed = nextTitle.trim();
     if (!trimmed) {
@@ -3211,22 +3296,25 @@ export function App() {
       setStatus("Regenerating older turns requires branch rewind and will be added later.");
       return;
     }
-    const instruction = window
-      .prompt(
-        "Correction instruction for next response:",
-        "Continue from the current user message. Do not replay the wrong branch.",
-      )
-      ?.trim();
+    const instruction = (
+      await promptDialog("Fix next response", "Continue from the current user message. Do not replay the wrong branch.", {
+        message: "Correction instruction for the regenerated response.",
+        textarea: true,
+        confirmLabel: "Apply",
+      })
+    )?.trim();
     if (!instruction) return;
     await executeTurnFromUserMessage(message, "Applying fix instruction", instruction);
   }
 
   async function handleDeleteChatMessage(message: ChatMessage) {
     if (busy || stateUpdating) return;
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
+      "Hide turn",
       message.role === "assistant"
         ? "Hide this generated response and all later turns in this session? This is recoverable with Restore hidden turns."
         : "Hide this user message and all later turns in this session? This is recoverable with Restore hidden turns.",
+      true,
     );
     if (!confirmed) return;
 
@@ -3288,10 +3376,11 @@ export function App() {
 
   async function handleEditUserMessage(message: ChatMessage) {
     if (busy || stateUpdating || message.role !== "user") return;
-    const nextContent = window.prompt(
-      "Edit user message. Soul memory and later responses are not rewound.",
-      message.content,
-    );
+    const nextContent = await promptDialog("Edit user message", message.content, {
+      message: "Soul memory and later responses are not rewound.",
+      textarea: true,
+      confirmLabel: "Save",
+    });
     if (nextContent === null) return;
     const trimmed = nextContent.trim();
     if (!trimmed || trimmed === message.content) return;
@@ -3434,8 +3523,10 @@ export function App() {
   async function handleDeleteChat(conversationId = currentConversationId) {
     if (!soul) return;
     const deletingActiveConversation = conversationId === currentConversationId;
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
+      "Archive session",
       "Archive this local session? It stays recoverable; messages, payload logs, and session clones are kept.",
+      true,
     );
     if (!confirmed) return;
 
@@ -3459,7 +3550,8 @@ export function App() {
 
   async function handleRestoreSession(conversationId = currentConversationId) {
     if (!soul || !conversationId) return;
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
+      "Restore session",
       "Restore this archived session to your active chats?",
     );
     if (!confirmed) return;
@@ -3493,8 +3585,10 @@ export function App() {
 
   async function handleDeleteSoul() {
     if (!soul) return;
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
+      "Archive Soul",
       `Archive ${soul.character_name}? Local chats and savepoint history remain safe and recoverable.`,
+      true,
     );
     if (!confirmed) return;
 
@@ -3563,8 +3657,10 @@ export function App() {
 
   async function handlePurgeSoul() {
     if (!soul) return;
-    const confirmed = window.confirm(
-      `PERMANENTLY delete ${soul.character_name}? This creates a safety backup but cannot be undone from the UI. Type OK to confirm.`,
+    const confirmed = await confirmDialog(
+      "Permanently delete Soul",
+      `Permanently delete ${soul.character_name}? This creates a safety backup but cannot be undone from the UI.`,
+      true,
     );
     if (!confirmed) return;
     setBusy(true);
@@ -3609,12 +3705,14 @@ export function App() {
     }
 
     if (activeSettingIds.includes(setting.setting_id)) {
-      window.alert("Cannot archive the active/default setting. Switch settings first.");
+      await alertDialog("Cannot archive setting", "Cannot archive the active/default setting. Switch settings first.");
       return;
     }
 
-    const confirmed = window.confirm(
+    const confirmed = await confirmDialog(
+      "Archive setting",
       `Archive ${setting.setting_name}? Local chats and world settings remain safe and recoverable.`,
+      true,
     );
     if (!confirmed) return;
 
@@ -3695,9 +3793,42 @@ export function App() {
     }
     setFormEvalBusy(true);
     setFormEvalReport(null);
-    setStatus("Running form-eval benchmark on this session (dry-run, nothing applied)…");
+    setStatus("Running form-eval benchmark on this session (dry-run, nothing applied)...");
     try {
-      const report = await runSessionFormEvalBenchmark(currentConversationId, profileId);
+      // Resolve the repair endpoint the same way live repair does. If the user's
+      // repair selection is the embedded local model, make sure it's actually up
+      // (auto-start + wait) and build the settings from its live URL, otherwise
+      // the benchmark would silently test repair against the eval profile.
+      let repairSettings = repairSettingsRef.current ?? undefined;
+      const wantsEmbedded =
+        selectedRepairProfileId !== REPAIR_MODEL_EVALUATOR &&
+        !providerProfiles.some((profile) => profile.id === selectedRepairProfileId) &&
+        Boolean(embeddedModelPath.trim());
+      if (wantsEmbedded) {
+        setStatus("Ensuring local repair model is up for the benchmark...");
+        const ready = await ensureLocalRepairModelReady();
+        const status = ready ? await embeddedRepairModelStatus() : null;
+        if (status?.ready && status.url) {
+          repairSettings = {
+            ...(repairSettingsRef.current ?? apiSettings),
+            base_url: status.url,
+            api_key: "local",
+            model: status.model ?? "local-model",
+          };
+        } else {
+          setProviderAlert({
+            title: "Local repair model unavailable",
+            detail: "The embedded repair model couldn't be started for the benchmark.",
+            hint: "Check the model path in Settings. The repair stage will use the eval profile instead.",
+          });
+        }
+      }
+      setStatus("Running form-eval benchmark on this session (dry-run, nothing applied)...");
+      const report = await runSessionFormEvalBenchmark(
+        currentConversationId,
+        profileId,
+        repairSettings,
+      );
       setFormEvalReport(report);
       setStatus(
         `Form-eval benchmark: ${report.form_passed}/${report.turns_total} form-valid, ${report.repair_recovered} recovered by repair.`,
@@ -3732,7 +3863,7 @@ export function App() {
           errors: report.errors,
           raw_response: report.raw_response,
         });
-        window.alert(`Evaluator contract test failed:\n\n${errorMsg}\n\nRaw response:\n${report.raw_response}`);
+        await alertDialog("Evaluator contract test failed", `${errorMsg}\n\nRaw response:\n${report.raw_response}`, devModeActive);
       }
       setProviderProfiles(await listProviderProfiles());
     } catch (error) {
@@ -4335,7 +4466,10 @@ export function App() {
     if (!profile) return;
 
     if (profile.evaluator_compatibility_status === 2 && !devOverrideActive) {
-      window.alert(`Cannot activate profile "${profile.name}": Compatibility status is FAILED. Run contract test or enable Developer Override to proceed.`);
+      await alertDialog(
+        "Cannot activate profile",
+        `Compatibility status for "${profile.name}" is FAILED. Run contract test or enable Developer Override to proceed.`,
+      );
       return;
     }
 
@@ -4343,8 +4477,9 @@ export function App() {
     const isStalePrompt = profile.evaluator_prompt_version !== CURRENT_EVALUATOR_PROMPT_VERSION;
     if (profile.evaluator_compatibility_status === 0 || isStalePrompt) {
       const reason = profile.evaluator_compatibility_status === 0 ? "is untested" : "has a stale prompt version";
-      const confirmRun = window.confirm(
-        `Profile "${profile.name}" ${reason}.\n\nWould you like to run the compatibility contract test now?\n\nClick Cancel to bypass and load with a developer warning.`
+      const confirmRun = await confirmDialog(
+        "Run compatibility test?",
+        `Profile "${profile.name}" ${reason}.\n\nRun the compatibility contract test now? Cancel bypasses and loads with a developer warning.`
       );
       if (confirmRun) {
         await handleRunContractTest(profileId);
@@ -4352,7 +4487,7 @@ export function App() {
         setProviderProfiles(updatedProfiles);
         const refreshedProfile = updatedProfiles.find(item => item.id === profileId);
         if (refreshedProfile && refreshedProfile.evaluator_compatibility_status !== 1 && !devOverrideActive) {
-          window.alert("Contract test did not pass. Profile activation cancelled.");
+          await alertDialog("Profile activation cancelled", "Contract test did not pass.");
           return;
         }
       } else {
@@ -4503,7 +4638,7 @@ export function App() {
       activeIds.push(selectedRepairProfileId);
     }
     if (activeIds.includes(profileId)) {
-      window.alert("Cannot archive the active provider profile. Switch profiles first.");
+      await alertDialog("Cannot archive profile", "Cannot archive the active provider profile. Switch profiles first.");
       return;
     }
     setBusy(true);
@@ -4549,7 +4684,10 @@ export function App() {
   async function handleCreateSnapshot() {
     if (!soul) return;
     const defaultName = `${soul.character_name} Snapshot ${formatSnapshotTimestamp(new Date())}`;
-    const name = window.prompt("Name this Soul snapshot", defaultName);
+    const name = await promptDialog("Name this Soul snapshot", defaultName, {
+      placeholder: "Snapshot name",
+      confirmLabel: "Save Snapshot",
+    });
     if (name === null) return;
     setBusy(true);
     try {
@@ -4665,7 +4803,11 @@ export function App() {
   }
 
   async function handleImportMne() {
-    const manualPath = window.prompt("Path to .mne bundle");
+    const manualPath = await promptDialog("Import .mne bundle", "", {
+      message: "Enter the absolute path to the .mne bundle.",
+      placeholder: "C:\\path\\to\\bundle.mne",
+      confirmLabel: "Import",
+    });
     const filePath = manualPath?.trim() || null;
     if (!filePath) return;
     setBusy(true);
@@ -4811,15 +4953,6 @@ export function App() {
   const activeEvaluatorJobIsLive =
     activeEvaluatorJob?.status === "pending" || activeEvaluatorJob?.status === "running";
   const showEvaluatorJobBanner = Boolean(activeEvaluatorJob) && !evaluatorJobBannerDismissed;
-  const filteredDevLogs = useMemo(
-    () =>
-      devLogs.filter(
-        (entry) =>
-          (devLogLevelFilter === "all" || entry.level === devLogLevelFilter) &&
-          (devLogCategoryFilter === "all" || entry.category === devLogCategoryFilter),
-      ),
-    [devLogs, devLogLevelFilter, devLogCategoryFilter],
-  );
   const disclaimerScreen = (
     <DisclaimerScreen
       mode={disclaimerMode}
@@ -4932,7 +5065,7 @@ export function App() {
           <span>Form-Eval Dry-Run (open session)</span>
           <p className="provider-note">
             Replays this session's chat log through the non-tool-call FORM evaluator and the
-            repair path, validating each result the way the live system does — but applies
+            repair path, validating each result the way the live system does, but applies
             nothing to the session. Uses the selected Evaluator profile. Slow on CPU models.
           </p>
           <button
@@ -4941,15 +5074,15 @@ export function App() {
             onClick={() => void handleSessionFormEvalBenchmark()}
             disabled={formEvalBusy || !currentConversationId}
           >
-            <span>{formEvalBusy ? "Running form-eval…" : "Run form-eval benchmark on this session"}</span>
+            <span>{formEvalBusy ? "Running form-eval..." : "Run form-eval benchmark on this session"}</span>
           </button>
           {formEvalReport && (
             <div style={{ marginTop: "8px", fontSize: "0.8rem" }}>
               <div>
-                <strong>{formEvalReport.model}</strong> — {formEvalReport.turns_total} turns ·
-                form-valid {formEvalReport.form_passed} · failed {formEvalReport.form_failed} ·
-                repair-recovered {formEvalReport.repair_recovered}
-              </div>
+                <strong>{formEvalReport.model}</strong> - {formEvalReport.turns_total} turns -
+                form-valid {formEvalReport.form_passed} - failed {formEvalReport.form_failed} -
+                repair-recovered {formEvalReport.repair_recovered} - repair via{" "}
+                <strong>{formEvalReport.repair_model}</strong>              </div>
               <ul style={{ margin: "4px 0 0", paddingLeft: "1.1rem" }}>
                 {formEvalReport.per_turn.map((turn) => (
                   <li
@@ -4964,18 +5097,18 @@ export function App() {
                   >
                     turn {turn.turn_index}:{" "}
                     {turn.form_passed
-                      ? "form OK"
+                      ? `form OK (${turn.form_rows_accepted} rows accepted)`
                       : `form FAIL${
                           turn.repair_attempted
                             ? turn.repair_recovered
-                              ? ` → repair recovered (${turn.repair_ops} ops)`
+                              ? ` ??repair recovered (${turn.repair_ops} ops)`
                               : turn.repair_error
-                                ? ` → repair ERROR: ${turn.repair_error.slice(0, 90)}`
-                                : ` → repair parsed ${turn.repair_ops} ops but committed no state (no-op/under-extraction)`
+                                ? ` ??repair ERROR: ${turn.repair_error.slice(0, 90)}`
+                                : ` ??repair parsed ${turn.repair_ops} ops but committed no state (no-op/under-extraction)`
                             : ""
                         }`}
                     {turn.form_error && !turn.form_passed
-                      ? ` — form: ${turn.form_error.slice(0, 90)}`
+                      ? ` ??form: ${turn.form_error.slice(0, 90)}`
                       : ""}
                   </li>
                 ))}
@@ -5288,7 +5421,7 @@ export function App() {
                 <input
                   type="number"
                   min="0"
-                  value={Math.round((apiSettings.narrator_timeout_ms ?? 0) / 1000)}
+                  value={apiSettings.narrator_timeout_ms ? Math.round(apiSettings.narrator_timeout_ms / 1000) : ""}
                   onChange={(event) =>
                     setApiSettings((current) => ({
                       ...current,
@@ -5296,7 +5429,7 @@ export function App() {
                         Number(event.target.value) > 0 ? Number(event.target.value) * 1000 : null,
                     }))
                   }
-                  placeholder="0 = provider default"
+                  placeholder="None / provider default"
                   disabled={busy}
                 />
               </label>
@@ -5604,69 +5737,8 @@ export function App() {
                     <Archive size={16} />
                     <span>Archive Profile</span>
                   </button>
-                  {devModeActive && (
-                    <>
-                      <button
-                        type="button"
-                        className="ghost-action"
-                        onClick={() => void handleRunContractTest(selectedStateUpdaterProfileId)}
-                        disabled={busy || !selectedStateUpdaterProfileId}
-                      >
-                        <Play size={16} />
-                        <span>Run Contract Test</span>
-                      </button>
-                      <button
-                        type="button"
-                        className="ghost-action"
-                        onClick={() => void handleRunStructuredDiagnostic()}
-                        disabled={busy || structuredDiagnosticRunning || (!selectedStateUpdaterProfileId && !selectedProviderProfileId)}
-                      >
-                        <Play size={16} />
-                        <span>Run Structured Evaluator Diagnostic</span>
-                      </button>
-                    </>
-                  )}
                 </div>
               </>
-            )}
-            {useNarratorProviderForUpdater && devModeActive && (
-              <div className="button-row">
-                <button
-                  type="button"
-                  className="ghost-action"
-                  onClick={() => void handleRunStructuredDiagnostic()}
-                  disabled={busy || structuredDiagnosticRunning || (!selectedStateUpdaterProfileId && !selectedProviderProfileId)}
-                >
-                  <Play size={16} />
-                  <span>Run Structured Evaluator Diagnostic</span>
-                </button>
-              </div>
-            )}
-            {(structuredDiagnosticResult || structuredDiagnosticError) && (
-              <div className="provider-note">
-                {structuredDiagnosticResult ? (
-                  <>
-                    <strong>
-                      {structuredDiagnosticResult.resolved_evaluator_source === "evaluator_structured_v1" &&
-                      structuredDiagnosticResult.evaluator_mode_per_run.every((mode) => mode === "evaluator_structured_v1") &&
-                      structuredDiagnosticResult.runs.every((run) => !run.error)
-                        ? "PASS"
-                        : "FAIL"}
-                    </strong>{" "}
-                    {structuredDiagnosticResult.provider_model} - enforcement{" "}
-                    {structuredDiagnosticResult.structured_enforcement_per_run.join(", ") || "none"} - fallback{" "}
-                    {structuredDiagnosticResult.fallback_paths.map((path) => path.join(" > ")).join(" | ") || "none"}
-                    <br />
-                    Payload: {structuredDiagnosticResult.payload_history_path}
-                    <br />
-                    MNE: {structuredDiagnosticResult.mne_checkpoint_path}
-                    <br />
-                    Summary: {structuredDiagnosticResult.summary_json_path}
-                  </>
-                ) : (
-                  <><strong>FAIL</strong> {structuredDiagnosticError}</>
-                )}
-              </div>
             )}
           </section>
 
@@ -5742,15 +5814,6 @@ export function App() {
                 disabled={embeddedModelBusy || !embeddedModel.running}
               >
                 <span>Stop</span>
-              </button>
-              <button
-                type="button"
-                className="ghost-action"
-                onClick={() => void handleRetrySessionRepair()}
-                disabled={retryRepairBusy}
-                title="Re-run local repair (re-extraction) on every turn of the current session - recovers state that was dropped when repair was unavailable, without re-running the benchmark."
-              >
-                <span>{retryRepairBusy ? "Retrying repair..." : "Retry repair on session"}</span>
               </button>
             </div>
             <p className="provider-note">
@@ -5876,7 +5939,6 @@ export function App() {
           </section>
         </>
       ) : null}
-      {benchmarkRunnerPanel}
     </div>
   );
   const settingsDrawerToggle = (
@@ -5885,78 +5947,145 @@ export function App() {
       className={`settings-drawer-toggle ${settingsDrawerOpen ? "open" : ""}`}
       onClick={() => {
         setSettingsDrawerOpen((open) => !open);
-        if (!settingsDrawerOpen) setDevConsoleOpen(false);
       }}
     >
-      <Database size={16} />
+      <SettingsIcon size={16} />
       <span>Settings</span>
     </button>
   );
-  const settingsContent = (
-      <div className="settings-drawer-main">
+  const chatSettingsPanel = (
+    <div className="settings-tab-panel">
+      <section className="settings-section">
+        <div className="settings-section-heading">
+          <div>
+            <span className="eyebrow">Sessions</span>
+            <h3>Chat Defaults</h3>
+          </div>
+        </div>
+        <div className="chat-start-options settings-radio-group" role="radiogroup" aria-label="Default chat start mode">
+          <label>
+            <input
+              type="radio"
+              name="settings-chat-start-mode"
+              value="continue"
+              checked={chatStartMode === "continue"}
+              onChange={() => setChatStartMode("continue")}
+              disabled={busy}
+            />
+            <span>Continue Soul continuity</span>
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="settings-chat-start-mode"
+              value="fresh"
+              checked={chatStartMode === "fresh"}
+              onChange={() => setChatStartMode("fresh")}
+              disabled={busy}
+            />
+            <span>New isolated Session</span>
+          </label>
+        </div>
+        <label className="toggle-row">
+          <input
+            type="checkbox"
+            checked={showArchivedSessions}
+            onChange={(event) => setShowArchivedSessions(event.target.checked)}
+          />
+          <span>Show archived sessions by default</span>
+        </label>
+        <p className="settings-note">Composer shortcut: Enter to send, Shift+Enter for a new line.</p>
+      </section>
+    </div>
+  );
+  const dataSettingsPanel = (
+    <div className="settings-tab-panel">
+      <section className="settings-section">
+        <div className="settings-section-heading">
+          <div>
+            <span className="eyebrow">Data</span>
+            <h3>Storage & Imports</h3>
+          </div>
+        </div>
+        <p className="settings-note">Session data lives locally. Import, export, and archive workflows stay in Library and Dev Mode so this page remains a clean preferences surface.</p>
+        <div className="button-row">
+          <button type="button" className="ghost-action" onClick={() => void openSessionDataLocation()} disabled={busy}>
+            <FolderOpen size={16} />
+            <span>Open Data Folder</span>
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+  const aboutSettingsPanel = (
+    <div className="settings-tab-panel">
+      <section className="settings-section">
+        <div className="settings-section-heading">
+          <div>
+            <span className="eyebrow">About</span>
+            <h3>Mnemosyne</h3>
+          </div>
+        </div>
+        <p className="settings-note">Mnemosyne is an experimental AI roleplay state engine. Human-facing surfaces stay paper/editorial; raw machine inspection stays in terminal Dev Mode.</p>
+        <div className="button-row">
+          <button type="button" className="ghost-action" onClick={handleViewDisclaimer}>
+            <Clipboard size={16} />
+            <span>View Disclaimer</span>
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+  const activeSettingsPanel =
+    settingsTab === "ai"
+      ? providerSettingsPanel
+      : settingsTab === "chat"
+        ? chatSettingsPanel
+        : settingsTab === "data"
+          ? dataSettingsPanel
+          : aboutSettingsPanel;
+  const settingsCategoryItems: Array<{ id: SettingsTab; label: string; icon: JSX.Element }> = [
+    { id: "ai", label: "AI", icon: <Sparkles size={18} /> },
+    { id: "chat", label: "Chat", icon: <MessageSquareText size={18} /> },
+    { id: "data", label: "Data", icon: <FolderOpen size={18} /> },
+    { id: "about", label: "About", icon: <Clipboard size={18} /> },
+  ];
+  const settingsDrawerContent = (
+    <div className="settings-drawer-main">
       <nav className="settings-drawer-tabs" aria-label="Settings categories">
-        {(["ai", "chat"] as SettingsTab[]).map((tab) => (
+        {settingsCategoryItems.map((tab) => (
           <button
-            key={tab}
+            key={tab.id}
             type="button"
-            className={settingsTab === tab ? "selected" : ""}
-            onClick={() => setSettingsTab(tab)}
-            title={tab.toUpperCase()}
+            className={settingsTab === tab.id ? "selected" : ""}
+            onClick={() => setSettingsTab(tab.id)}
+            title={tab.label}
           >
-            {tab === "ai" ? <Sparkles size={18} /> : <MessageSquareText size={18} />}
-            <span>{tab === "ai" ? "AI" : "Chat"}</span>
+            {tab.icon}
+            <span>{tab.label}</span>
           </button>
         ))}
       </nav>
-      <div className="settings-drawer-body">
-        {settingsTab === "ai" ? providerSettingsPanel : null}
-        {settingsTab === "chat" ? (
-          <div className="settings-tab-panel">
-            <section className="settings-section">
-              <div className="settings-section-heading">
-                <div>
-                  <span className="eyebrow">Sessions</span>
-                  <h3>Chat Defaults</h3>
-                </div>
-              </div>
-              <div className="chat-start-options settings-radio-group" role="radiogroup" aria-label="Default chat start mode">
-                <label>
-                  <input
-                    type="radio"
-                    name="settings-chat-start-mode"
-                    value="continue"
-                    checked={chatStartMode === "continue"}
-                    onChange={() => setChatStartMode("continue")}
-                    disabled={busy}
-                  />
-                  <span>Continue Soul continuity</span>
-                </label>
-                <label>
-                  <input
-                    type="radio"
-                    name="settings-chat-start-mode"
-                    value="fresh"
-                    checked={chatStartMode === "fresh"}
-                    onChange={() => setChatStartMode("fresh")}
-                    disabled={busy}
-                  />
-                  <span>New isolated Session</span>
-                </label>
-              </div>
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={showArchivedSessions}
-                  onChange={(event) => setShowArchivedSessions(event.target.checked)}
-                />
-                <span>Show archived sessions by default</span>
-              </label>
-              <p className="settings-note">Composer shortcut: Enter to send, Shift+Enter for a new line.</p>
-            </section>
-          </div>
-        ) : null}
-      </div>
-      </div>
+      <div className="settings-drawer-body">{activeSettingsPanel}</div>
+    </div>
+  );
+  const settingsPageContent = (
+    <div className="settings-page-layout">
+      <aside className="settings-page-nav" aria-label="Settings categories">
+        {settingsCategoryItems.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            className={settingsTab === tab.id ? "selected" : ""}
+            onClick={() => setSettingsTab(tab.id)}
+          >
+            {tab.icon}
+            <span>{tab.label}</span>
+          </button>
+        ))}
+      </aside>
+      <section className="settings-page-panel">{activeSettingsPanel}</section>
+    </div>
   );
   const settingsDrawerPanel = settingsDrawerOpen ? (
     <aside className="settings-drawer-panel" aria-label="Settings">
@@ -5969,256 +6098,10 @@ export function App() {
           Close
         </button>
       </header>
-      {settingsContent}
+      {settingsDrawerContent}
     </aside>
   ) : null;
-  const devConsoleToggle = (
-    <button
-      type="button"
-      className={`dev-console-toggle ${devConsoleOpen ? "open" : ""}`}
-      onClick={() => {
-        setDevConsoleOpen((open) => !open);
-        if (!devConsoleOpen) setSettingsDrawerOpen(false);
-        logDev("info", "app", devConsoleOpen ? "Dev Console closed" : "Dev Console opened");
-      }}
-    >
-      <Terminal size={16} />
-      <span>Dev Console</span>
-      <strong>{devLogs.length}</strong>
-    </button>
-  );
-  const devConsolePanel = devConsoleOpen ? (
-    <aside className="dev-console-panel" aria-label="Dev Console">
-      <header className="dev-console-header">
-        <div>
-          <span className="eyebrow">Live terminal</span>
-          <h2>Dev Console</h2>
-        </div>
-        <button type="button" onClick={() => setDevConsoleOpen(false)}>
-          Close
-        </button>
-      </header>
-      {latestPipelineTrace && (
-        <div className="dev-pipeline-trace-panel" style={{ padding: "12px 16px", backgroundColor: "#111827", borderBottom: "1px solid #1f2937", fontSize: "12px", fontFamily: "monospace", color: "#d1d5db" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" }}>
-            <span style={{ color: "#10b981", fontWeight: "bold", fontSize: "13px" }}>
-              Turn Pipeline Trace (Status: {latestPipelineTrace.final_status})
-            </span>
-            <button
-              type="button"
-              style={{ padding: "2px 8px", fontSize: "11px", backgroundColor: "#374151", color: "#f3f4f6", border: "none", borderRadius: "3px", cursor: "pointer" }}
-              onClick={() => {
-                void navigator.clipboard.writeText(JSON.stringify(latestPipelineTrace, null, 2));
-              }}
-            >
-              Copy Trace
-            </button>
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "6px", marginBottom: "8px", fontSize: "11px", color: "#9ca3af" }}>
-            <div>Request ID: <span style={{ color: "#f3f4f6" }}>{latestPipelineTrace.request_id.slice(0, 8)}...</span></div>
-            <div>Elapsed: <span style={{ color: "#f3f4f6" }}>{latestPipelineTrace.total_elapsed_ms}ms</span></div>
-            {latestPipelineTrace.failing_stage && (
-              <div style={{ color: "#f87171", fontWeight: "bold" }}>Failing Stage: {latestPipelineTrace.failing_stage}</div>
-            )}
-          </div>
-          {latestPipelineTrace.token_usage && (
-            <div style={{ display: "flex", gap: "12px", marginBottom: "8px", fontSize: "11px", color: "#9ca3af" }}>
-              <div>
-                Narrator tokens:{" "}
-                <span style={{ color: "#f3f4f6" }}>
-                  {latestPipelineTrace.token_usage.narrator_prompt_tokens ?? "?"} in /{" "}
-                  {latestPipelineTrace.token_usage.narrator_completion_tokens ?? "?"} out
-                  {latestPipelineTrace.token_usage.narrator_estimated ? " (est.)" : ""}
-                </span>
-              </div>
-              <div>
-                Evaluator tokens:{" "}
-                <span style={{ color: "#f3f4f6" }}>
-                  {latestPipelineTrace.token_usage.evaluator_prompt_tokens ?? "?"} in /{" "}
-                  {latestPipelineTrace.token_usage.evaluator_completion_tokens ?? "?"} out
-                  {latestPipelineTrace.token_usage.evaluator_estimated ? " (est.)" : ""}
-                </span>
-              </div>
-            </div>
-          )}
-          {latestPipelineTrace.suggested_debug_action && (
-            <div style={{ padding: "6px 8px", backgroundColor: "#7f1d1d", color: "#fca5a5", borderRadius: "4px", marginBottom: "8px", fontSize: "11px" }}>
-              <strong>Debug Suggestion:</strong> {latestPipelineTrace.suggested_debug_action}
-            </div>
-          )}
-          <div style={{ display: "flex", gap: "6px", overflowX: "auto", paddingBottom: "4px", maxHeight: "120px" }}>
-            {latestPipelineTrace.stages.map((stage) => {
-              let badgeColor = "#10b981";
-              if (stage.status === "failed") badgeColor = "#ef4444";
-              else if (stage.status === "warning") badgeColor = "#f59e0b";
-              else if (stage.status === "skipped") badgeColor = "#6b7280";
-
-              return (
-                <div key={stage.stage_name} style={{ flexShrink: 0, padding: "6px 8px", backgroundColor: "#1f2937", border: `1px solid ${stage.status === "failed" ? "#ef4444" : "#374151"}`, borderRadius: "4px", width: "160px" }}>
-                  <div style={{ fontWeight: "bold", textOverflow: "ellipsis", overflow: "hidden", whiteSpace: "nowrap", color: "#f3f4f6" }} title={stage.stage_name}>
-                    {stage.stage_name}
-                  </div>
-                  <div style={{ fontSize: "10px", marginTop: "2px", display: "flex", justifyContent: "space-between" }}>
-                    <span style={{ color: badgeColor }}>{stage.status}</span>
-                    <span>{stage.elapsed_ms}ms</span>
-                  </div>
-                  {stage.error_message && (
-                    <div style={{ fontSize: "9px", color: "#fca5a5", marginTop: "4px", maxHeight: "40px", overflow: "hidden", textOverflow: "ellipsis" }} title={stage.error_message}>
-                      {stage.error_message}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-      {import.meta.env.DEV && renderTrace && (
-        <div className="dev-render-trace-banner" style={{ padding: "10px 16px", backgroundColor: "#1e293b", borderBottom: "1px solid #334155", fontSize: "11px", fontFamily: "monospace", color: "#94a3b8" }}>
-          <div style={{ color: "#38bdf8", fontWeight: "bold", marginBottom: "4px" }}>
-            Render Source: prepareMessagesForRender (Deduplicated)
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "4px 12px" }}>
-            <div>Saved Count: <span style={{ color: "#f8fafc" }}>{renderTrace.saved_message_count}</span></div>
-            <div>Pending Count: <span style={{ color: "#f8fafc" }}>{renderTrace.pending_message_count}</span></div>
-            <div>Dup Saved Suppressed: <span style={{ color: "#f8fafc" }}>{renderTrace.duplicate_saved_suppressed}</span></div>
-            <div>Dup Pending Suppressed: <span style={{ color: "#f8fafc" }}>{renderTrace.duplicate_pending_suppressed}</span></div>
-            <div>Pending Replaced: <span style={{ color: "#f8fafc" }}>{renderTrace.pending_replaced_by_saved}</span></div>
-            <div>Active Listeners: <span style={{ color: "#f8fafc" }}>{renderTrace.active_listener_count}</span></div>
-            <div>Visual Pair: <span style={{ color: "#f8fafc" }}>{renderTrace.duplicate_visual_pair ? "yes" : "no"}</span></div>
-            <div>Saved DB Dup: <span style={{ color: "#f8fafc" }}>{renderTrace.duplicate_saved_db_assistant_detected ? "yes" : "no"}</span></div>
-          </div>
-          <div style={{ marginTop: "6px", maxHeight: "96px", overflow: "auto" }}>
-            {renderTrace.visible_bubble_trace.map((row) => (
-              <div key={`${row.render_index}-${row.message_id}-${row.render_source}`}>
-                #{row.render_index} {row.role} {row.render_source} id={row.message_id} req={row.request_id || "-"} hash={row.content_hash}
-                {row.duplicate_visual_pair ? ` duplicate=${row.duplicate_render_sources?.join("+")}` : ""}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      <div className="dev-console-controls">
-        <label>
-          <span>Level</span>
-          <select
-            value={devLogLevelFilter}
-            onChange={(event) => setDevLogLevelFilter(event.target.value as DevLogLevel | "all")}
-          >
-            <option value="all">All</option>
-            {DEV_LOG_LEVELS.map((level) => (
-              <option key={level} value={level}>
-                {level}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <span>Category</span>
-          <select
-            value={devLogCategoryFilter}
-            onChange={(event) =>
-              setDevLogCategoryFilter(event.target.value as DevLogCategory | "all")
-            }
-          >
-            <option value="all">All</option>
-            {DEV_LOG_CATEGORIES.map((category) => (
-              <option key={category} value={category}>
-                {category}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="dev-console-checkbox">
-          <input
-            type="checkbox"
-            checked={devConsolePaused}
-            onChange={(event) => setDevConsolePaused(event.target.checked)}
-          />
-          <span>Pause scroll</span>
-        </label>
-      </div>
-      <div className="dev-console-actions">
-        <button type="button" onClick={handleCopyDevLogs} disabled={devLogs.length === 0}>
-          <Clipboard size={14} />
-          <span>Copy</span>
-        </button>
-        <button type="button" onClick={handleExportDevLogs} disabled={devLogs.length === 0}>
-          <FileDown size={14} />
-          <span>Export</span>
-        </button>
-        <button type="button" onClick={handleExportLlmPayloadHistory} disabled={busy || !currentConversationId}>
-          <FileDown size={14} />
-          <span>Export Payload</span>
-        </button>
-        <button type="button" onClick={handleClearDevLogs} disabled={devLogs.length === 0}>
-          <Trash2 size={14} />
-          <span>Clear</span>
-        </button>
-      </div>
-      <div className="dev-console-actions" style={{ borderTop: "1px solid #374151", paddingTop: "8px", marginTop: "8px", gap: "8px" }}>
-        <button type="button" onClick={handleValidateMne}>
-          <Clipboard size={14} />
-          <span>Validate .mne</span>
-        </button>
-        <button type="button" onClick={handlePreviewMne}>
-          <FileDown size={14} />
-          <span>Preview .mne</span>
-        </button>
-        <button type="button" onClick={handleImportMneAsNew}>
-          <FileUp size={14} />
-          <span>Import as new copy</span>
-        </button>
-      </div>
-      <section className="dev-command-console" aria-label="Repair Commands">
-        <div className="dev-command-header">
-          <div>
-            <span className="eyebrow">Session Repair</span>
-            <h3>Command Runner</h3>
-          </div>
-        </div>
-        <div className="dev-labeled-buttons">
-          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("dedupe_active_adjacent_user_messages", {})} disabled={devCommandRunning || !currentConversationId}>[ Repair Duplicate Turns ]</button>
-          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("restore_inactive_messages", {})} disabled={devCommandRunning || !currentConversationId}>[ Restore Hidden Turns ]</button>
-          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("repair_accidental_normal_send_variants", {})} disabled={devCommandRunning || !currentConversationId}>[ Repair Accidental Variants ]</button>
-          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("rebuild_session_from_ledger", {})} disabled={devCommandRunning || !currentConversationId}>[ Rebuild From Ledger ]</button>
-          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("inspect_turn_branch_integrity", {})} disabled={devCommandRunning || !currentConversationId}>[ Inspect Branch Integrity ]</button>
-          <button type="button" className="dev-cmd-btn" onClick={() => void handleRunDevCommand("get_branch_patch_debug", {})} disabled={devCommandRunning || !currentConversationId}>[ Branch Patch Debug ]</button>
-        </div>
-        {devCommandResult ? (
-          <div className="dev-command-result">
-            <span>Result</span>
-            <pre>{devCommandResult}</pre>
-          </div>
-        ) : null}
-        {devCommandError ? (
-          <div className="dev-command-error">
-            <span>Error</span>
-            <pre>{devCommandError}</pre>
-          </div>
-        ) : null}
-      </section>
-      <div className="dev-console-body" ref={devConsoleBodyRef}>
-        {filteredDevLogs.length === 0 ? (
-          <p className="dev-console-empty">No logs.</p>
-        ) : (
-          filteredDevLogs.map((entry) => (
-            <article className={`dev-log-entry ${entry.level}`} key={entry.id}>
-              <div className="dev-log-line">
-                <time>{formatDevLogTimestamp(entry.timestamp)}</time>
-                <span className={`dev-log-level ${entry.level}`}>{entry.level}</span>
-                <span className="dev-log-category">{entry.category}</span>
-                <span className="dev-log-message">{entry.message}</span>
-              </div>
-              {entry.details && Object.keys(entry.details).length > 0 ? (
-                <pre>{JSON.stringify(entry.details, null, 2)}</pre>
-              ) : null}
-            </article>
-          ))
-        )}
-      </div>
-    </aside>
-  ) : null;
+  const appDialogNode = <AppDialog dialog={appDialog} onResolve={resolveAppDialog} />;
   if (disclaimerMode) {
     return disclaimerScreen;
   }
@@ -6240,7 +6123,7 @@ export function App() {
         {railCollapsed ? <PanelLeftOpen size={16} aria-hidden="true" /> : <PanelLeftClose size={16} aria-hidden="true" />}
       </button>
       <button type="button" className={`app-rail-item${view === "home" ? " is-active" : ""}`} onClick={() => setView("home")}>
-        <Database size={18} aria-hidden="true" />
+        <Home size={18} aria-hidden="true" />
         <span>Home</span>
       </button>
       <button type="button" className={`app-rail-item${view === "chat" ? " is-active" : ""}`} onClick={() => void handleOpenMostRecentChat()}>
@@ -6256,7 +6139,7 @@ export function App() {
         <span>Library</span>
       </button>
       <button type="button" className={`app-rail-item${view === "settings" ? " is-active" : ""}`} onClick={() => { setSettingsDrawerOpen(false); setView("settings"); }}>
-        <Clipboard size={18} aria-hidden="true" />
+        <SettingsIcon size={18} aria-hidden="true" />
         <span>Settings</span>
       </button>
       <div className="app-rail-spacer" />
@@ -6319,18 +6202,7 @@ export function App() {
         return { sym: "[OK]", cls: "ok" };
       };
 
-      return (
-        <main className="cli-shell">
-          <div className="cli-scanlines" aria-hidden="true" />
-          <header className="cli-header">
-            <span className="cli-brand">root@mnemosyne</span>
-            <span className="cli-path">:~/{(currentSessionTitle || "session").replace(/\s+/g, "_").toLowerCase()}$</span>
-            <span className="cli-spacer" />
-            <button type="button" className="cli-btn" onClick={() => setDevPanelTab(devPanelTab === "settings" ? "dev" : "settings")}>[ {devPanelTab === "settings" ? "DEV PANEL" : "SETTINGS"} ]</button>
-            <button type="button" className="cli-btn" onClick={() => setDevModeActive(false)}>[ EXIT DEV ]</button>
-            <button type="button" className="cli-btn" onClick={() => setView("library")}>[ LIBRARY ]</button>
-          </header>
-          <div className="cli-body">
+      const devPipelineRail = (
             <aside className="cli-rail" aria-label="Pipeline">
               <div className="cli-rail-title">// PIPELINE</div>
               {latestPipelineTrace ? (
@@ -6353,6 +6225,8 @@ export function App() {
                 <div className="cli-rail-empty">awaiting first turn_</div>
               )}
             </aside>
+      );
+      const devStreamPanel = (
             <section className="cli-stream" ref={devStreamRef} aria-label="Stream">
               {devStream.length === 0 ? (
                 <div className="cli-line muted">// stream empty - type /chat &lt;message&gt; to begin</div>
@@ -6374,6 +6248,8 @@ export function App() {
                 )
               )}
             </section>
+      );
+      const devDiagnosticsPanel = (
             <aside className="cli-diagnostics" aria-label="Dev and settings panel">
               <div className="cli-diag-tabs">
                 <button
@@ -6390,9 +6266,18 @@ export function App() {
                 >
                   [ SETTINGS ]
                 </button>
+                <button
+                  type="button"
+                  className={`cli-btn${devPanelTab === "benchmarks" ? " selected" : ""}`}
+                  onClick={() => setDevPanelTab("benchmarks")}
+                >
+                  [ BENCHMARKS ]
+                </button>
               </div>
               {devPanelTab === "settings" ? (
                 <div className="cli-embedded-settings">{providerSettingsPanel}</div>
+              ) : devPanelTab === "benchmarks" ? (
+                <div className="cli-embedded-settings">{benchmarkRunnerPanel}</div>
               ) : (
                 <>
               <section className="cli-diag-card">
@@ -6433,10 +6318,10 @@ export function App() {
               <section className="cli-diag-card danger">
                 <div className="cli-diag-title">// DESTRUCTIVE REPAIR</div>
                 <div className="cli-diag-actions grid">
-                  <button type="button" className="cli-mini-btn" onClick={() => { if (window.confirm("Clear WORLD state? This permanently deletes it and cannot be undone.")) void handleSoulRepair("world"); }} disabled={busy || !soul}>[ CLEAR WORLD ]</button>
-                  <button type="button" className="cli-mini-btn" onClick={() => { if (window.confirm("Clear SCENARIO? This permanently deletes it and cannot be undone.")) void handleSoulRepair("scenario"); }} disabled={busy || !soul}>[ CLEAR SCENARIO ]</button>
-                  <button type="button" className="cli-mini-btn" onClick={() => { if (window.confirm("Clear EVENTS? This permanently deletes them and cannot be undone.")) void handleSoulRepair("events"); }} disabled={busy || !soul}>[ CLEAR EVENTS ]</button>
-                  <button type="button" className="cli-mini-btn danger" onClick={() => { if (window.confirm("Clear MEMORIES? This permanently deletes them and cannot be undone.")) void handleSoulRepair("memories"); }} disabled={busy || !soul}>[ CLEAR MEMORIES ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleSoulRepair("world")} disabled={busy || !soul}>[ CLEAR WORLD ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleSoulRepair("scenario")} disabled={busy || !soul}>[ CLEAR SCENARIO ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleSoulRepair("events")} disabled={busy || !soul}>[ CLEAR EVENTS ]</button>
+                  <button type="button" className="cli-mini-btn danger" onClick={() => void handleSoulRepair("memories")} disabled={busy || !soul}>[ CLEAR MEMORIES ]</button>
                 </div>
               </section>
               <section className="cli-diag-card">
@@ -6454,13 +6339,53 @@ export function App() {
                   >
                     [ CONTRACT TEST ]
                   </button>
+                  <button
+                    type="button"
+                    className="cli-mini-btn"
+                    onClick={() => void handleRunStructuredDiagnostic()}
+                    disabled={busy || structuredDiagnosticRunning || (!selectedStateUpdaterProfileId && !selectedProviderProfileId)}
+                  >
+                    [ STRUCTURED DIAG ]
+                  </button>
+                  <button
+                    type="button"
+                    className="cli-mini-btn"
+                    onClick={() => void handleRetrySessionRepair()}
+                    disabled={retryRepairBusy}
+                  >
+                    [ {retryRepairBusy ? "RETRYING" : "RETRY REPAIR"} ]
+                  </button>
                 </div>
+                {(structuredDiagnosticResult || structuredDiagnosticError) && (
+                  <div className="cli-diag-note">
+                    {structuredDiagnosticResult ? (
+                      <>
+                        {structuredDiagnosticResult.provider_model} /{" "}
+                        {structuredDiagnosticResult.structured_enforcement_per_run.join(", ") || "none"}
+                      </>
+                    ) : (
+                      <>FAIL / {structuredDiagnosticError}</>
+                    )}
+                  </div>
+                )}
               </section>
-              <div className="cli-embedded-settings">{benchmarkRunnerPanel}</div>
+              <section className="cli-diag-card">
+                <div className="cli-diag-title">// SESSION REPAIR</div>
+                <div className="cli-diag-actions grid">
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleRunDevCommand("dedupe_active_adjacent_user_messages", {})} disabled={devCommandRunning || !currentConversationId}>[ DEDUPE TURNS ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleRunDevCommand("restore_inactive_messages", {})} disabled={devCommandRunning || !currentConversationId}>[ RESTORE HIDDEN ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleRunDevCommand("repair_accidental_normal_send_variants", {})} disabled={devCommandRunning || !currentConversationId}>[ REPAIR VARIANTS ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleRunDevCommand("rebuild_session_from_ledger", {})} disabled={devCommandRunning || !currentConversationId}>[ REBUILD LEDGER ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleRunDevCommand("inspect_turn_branch_integrity", {})} disabled={devCommandRunning || !currentConversationId}>[ INSPECT BRANCH ]</button>
+                  <button type="button" className="cli-mini-btn" onClick={() => void handleRunDevCommand("get_branch_patch_debug", {})} disabled={devCommandRunning || !currentConversationId}>[ PATCH DEBUG ]</button>
+                </div>
+                {devCommandResult ? <pre className="cli-diag-pre">{devCommandResult}</pre> : null}
+              </section>
                 </>
               )}
             </aside>
-          </div>
+      );
+      const devInputForm = (
           <form className="cli-input" onSubmit={handleDevTerminalSubmit}>
             <span className="cli-prompt">root@mnemosyne:~$</span>
             <input
@@ -6473,40 +6398,37 @@ export function App() {
             />
             <span className="cli-cursor" aria-hidden="true">|</span>
           </form>
-        </main>
+      );
+
+      return (
+        <DevModeShell
+          appDialogNode={appDialogNode}
+          diagnostics={devDiagnosticsPanel}
+          inputForm={devInputForm}
+          onExitDev={() => setDevModeActive(false)}
+          onOpenLibrary={() => setView("library")}
+          pipelineRail={devPipelineRail}
+          sessionTitle={currentSessionTitle || "session"}
+          stream={devStreamPanel}
+        />
       );
     }
 
+    const chatPipelineRail = (
+      <ChatPipelineRail
+        latestPipelineTrace={latestPipelineTrace}
+        pipelineSteps={pipelineSteps}
+        pipelineSummary={pipelineSummary}
+      />
+    );
+
     return (
-      <div className={`chat-with-sidebar${railShellClass}`}>
-      {railNav}
-      <aside className="chat-pipeline-rail" aria-label="Turn pipeline">
-        <div className="rail-progress-card">
-          <div className="rail-progress-head">
-            <span>Turn pipeline</span>
-            <strong>{pipelineSummary}</strong>
-          </div>
-          <ol className="rail-progress-list">
-            {pipelineSteps.map((stage, index) => {
-              const isCompleted = ["completed", "ok", "success"].includes(stage.status);
-              const isRunning = ["running", "pending", "in_progress", "ready"].includes(stage.status);
-              const isFailed = stage.status === "failed" || stage.status === "error";
-              const stateClass = isFailed ? "is-error" : isCompleted ? "is-done" : isRunning ? "is-active" : "is-waiting";
-              return (
-                <li key={`${stage.stage_name}-${index}`} className={`rail-progress-step ${stateClass}`}>
-                  <span className="rail-progress-node" aria-hidden="true" />
-                  <span className="rail-progress-copy">
-                    <span className="rail-progress-name">{stage.stage_name}</span>
-                    <span className="rail-progress-meta">
-                      {latestPipelineTrace ? `${stage.status} / ${stage.elapsed_ms}ms` : index === 0 ? "Ready to send" : "Waiting"}
-                    </span>
-                  </span>
-                </li>
-              );
-            })}
-          </ol>
-        </div>
-      </aside>
+      <ChatView
+        appDialogNode={appDialogNode}
+        pipelineRail={chatPipelineRail}
+        railNav={railNav}
+        railShellClass={railShellClass}
+      >
       <main className="chat-only-shell">
         <header className="chat-only-header">
           <button className="ghost-action chat-back-mobile" onClick={() => setView("library")}>
@@ -6533,49 +6455,22 @@ export function App() {
             <p className="session-state-label">{soul?.character_name ?? "Mnemosyne"} - {sessionContinuityLabel}</p>
           </div>
           <div className="chat-top-actions">
-            <div className="chat-more-menu-wrap">
-              <button
-                type="button"
-                className={`ghost-action chat-more-btn${chatMoreMenuOpen ? " open" : ""}`}
-                title="More actions"
-                onClick={() => setChatMoreMenuOpen((v) => !v)}
-              >
-                ...
-              </button>
-              {chatMoreMenuOpen && (
-                <div className="chat-more-menu" role="menu">
-                  <button type="button" className="chat-more-menu-item" onClick={() => { setDevModeActive(true); setChatMoreMenuOpen(false); }}>
-                    <Terminal size={14} />
-                    <span>Dev Mode</span>
-                  </button>
-                  <div className="chat-more-menu-divider" />
-                  {isCurrentSessionArchived ? (
-                    <button type="button" className="chat-more-menu-item" onClick={() => { void handleRestoreSession(); setChatMoreMenuOpen(false); }} disabled={busy}>
-                      <RefreshCcw size={14} />
-                      <span>Restore Session</span>
-                    </button>
-                  ) : (
-                    <button type="button" className="chat-more-menu-item danger" onClick={() => { void handleDeleteChat(); setChatMoreMenuOpen(false); }} disabled={busy}>
-                      <Trash2 size={14} />
-                      <span>Archive Session</span>
-                    </button>
-                  )}
-                  <div className="chat-more-menu-divider" />
-                  <button type="button" className="chat-more-menu-item" onClick={() => { handleRestoreHiddenTurns(); setChatMoreMenuOpen(false); }} disabled={busy || !currentConversationId}>
-                    <RefreshCcw size={14} />
-                    <span>Restore Turns</span>
-                  </button>
-                  <button type="button" className="chat-more-menu-item" onClick={() => { void handleExportCurrentSessionMne(); setChatMoreMenuOpen(false); }} disabled={busy || !currentConversationId}>
-                    <FileDown size={14} />
-                    <span>Session .mne</span>
-                  </button>
-                  <button type="button" className="chat-more-menu-item" onClick={() => { void handleExportVisibleChatLog(); setChatMoreMenuOpen(false); }} disabled={busy || activeMessages.length === 0}>
-                    <FileDown size={14} />
-                    <span>Export Chat</span>
-                  </button>
-                </div>
-              )}
-            </div>
+            <ChatMoreMenu
+              activeMessageCount={activeMessages.length}
+              busy={busy}
+              currentConversationId={currentConversationId}
+              isArchived={isCurrentSessionArchived}
+              menuOpen={chatMoreMenuOpen}
+              menuRef={chatMoreMenuRef}
+              onArchive={() => void handleDeleteChat()}
+              onExportChat={() => void handleExportVisibleChatLog()}
+              onExportSession={() => void handleExportCurrentSessionMne()}
+              onOpenDevMode={() => setDevModeActive(true)}
+              onRestoreHiddenTurns={handleRestoreHiddenTurns}
+              onRestoreSession={() => void handleRestoreSession()}
+              setMenuOpen={setChatMoreMenuOpen}
+              triggerRef={chatMoreButtonRef}
+            />
             <div className="token-pill">
               {context?.estimated_tokens ?? 0}
               <span>tok</span>
@@ -6653,7 +6548,7 @@ export function App() {
                               selectedIndex >= variants.length - 1
                             }
                           >
-                            <ArrowLeft size={13} className="next-variant-icon" />
+                            <ArrowRight size={13} />
                           </button>
                         </div>
                         <button
@@ -6791,178 +6686,27 @@ export function App() {
         ) : null}
 
         {personaModalMode ? (
-          <section className="persona-modal-backdrop" role="dialog" aria-modal="true">
-            <div className="persona-modal">
-              <header>
-                <div>
-                  <span className="eyebrow">Persona</span>
-                  <h2>
-                    {personaModalMode === "list"
-                      ? "Player Persona"
-                      : personaModalMode === "add"
-                        ? "Add Persona"
-                        : "Edit Persona"}
-                  </h2>
-                </div>
-                <button type="button" title="Close" onClick={closePersonaModal}>
-                  <X size={16} />
-                </button>
-              </header>
-              {personaModalMode === "list" ? (
-                <div className="persona-list">
-                  {playerPersonas.map((persona) => (
-                    <article
-                      key={persona.persona_id}
-                      className={
-                        activePlayerPersona?.persona_id === persona.persona_id
-                          ? "persona-row selected"
-                          : "persona-row"
-                      }
-                    >
-                      <div>
-                        <strong>{persona.display_name}</strong>
-                        <span>{persona.persona_id}</span>
-                        <p>{persona.description}</p>
-                      </div>
-                      <div className="persona-row-actions">
-                        <button type="button" onClick={() => handleSelectPersona(persona.persona_id)}>
-                          Select
-                        </button>
-                        {!persona.is_builtin ? (
-                          <button type="button" onClick={() => openPersonaEdit(persona.persona_id)}>
-                            Edit
-                          </button>
-                        ) : null}
-                        {!persona.is_builtin ? (
-                          <button
-                            type="button"
-                            onClick={() => void handleArchivePersona(persona)}
-                            disabled={busy || activePlayerPersona?.persona_id === persona.persona_id}
-                            title={
-                              activePlayerPersona?.persona_id === persona.persona_id
-                                ? "Select another persona before archiving this one"
-                                : "Archive persona"
-                            }
-                          >
-                            Archive
-                          </button>
-                        ) : null}
-                      </div>
-                    </article>
-                  ))}
-                  {archivedPlayerPersonas.length > 0 ? (
-                    <section className="compact-list library-list archived-resource-list" aria-label="Archived personas">
-                      <div className="list-section-heading">
-                        <strong>Archived Personas</strong>
-                        <span className="muted">{archivedPlayerPersonas.length}</span>
-                      </div>
-                      {archivedPlayerPersonas.map((persona) => (
-                        <article key={persona.persona_id} className="soul-row archived-resource-row">
-                          <span>{persona.display_name}</span>
-                          <small>{persona.description || persona.persona_id}</small>
-                          <button
-                            type="button"
-                            className="ghost-action"
-                            onClick={() => void handleRestoreArchivedPersona(persona)}
-                            disabled={busy}
-                            title="Restore archived persona"
-                          >
-                            <RefreshCcw size={14} />
-                            <span>Restore</span>
-                          </button>
-                        </article>
-                      ))}
-                    </section>
-                  ) : null}
-                  <div className="persona-list-actions">
-                    <button type="button" className="persona-add-button" onClick={openPersonaAdd}>
-                      Add Persona
-                    </button>
-                    {personaListConfirmRequired ? (
-                      <div className="persona-form-actions">
-                        <button type="button" className="persona-cancel-button" onClick={closePersonaModal}>
-                          Cancel
-                        </button>
-                        <button
-                          type="button"
-                          className="persona-confirm-button"
-                          onClick={handleConfirmPersonaList}
-                          disabled={!activePlayerPersona}
-                        >
-                          Confirm Persona
-                        </button>
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-              ) : (
-                <div className="persona-form">
-                  <label>
-                    <span>Name</span>
-                    <input
-                      value={personaForm.display_name}
-                      onChange={(event) =>
-                        setPersonaForm((current) => ({ ...current, display_name: event.target.value }))
-                      }
-                    />
-                  </label>
-                  <label>
-                    <span>Gender code</span>
-                    <input
-                      value={personaForm.gender_code}
-                      onChange={(event) =>
-                        setPersonaForm((current) => ({ ...current, gender_code: event.target.value }))
-                      }
-                    />
-                  </label>
-                  <label>
-                    <span>Pronouns</span>
-                    <input
-                      value={personaForm.pronouns}
-                      onChange={(event) =>
-                        setPersonaForm((current) => ({ ...current, pronouns: event.target.value }))
-                      }
-                    />
-                  </label>
-                  <label>
-                    <span>Description</span>
-                    <textarea
-                      value={personaForm.description}
-                      onChange={(event) =>
-                        setPersonaForm((current) => ({ ...current, description: event.target.value }))
-                      }
-                    />
-                  </label>
-                  <label>
-                    <span>Appearance</span>
-                    <textarea
-                      value={personaForm.appearance ?? ""}
-                      onChange={(event) =>
-                        setPersonaForm((current) => ({ ...current, appearance: event.target.value }))
-                      }
-                    />
-                  </label>
-                  <label>
-                    <span>Notes</span>
-                    <textarea
-                      value={personaForm.notes ?? ""}
-                      onChange={(event) =>
-                        setPersonaForm((current) => ({ ...current, notes: event.target.value }))
-                      }
-                    />
-                  </label>
-                  <div className="persona-form-actions">
-                    <button type="button" onClick={() => setPersonaModalMode("list")}>
-                      Cancel
-                    </button>
-                    <button type="button" onClick={handleSavePersona}>
-                      Save
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          </section>
+          <PersonaModal
+            activePersona={activePlayerPersona}
+            archivedPersonas={archivedPlayerPersonas}
+            busy={busy}
+            form={personaForm}
+            listConfirmRequired={personaListConfirmRequired}
+            mode={personaModalMode}
+            modalRef={personaModalRef}
+            onArchive={(persona) => void handleArchivePersona(persona)}
+            onBackdropClose={closePersonaModal}
+            onCancelForm={() => setPersonaModalMode("list")}
+            onClose={closePersonaModal}
+            onConfirmList={handleConfirmPersonaList}
+            onEdit={(personaId) => void openPersonaEdit(personaId)}
+            onOpenAdd={openPersonaAdd}
+            onRestore={(persona) => void handleRestoreArchivedPersona(persona)}
+            onSave={() => void handleSavePersona()}
+            onSelect={(personaId) => void handleSelectPersona(personaId)}
+            personas={playerPersonas}
+            setForm={setPersonaForm}
+          />
         ) : null}
 
         <form className="chat-only-composer" onSubmit={handleSubmit}>
@@ -7029,7 +6773,7 @@ export function App() {
         <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
         {settingsDrawerPanel}
       </main>
-      </div>
+      </ChatView>
     );
   }
 
@@ -7050,8 +6794,7 @@ export function App() {
       .slice(0, 6);
 
     return (
-      <main className={`app-shell home-shell${railShellClass}`}>
-        {railNav}
+      <HomeView appDialogNode={appDialogNode} railNav={railNav} railShellClass={railShellClass}>
         <header className="home-header">
           <div>
             <span className="eyebrow">Home</span>
@@ -7163,7 +6906,7 @@ export function App() {
             </div>
           </aside>
         </div>
-      </main>
+      </HomeView>
     );
   }
 
@@ -7182,8 +6925,7 @@ export function App() {
       ["Desire", "desire"],
     ];
     return (
-      <main className={`app-shell statemap-shell${railShellClass}`}>
-        {railNav}
+      <StateMapView appDialogNode={appDialogNode} railNav={railNav} railShellClass={railShellClass}>
         <header className="launcher-header">
           <div>
             <span className="eyebrow">State Map / recent sessions</span>
@@ -7344,7 +7086,7 @@ export function App() {
         ) : (
           <p className="muted statemap-empty">No active sessions yet. Start one from the Library to populate the State Map.</p>
         )}
-      </main>
+      </StateMapView>
     );
   }
 
@@ -7359,8 +7101,7 @@ export function App() {
       ["Desire", "desire"],
     ];
     return (
-      <main className={`app-shell statemap-shell${railShellClass}`}>
-        {railNav}
+      <StateMapView appDialogNode={appDialogNode} railNav={railNav} railShellClass={railShellClass}>
         <header className="launcher-header">
           <div>
             <span className="eyebrow">State Map{soul ? ` - ${soul.character_name}` : ""}</span>
@@ -7489,28 +7230,23 @@ export function App() {
             </section>
           </div>
         )}
-      </main>
+      </StateMapView>
     );
   }
 
   if (view === "settings") {
     return (
-      <main className={`app-shell settings-page${railShellClass}`}>
-        {railNav}
-        <header className="launcher-header">
-          <div>
-            <span className="eyebrow">Settings</span>
-            <h1>Engine &amp; providers</h1>
-          </div>
-        </header>
-        <div className="settings-page-body">{settingsContent}</div>
-      </main>
+      <SettingsPageView
+        appDialogNode={appDialogNode}
+        railNav={railNav}
+        railShellClass={railShellClass}
+        settingsPageContent={settingsPageContent}
+      />
     );
   }
 
   return (
-    <main className={`app-shell launcher-shell${railShellClass}`}>
-      {railNav}
+    <LibraryView appDialogNode={appDialogNode} railNav={railNav} railShellClass={railShellClass}>
       <header className="launcher-header">
         <div>
           <span className="eyebrow">{view === "editor" ? "Workshop" : "Launcher"}</span>
@@ -7802,14 +7538,14 @@ export function App() {
                     <input
                       type="number"
                       min="0"
-                      value={Math.round((apiSettings.narrator_timeout_ms ?? 0) / 1000)}
+                      value={apiSettings.narrator_timeout_ms ? Math.round(apiSettings.narrator_timeout_ms / 1000) : ""}
                       onChange={(event) =>
                         setApiSettings((current) => ({
                           ...current,
                           narrator_timeout_ms: Number(event.target.value) > 0 ? Number(event.target.value) * 1000 : null,
                         }))
                       }
-                      placeholder="0 = provider default"
+                      placeholder="None / provider default"
                       disabled={busy}
                     />
                   </label>
@@ -8681,7 +8417,7 @@ export function App() {
       )}
 
       <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
-    </main>
+    </LibraryView>
   );
 }
 
@@ -8729,128 +8465,10 @@ function loadStoredChatStartMode(): ChatStartMode {
 function loadStoredSettingsTab(): SettingsTab {
   try {
     const raw = localStorage.getItem(SETTINGS_DRAWER_TAB_STORAGE_KEY);
-    return raw === "ai" || raw === "chat" ? raw : "ai";
+    return raw === "ai" || raw === "chat" || raw === "data" || raw === "about" ? raw : "ai";
   } catch {
     return "ai";
   }
-}
-
-function loadStoredDevLogLevelFilter(): DevLogLevel | "all" {
-  try {
-    const raw = localStorage.getItem(DEV_LOG_LEVEL_FILTER_STORAGE_KEY);
-    return raw === "all" || DEV_LOG_LEVELS.includes(raw as DevLogLevel) ? (raw as DevLogLevel | "all") : "all";
-  } catch {
-    return "all";
-  }
-}
-
-function loadStoredDevLogCategoryFilter(): DevLogCategory | "all" {
-  try {
-    const raw = localStorage.getItem(DEV_LOG_CATEGORY_FILTER_STORAGE_KEY);
-    return raw === "all" || DEV_LOG_CATEGORIES.includes(raw as DevLogCategory)
-      ? (raw as DevLogCategory | "all")
-      : "all";
-  } catch {
-    return "all";
-  }
-}
-
-function DisclaimerScreen({
-  mode,
-  understood,
-  remember,
-  onUnderstoodChange,
-  onRememberChange,
-  onAccept,
-  onClose,
-}: {
-  mode: DisclaimerMode;
-  understood: boolean;
-  remember: boolean;
-  onUnderstoodChange: (value: boolean) => void;
-  onRememberChange: (value: boolean) => void;
-  onAccept: () => void;
-  onClose: () => void;
-}) {
-  const isLaunch = mode === "launch";
-
-  return (
-    <main className="disclaimer-screen">
-      <section className="disclaimer-card" role="dialog" aria-modal={isLaunch} aria-labelledby="disclaimer-title">
-        <div className="disclaimer-heading">
-          <span className="eyebrow">Before you continue</span>
-          <h1 id="disclaimer-title">Mnemosyne Experimental Use Disclaimer</h1>
-        </div>
-
-        <div className="disclaimer-copy">
-          <p>Mnemosyne is experimental open-source AI roleplay software.</p>
-          <p>
-            Mnemosyne creates fictional continuity through memory, state tracking, and AI-generated narration. Characters may
-            appear persistent, emotionally responsive, or self-aware, but the software does not verify consciousness,
-            sentience, or real personhood.
-          </p>
-          <p>
-            You are responsible for how you use this software, what models/providers you connect, what content you generate,
-            and how you interpret fictional character continuity.
-          </p>
-          <p>
-            Mnemosyne is not therapy, medical care, legal advice, crisis support, or a substitute for real-world relationships
-            or professional help.
-          </p>
-          <p>
-            If you use external API providers, your prompts, character data, and generated responses may be sent to those
-            providers according to their own policies. Local use depends on your own configuration.
-          </p>
-          <p>
-            This software may produce emotionally intense, disturbing, intimate, fictional, or misleading outputs. Use personal
-            caution, especially during long sessions or emotionally heavy roleplay.
-          </p>
-          <p>
-            By continuing, you acknowledge that Mnemosyne is an experimental fiction and roleplay engine, and that you use it
-            at your own discretion.
-          </p>
-        </div>
-
-        {isLaunch ? (
-          <div className="disclaimer-options">
-            <label>
-              <input
-                type="checkbox"
-                checked={understood}
-                onChange={(event) => onUnderstoodChange(event.target.checked)}
-              />
-              <span>I understand and want to continue.</span>
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={remember}
-                onChange={(event) => onRememberChange(event.target.checked)}
-              />
-              <span>Do not show this again</span>
-            </label>
-          </div>
-        ) : null}
-
-        <div className="disclaimer-actions">
-          {isLaunch ? (
-            <>
-              <button type="button" className="ghost-action disclaimer-exit" onClick={() => window.close()}>
-                Exit
-              </button>
-              <button type="button" className="start-chat-button" onClick={onAccept} disabled={!understood}>
-                Accept and Continue
-              </button>
-            </>
-          ) : (
-            <button type="button" className="start-chat-button" onClick={onClose}>
-              Close
-            </button>
-          )}
-        </div>
-      </section>
-    </main>
-  );
 }
 
 function formatLlmPayloadDebugBlock(payload: LlmPayloadPreview) {
@@ -8951,96 +8569,9 @@ function formatRelativeTime(timestamp: number): string {
   return new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-function formatDevLogTimestamp(timestamp: number) {
-  const millis = timestamp > 1_000_000_000_000 ? timestamp : timestamp * 1000;
-  return new Date(millis).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
-
-function formatDevLogs(logs: DevLogEntry[]) {
-  return logs
-    .map((entry) => {
-      const details =
-        entry.details && Object.keys(entry.details).length
-          ? `\n${JSON.stringify(entry.details, null, 2)}`
-          : "";
-      return `[${formatDevLogTimestamp(entry.timestamp)}] ${entry.level.toUpperCase()} ${entry.category}: ${entry.message}${details}`;
-    })
-    .join("\n\n");
-}
-
 function selectedVariantIndex(variants: AssistantMessageVariant[]) {
   const index = variants.findIndex((variant) => variant.is_selected);
   return index >= 0 ? index : 0;
-}
-
-function Stat({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="stat">
-      <span>{label}</span>
-      <strong>{Math.round(value)}</strong>
-    </div>
-  );
-}
-
-function SoulAvatar({ soulName, asset }: { soulName: string; asset?: ImageAsset | null }) {
-  return (
-    <div className={`avatar ${asset ? "image-avatar" : ""}`} aria-hidden="true">
-      {asset ? <AssetImage asset={asset} alt="" /> : soulName.slice(0, 1) || "M"}
-    </div>
-  );
-}
-
-function AssetImage({ asset, alt }: { asset: ImageAsset; alt: string }) {
-  const [src, setSrc] = useState("");
-  useEffect(() => {
-    let cancelled = false;
-    getImageAssetDataUrl(asset.id)
-      .then((dataUrl) => {
-        if (!cancelled) setSrc(dataUrl);
-      })
-      .catch(() => {
-        if (!cancelled) setSrc("");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [asset.id]);
-  return src ? <img src={src} alt={alt} /> : <span className="image-loading">Loading image</span>;
-}
-
-function ImagePreviewModal({
-  asset,
-  onClose,
-}: {
-  asset: ImageAsset | null;
-  onClose: () => void;
-}) {
-  if (!asset) return null;
-  return (
-    <div className="image-preview-backdrop" role="dialog" aria-modal="true" onClick={onClose}>
-      <section className="image-preview-modal" onClick={(event) => event.stopPropagation()}>
-        <button type="button" className="image-preview-close" onClick={onClose} aria-label="Close image preview">
-          <X size={18} />
-        </button>
-        <AssetImage asset={asset} alt="Image preview" />
-        <div className="image-preview-meta">
-          <strong>{asset.source}</strong>
-          <span>{imageAssetMeta(asset)}</span>
-          {asset.prompt ? <p>{asset.prompt}</p> : null}
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function imageAssetMeta(asset: ImageAsset) {
-  const dimensions = asset.width && asset.height ? `${asset.width}x${asset.height}` : "dimensions unknown";
-  const mime = asset.mime_type ?? "image";
-  return `${mime} / ${dimensions}`;
 }
 
 function formatDebugDelta(value: number | null | undefined) {
@@ -9508,34 +9039,6 @@ function normalizeTrailingStatusBlock(content: string) {
   const status = statusBlocks[statusBlocks.length - 1][0].trim();
   const body = content.replace(/```status[\s\S]*?```/gi, "").trimEnd();
   return body ? `${body}\n\n${status}` : status;
-}
-
-function RangeField({
-  label,
-  value,
-  min = 0,
-  max = 100,
-  onChange,
-}: {
-  label: string;
-  value: number;
-  min?: number;
-  max?: number;
-  onChange: (value: number) => void;
-}) {
-  return (
-    <label className="range-field">
-      <span>{label}</span>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        value={value}
-        onChange={(event) => onChange(Number(event.target.value))}
-      />
-      <strong>{value > 0 && min < 0 ? `+${value}` : value}</strong>
-    </label>
-  );
 }
 
 function conversationIdForSoul(soulId: string) {

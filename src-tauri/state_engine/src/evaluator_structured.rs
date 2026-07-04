@@ -954,6 +954,31 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
     })
 }
 
+/// Schema name for the repair variant, distinct so providers that cache
+/// response_format definitions by name never mix the two.
+pub const EVALUATOR_OPS_REPAIR_SCHEMA_NAME: &str = "evaluator_structured_ops_repair_v1";
+
+/// The REPAIR variant of the ops schema. Repair only fires on turns the system
+/// already judged to contain durable change, so the `no_op` escape hatch is
+/// removed and at least one real op is required — small local models otherwise
+/// reason correctly about the scene and then punt into `no_op` anyway; the
+/// grammar makes that impossible. Fabrication risk is backstopped by Rust-side
+/// validation: ops with invented evidence quotes or bad entity ids are rejected
+/// and commit nothing, exactly as before.
+pub fn evaluator_ops_repair_json_schema() -> serde_json::Value {
+    let mut schema = evaluator_ops_json_schema();
+    let ops = &mut schema["properties"]["ops"];
+    ops["minItems"] = json!(1);
+    if let Some(variants) = ops["items"]["anyOf"].as_array_mut() {
+        variants.retain(|variant| {
+            variant["properties"]["op"]["enum"][0].as_str() != Some("no_op")
+        });
+    }
+    // No prose escape valve either: the reason slot must stay empty.
+    schema["properties"]["no_op_reason"] = json!({ "type": "null" });
+    schema
+}
+
 fn op_schema(
     op_name: &str,
     properties: serde_json::Value,
@@ -1038,6 +1063,32 @@ mod tests {
         }
         assert!(schema_text.contains("\"additionalProperties\":false"));
         assert!(schema_text.contains("relationship_event"));
+    }
+
+    #[test]
+    fn repair_schema_forces_at_least_one_real_op() {
+        let schema = evaluator_ops_repair_json_schema();
+        // At least one op is mandatory.
+        assert_eq!(schema["properties"]["ops"]["minItems"], json!(1));
+        // The no_op escape hatch is gone; every real op variant remains.
+        let text = serde_json::to_string(&schema).unwrap();
+        assert!(!text.contains("\"no_op\""));
+        for kept in [
+            "add_memory",
+            "relationship_event",
+            "update_object_state",
+            "update_scene_state",
+            "add_world_event",
+        ] {
+            assert!(text.contains(kept), "{kept} missing from repair schema");
+        }
+        // The prose escape valve is closed too.
+        assert_eq!(
+            schema["properties"]["no_op_reason"],
+            json!({ "type": "null" })
+        );
+        // Distinct schema name so provider-side caching never mixes variants.
+        assert_ne!(EVALUATOR_OPS_REPAIR_SCHEMA_NAME, EVALUATOR_OPS_SCHEMA_NAME);
     }
 
     #[test]

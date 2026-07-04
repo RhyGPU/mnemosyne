@@ -35,7 +35,8 @@ use state_engine::{
     evaluator_ingest::{parse_evaluator_output_with_context, EvaluatorDraftContext},
     evaluator_structured::{
         compile_evaluator_ops_to_engine_patch, evaluator_ops_json_schema,
-        EvaluatorStructuredOutputV1, EVALUATOR_OPS_SCHEMA_NAME,
+        evaluator_ops_repair_json_schema, EvaluatorStructuredOutputV1,
+        EVALUATOR_OPS_REPAIR_SCHEMA_NAME, EVALUATOR_OPS_SCHEMA_NAME,
     },
     hidden_state::{parse_hidden_state, HiddenState},
     memory::{restore_archived_memory, set_memory_pinned},
@@ -4783,6 +4784,7 @@ fn provider_profile_to_api_settings(profile: &ProviderProfile) -> ApiProviderSet
         structured_evaluator_policy: profile.structured_evaluator_policy.clone(),
         structured_evaluator_transport: None,
         structured_evaluator_max_retries: Some(1),
+        structured_require_ops: None,
         wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn,
         allow_send_with_stale_state: profile.allow_send_with_stale_state,
         evaluator_background_enabled: profile.evaluator_background_enabled,
@@ -6531,6 +6533,7 @@ pub async fn run_evaluator_contract_test(
         structured_evaluator_policy: Some("prefer".into()),
         structured_evaluator_transport: None,
         structured_evaluator_max_retries: Some(1),
+        structured_require_ops: None,
         wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn,
         allow_send_with_stale_state: profile.allow_send_with_stale_state,
         evaluator_background_enabled: profile.evaluator_background_enabled,
@@ -6722,6 +6725,8 @@ pub struct SessionFormEvalTurn {
     pub user_excerpt: String,
     /// The FORM eval output passed the system's ingestion/validation contract.
     pub form_passed: bool,
+    /// How many form rows the compiler accepted (durable state actually extracted).
+    pub form_rows_accepted: usize,
     pub form_error: Option<String>,
     /// Repair was attempted (only when form validation failed).
     pub repair_attempted: bool,
@@ -6735,6 +6740,9 @@ pub struct SessionFormEvalTurn {
 pub struct SessionFormEvalReport {
     pub conversation_id: String,
     pub model: String,
+    /// The model the repair stage actually ran against (repair profile /
+    /// embedded local model) — distinct from the eval `model` above.
+    pub repair_model: String,
     pub turns_total: usize,
     pub form_passed: usize,
     pub form_failed: usize,
@@ -6754,7 +6762,9 @@ pub async fn run_session_form_eval_benchmark(
     state: State<'_, AppState>,
     conversation_id: String,
     profile_id: String,
+    repair_settings: Option<ApiProviderSettings>,
 ) -> Result<SessionFormEvalReport, String> {
+    let repair_settings_override = repair_settings;
     let profile = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         db::get_provider_profile(&conn, &profile_id).map_err(|err| err.to_string())?
@@ -6777,9 +6787,14 @@ pub async fn run_session_form_eval_benchmark(
         form_settings.evaluator_timeout_ms = Some(LOCAL_REPAIR_TIMEOUT_MS);
     }
 
-    // Repair settings: structured ops, pinned for a local endpoint.
-    let mut repair_settings = form_settings.clone();
+    // Repair settings: the caller passes the CONFIGURED repair endpoint (repair
+    // profile / embedded local model), because the whole architecture is
+    // "weak eval generates failures, the dedicated repair model fixes them" —
+    // testing repair against the same weak eval profile would be meaningless.
+    // Fall back to the eval profile only when no repair endpoint is configured.
+    let mut repair_settings = repair_settings_override.unwrap_or_else(|| form_settings.clone());
     repair_settings.evaluator_mode = Some(EVALUATOR_MODE_STRUCTURED_V1.into());
+    repair_settings.structured_require_ops = Some(true);
     if is_loopback_endpoint(&repair_settings.base_url) {
         repair_settings.structured_evaluator_transport = Some("json_schema".into());
         repair_settings.structured_evaluator_policy = Some("allow_fallback".into());
@@ -6829,6 +6844,7 @@ pub async fn run_session_form_eval_benchmark(
             turn_index: index,
             user_excerpt: user.chars().take(80).collect(),
             form_passed: false,
+            form_rows_accepted: 0,
             form_error: None,
             repair_attempted: false,
             repair_ops: 0,
@@ -6878,12 +6894,28 @@ pub async fn run_session_form_eval_benchmark(
                 }
                 Ok(form_outcome) => {
                     let rejected = form_outcome.form_rejected_rows.len();
-                    if !form_outcome.conversion.patch.is_empty() && rejected == 0 {
+                    turn.form_rows_accepted = form_outcome
+                        .form_trace
+                        .as_ref()
+                        .map(|trace| trace.form_rows_accepted)
+                        .unwrap_or(0);
+                    // A real pass requires: non-empty patch, no rejected rows, and NOT the
+                    // partial_success path — the minimal-scene fallback (used when parse
+                    // fails outright, or when the form compiled to nothing) also yields a
+                    // non-empty patch with zero rejections, and must not masquerade as OK.
+                    if !form_outcome.conversion.patch.is_empty()
+                        && rejected == 0
+                        && !form_outcome.partial_success
+                    {
                         turn.form_passed = true;
                         form_passed += 1;
                         false
                     } else {
-                        turn.form_error = Some(if rejected > 0 {
+                        turn.form_error = Some(if let Some(reason) =
+                            form_outcome.partial_success_reason.as_deref()
+                        {
+                            format!("form fell back: {reason}")
+                        } else if rejected > 0 {
                             format!(
                                 "{rejected} form row(s) rejected: {}",
                                 form_outcome
@@ -6915,8 +6947,8 @@ pub async fn run_session_form_eval_benchmark(
                     &repair_user,
                     0.3,
                     Some(Duration::from_millis(LOCAL_REPAIR_TIMEOUT_MS)),
-                    EVALUATOR_OPS_SCHEMA_NAME,
-                    &evaluator_ops_json_schema(),
+                    EVALUATOR_OPS_REPAIR_SCHEMA_NAME,
+                    &evaluator_ops_repair_json_schema(),
                 )
                 .await
             {
@@ -6947,6 +6979,7 @@ pub async fn run_session_form_eval_benchmark(
     Ok(SessionFormEvalReport {
         conversation_id,
         model: form_settings.model.clone(),
+        repair_model: repair_settings.model.clone(),
         turns_total: turns.len(),
         form_passed,
         form_failed,
@@ -7687,6 +7720,7 @@ fn diagnostic_structured_settings_from_profile(
         structured_evaluator_policy: Some(structured_policy.to_string()),
         structured_evaluator_transport: Some("tool_call".into()),
         structured_evaluator_max_retries: Some(1),
+        structured_require_ops: None,
         wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn,
         allow_send_with_stale_state: profile.allow_send_with_stale_state,
         evaluator_background_enabled: Some(false),
@@ -8194,9 +8228,12 @@ fn build_reextract_user_message(user_text: &str, narrator_text: &str) -> String 
          - object / scene state: anything moved, set down, opened, changed, or newly observed.\n\n\
          Rules: copy EXACT evidence_quote substrings verbatim from the exchange below; invent \
          nothing and add no change the text doesn't support; resolve \"I\" to the active player \
-         persona; prefer entity aliases. Return ops: [] ONLY if the turn is genuinely pure filler \
-         or out-of-character chatter, and then give a specific no_op_reason. Do NOT default to \
-         empty — that is the failure the primary already made.\n\n",
+         persona; prefer entity aliases (active_soul, active_player). You MUST return at least \
+         one op — empty ops are not accepted on this task.\n\n\
+         Op shapes (copy these exactly, filling your own values):\n\
+         {\"op\":\"relationship_event\",\"source_soul_id\":\"active_soul\",\"target_entity_id\":\"active_player\",\"actor_entity_id\":\"active_player\",\"perceived_by_entity_id\":\"active_soul\",\"evidence_quote\":\"<verbatim substring>\",\"axes\":{\"intent\":2,\"honesty\":1,\"reliability\":1,\"boundary_treatment\":3,\"responsiveness\":2,\"power_use\":0,\"evaluation_tone\":1,\"competence\":0,\"disclosure\":1,\"reciprocity\":1,\"repair\":0,\"predictability\":1},\"modifiers\":{\"salience\":70,\"certainty\":80,\"directness\":70,\"costliness\":20,\"stakes\":50,\"repetition\":0},\"event_flags_u64\":0}\n\
+         {\"op\":\"add_memory\",\"owner_soul_id\":\"active_soul\",\"slot\":\"relationship_memory\",\"content\":\"<one-line durable fact>\",\"evidence_quote\":\"<verbatim substring>\",\"confidence\":0.8,\"salience\":70,\"source_message_id\":null,\"target_entity_ids\":[\"active_player\"],\"truth_status\":\"scene_event\"}\n\
+         {\"op\":\"update_object_state\",\"object_label\":\"<object>\",\"object_type\":\"<kind>\",\"owner_entity_id\":\"active_soul\",\"status\":\"<status>\",\"location\":\"<where>\",\"last_observed_state\":\"<observed state>\",\"evidence_quote\":\"<verbatim substring>\"}\n\n",
     );
     out.push_str("Scene this turn:\n");
     out.push_str("User: ");
@@ -8446,6 +8483,10 @@ pub async fn repair_evaluator_ops(
     // runs against the caller-supplied (e.g. local) endpoint.
     let mut repair_settings = repair_settings;
     repair_settings.evaluator_mode = Some(EVALUATOR_MODE_STRUCTURED_V1.into());
+    // Repair only fires on turns already known to contain durable change, so use
+    // the strict repair schema: at least one real op, no `no_op` escape. Small
+    // models otherwise reason correctly and then punt into no_op anyway.
+    repair_settings.structured_require_ops = Some(true);
     if repair_settings
         .structured_evaluator_max_retries
         .unwrap_or(0)
@@ -18468,6 +18509,20 @@ struct StructuredRetryFailure {
     first_trace: StructuredCompletionTrace,
 }
 
+/// Pick the ops schema for a structured evaluator call: the strict repair schema
+/// (at least one op, no `no_op` escape) when the settings mark this as a repair,
+/// otherwise the standard ops schema.
+fn evaluator_schema_for(settings: &ApiProviderSettings) -> (&'static str, serde_json::Value) {
+    if settings.structured_require_ops == Some(true) {
+        (
+            EVALUATOR_OPS_REPAIR_SCHEMA_NAME,
+            evaluator_ops_repair_json_schema(),
+        )
+    } else {
+        (EVALUATOR_OPS_SCHEMA_NAME, evaluator_ops_json_schema())
+    }
+}
+
 async fn complete_evaluator_with_config(
     provider: &ApiProvider,
     settings: &ApiProviderSettings,
@@ -18476,7 +18531,7 @@ async fn complete_evaluator_with_config(
 ) -> Result<EvaluatorCompletion, String> {
     let timeout = effective_evaluator_timeout_ms(settings).map(Duration::from_millis);
     if selected_evaluator_source(&evaluator_mode(settings)) == EVALUATOR_MODE_STRUCTURED_V1 {
-        let schema = evaluator_ops_json_schema();
+        let (schema_name, schema) = evaluator_schema_for(settings);
         let completion = provider
             .complete_structured_prompt(
                 settings,
@@ -18484,7 +18539,7 @@ async fn complete_evaluator_with_config(
                 user_message,
                 0.0,
                 timeout,
-                EVALUATOR_OPS_SCHEMA_NAME,
+                schema_name,
                 &schema,
             )
             .await?;
@@ -18535,7 +18590,7 @@ async fn retry_structured_tool_call_after_compile_failure(
     let retry_user_message =
         structured_tool_retry_user_message(user_message, Some(&completion.raw_text), first_error);
     let timeout = effective_evaluator_timeout_ms(settings).map(Duration::from_millis);
-    let schema = evaluator_ops_json_schema();
+    let (schema_name, schema) = evaluator_schema_for(settings);
     let retry_completion = provider
         .complete_structured_tool_call_prompt(
             settings,
@@ -18543,7 +18598,7 @@ async fn retry_structured_tool_call_after_compile_failure(
             &retry_user_message,
             0.0,
             timeout,
-            EVALUATOR_OPS_SCHEMA_NAME,
+            schema_name,
             &schema,
         )
         .await
@@ -22999,6 +23054,15 @@ mod tests {
         assert!(message.contains("Aurora watches him."));
         // It is NOT the focused fix prompt.
         assert!(!message.contains("REPAIR TASK"));
+        // Bulletproofing: exact op shapes are shown and empty ops are forbidden.
+        assert!(message.contains("MUST return at least one op"));
+        assert!(message.contains("\"op\":\"relationship_event\""));
+        assert!(message.contains("\"op\":\"add_memory\""));
+        assert!(message.contains("\"op\":\"update_object_state\""));
+        // Example axes must match the schema's required keys exactly.
+        for axis in ["intent", "honesty", "boundary_treatment", "predictability"] {
+            assert!(message.contains(&format!("\"{axis}\":")), "{axis} missing from example");
+        }
     }
 
     /// Dev-only repair benchmark. Drives a LIVE local model through the same
@@ -23046,9 +23110,9 @@ mod tests {
         };
 
         let provider = crate::providers::api::ApiProvider::default();
-        // The ops schema (schema_version/ops/no_op_reason) — NOT the EnginePatch
-        // schema; the repair path validates against EvaluatorStructuredOutputV1.
-        let schema = evaluator_ops_json_schema();
+        // The strict REPAIR ops schema (at least one op, no no_op escape) — the
+        // same one the live repair path uses, NOT the EnginePatch schema.
+        let schema = evaluator_ops_repair_json_schema();
         // The slow FORM (non-tool-call) stage is opt-in: it adds a large second
         // call per scene (~5 min on CPU) and isn't validated. Set REPAIR_BENCH_FORM=1.
         let run_form_stage = std::env::var("REPAIR_BENCH_FORM").is_ok();
@@ -23090,7 +23154,7 @@ mod tests {
                 &repair_user,
                 0.3,
                 Some(Duration::from_millis(LOCAL_REPAIR_TIMEOUT_MS)),
-                "evaluator_ops_v1",
+                EVALUATOR_OPS_REPAIR_SCHEMA_NAME,
                 &schema,
             ));
             let elapsed = started.elapsed();

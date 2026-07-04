@@ -1,8 +1,9 @@
 // Small presentational components extracted from App.tsx (Phase 0 refactor).
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { ImageAsset, getImageAssetDataUrl } from "../tauri";
 import { DisclaimerMode } from "../uiTypes";
+import { useModalBehavior } from "./a11y";
 
 export function Stat({ label, value }: { label: string; value: number }) {
   return (
@@ -52,10 +53,29 @@ export function ImagePreviewModal({
   asset: ImageAsset | null;
   onClose: () => void;
 }) {
+  const modalRef = useRef<HTMLElement | null>(null);
+  useModalBehavior({
+    active: Boolean(asset),
+    onClose,
+    panelRef: modalRef,
+  });
   if (!asset) return null;
   return (
-    <div className="image-preview-backdrop" role="dialog" aria-modal="true" onClick={onClose}>
-      <section className="image-preview-modal" onClick={(event) => event.stopPropagation()}>
+    <div
+      className="image-preview-backdrop"
+      role="dialog"
+      aria-modal="true"
+      onClick={onClose}
+      onMouseDown={onClose}
+      onPointerDown={onClose}
+    >
+      <section
+        className="image-preview-modal"
+        ref={modalRef}
+        onClick={(event) => event.stopPropagation()}
+        onMouseDown={(event) => event.stopPropagation()}
+        onPointerDown={(event) => event.stopPropagation()}
+      >
         <button type="button" className="image-preview-close" onClick={onClose} aria-label="Close image preview">
           <X size={18} />
         </button>
@@ -116,41 +136,47 @@ export function DisclaimerScreen({
   onClose: () => void;
 }) {
   const isLaunch = mode === "launch";
+  const dialogRef = useRef<HTMLElement | null>(null);
+  useModalBehavior({
+    active: Boolean(mode),
+    closeOnEscape: !isLaunch,
+    onClose,
+    panelRef: dialogRef,
+  });
 
   return (
     <main className="disclaimer-screen">
-      <section className="disclaimer-card" role="dialog" aria-modal={isLaunch} aria-labelledby="disclaimer-title">
+      <section
+        className="disclaimer-card"
+        ref={dialogRef}
+        role="dialog"
+        aria-modal={isLaunch}
+        aria-labelledby="disclaimer-title"
+      >
         <div className="disclaimer-heading">
           <span className="eyebrow">Before you continue</span>
-          <h1 id="disclaimer-title">Mnemosyne Experimental Use Disclaimer</h1>
+          <h1 id="disclaimer-title">Mnemosyne is experimental fiction software</h1>
         </div>
 
         <div className="disclaimer-copy">
-          <p>Mnemosyne is experimental open-source AI roleplay software.</p>
           <p>
-            Mnemosyne creates fictional continuity through memory, state tracking, and AI-generated narration. Characters may
-            appear persistent, emotionally responsive, or self-aware, but the software does not verify consciousness,
-            sentience, or real personhood.
+            Mnemosyne creates fictional continuity through memory, state tracking, and AI-generated narration. Characters can
+            feel persistent or emotionally responsive, but the software does not verify consciousness, sentience, or real
+            personhood.
           </p>
           <p>
-            You are responsible for how you use this software, what models/providers you connect, what content you generate,
-            and how you interpret fictional character continuity.
+            You are responsible for the models and providers you connect, the content you generate, and how you interpret
+            fictional character continuity. External API providers may receive prompts, character data, and responses under
+            their own policies.
           </p>
           <p>
             Mnemosyne is not therapy, medical care, legal advice, crisis support, or a substitute for real-world relationships
             or professional help.
           </p>
           <p>
-            If you use external API providers, your prompts, character data, and generated responses may be sent to those
-            providers according to their own policies. Local use depends on your own configuration.
-          </p>
-          <p>
             This software may produce emotionally intense, disturbing, intimate, fictional, or misleading outputs. Use personal
-            caution, especially during long sessions or emotionally heavy roleplay.
-          </p>
-          <p>
-            By continuing, you acknowledge that Mnemosyne is an experimental fiction and roleplay engine, and that you use it
-            at your own discretion.
+            caution, especially during long sessions or emotionally heavy roleplay. By continuing, you acknowledge that you use
+            Mnemosyne at your own discretion.
           </p>
         </div>
 
@@ -178,8 +204,8 @@ export function DisclaimerScreen({
         <div className="disclaimer-actions">
           {isLaunch ? (
             <>
-              <button type="button" className="ghost-action disclaimer-exit" onClick={() => window.close()}>
-                Exit
+              <button type="button" className="ghost-action disclaimer-exit" onClick={onClose}>
+                Not now
               </button>
               <button type="button" className="start-chat-button" onClick={onAccept} disabled={!understood}>
                 Accept and Continue

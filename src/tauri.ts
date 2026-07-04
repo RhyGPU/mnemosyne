@@ -1795,6 +1795,7 @@ export type SessionFormEvalTurn = {
   turn_index: number;
   user_excerpt: string;
   form_passed: boolean;
+  form_rows_accepted: number;
   form_error: string | null;
   repair_attempted: boolean;
   repair_ops: number;
@@ -1805,6 +1806,7 @@ export type SessionFormEvalTurn = {
 export type SessionFormEvalReport = {
   conversation_id: string;
   model: string;
+  repair_model: string;
   turns_total: number;
   form_passed: number;
   form_failed: number;
@@ -1813,14 +1815,17 @@ export type SessionFormEvalReport = {
 };
 
 /** Dev-mode: replay the open session's chat log through the FORM evaluator + repair,
- * dry-run validated (nothing applied). */
+ * dry-run validated (nothing applied). `repairSettings` is the CONFIGURED repair
+ * endpoint (repair profile / embedded local model) — without it the repair stage
+ * falls back to the eval profile, which defeats the weak-eval→repair architecture. */
 export function runSessionFormEvalBenchmark(
   conversationId: string,
   profileId: string,
+  repairSettings?: ApiProviderSettings,
 ): Promise<SessionFormEvalReport> {
   return invokeOrPreview(
     "run_session_form_eval_benchmark",
-    { conversationId, profileId },
+    { conversationId, profileId, repairSettings },
     () => {
       throw new Error("Session form-eval benchmark requires the Tauri runtime.");
     },

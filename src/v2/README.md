@@ -1,6 +1,8 @@
-# UX v2 prototype (`src/v2/`)
+# UX v2 reference prototype (`src/v2/`)
 
-A runnable, mock-data prototype of the new session-purpose-driven UX.
+Reference-only mock-data prototype of the new session-purpose-driven UX. This is not
+the live application surface; use it as design/spec material while the production
+UI continues to live in `src/App.tsx`.
 Spec: `docs/UX-plan-v2.md`. Theme: `docs/UI-theme-direction.md`.
 
 ## Run it
