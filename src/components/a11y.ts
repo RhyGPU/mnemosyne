@@ -1,4 +1,4 @@
-import { RefObject, useEffect } from "react";
+import { RefObject, useEffect, useRef } from "react";
 
 const FOCUSABLE_SELECTOR = [
   "a[href]",
@@ -53,6 +53,12 @@ export function useModalBehavior({
   panelRef: RefObject<HTMLElement>;
   restoreFocus?: boolean;
 }) {
+  const onCloseRef = useRef(onClose);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   useEffect(() => {
     if (!active) return;
     const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -60,7 +66,7 @@ export function useModalBehavior({
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && closeOnEscape) {
         event.preventDefault();
-        onClose();
+        onCloseRef.current();
         return;
       }
       trapTabKey(event, panelRef.current);
@@ -71,5 +77,5 @@ export function useModalBehavior({
       document.removeEventListener("keydown", handleKeyDown, true);
       if (restoreFocus) previouslyFocused?.focus();
     };
-  }, [active, closeOnEscape, onClose, panelRef, restoreFocus]);
+  }, [active, closeOnEscape, panelRef, restoreFocus]);
 }

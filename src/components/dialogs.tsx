@@ -71,10 +71,10 @@ export function AppDialog({
         </header>
         {dialog.message ? <p>{dialog.message}</p> : null}
         {dialog.mode === "prompt" ? (
-          <input value={value} placeholder={dialog.placeholder} onChange={(event) => setValue(event.target.value)} />
+          <input autoFocus value={value} placeholder={dialog.placeholder} onChange={(event) => setValue(event.target.value)} />
         ) : null}
         {dialog.mode === "textarea" ? (
-          <textarea value={value} placeholder={dialog.placeholder} rows={7} onChange={(event) => setValue(event.target.value)} />
+          <textarea autoFocus value={value} placeholder={dialog.placeholder} rows={7} onChange={(event) => setValue(event.target.value)} />
         ) : null}
         <footer>
           {dialog.mode !== "alert" ? (

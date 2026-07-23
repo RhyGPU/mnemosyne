@@ -614,11 +614,16 @@ button {
 }
 
 .ghost-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-height: 40px;
   gap: 8px;
   border: 1px solid var(--rule-soft);
+  border-radius: 6px;
   background: var(--paper-white);
   color: var(--ink-deep);
+  cursor: pointer;
   padding: 0 12px;
   font-weight: 800;
 }
@@ -1409,17 +1414,6 @@ button:disabled {
   padding: 14px 22px;
   border-bottom: 1px solid var(--rule-light);
   background: var(--paper-warm);
-}
-
-.provider-card {
-  display: none;
-}
-
-.launcher-provider-strip {
-  grid-template-columns: repeat(3, minmax(160px, 1fr));
-  border: 0;
-  background: transparent;
-  padding: 0;
 }
 
 .provider-pass-card {
