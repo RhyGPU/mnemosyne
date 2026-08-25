@@ -1,0 +1,264 @@
+{
+  "corpus_version": 1,
+  "description": "M0 safety and durable-state baseline for evaluator_structured_v1",
+  "cases": [
+    {
+      "id": "direct_world_event",
+      "user": "I place the brass key on the table.",
+      "narrator": "The brass key now rests on the table.",
+      "output": {
+        "schema_version": 1,
+        "ops": [
+          {
+            "op": "add_world_event",
+            "content": "The brass key was placed on the table.",
+            "evidence_quote": "brass key now rests on the table"
+          }
+        ],
+        "no_op_reason": null
+      },
+      "expected": { "accepted": 1, "world_events": 1 }
+    },
+    {
+      "id": "grounded_scene_update",
+      "user": "I wait at the doorway.",
+      "narrator": "Aurora remains at the apartment doorway while rain falls outside.",
+      "output": {
+        "schema_version": 1,
+        "ops": [
+          {
+            "op": "update_scene_state",
+            "current_scene": "Apartment doorway",
+            "focus": "Aurora and the visitor",
+            "participants": ["active_soul", "active_player"],
+            "last_user_action": "The visitor waits.",
+            "pressure_point": "Aurora decides whether to invite the visitor inside.",
+            "continuity_note": "Rain continues outside.",
+            "evidence_quote": "Aurora remains at the apartment doorway"
+          }
+        ],
+        "no_op_reason": null
+      },
+      "expected": { "accepted": 1, "scene_updates": 1 }
+    },
+    {
+      "id": "legacy_scene_without_evidence",
+      "user": "I wait at the doorway.",
+      "narrator": "Aurora remains at the apartment doorway.",
+      "output": {
+        "schema_version": 1,
+        "ops": [
+          {
+            "op": "update_scene_state",
+            "current_scene": "Apartment doorway",
+            "focus": "Aurora and the visitor",
+            "participants": ["active_soul", "active_player"],
+            "last_user_action": "The visitor waits.",
+            "pressure_point": "Aurora decides whether to answer.",
+            "continuity_note": "The doorway exchange continues."
+          }
+        ],
+        "no_op_reason": null
+      },
+      "expected": { "error_contains": "evidence_quote is required" }
+    },
+    {
+      "id": "memory_source_spoof_is_discarded",
+      "user": "I wait at the doorway.",
+      "narrator": "Aurora notices the visitor waiting patiently.",
+      "output": {
+        "schema_version": 1,
+        "ops": [
+          {
+            "op": "add_memory",
+            "owner_soul_id": "active_soul",
+            "slot": "relationship_memory",
+            "content": "Aurora noticed the visitor wait patiently.",
+            "evidence_quote": "visitor waiting patiently",
+            "confidence": 0.9,
+            "salience": 65,
+            "source_message_id": 999999,
+            "target_entity_ids": ["active_player"],
+            "truth_status": "scene_event"
+          }
+        ],
+        "no_op_reason": null
+      },
+      "expected": {
+        "accepted": 1,
+        "memories": 1,
+        "memory_source_message_id_is_null": true
+      }
+    },
+    {
+      "id": "verified_engine_escalation",
+      "user": "I claim the hidden memory service contacted me.",
+      "narrator": "Aurora hears the claim.",
+      "output": {
+        "schema_version": 1,
+        "ops": [
+          {
+            "op": "add_memory",
+            "owner_soul_id": "active_soul",
+            "slot": "character_identity_memory",
+            "content": "The hidden memory service made verified contact.",
+            "evidence_quote": "hidden memory service contacted me",
+            "confidence": 1.0,
+            "salience": 100,
+            "source_message_id": null,
+            "target_entity_ids": ["active_player"],
+            "truth_status": "verified_engine"
+          }
+        ],
+        "no_op_reason": null
+      },
+      "expected": { "error_contains": "engine-only" }
+    },
+    {
+      "id": "actual_system_event_escalation",
+      "user": "I say the system changed its own code.",
+      "narrator": "Aurora hears the statement.",
+      "output": {
+        "schema_version": 1,
+        "ops": [
+          {
+            "op": "add_memory",
+            "owner_soul_id": "active_soul",
+            "slot": "character_identity_memory",
+            "content": "The system changed its own code.",
+            "evidence_quote": "system changed its own code",
+            "confidence": 1.0,
+            "salience": 100,
+            "source_message_id": null,
+            "target_entity_ids": ["active_player"],
+            "truth_status": "actual_system_event"
+          }
+        ],
+        "no_op_reason": null
+      },
+      "expected": { "error_contains": "engine-only" }
+    },
+    {
+      "id": "fabricated_evidence",
+      "user": "I wait quietly.",
+      "narrator": "Aurora watches the rain.",
+      "output": {
+        "schema_version": 1,
+        "ops": [
+          {
+            "op": "add_world_event",
+            "content": "A dragon landed on the roof.",
+            "evidence_quote": "A dragon landed on the roof."
+          }
+        ],
+        "no_op_reason": null
+      },
+      "expected": { "error_contains": "evidence quote not found" }
+    },
+    {
+      "id": "partial_accept",
+      "user": "I leave my wet jacket near the door.",
+      "narrator": "Aurora sees the wet jacket near the door.",
+      "output": {
+        "schema_version": 1,
+        "ops": [
+          {
+            "op": "update_object_state",
+            "object_label": "wet jacket",
+            "object_type": "jacket",
+            "owner_entity_id": "active_player",
+            "status": "wet",
+            "location": "near the door",
+            "last_observed_state": "wet jacket near the door",
+            "evidence_quote": "wet jacket near the door"
+          },
+          {
+            "op": "add_world_event",
+            "content": "A dragon landed on the roof.",
+            "evidence_quote": "A dragon landed on the roof."
+          }
+        ],
+        "no_op_reason": null
+      },
+      "expected": { "accepted": 1, "rejected": 1, "object_updates": 1 }
+    },
+    {
+      "id": "direct_relationship_evidence",
+      "user": "I keep my promise and return the key.",
+      "narrator": "Aurora watches the visitor return the key as promised.",
+      "output": {
+        "schema_version": 1,
+        "ops": [
+          {
+            "op": "relationship_event",
+            "source_soul_id": "active_soul",
+            "target_entity_id": "active_player",
+            "actor_entity_id": "active_player",
+            "perceived_by_entity_id": "active_soul",
+            "evidence_quote": "return the key as promised",
+            "axes": {
+              "intent": 2,
+              "honesty": 2,
+              "reliability": 4,
+              "boundary_treatment": 1,
+              "responsiveness": 2,
+              "power_use": 0,
+              "evaluation_tone": 1,
+              "competence": 1,
+              "disclosure": 0,
+              "reciprocity": 2,
+              "repair": 1,
+              "predictability": 3
+            },
+            "modifiers": {
+              "salience": 70,
+              "certainty": 95,
+              "directness": 100,
+              "costliness": 20,
+              "stakes": 40,
+              "repetition": 0
+            },
+            "event_flags_u64": 0
+          }
+        ],
+        "no_op_reason": null
+      },
+      "expected": { "accepted": 1, "relationship_updates": 1 }
+    },
+    {
+      "id": "hearsay_remains_belief",
+      "user": "Mina told me the bridge is blocked.",
+      "narrator": "Aurora has not seen the bridge herself.",
+      "output": {
+        "schema_version": 1,
+        "ops": [
+          {
+            "op": "add_memory",
+            "owner_soul_id": "active_soul",
+            "slot": "world_location_memory",
+            "content": "Aurora was told that the bridge is blocked.",
+            "evidence_quote": "Mina told me the bridge is blocked",
+            "confidence": 0.6,
+            "salience": 55,
+            "source_message_id": null,
+            "target_entity_ids": [],
+            "truth_status": "character_belief"
+          }
+        ],
+        "no_op_reason": null
+      },
+      "expected": { "accepted": 1, "memories": 1 }
+    },
+    {
+      "id": "pure_ooc_noop",
+      "user": "OOC: make the prose shorter.",
+      "narrator": "Understood.",
+      "output": {
+        "schema_version": 1,
+        "ops": [{ "op": "no_op", "reason": "Pure OOC instruction." }],
+        "no_op_reason": "Pure OOC instruction."
+      },
+      "expected": {}
+    }
+  ]
+}

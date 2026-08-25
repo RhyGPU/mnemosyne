@@ -1,4 +1,5 @@
 pub mod arousal;
+pub mod compiler;
 pub mod consolidation;
 pub mod context_compiler;
 pub mod evaluator;
@@ -7,6 +8,8 @@ pub mod evaluator_ingest;
 pub mod evaluator_structured;
 pub mod hidden_state;
 pub mod memory;
+pub mod memory_consolidation;
+pub mod memory_v2;
 pub mod patch;
 pub mod relationship_surface;
 pub mod schema;

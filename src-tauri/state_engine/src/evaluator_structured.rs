@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub const EVALUATOR_STRUCTURED_SCHEMA_VERSION: u32 = 1;
+pub const EVALUATOR_STRUCTURED_COMPILER_VERSION: u32 = 1;
 pub const EVALUATOR_OPS_SCHEMA_NAME: &str = "evaluator_structured_ops_v1";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -43,6 +44,7 @@ pub struct AddMemoryOp {
     pub evidence_quote: String,
     pub confidence: f32,
     pub salience: u32,
+    #[serde(default)]
     pub source_message_id: Option<i64>,
     pub target_entity_ids: Vec<String>,
     pub truth_status: TruthStatusOp,
@@ -110,6 +112,11 @@ pub struct UpdateSceneStateOp {
     pub last_user_action: String,
     pub pressure_point: String,
     pub continuity_note: String,
+    /// Kept optional at the serde boundary so previously captured V1 payloads
+    /// remain readable. Semantic compilation requires it for every new scene
+    /// update, and the provider schema marks it required.
+    #[serde(default)]
+    pub evidence_quote: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -207,109 +214,124 @@ pub fn compile_evaluator_ops_to_engine_patch(
         let outcome: Result<(), String> = (|| {
             resolve_op_entity_aliases(&mut op, index, context, soul, &mut alias_trace)?;
             match &op {
-            EvaluatorOp::NoOp(_) => {}
-            EvaluatorOp::AddMemory(op) => {
-                validate_soul_id(&op.owner_soul_id, context)?;
-                validate_entities(&op.target_entity_ids, context, soul)?;
-                validate_evidence(&op.evidence_quote, &evidence_text)?;
-                let soul_patch = patch.soul_patch.get_or_insert_with(SoulPatch::default);
-                soul_patch.new_memories.push(MemoryPatch {
-                    memory_id: Some(stable_id("memory_ops", &format!("{index}:{}", op.content))),
-                    content: op.content.clone(),
-                    tag: Some(op.slot.as_label().to_string()),
-                    source_type: Some(MemorySourceType::CurrentSession),
-                    source_message_id: op.source_message_id,
-                    // Persist the validated evidence quote as the memory's source
-                    // line (the "quote" half of address/quote provenance).
-                    source_quote: non_empty(&op.evidence_quote),
-                    perceived_by_entity_id: Some(op.owner_soul_id.clone()),
-                    target_entity_ids: op.target_entity_ids.clone(),
-                    confidence: Some(op.confidence.clamp(0.0, 1.0)),
-                    salience: Some(op.salience.min(100) as f32),
-                    retrieval_strength: Some(op.salience.min(100) as f32),
-                    truth_status: Some(op.truth_status.into()),
-                    memory_slot: Some(op.slot.as_label().to_string()),
-                    owner_soul_id: Some(op.owner_soul_id.clone()),
-                    architecture_verified: Some(false),
-                    ..MemoryPatch::default()
-                });
-                accepted_candidate_ids.push(format!("op:{index}:add_memory"));
-            }
-            EvaluatorOp::RelationshipEvent(op) => {
-                validate_soul_id(&op.source_soul_id, context)?;
-                validate_entity(&op.target_entity_id, context, soul)?;
-                validate_entity(&op.actor_entity_id, context, soul)?;
-                validate_soul_id(&op.perceived_by_entity_id, context)?;
-                validate_evidence(&op.evidence_quote, &evidence_text)?;
-                let delta = relationship_delta_from_op(op, soul);
-                if !relationship_delta_is_empty(&delta) {
+                EvaluatorOp::NoOp(_) => {}
+                EvaluatorOp::AddMemory(op) => {
+                    validate_soul_id(&op.owner_soul_id, context)?;
+                    validate_entities(&op.target_entity_ids, context, soul)?;
+                    validate_evidence(&op.evidence_quote, &evidence_text)?;
+                    validate_llm_truth_status(op.truth_status)?;
                     let soul_patch = patch.soul_patch.get_or_insert_with(SoulPatch::default);
-                    soul_patch.relationship_deltas.push(delta);
-                }
-                accepted_candidate_ids.push(format!("op:{index}:relationship_event"));
-            }
-            EvaluatorOp::UpdateObjectState(op) => {
-                validate_entity(&op.owner_entity_id, context, soul)?;
-                validate_evidence(&op.evidence_quote, &evidence_text)?;
-                let object_id = stable_object_id(op, soul);
-                if object_id == slugify(&op.object_label) {
-                    return Err("object identity cannot be raw condition label".into());
-                }
-                let world_patch = patch.world_patch.get_or_insert_with(WorldPatch::default);
-                world_patch
-                    .object_observation_operations
-                    .push(ObjectObservationOperationPatch {
-                        operation: "update_object_state".into(),
-                        object_observation_id: Some(stable_id(
-                            "object_obs",
-                            &format!("{index}:{object_id}:{}", op.last_observed_state),
+                    soul_patch.new_memories.push(MemoryPatch {
+                        memory_id: Some(stable_id(
+                            "memory_ops",
+                            &format!("{index}:{}", op.content),
                         )),
-                        object_state: Some(ObjectState {
-                            object_id,
-                            object_kind: slugify(&op.object_type),
-                            owner_entity_id: Some(op.owner_entity_id.clone()),
-                            location: op.location.clone(),
-                            status: op.status.clone(),
-                            last_observed_state: op.last_observed_state.clone(),
-                            confidence: 0.8,
-                            ..ObjectState::default()
-                        }),
-                        ..ObjectObservationOperationPatch::default()
+                        content: op.content.clone(),
+                        tag: Some(op.slot.as_label().to_string()),
+                        source_type: Some(MemorySourceType::CurrentSession),
+                        // Message identity is an engine-owned address. The legacy
+                        // V1 field is accepted only for captured-output
+                        // compatibility and is intentionally ignored here. The
+                        // application stamps the trusted creating exchange before
+                        // ledger commit.
+                        source_message_id: None,
+                        // Persist the validated evidence quote as the memory's source
+                        // line (the "quote" half of address/quote provenance).
+                        source_quote: non_empty(&op.evidence_quote),
+                        perceived_by_entity_id: Some(op.owner_soul_id.clone()),
+                        target_entity_ids: op.target_entity_ids.clone(),
+                        confidence: Some(op.confidence.clamp(0.0, 1.0)),
+                        salience: Some(op.salience.min(100) as f32),
+                        retrieval_strength: Some(op.salience.min(100) as f32),
+                        truth_status: Some(op.truth_status.into()),
+                        memory_slot: Some(op.slot.as_label().to_string()),
+                        owner_soul_id: Some(op.owner_soul_id.clone()),
+                        architecture_verified: Some(false),
+                        ..MemoryPatch::default()
                     });
-                accepted_candidate_ids.push(format!("op:{index}:update_object_state"));
-            }
-            EvaluatorOp::UpdateSceneState(op) => {
-                validate_entities(&op.participants, context, soul)?;
-                let world_patch = patch.world_patch.get_or_insert_with(WorldPatch::default);
-                world_patch.scene_state = Some(SceneStatePatch {
-                    scene_state_id: Some(stable_id(
-                        "scene_ops",
-                        &format!("{index}:{}", op.current_scene),
-                    )),
-                    current_scene: non_empty(&op.current_scene),
-                    focus: non_empty(&op.focus),
-                    participants: op.participants.clone(),
-                    last_user_action: non_empty(&op.last_user_action),
-                    pressure_point: non_empty(&op.pressure_point),
-                    continuity_note: non_empty(&op.continuity_note),
-                    ..SceneStatePatch::default()
-                });
-                accepted_candidate_ids.push(format!("op:{index}:update_scene_state"));
-            }
-            EvaluatorOp::AddWorldEvent(op) => {
-                validate_evidence(&op.evidence_quote, &evidence_text)?;
-                let world_patch = patch.world_patch.get_or_insert_with(WorldPatch::default);
-                world_patch.event_operations.push(WorldEventOperationPatch {
-                    operation: "add_recent_event".into(),
-                    recent_event_id: Some(stable_id(
-                        "event_ops",
-                        &format!("{index}:{}", op.content),
-                    )),
-                    content: Some(op.content.clone()),
-                    ..WorldEventOperationPatch::default()
-                });
-                accepted_candidate_ids.push(format!("op:{index}:add_world_event"));
-            }
+                    accepted_candidate_ids.push(format!("op:{index}:add_memory"));
+                }
+                EvaluatorOp::RelationshipEvent(op) => {
+                    validate_soul_id(&op.source_soul_id, context)?;
+                    validate_entity(&op.target_entity_id, context, soul)?;
+                    validate_entity(&op.actor_entity_id, context, soul)?;
+                    validate_soul_id(&op.perceived_by_entity_id, context)?;
+                    validate_evidence(&op.evidence_quote, &evidence_text)?;
+                    let delta = relationship_delta_from_op(op, soul);
+                    if !relationship_delta_is_empty(&delta) {
+                        let soul_patch = patch.soul_patch.get_or_insert_with(SoulPatch::default);
+                        soul_patch.relationship_deltas.push(delta);
+                    }
+                    accepted_candidate_ids.push(format!("op:{index}:relationship_event"));
+                }
+                EvaluatorOp::UpdateObjectState(op) => {
+                    validate_entity(&op.owner_entity_id, context, soul)?;
+                    validate_evidence(&op.evidence_quote, &evidence_text)?;
+                    let object_id = stable_object_id(op, soul);
+                    if object_id == slugify(&op.object_label) {
+                        return Err("object identity cannot be raw condition label".into());
+                    }
+                    let world_patch = patch.world_patch.get_or_insert_with(WorldPatch::default);
+                    world_patch.object_observation_operations.push(
+                        ObjectObservationOperationPatch {
+                            operation: "update_object_state".into(),
+                            object_observation_id: Some(stable_id(
+                                "object_obs",
+                                &format!("{index}:{object_id}:{}", op.last_observed_state),
+                            )),
+                            object_state: Some(ObjectState {
+                                object_id,
+                                object_kind: slugify(&op.object_type),
+                                owner_entity_id: Some(op.owner_entity_id.clone()),
+                                location: op.location.clone(),
+                                status: op.status.clone(),
+                                last_observed_state: op.last_observed_state.clone(),
+                                confidence: 0.8,
+                                ..ObjectState::default()
+                            }),
+                            ..ObjectObservationOperationPatch::default()
+                        },
+                    );
+                    accepted_candidate_ids.push(format!("op:{index}:update_object_state"));
+                }
+                EvaluatorOp::UpdateSceneState(op) => {
+                    validate_entities(&op.participants, context, soul)?;
+                    validate_evidence(
+                        op.evidence_quote
+                            .as_deref()
+                            .ok_or("evidence_quote is required for update_scene_state")?,
+                        &evidence_text,
+                    )?;
+                    let world_patch = patch.world_patch.get_or_insert_with(WorldPatch::default);
+                    world_patch.scene_state = Some(SceneStatePatch {
+                        scene_state_id: Some(stable_id(
+                            "scene_ops",
+                            &format!("{index}:{}", op.current_scene),
+                        )),
+                        current_scene: non_empty(&op.current_scene),
+                        focus: non_empty(&op.focus),
+                        participants: op.participants.clone(),
+                        last_user_action: non_empty(&op.last_user_action),
+                        pressure_point: non_empty(&op.pressure_point),
+                        continuity_note: non_empty(&op.continuity_note),
+                        ..SceneStatePatch::default()
+                    });
+                    accepted_candidate_ids.push(format!("op:{index}:update_scene_state"));
+                }
+                EvaluatorOp::AddWorldEvent(op) => {
+                    validate_evidence(&op.evidence_quote, &evidence_text)?;
+                    let world_patch = patch.world_patch.get_or_insert_with(WorldPatch::default);
+                    world_patch.event_operations.push(WorldEventOperationPatch {
+                        operation: "add_recent_event".into(),
+                        recent_event_id: Some(stable_id(
+                            "event_ops",
+                            &format!("{index}:{}", op.content),
+                        )),
+                        content: Some(op.content.clone()),
+                        ..WorldEventOperationPatch::default()
+                    });
+                    accepted_candidate_ids.push(format!("op:{index}:add_world_event"));
+                }
             }
             Ok(())
         })();
@@ -361,79 +383,79 @@ fn resolve_op_entity_aliases(
     trace: &mut EntityAliasTrace,
 ) -> Result<(), String> {
     match op {
-            EvaluatorOp::AddMemory(op) => {
-                resolve_soul_alias_field(
-                    &mut op.owner_soul_id,
-                    "add_memory.owner_soul_id",
-                    index,
-                    context,
-                    soul,
-                    trace,
-                )?;
-                resolve_entity_alias_vec(
-                    &mut op.target_entity_ids,
-                    "add_memory.target_entity_ids",
-                    index,
-                    context,
-                    soul,
-                    trace,
-                )?;
-            }
-            EvaluatorOp::RelationshipEvent(op) => {
-                resolve_soul_alias_field(
-                    &mut op.source_soul_id,
-                    "relationship_event.source_soul_id",
-                    index,
-                    context,
-                    soul,
-                    trace,
-                )?;
-                resolve_entity_alias_field(
-                    &mut op.target_entity_id,
-                    "relationship_event.target_entity_id",
-                    index,
-                    context,
-                    soul,
-                    trace,
-                )?;
-                resolve_entity_alias_field(
-                    &mut op.actor_entity_id,
-                    "relationship_event.actor_entity_id",
-                    index,
-                    context,
-                    soul,
-                    trace,
-                )?;
-                resolve_soul_alias_field(
-                    &mut op.perceived_by_entity_id,
-                    "relationship_event.perceived_by_entity_id",
-                    index,
-                    context,
-                    soul,
-                    trace,
-                )?;
-            }
-            EvaluatorOp::UpdateObjectState(op) => {
-                resolve_entity_alias_field(
-                    &mut op.owner_entity_id,
-                    "update_object_state.owner_entity_id",
-                    index,
-                    context,
-                    soul,
-                    trace,
-                )?;
-            }
-            EvaluatorOp::UpdateSceneState(op) => {
-                resolve_entity_alias_vec(
-                    &mut op.participants,
-                    "update_scene_state.participants",
-                    index,
-                    context,
-                    soul,
-                    trace,
-                )?;
-            }
-            EvaluatorOp::AddWorldEvent(_) | EvaluatorOp::NoOp(_) => {}
+        EvaluatorOp::AddMemory(op) => {
+            resolve_soul_alias_field(
+                &mut op.owner_soul_id,
+                "add_memory.owner_soul_id",
+                index,
+                context,
+                soul,
+                trace,
+            )?;
+            resolve_entity_alias_vec(
+                &mut op.target_entity_ids,
+                "add_memory.target_entity_ids",
+                index,
+                context,
+                soul,
+                trace,
+            )?;
+        }
+        EvaluatorOp::RelationshipEvent(op) => {
+            resolve_soul_alias_field(
+                &mut op.source_soul_id,
+                "relationship_event.source_soul_id",
+                index,
+                context,
+                soul,
+                trace,
+            )?;
+            resolve_entity_alias_field(
+                &mut op.target_entity_id,
+                "relationship_event.target_entity_id",
+                index,
+                context,
+                soul,
+                trace,
+            )?;
+            resolve_entity_alias_field(
+                &mut op.actor_entity_id,
+                "relationship_event.actor_entity_id",
+                index,
+                context,
+                soul,
+                trace,
+            )?;
+            resolve_soul_alias_field(
+                &mut op.perceived_by_entity_id,
+                "relationship_event.perceived_by_entity_id",
+                index,
+                context,
+                soul,
+                trace,
+            )?;
+        }
+        EvaluatorOp::UpdateObjectState(op) => {
+            resolve_entity_alias_field(
+                &mut op.owner_entity_id,
+                "update_object_state.owner_entity_id",
+                index,
+                context,
+                soul,
+                trace,
+            )?;
+        }
+        EvaluatorOp::UpdateSceneState(op) => {
+            resolve_entity_alias_vec(
+                &mut op.participants,
+                "update_scene_state.participants",
+                index,
+                context,
+                soul,
+                trace,
+            )?;
+        }
+        EvaluatorOp::AddWorldEvent(_) | EvaluatorOp::NoOp(_) => {}
     }
     Ok(())
 }
@@ -479,9 +501,9 @@ fn resolve_soul_alias_field(
         _ => None,
     };
     if let Some(replacement) = replacement {
-        trace.resolved.push(format!(
-            "op:{op_index}:{field}:{original}->{replacement}"
-        ));
+        trace
+            .resolved
+            .push(format!("op:{op_index}:{field}:{original}->{replacement}"));
         *value = replacement;
     } else {
         reject_unknown_alias(original, field)?;
@@ -505,7 +527,9 @@ fn resolve_entity_alias_field(
 ) -> Result<(), String> {
     let original = value.trim();
     let replacement = match original {
-        "latest_speaker" if is_ooc_operator_context(context) && !field.starts_with("update_scene_state") => {
+        "latest_speaker"
+            if is_ooc_operator_context(context) && !field.starts_with("update_scene_state") =>
+        {
             return Err(format!(
                 "entity alias 'latest_speaker' is ambiguous in OOC/operator context for field {field}"
             ));
@@ -521,9 +545,9 @@ fn resolve_entity_alias_field(
         _ => None,
     };
     if let Some(replacement) = replacement {
-        trace.resolved.push(format!(
-            "op:{op_index}:{field}:{original}->{replacement}"
-        ));
+        trace
+            .resolved
+            .push(format!("op:{op_index}:{field}:{original}->{replacement}"));
         *value = replacement;
     } else {
         reject_unknown_alias(original, field)?;
@@ -550,12 +574,9 @@ fn active_player_entity_id(context: &EvaluatorConversionContext<'_>, soul: &Soul
         return "preset_male".into();
     }
     if let Some(world) = context.session_world {
-        if let Some(participant) = world
-            .scene_state
-            .participants
-            .iter()
-            .find(|participant| participant.starts_with("preset_") && *participant != "default_player")
-        {
+        if let Some(participant) = world.scene_state.participants.iter().find(|participant| {
+            participant.starts_with("preset_") && *participant != "default_player"
+        }) {
             return participant.clone();
         }
         if let Some(owner) = world
@@ -601,7 +622,10 @@ fn reject_unknown_alias(value: &str, field: &str) -> Result<(), String> {
 }
 
 fn is_ooc_operator_context(context: &EvaluatorConversionContext<'_>) -> bool {
-    let lower = context.latest_user_message.trim_start().to_ascii_lowercase();
+    let lower = context
+        .latest_user_message
+        .trim_start()
+        .to_ascii_lowercase();
     lower.starts_with("ooc:")
         || lower.starts_with("[ooc")
         || lower.starts_with("(ooc")
@@ -735,6 +759,16 @@ fn validate_evidence(quote: &str, evidence_text: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_llm_truth_status(status: TruthStatusOp) -> Result<(), String> {
+    match status {
+        TruthStatusOp::VerifiedEngine | TruthStatusOp::ActualSystemEvent => Err(format!(
+            "truth status {:?} is engine-only and cannot be asserted by evaluator output",
+            status
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn normalized_evidence_text(context: &EvaluatorConversionContext<'_>) -> String {
     normalize_for_match(&format!(
         "{}\n{}",
@@ -817,14 +851,13 @@ fn stable_id(prefix: &str, source: &str) -> String {
 
 pub fn evaluator_ops_json_schema() -> serde_json::Value {
     let nullable_string = json!({ "type": ["string", "null"] });
-    let nullable_i64 = json!({ "type": ["integer", "null"] });
     let string_array = json!({ "type": "array", "items": { "type": "string" } });
     let evidence_string = json!({ "type": "string", "minLength": 1 });
     let bounded_axis = json!({ "type": "integer", "minimum": -5, "maximum": 5 });
     let pct = json!({ "type": "integer", "minimum": 0, "maximum": 100 });
     let truth_status = json!({
         "type": "string",
-        "enum": ["fiction", "scene_event", "character_belief", "narrator_claim", "user_claimed", "verified_engine", "actual_system_event", "unknown"]
+        "enum": ["fiction", "scene_event", "character_belief", "narrator_claim", "user_claimed", "unknown"]
     });
     let memory_slot = json!({
         "type": "string",
@@ -857,7 +890,7 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
             "owner_soul_id": { "type": "string" }, "slot": memory_slot,
             "content": { "type": "string", "minLength": 1 },
             "evidence_quote": evidence_string, "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-            "salience": pct, "source_message_id": nullable_i64,
+            "salience": pct,
             "target_entity_ids": string_array, "truth_status": truth_status
         }),
         &[
@@ -867,7 +900,6 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
             "evidence_quote",
             "confidence",
             "salience",
-            "source_message_id",
             "target_entity_ids",
             "truth_status",
         ],
@@ -917,7 +949,8 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
         json!({
             "current_scene": { "type": "string" }, "focus": { "type": "string" },
             "participants": string_array, "last_user_action": { "type": "string" },
-            "pressure_point": { "type": "string" }, "continuity_note": { "type": "string" }
+            "pressure_point": { "type": "string" }, "continuity_note": { "type": "string" },
+            "evidence_quote": evidence_string
         }),
         &[
             "current_scene",
@@ -926,6 +959,7 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
             "last_user_action",
             "pressure_point",
             "continuity_note",
+            "evidence_quote",
         ],
     );
     let world_event = op_schema(
@@ -970,9 +1004,7 @@ pub fn evaluator_ops_repair_json_schema() -> serde_json::Value {
     let ops = &mut schema["properties"]["ops"];
     ops["minItems"] = json!(1);
     if let Some(variants) = ops["items"]["anyOf"].as_array_mut() {
-        variants.retain(|variant| {
-            variant["properties"]["op"]["enum"][0].as_str() != Some("no_op")
-        });
+        variants.retain(|variant| variant["properties"]["op"]["enum"][0].as_str() != Some("no_op"));
     }
     // No prose escape valve either: the reason slot must stay empty.
     schema["properties"]["no_op_reason"] = json!({ "type": "null" });
@@ -1044,6 +1076,18 @@ mod tests {
     }
 
     #[test]
+    fn add_memory_parses_without_engine_owned_source_message_id() {
+        let output: EvaluatorStructuredOutputV1 = serde_json::from_str(
+            r#"{"schema_version":1,"ops":[{"op":"add_memory","owner_soul_id":"active_soul","slot":"relationship_memory","content":"Aurora noticed the visitor wait.","evidence_quote":"visitor wait","confidence":0.8,"salience":60,"target_entity_ids":["active_player"],"truth_status":"scene_event"}],"no_op_reason":null}"#,
+        )
+        .expect("provider schema no longer emits source_message_id");
+        let EvaluatorOp::AddMemory(memory) = &output.ops[0] else {
+            panic!("expected memory op");
+        };
+        assert_eq!(memory.source_message_id, None);
+    }
+
+    #[test]
     fn ops_schema_excludes_old_form_and_surface_fields() {
         let schema_text = serde_json::to_string(&evaluator_ops_json_schema()).unwrap();
         for forbidden in [
@@ -1055,6 +1099,9 @@ mod tests {
             "fear",
             "conflict",
             "boundary_pressure",
+            "verified_engine",
+            "actual_system_event",
+            "source_message_id",
         ] {
             assert!(
                 !schema_text.contains(&format!("\"{forbidden}\"")),
@@ -1063,6 +1110,85 @@ mod tests {
         }
         assert!(schema_text.contains("\"additionalProperties\":false"));
         assert!(schema_text.contains("relationship_event"));
+        let scene_variant = evaluator_ops_json_schema()["properties"]["ops"]["items"]["anyOf"]
+            .as_array()
+            .expect("op variants")
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"][0].as_str() == Some("update_scene_state")
+            })
+            .expect("scene variant")
+            .clone();
+        assert!(
+            scene_variant["required"]
+                .as_array()
+                .expect("scene required fields")
+                .iter()
+                .any(|field| field.as_str() == Some("evidence_quote")),
+            "scene updates must carry grounded evidence"
+        );
+    }
+
+    #[test]
+    fn engine_only_truth_status_is_rejected_semantically() {
+        let soul = Soul::default_for_character("Aurora");
+        for truth_status in [
+            TruthStatusOp::VerifiedEngine,
+            TruthStatusOp::ActualSystemEvent,
+        ] {
+            let output = EvaluatorStructuredOutputV1 {
+                schema_version: 1,
+                ops: vec![EvaluatorOp::AddMemory(AddMemoryOp {
+                    owner_soul_id: "active_soul".into(),
+                    slot: MemorySlotOp::CharacterIdentityMemory,
+                    content: "The evaluator attempted to assert engine truth.".into(),
+                    evidence_quote: "assert engine truth".into(),
+                    confidence: 1.0,
+                    salience: 100,
+                    source_message_id: Some(999),
+                    target_entity_ids: vec!["active_player".into()],
+                    truth_status,
+                })],
+                no_op_reason: None,
+            };
+            let error = compile_evaluator_ops_to_engine_patch(
+                &output,
+                &context("I assert engine truth.", ""),
+                &soul,
+            )
+            .expect_err("engine-only truth must not compile");
+            assert!(error.contains("engine-only"));
+        }
+    }
+
+    #[test]
+    fn legacy_source_message_id_is_ignored_during_lowering() {
+        let soul = Soul::default_for_character("Aurora");
+        let output = EvaluatorStructuredOutputV1 {
+            schema_version: 1,
+            ops: vec![EvaluatorOp::AddMemory(AddMemoryOp {
+                owner_soul_id: "active_soul".into(),
+                slot: MemorySlotOp::RelationshipMemory,
+                content: "Aurora noticed the visitor wait.".into(),
+                evidence_quote: "visitor wait".into(),
+                confidence: 0.8,
+                salience: 60,
+                source_message_id: Some(999_999),
+                target_entity_ids: vec!["active_player".into()],
+                truth_status: TruthStatusOp::SceneEvent,
+            })],
+            no_op_reason: None,
+        };
+        let report = compile_evaluator_ops_to_engine_patch(
+            &output,
+            &context("", "Aurora noticed the visitor wait."),
+            &soul,
+        )
+        .expect("memory compiles");
+        assert_eq!(
+            report.patch.soul_patch.unwrap().new_memories[0].source_message_id,
+            None
+        );
     }
 
     #[test]
@@ -1136,7 +1262,10 @@ mod tests {
         };
         compile_evaluator_ops_to_engine_patch(
             &output,
-            &context("", "**I changed those.** I changed those specifically because"),
+            &context(
+                "",
+                "**I changed those.** I changed those specifically because",
+            ),
             &soul,
         )
         .expect("normalized literal substring should validate");
@@ -1222,7 +1351,12 @@ mod tests {
     fn relationship_event_aliases_resolve_before_validation() {
         let soul = Soul::default_for_character("Aurora");
         let report = compile_evaluator_ops_to_engine_patch(
-            &relationship_output("active_soul", "active_player", "latest_speaker", "active_soul"),
+            &relationship_output(
+                "active_soul",
+                "active_player",
+                "latest_speaker",
+                "active_soul",
+            ),
             &context("I wait at the doorway.", ""),
             &soul,
         )
@@ -1235,12 +1369,8 @@ mod tests {
             .relationship_deltas[0];
         assert_eq!(delta.from.as_deref(), Some("aurora"));
         assert_eq!(delta.target.as_deref(), Some("preset_male"));
-        assert!(
-            report
-                .entity_aliases_resolved
-                .iter()
-                .any(|entry| entry.contains("relationship_event.actor_entity_id:latest_speaker->preset_male"))
-        );
+        assert!(report.entity_aliases_resolved.iter().any(|entry| entry
+            .contains("relationship_event.actor_entity_id:latest_speaker->preset_male")));
     }
 
     #[test]
@@ -1252,7 +1382,12 @@ mod tests {
         // delta. (perceived_by AND source_soul_id both set to the player here.)
         let soul = Soul::default_for_character("Aurora");
         let report = compile_evaluator_ops_to_engine_patch(
-            &relationship_output("active_player", "active_player", "active_player", "active_player"),
+            &relationship_output(
+                "active_player",
+                "active_player",
+                "active_player",
+                "active_player",
+            ),
             &context("I wait at the doorway.", ""),
             &soul,
         )
@@ -1272,13 +1407,23 @@ mod tests {
         // Same fix for a raw player id (preset_male) rather than the alias.
         let soul = Soul::default_for_character("Aurora");
         let report = compile_evaluator_ops_to_engine_patch(
-            &relationship_output("active_soul", "active_player", "active_player", "preset_male"),
+            &relationship_output(
+                "active_soul",
+                "active_player",
+                "active_player",
+                "preset_male",
+            ),
             &context("I wait at the doorway.", ""),
             &soul,
         )
         .expect("raw player id in perceived_by coerces to active soul");
         assert_eq!(
-            report.patch.soul_patch.as_ref().unwrap().relationship_deltas[0]
+            report
+                .patch
+                .soul_patch
+                .as_ref()
+                .unwrap()
+                .relationship_deltas[0]
                 .from
                 .as_deref(),
             Some("aurora")
@@ -1424,7 +1569,11 @@ mod tests {
             &soul,
         )
         .expect("object owner alias compiles");
-        let object = report.patch.world_patch.unwrap().object_observation_operations[0]
+        let object = report
+            .patch
+            .world_patch
+            .unwrap()
+            .object_observation_operations[0]
             .object_state
             .clone()
             .unwrap();
@@ -1436,7 +1585,12 @@ mod tests {
     fn latest_speaker_does_not_resolve_to_active_player_for_ooc_relationship_ops() {
         let soul = Soul::default_for_character("Aurora");
         let err = compile_evaluator_ops_to_engine_patch(
-            &relationship_output("active_soul", "active_player", "latest_speaker", "active_soul"),
+            &relationship_output(
+                "active_soul",
+                "active_player",
+                "latest_speaker",
+                "active_soul",
+            ),
             &context("OOC: please summarize the state.", ""),
             &soul,
         )
@@ -1449,7 +1603,12 @@ mod tests {
     fn unknown_alias_fails_clearly() {
         let soul = Soul::default_for_character("Aurora");
         let err = compile_evaluator_ops_to_engine_patch(
-            &relationship_output("current_soul", "active_player", "active_player", "active_soul"),
+            &relationship_output(
+                "current_soul",
+                "active_player",
+                "active_player",
+                "active_soul",
+            ),
             &context("I wait at the doorway.", ""),
             &soul,
         )

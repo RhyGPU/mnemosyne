@@ -10,6 +10,7 @@
     "build:frontend": "tsc --noEmit && vite build",
     "dev:frontend": "vite --host 127.0.0.1 --port 1420",
     "test:slash": "node scripts/test-slash-commands.mjs",
+    "test:models": "node scripts/test-frontend-models.mjs",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "typecheck": "tsc --noEmit"
   },

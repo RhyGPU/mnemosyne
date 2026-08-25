@@ -1235,8 +1235,8 @@ fn build_relationship_section(
     }
 
     let active_persona_id = player_persona.persona_id.trim();
-    let has_active_persona_relationship = !active_persona_id.is_empty()
-        && soul.relationships.contains_key(active_persona_id);
+    let has_active_persona_relationship =
+        !active_persona_id.is_empty() && soul.relationships.contains_key(active_persona_id);
     let mut relationships = soul
         .relationships
         .iter()
@@ -2133,6 +2133,7 @@ mod tests {
             .contains("The conversation continued without a major rupture"));
     }
 
+    #[test]
     fn latest_exchange_omits_current_user_when_separate_message_follows() {
         let soul = soul_with_phone_scene();
         let preview =

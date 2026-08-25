@@ -1,6 +1,10 @@
 import type { ReactNode } from "react";
 import { Play, RefreshCcw } from "lucide-react";
 import type { SessionStateMap } from "../../tauri";
+import {
+  buildStateMapPresentation,
+  humanizeStateMapText,
+} from "../../features/state-map/model/stateMapPresentation";
 
 export function StateMapView({
   appDialogNode,
@@ -39,6 +43,7 @@ export function StateMapDashboard({
     stateMap?.memories[0] ??
     null;
   const latestScene = stateMap?.scenes[0] ?? null;
+  const presentation = stateMap ? buildStateMapPresentation(stateMap) : null;
   const relKeys: Array<[string, "trust" | "affection" | "intimacy" | "fear" | "desire"]> = [
     ["Trust", "trust"],
     ["Affection", "affection"],
@@ -87,7 +92,7 @@ export function StateMapDashboard({
                 <dl className="statemap-fields">
                   <div><dt>Latest location</dt><dd>{latestScene.location || "Unknown"}</dd></div>
                   <div><dt>Latest time</dt><dd>{latestScene.time_elapsed || "Unknown"}</dd></div>
-                  <div><dt>Current focus</dt><dd>{latestScene.focus || latestScene.current_scene || "No focus captured yet."}</dd></div>
+                  <div><dt>Current focus</dt><dd>{humanizeStateMapText(latestScene.focus || latestScene.current_scene) || "No focus captured yet."}</dd></div>
                   <div><dt>Pressure</dt><dd>{latestScene.pressure_point || "No pressure point captured yet."}</dd></div>
                 </dl>
               ) : null}
@@ -108,14 +113,17 @@ export function StateMapDashboard({
                 <span className="statemap-dot cool" /> Characters <span className="statemap-count">who knows what</span>
               </h2>
               <div className="statemap-character-list">
-                {stateMap.characters.slice(0, 8).map((character, index) => (
-                  <div key={`${character.session_id}-${character.name}-${index}`} className="statemap-character-row">
+                {presentation?.characters.slice(0, 8).map((character, index) => (
+                  <div key={character.identity_key} className="statemap-character-row">
                     <span className={`statemap-character-avatar${index > 0 ? " muted" : ""}`}>
                       {(character.name.charAt(0) || "?").toUpperCase()}
                     </span>
                     <span>
                       <strong>{character.name}</strong>
-                      <small>{character.role || "entity"} / {character.session_title}</small>
+                      <small>
+                        {character.role || "Entity"} / {character.session_title}
+                        {character.session_count > 1 ? ` + ${character.session_count - 1} sessions` : ""}
+                      </small>
                       <em>{character.detail}</em>
                     </span>
                   </div>
@@ -126,18 +134,21 @@ export function StateMapDashboard({
             <section className="statemap-panel statemap-relationships-panel">
               <h2 className="statemap-panel-title">
                 <span className="statemap-dot green" /> Relationships{" "}
-                <span className="statemap-count">{stateMap.relationships.length}</span>
+                <span className="statemap-count">{presentation?.relationships.length ?? 0}</span>
               </h2>
-              {stateMap.relationships.length === 0 ? (
+              {!presentation?.relationships.length ? (
                 <p className="statemap-note">No relationships tracked yet.</p>
               ) : (
                 <div className="statemap-rels">
-                  {stateMap.relationships.map((relationship, index) => (
-                    <div key={`${relationship.session_id}-${relationship.target}-${index}`} className="statemap-rel">
+                  {presentation.relationships.map((relationship) => (
+                    <div key={relationship.identity_key} className="statemap-rel">
                       <div className="statemap-rel-name">
                         {relationship.soul_name} {"->"} {relationship.target}{" "}
                         <span className="statemap-rel-label">
-                          {relationship.session_title} / {relationship.love_type || "relationship"}
+                          {relationship.session_title}
+                          {relationship.session_count > 1 ? ` + ${relationship.session_count - 1} sessions` : ""}
+                          {" / "}
+                          {relationship.love_type || "Relationship"}
                         </span>
                       </div>
                       <div className="statemap-rel-bars">
@@ -171,12 +182,17 @@ export function StateMapDashboard({
                 <span className="statemap-dot gold" /> Objects{" "}
                 <span className="statemap-count">identity / owner / status</span>
               </h2>
-              {stateMap.objects.length > 0 ? (
+              {presentation?.objects.length ? (
                 <ul className="statemap-object-list">
-                  {stateMap.objects.slice(0, 8).map((object, index) => (
-                    <li key={`${object.session_id}-${object.name}-${index}`}>
+                  {presentation.objects.slice(0, 8).map((object) => (
+                    <li key={object.identity_key}>
                       <strong>{object.name}</strong>
-                      <span>{object.session_title} / {object.owner} / {object.status || object.kind}</span>
+                      <span>
+                        {object.session_title}
+                        {object.session_count > 1 ? ` + ${object.session_count - 1} sessions` : ""}
+                        {" / "}
+                        {object.owner || "Unassigned"} / {object.status || object.kind}
+                      </span>
                     </li>
                   ))}
                 </ul>
@@ -239,6 +255,42 @@ export function StateMapDashboard({
                       <div><dt>State</dt><dd>{featuredMemory?.is_pinned ? "Pinned" : featuredMemory?.is_active ? "Active" : "Stored"}</dd></div>
                     </dl>
                   </aside>
+                </div>
+              )}
+            </section>
+
+            <section className="statemap-panel statemap-memory-panel">
+              <h2 className="statemap-panel-title">
+                <span className="statemap-dot green" /> Memory V2 Evidence Map{" "}
+                <span className="statemap-count">
+                  {stateMap.memory_v2.filter((memory) => memory.validity === "valid").length} valid /{" "}
+                  {stateMap.memory_v2.filter((memory) => memory.validity === "stale").length} stale
+                </span>
+              </h2>
+              {stateMap.memory_v2.length === 0 ? (
+                <p className="statemap-note">No ledger-backed Memory V2 projections yet.</p>
+              ) : (
+                <div className="statemap-memory-stack">
+                  {stateMap.memory_v2.slice(0, 16).map((memory) => (
+                    <article
+                      key={`${memory.session_id}-${memory.memory_id}`}
+                      className={`statemap-mem-card${memory.validity !== "valid" ? " stale" : ""}`}
+                    >
+                      <span className="statemap-mem-kind">
+                        {memory.layer} / {memory.memory_kind} / {memory.validity}
+                      </span>
+                      <strong>{memory.content}</strong>
+                      <small>
+                        {memory.session_title} / confidence {memory.confidence.toFixed(2)} / {memory.truth_status}
+                      </small>
+                      <small>
+                        {memory.layer === "derived"
+                          ? `sources ${memory.source_memory_ids.length} / supports ${memory.supporting_evidence_count} / contradicts ${memory.contradicting_evidence_count}`
+                          : `turn ${memory.source_turn_id ?? "unknown"} / patch ${memory.source_patch_id ?? "legacy base"}`}
+                      </small>
+                      {memory.source_quote ? <em>“{memory.source_quote}”</em> : null}
+                    </article>
+                  ))}
                 </div>
               )}
             </section>

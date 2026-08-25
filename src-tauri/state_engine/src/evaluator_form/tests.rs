@@ -1694,7 +1694,7 @@ fn form_validated_relationship_bypasses_second_evidence_check_only_for_that_row(
 #[test]
 fn latest_payload_event_row_without_id_or_summary_compiles() {
     let (soul, world) = soul_and_world();
-    let (spec, context) = spec_and_context(
+    let (_spec, _context) = spec_and_context(
         &soul,
         &world,
         "I knock.",

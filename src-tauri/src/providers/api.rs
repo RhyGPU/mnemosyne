@@ -315,6 +315,11 @@ pub struct ApiProviderSettings {
     pub api_key: String,
     pub model: String,
     pub system_prompt: String,
+    pub narrator_temperature: Option<f32>,
+    pub narrator_max_tokens: Option<u32>,
+    pub narrator_top_p: Option<f32>,
+    pub narrator_frequency_penalty: Option<f32>,
+    pub narrator_presence_penalty: Option<f32>,
     pub narrator_timeout_ms: Option<u64>,
     pub evaluator_timeout_ms: Option<u64>,
     pub structured_evaluator_timeout_ms: Option<u64>,
@@ -359,11 +364,49 @@ impl Default for ApiProvider {
     }
 }
 
+fn narrator_temperature(settings: &ApiProviderSettings) -> f32 {
+    settings
+        .narrator_temperature
+        .unwrap_or(0.85)
+        .clamp(0.0, 2.0)
+}
+
+fn narrator_max_tokens(settings: &ApiProviderSettings) -> Option<u32> {
+    settings
+        .narrator_max_tokens
+        .filter(|value| *value > 0)
+        .map(|value| value.clamp(16, 32_768))
+}
+
+fn narrator_top_p(settings: &ApiProviderSettings) -> Option<f32> {
+    settings.narrator_top_p.map(|value| value.clamp(0.01, 1.0))
+}
+
+fn narrator_frequency_penalty(settings: &ApiProviderSettings) -> Option<f32> {
+    settings
+        .narrator_frequency_penalty
+        .map(|value| value.clamp(-2.0, 2.0))
+}
+
+fn narrator_presence_penalty(settings: &ApiProviderSettings) -> Option<f32> {
+    settings
+        .narrator_presence_penalty
+        .map(|value| value.clamp(-2.0, 2.0))
+}
+
 #[derive(Debug, Default, Serialize)]
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<ApiRequestMessage>,
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -599,7 +642,11 @@ impl ApiProvider {
 
         let request = ChatCompletionRequest {
             model: model.to_string(),
-            temperature: 0.85,
+            temperature: narrator_temperature(settings),
+            max_tokens: narrator_max_tokens(settings),
+            top_p: narrator_top_p(settings),
+            frequency_penalty: narrator_frequency_penalty(settings),
+            presence_penalty: narrator_presence_penalty(settings),
             stream: false,
             response_format: None,
             messages: vec![
@@ -1194,7 +1241,11 @@ impl ApiProvider {
 
         let request = ChatCompletionRequest {
             model: model.to_string(),
-            temperature: 0.85,
+            temperature: narrator_temperature(settings),
+            max_tokens: narrator_max_tokens(settings),
+            top_p: narrator_top_p(settings),
+            frequency_penalty: narrator_frequency_penalty(settings),
+            presence_penalty: narrator_presence_penalty(settings),
             stream: true,
             response_format: None,
             messages,
@@ -1916,6 +1967,48 @@ Do not return empty ops for entering/leaving a location, object movement/conditi
 Use only fields defined for each op. Never put confidence on update_scene_state; confidence is allowed only on add_memory.\n\
 Resolve user-controlled \"I\" to the active player persona. Prefer aliases instead of copying raw UUIDs when valid: active_soul, active_player, latest_speaker, session_world.\n\
 Current truth comes from the compact state JSON below; Rust validates semantics and applies the ledger.\n\n{}",
+        structured_evaluator_current_state_block(
+            soul,
+            session_world,
+            player_persona_id,
+            player_persona_display_name
+        ),
+    )
+}
+
+pub const PERCEPTION_V2_PROMPT_VERSION: &str = "perception-v2.0";
+
+pub fn build_perception_v2_prompt(soul: &Soul, session_world: Option<&SessionWorld>) -> String {
+    build_perception_v2_prompt_with_player_persona(
+        soul,
+        session_world,
+        "preset_male",
+        "Male Persona",
+    )
+}
+
+pub fn build_perception_v2_prompt_with_player_persona(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    player_persona_id: &str,
+    player_persona_display_name: &str,
+) -> String {
+    format!(
+        "# SYSTEM: Mnemosyne Perception Compiler V2\n\n\
+Read only the latest user and assistant exchange and extract evidence-backed perceptions.\n\
+Return PerceptionBatchDraft JSON only under the provider-enforced schema.\n\
+You describe what was perceived or claimed; you never issue state changes.\n\
+Never output conversation, branch, turn, message, source hash, compiler version, truth status, score delta, EnginePatch, or StateEffect fields.\n\
+Use exact continuous evidence.quote substrings from the selected source message.\n\
+Set evidence.source to user_message or assistant_message. Use null offsets unless exact character offsets are certain.\n\
+Resolve user-controlled \"I\" to active_player and the active character to active_soul. Use aliases rather than inventing IDs.\n\
+Distinguish direct observation, a speaker's statement, narrator description, inference, and remembered material with epistemic_mode.\n\
+A statement or belief is not automatically a verified world fact. Preserve who said or perceived it.\n\
+For relationship_evidence only, provide behavior labels and bounded valence/directness/stakes/costliness/repetition; use null relationship_signal for every other kind.\n\
+Use correction only for explicit correction/retcon evidence. Do not silently erase older facts.\n\
+durability_hint is advisory only; Rust decides whether anything persists.\n\
+If the exchange has no meaningful perception candidate, return candidates: [] and a specific no_op_reason.\n\
+Do not invent events, motives, thoughts, temporal anchors, participants, or evidence.\n\n{}",
         structured_evaluator_current_state_block(
             soul,
             session_world,
@@ -2691,6 +2784,78 @@ mod tests {
     }
 
     #[test]
+    fn narrator_generation_settings_serialize_into_chat_request() {
+        let settings = ApiProviderSettings {
+            narrator_temperature: Some(1.15),
+            narrator_max_tokens: Some(768),
+            narrator_top_p: Some(0.92),
+            narrator_frequency_penalty: Some(0.25),
+            narrator_presence_penalty: Some(-0.1),
+            ..ApiProviderSettings::default()
+        };
+        let request = ChatCompletionRequest {
+            model: "test-model".into(),
+            temperature: narrator_temperature(&settings),
+            max_tokens: narrator_max_tokens(&settings),
+            top_p: narrator_top_p(&settings),
+            frequency_penalty: narrator_frequency_penalty(&settings),
+            presence_penalty: narrator_presence_penalty(&settings),
+            messages: Vec::new(),
+            ..ChatCompletionRequest::default()
+        };
+        let serialized = serde_json::to_value(&request).expect("serializes");
+
+        assert!((serialized["temperature"].as_f64().expect("temperature") - 1.15).abs() < 1e-6);
+        assert_eq!(serialized["max_tokens"], serde_json::json!(768));
+        assert!((serialized["top_p"].as_f64().expect("top_p") - 0.92).abs() < 1e-6);
+        assert!(
+            (serialized["frequency_penalty"]
+                .as_f64()
+                .expect("frequency_penalty")
+                - 0.25)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (serialized["presence_penalty"]
+                .as_f64()
+                .expect("presence_penalty")
+                + 0.1)
+                .abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn narrator_generation_settings_clamp_and_omit_provider_defaults() {
+        let settings = ApiProviderSettings {
+            narrator_temperature: Some(9.0),
+            narrator_max_tokens: Some(1),
+            narrator_top_p: Some(4.0),
+            narrator_frequency_penalty: Some(-9.0),
+            narrator_presence_penalty: None,
+            ..ApiProviderSettings::default()
+        };
+        let request = ChatCompletionRequest {
+            model: "test-model".into(),
+            temperature: narrator_temperature(&settings),
+            max_tokens: narrator_max_tokens(&settings),
+            top_p: narrator_top_p(&settings),
+            frequency_penalty: narrator_frequency_penalty(&settings),
+            presence_penalty: narrator_presence_penalty(&settings),
+            messages: Vec::new(),
+            ..ChatCompletionRequest::default()
+        };
+        let serialized = serde_json::to_value(&request).expect("serializes");
+
+        assert_eq!(serialized["temperature"], serde_json::json!(2.0));
+        assert_eq!(serialized["max_tokens"], serde_json::json!(16));
+        assert_eq!(serialized["top_p"], serde_json::json!(1.0));
+        assert_eq!(serialized["frequency_penalty"], serde_json::json!(-2.0));
+        assert!(serialized.get("presence_penalty").is_none());
+    }
+
+    #[test]
     fn chat_request_serializes_json_schema_response_format() {
         let request = ChatCompletionRequest {
             model: "test-model".into(),
@@ -3389,7 +3554,10 @@ mod tests {
 
     #[test]
     fn frontend_preview_prompt_matches_scene_only_behavior() {
-        let frontend_source = include_str!("../../../src/tauri.ts");
+        let frontend_source = concat!(
+            include_str!("../../../src/tauri.ts"),
+            include_str!("../../../src/tauri/previewRuntime.ts")
+        );
 
         assert!(frontend_source.contains("[SCENE TURN ASSUMPTION]"));
         assert!(frontend_source.contains(SCENE_TURN_ROUTER_ASSUMPTION));

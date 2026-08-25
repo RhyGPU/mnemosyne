@@ -36,6 +36,7 @@ import {
 import {
   ApiProviderSettings,
   AssistantMessageVariant,
+  BackgroundJobProgress,
   BenchmarkSettings,
   BenchmarkSummary,
   BenchmarkTarget,
@@ -117,6 +118,7 @@ import {
   listSouls,
   listArchivedSouls,
   listenApiStream,
+  listenBackgroundJobProgress,
   listenChatMessageSaved,
   listenDevLog,
   listenEvaluatorJobStatusChanged,
@@ -162,10 +164,7 @@ import {
   listenEvaluatorAutoFallbackTriggered,
   listenEvaluatorOpsRejected,
   repairEvaluatorOps,
-  startEmbeddedRepairModel,
-  stopEmbeddedRepairModel,
   embeddedRepairModelStatus,
-  EmbeddedModelStatus,
 } from "./tauri";
 import {
   AssetImage,
@@ -175,10 +174,50 @@ import {
   SoulAvatar,
   Stat,
 } from "./components/primitives";
-import { AppDialog, AppDialogResult, AppDialogState } from "./components/dialogs";
+import { AppDialog } from "./components/dialogs";
+import { useAppDialogs } from "./app/useAppDialogs";
 import { ChatMoreMenu } from "./components/chat/ChatMoreMenu";
 import { ChatPipelineRail } from "./components/chat/ChatPipelineRail";
 import { PersonaModal } from "./components/chat/PersonaModal";
+import {
+  ChatComposer,
+  ChatTranscript,
+  ChatWorkspaceHeader,
+  EvaluatorStatusBanner,
+} from "./components/chat/ChatWorkspace";
+import {
+  DevPipelinePanel,
+  DevStreamPanel,
+  type DevStreamItem,
+} from "./components/dev/DevRuntimePanels";
+import { useDevJobs } from "./features/dev/useDevJobs";
+import {
+  DEV_COMMAND_OPTIONS,
+  devBooleanArg,
+  devNumberArg,
+  devStringArg,
+  parseDevCommandArgs,
+  type DevCommandName,
+} from "./features/dev/commands";
+
+import {
+  formatLlmPayloadDebugBlock,
+  makeDevLogEntry,
+  sanitizeDevLogEntry,
+} from "./features/dev/logging";
+import {
+  AboutSettingsPanel,
+  DataSettingsPanel,
+  GenerationSettingsPanel,
+  QuickSettingsPanel,
+  ReadingSettingsPanel,
+} from "./components/settings/HumanSettingsPanels";
+import {
+  NarratorProviderPanel,
+  ProviderProfilesPanel,
+  RepairModelPanel,
+  StateUpdaterProviderPanel,
+} from "./components/settings/ProviderSettingsPanels";
 import { ChatView } from "./components/views/ChatView";
 import { DevModeShell } from "./components/views/DevModeShell";
 import { HomeDashboard, HomeView } from "./components/views/HomeView";
@@ -186,29 +225,101 @@ import { LibraryView } from "./components/views/LibraryView";
 import { SettingsPageView } from "./components/views/SettingsPageView";
 import { StateMapDashboard, StateMapView } from "./components/views/StateMapView";
 import { getFocusableElements, useModalBehavior } from "./components/a11y";
+import {
+  DEFAULT_GENERATION_PREFERENCES,
+  DEFAULT_READING_PREFERENCES,
+  GENERATION_PRESETS,
+  type ChatStartMode,
+  type GenerationPreferences,
+  type GenerationPresetName,
+  type NarrativeMode,
+  type ReadingPreferences,
+  type SettingsTab,
+} from "./settings/preferences";
+import {
+  REPAIR_MODEL_AUTO,
+  REPAIR_MODEL_EMBEDDED,
+  REPAIR_MODEL_EVALUATOR,
+} from "./settings/provider";
+import {
+  appendStreamingChunk,
+  clearFailedStreamingTurn,
+  hasSavedAssistantForGeneration,
+  prepareMessagesForRender,
+  reconcilePersistedMessages,
+  seedStreamingTurn,
+  upsertSavedChatMessage,
+  type ActiveGeneration,
+  type MessageRenderTrace,
+} from "./features/chat/model/messageLifecycle";
+import { useChatController } from "./features/chat/useChatController";
+import {
+  benchmarkEvaluatorJobCompletedOrSkipped,
+  benchmarkLiveUpdaterOverride,
+  fallbackBenchmarkTurnSummary,
+  turnResultEvaluatorCompletedOrSkipped,
+} from "./features/benchmark/model/benchmarkRuntime";
+import { useEmbeddedRepairModel } from "./features/settings/useEmbeddedRepairModel";
+import { useProviderSettings } from "./features/settings/useProviderSettings";
+import {
+  useBenchmarkController,
+  type BenchmarkTurnPhase,
+} from "./features/benchmark/useBenchmarkController";
+
+import {
+  CUSTOM_NARRATOR_PROMPT_STORAGE_KEY,
+  CHAT_START_MODE_STORAGE_KEY,
+  DEV_LOG_LIMIT,
+  DISCLAIMER_STORAGE_KEY,
+  DISCLAIMER_VERSION,
+  EMBEDDED_MODEL_PATH_STORAGE_KEY,
+  EVALUATOR_EXECUTION_MODE_STORAGE_KEY,
+  GENERATION_PREFERENCES_STORAGE_KEY,
+  NARRATOR_PROVIDER_PROFILE_STORAGE_KEY,
+  READING_PREFERENCES_STORAGE_KEY,
+  REPAIR_PROVIDER_PROFILE_STORAGE_KEY,
+  SESSIONS_PER_PAGE,
+  SETTINGS_DRAWER_OPEN_STORAGE_KEY,
+  SETTINGS_DRAWER_TAB_STORAGE_KEY,
+  SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY,
+  SHOW_ARCHIVED_SESSIONS_STORAGE_KEY,
+  STRUCTURED_EVALUATOR_TRANSPORT_STORAGE_KEY,
+  UPDATER_PROVIDER_PROFILE_STORAGE_KEY,
+  USE_NARRATOR_FOR_UPDATER_STORAGE_KEY,
+  hasAcceptedDisclaimerVersion,
+  loadStoredBoolean,
+  loadStoredChatStartMode,
+  loadStoredCustomNarratorPrompt,
+  loadStoredGenerationPreferences,
+  loadStoredReadingPreferences,
+  loadStoredSettingsTab,
+} from "./app/preferencesStorage";
+import {
+  evaluatorJobBannerTitle,
+  evaluatorJobRefreshesState,
+  evaluatorJobStatusText,
+} from "./features/chat/model/evaluatorJob";
+import {
+  conversationIdForSettingAndSoul,
+  selectedVariantIndex,
+} from "./features/chat/model/conversationIdentity";
+import {
+  PSYCHE_PRESETS,
+  cloneForUi,
+  formatSnapshotTimestamp,
+  normalizeWorldDraft,
+  parseMarkdownSoul,
+  psycheFromSoul,
+  settingFromImport,
+  soulFromImport,
+  worldDraftFromSetting,
+  type PsycheDraft,
+  type PsychePresetName,
+  type WorldDraft,
+} from "./features/library/model/editorModel";
 
 const DEFAULT_CONVERSATION_ID = "local-mock";
 const CONSOLIDATION_INTERVAL_TURNS = 10;
-const NARRATOR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:narrator_provider_profile_id";
-const UPDATER_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:state_updater_provider_profile_id";
-const REPAIR_PROVIDER_PROFILE_STORAGE_KEY = "mnemosyne:repair_provider_profile_id";
-const EMBEDDED_MODEL_PATH_STORAGE_KEY = "mnemosyne:embedded_repair_model_path";
-const REPAIR_MODEL_AUTO = "";
-const REPAIR_MODEL_EVALUATOR = "__evaluator__";
-const REPAIR_MODEL_EMBEDDED = "__embedded__";
-const USE_NARRATOR_FOR_UPDATER_STORAGE_KEY = "mnemosyne:use_narrator_provider_for_updater";
-const CUSTOM_NARRATOR_PROMPT_STORAGE_KEY = "mnemosyne:custom_narrator_prompt";
-const SETTINGS_DRAWER_OPEN_STORAGE_KEY = "mnemosyne:settings_drawer_open";
-const SETTINGS_DRAWER_TAB_STORAGE_KEY = "mnemosyne:settings_drawer_tab";
-const SETTINGS_FIRST_LAUNCH_SEEN_STORAGE_KEY = "mnemosyne:settings_first_launch_seen_v1";
-const CHAT_START_MODE_STORAGE_KEY = "mnemosyne:chat_start_mode";
-const SHOW_ARCHIVED_SESSIONS_STORAGE_KEY = "mnemosyne:show_archived_sessions";
-const EVALUATOR_EXECUTION_MODE_STORAGE_KEY = "mnemosyne:evaluator_execution_mode";
-const STRUCTURED_EVALUATOR_TRANSPORT_STORAGE_KEY = "mnemosyne:structured_evaluator_transport";
-const SESSIONS_PER_PAGE = 10;
-const DISCLAIMER_STORAGE_KEY = "mnemosyne_disclaimer_accepted_v1";
-const DISCLAIMER_VERSION = 1;
-const DEV_LOG_LIMIT = 1000;
 const DEV_LOG_CATEGORIES: DevLogCategory[] = [
   "app",
   "db",
@@ -223,301 +334,8 @@ const DEV_LOG_CATEGORIES: DevLogCategory[] = [
   "success",
 ];
 type ProviderKind = "Mock" | "API";
-type BenchmarkTurnPhase = "player_generation" | "execute_turn" | "evaluator_wait" | "turn_summary" | "completed";
-type NarrativeMode = "Realistic" | "Reader" | "Active Director" | "GM Simulation" | "Custom";
 type AppView = "home" | "library" | "editor" | "chat" | "statemap" | "settings";
-type ChatStartMode = "continue" | "fresh";
 type DisclaimerMode = "launch" | "manual" | null;
-// Non-dev settings drawer tabs only. Dev features live in the dev-shell side panel.
-type SettingsTab = "ai" | "data" | "about";
-type DevCommandName =
-  | "dedupe_active_adjacent_user_messages"
-  | "restore_inactive_messages"
-  | "get_branch_patch_debug"
-  | "rebuild_session_from_ledger"
-  | "inspect_turn_branch_integrity"
-  | "repair_accidental_normal_send_variants"
-  | "export_visible_chat_log"
-  | "export_llm_payload_history"
-  | "run_benchmark";
-
-const DEV_COMMAND_OPTIONS: Array<{ name: DevCommandName; label: string; defaultArgs: string }> = [
-  {
-    name: "dedupe_active_adjacent_user_messages",
-    label: "Repair Duplicate Turns",
-    defaultArgs: "{}",
-  },
-  {
-    name: "restore_inactive_messages",
-    label: "Restore Hidden Turns",
-    defaultArgs: "{}",
-  },
-  {
-    name: "get_branch_patch_debug",
-    label: "Get Branch Patch Debug",
-    defaultArgs: "{}",
-  },
-  {
-    name: "rebuild_session_from_ledger",
-    label: "Rebuild Session From Ledger",
-    defaultArgs: "{}",
-  },
-  {
-    name: "inspect_turn_branch_integrity",
-    label: "Inspect Branch Integrity",
-    defaultArgs: "{}",
-  },
-  {
-    name: "repair_accidental_normal_send_variants",
-    label: "Repair Accidental Variants",
-    defaultArgs: "{}",
-  },
-  {
-    name: "export_visible_chat_log",
-    label: "Export Visible Chat",
-    defaultArgs: "{}",
-  },
-  {
-    name: "export_llm_payload_history",
-    label: "Export Payload History",
-    defaultArgs: "{}",
-  },
-  {
-    name: "run_benchmark",
-    label: "Run Benchmark",
-    defaultArgs: JSON.stringify(
-      {
-        benchmark_type: "visible_ai_chat",
-        target: "current_session",
-        turn_count: 5,
-        strict_tool_evaluator: true,
-        player_goal: "Build cautious trust with the active Soul while respecting boundaries.",
-      },
-      null,
-      2,
-    ),
-  },
-];
-
-type ActiveGeneration = {
-  id: number;
-  conversationId: string;
-  narratorSaved: boolean;
-  knownAssistantIds: Set<number>;
-  replacementAssistantId?: number;
-  replacementOriginalContent?: string;
-};
-
-// Mutable state for a live AI-vs-AI benchmark run. Held in a ref (not React
-// state) so the per-turn effect reads/mutates it without re-render churn.
-type BenchmarkLiveContext = {
-  benchmarkId: string;
-  conversationId: string;
-  soulId: string;
-  startedAt: number;
-  playerProfileId: string;
-  playerGoal: string;
-  /** Opposing/user side uses the traditional RP engine (full chat, no memory)
-   * instead of the player simulator - the comparison-benchmark control. */
-  traditionalOpponent: boolean;
-  settings: BenchmarkSettings;
-  narratorSettings: ApiProviderSettings;
-  updaterSettings: ApiProviderSettings;
-  initialMemoryCount: number;
-  initialObjectCount: number;
-  initialRelationshipCount: number;
-  relationshipTargetChecked: string;
-  initialActivePlayerRelationship: Record<string, unknown> | null;
-  perTurn: BenchmarkTurnSummary[];
-  narratorFailures: number;
-  completedTurns: number;
-  nextTurnIndex: number;
-  lastPlayerText: string;
-};
-
-interface MessageRenderTrace {
-  frontend_message_render_count: number;
-  saved_message_count: number;
-  pending_message_count: number;
-  rendered_message_count: number;
-  duplicate_saved_suppressed: number;
-  duplicate_pending_suppressed: number;
-  pending_replaced_by_saved: number;
-  pending_assistant_replaced_by_saved: number;
-  active_listener_count: number;
-  pending_assistant_count: number;
-  rendered_saved_message_count: number;
-  rendered_pending_message_count: number;
-  duplicate_render_suppressed_count: number;
-  duplicate_visual_pair: boolean;
-  duplicate_saved_db_assistant_detected: boolean;
-  visible_bubble_trace: VisibleBubbleTraceRow[];
-}
-
-type VisibleBubbleRenderSource =
-  | "saved_db"
-  | "pending_overlay"
-  | "streaming_overlay"
-  | "local_optimistic"
-  | "unknown";
-
-interface VisibleBubbleTraceRow {
-  render_index: number;
-  role: ChatMessage["role"];
-  render_source: VisibleBubbleRenderSource;
-  message_id: number;
-  request_id?: string;
-  assistant_message_id?: number;
-  turn_id?: string;
-  content_hash: string;
-  created_at: number;
-  status?: string;
-  origin?: string;
-  duplicate_visual_pair?: boolean;
-  duplicate_render_sources?: VisibleBubbleRenderSource[];
-}
-
-function evaluatorJobStatusText(job: EvaluatorJob) {
-  if (job.status === "pending" || job.status === "running") return "Updating memory/state...";
-  if (job.status === "completed" || job.status === "partial_success") {
-    if (job.error_message && (job.error_message.startsWith("State updated") || job.error_message.includes("skipped"))) {
-      return job.error_message;
-    }
-  }
-  if (job.patch_applied) {
-    if (job.error_message && (job.error_message.startsWith("State updated") || job.error_message.includes("skipped"))) {
-      return job.error_message;
-    }
-  } else if (job.status === "failed") {
-    return "State update failed";
-  }
-  if (job.status === "completed") {
-    return job.patch_applied ? "Memory/state update completed" : "Memory/state update completed with no patch";
-  }
-  if (job.status === "partial_success") {
-    if (job.error_message?.includes("some enrichment rows rejected")) {
-      return "State updated; some enrichment rows rejected";
-    }
-    if (job.error_message?.includes("branch_advanced_before_background_evaluator_completed")) {
-      return "State updated; enrichment finished after branch advanced";
-    }
-    return "State updated partially";
-  }
-  if (job.status === "some_rows_rejected") return "State updated; some enrichment rows rejected";
-  if (job.status === "stale_skipped") return "State updated; enrichment skipped";
-  if (job.status === "canceled") return "State update canceled";
-  if (job.status === "timed_out") return "State update timed out";
-  if (job.status === "failed") return "State update failed";
-  return job.status;
-}
-
-function evaluatorJobBannerTitle(job: EvaluatorJob) {
-  if (job.status === "pending" || job.status === "running") return "Updating memory/state...";
-  if (job.patch_applied) {
-    if (job.error_message && (job.error_message.startsWith("State updated") || job.error_message.includes("skipped"))) {
-      return job.error_message;
-    }
-  }
-  if (job.status === "completed") return "Memory/state updated";
-  if (job.status === "partial_success") return evaluatorJobStatusText(job);
-  if (job.status === "some_rows_rejected") return "State updated; some enrichment rows rejected";
-  if (job.status === "stale_skipped") return "State updated; enrichment skipped";
-  if (job.status === "canceled") return "State update canceled";
-  if (job.status === "timed_out") return "State update timed out";
-  if (job.status === "failed") return "State update failed";
-  return job.status;
-}
-
-function evaluatorJobRefreshesState(job: EvaluatorJob) {
-  return ["completed", "partial_success", "some_rows_rejected", "stale_skipped"].includes(job.status);
-}
-type PsychePresetName =
-  | "Stranger"
-  | "Traumatized Survivor"
-  | "Trusting Friend"
-  | "Devoted Partner"
-  | "Hostile Rival"
-  | "Custom";
-
-type PsycheDraft = {
-  global: {
-    fear_baseline: number;
-    resolve: number;
-    shame: number;
-    openness: number;
-  };
-  maslow: [number, number, number, number, number];
-  sdt: [number, number, number];
-  trauma: {
-    phase: number;
-    hypervigilance: number;
-    flashbacks: number;
-    numbing: number;
-    avoidance: number;
-  };
-  relationship: {
-    trust: number;
-    affection: number;
-    intimacy: number;
-    passion: number;
-    commitment: number;
-    fear: number;
-    desire: number;
-  };
-};
-
-type WorldDraft = {
-  location: string;
-  activePlots: string;
-  keyObjects: string;
-  timeElapsed: string;
-};
-
-const PSYCHE_PRESETS: Record<PsychePresetName, PsycheDraft> = {
-  Stranger: {
-    global: { fear_baseline: 35, resolve: 40, shame: 35, openness: 35 },
-    maslow: [70, 55, 35, 35, 20],
-    sdt: [55, 45, 25],
-    trauma: { phase: 1, hypervigilance: 30, flashbacks: 15, numbing: 20, avoidance: 35 },
-    relationship: { trust: 0, affection: 0, intimacy: 0, passion: 0, commitment: 0, fear: 20, desire: 0 },
-  },
-  "Traumatized Survivor": {
-    global: { fear_baseline: 75, resolve: 55, shame: 60, openness: 25 },
-    maslow: [45, 20, 25, 20, 10],
-    sdt: [25, 30, 15],
-    trauma: { phase: 2, hypervigilance: 80, flashbacks: 65, numbing: 55, avoidance: 70 },
-    relationship: { trust: -35, affection: -5, intimacy: 0, passion: 0, commitment: 0, fear: 70, desire: -10 },
-  },
-  "Trusting Friend": {
-    global: { fear_baseline: 20, resolve: 55, shame: 25, openness: 70 },
-    maslow: [75, 70, 80, 60, 35],
-    sdt: [70, 60, 75],
-    trauma: { phase: 3, hypervigilance: 20, flashbacks: 10, numbing: 15, avoidance: 20 },
-    relationship: { trust: 55, affection: 60, intimacy: 35, passion: 5, commitment: 30, fear: 5, desire: 10 },
-  },
-  "Devoted Partner": {
-    global: { fear_baseline: 15, resolve: 65, shame: 20, openness: 80 },
-    maslow: [80, 75, 90, 70, 45],
-    sdt: [75, 65, 90],
-    trauma: { phase: 4, hypervigilance: 15, flashbacks: 5, numbing: 10, avoidance: 10 },
-    relationship: { trust: 85, affection: 90, intimacy: 85, passion: 70, commitment: 90, fear: 0, desire: 75 },
-  },
-  "Hostile Rival": {
-    global: { fear_baseline: 45, resolve: 80, shame: 20, openness: 10 },
-    maslow: [70, 60, 15, 55, 25],
-    sdt: [80, 70, 10],
-    trauma: { phase: 1, hypervigilance: 55, flashbacks: 10, numbing: 35, avoidance: 60 },
-    relationship: { trust: -80, affection: -65, intimacy: -50, passion: 0, commitment: -40, fear: 45, desire: -30 },
-  },
-  Custom: {
-    global: { fear_baseline: 15, resolve: 40, shame: 45, openness: 45 },
-    maslow: [60, 50, 40, 30, 20],
-    sdt: [70, 40, 10],
-    trauma: { phase: 2, hypervigilance: 10, flashbacks: 10, numbing: 10, avoidance: 10 },
-    relationship: { trust: 10, affection: 20, intimacy: 10, passion: 10, commitment: 10, fear: 10, desire: 20 },
-  },
-};
-
 export function App() {
   const [souls, setSouls] = useState<SoulSummary[]>([]);
   const [archivedSouls, setArchivedSouls] = useState<SoulSummary[]>([]);
@@ -640,104 +458,48 @@ export function App() {
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providerProfiles]);
-  const [narratorProviderProfileName, setNarratorProviderProfileName] = useState("Narrator API");
-  const [updaterProviderProfileName, setUpdaterProviderProfileName] = useState("Updater API");
-  const [selectedProviderProfileId, setSelectedProviderProfileId] = useState(() =>
-    localStorage.getItem(NARRATOR_PROVIDER_PROFILE_STORAGE_KEY) ?? "",
-  );
-  const [selectedStateUpdaterProfileId, setSelectedStateUpdaterProfileId] = useState(() =>
-    localStorage.getItem(UPDATER_PROVIDER_PROFILE_STORAGE_KEY) ?? "",
-  );
-  // The light, local repair model has its own provider slot, separate from the
-  // narrator and the (smart) evaluator. Empty = fall back to the evaluator's
-  // settings (and, once shipped, the embedded local model).
-  const [selectedRepairProfileId, setSelectedRepairProfileId] = useState(() =>
-    localStorage.getItem(REPAIR_PROVIDER_PROFILE_STORAGE_KEY) ?? "",
-  );
-  // Embedded local repair model (a llamafile the app spawns). Path is hardcoded
-  // by the user here; status is polled from the backend.
-  const [embeddedModelPath, setEmbeddedModelPath] = useState(
-    () => localStorage.getItem(EMBEDDED_MODEL_PATH_STORAGE_KEY) ?? "",
-  );
-  const [embeddedModel, setEmbeddedModel] = useState<EmbeddedModelStatus>({
-    running: false,
-    ready: false,
-    url: null,
-    model: null,
-  });
-  const [embeddedModelBusy, setEmbeddedModelBusy] = useState(false);
-  const [embeddedModelError, setEmbeddedModelError] = useState<string | null>(null);
+  const {
+    narratorProviderProfileName,
+    setNarratorProviderProfileName,
+    updaterProviderProfileName,
+    setUpdaterProviderProfileName,
+    selectedProviderProfileId,
+    setSelectedProviderProfileId,
+    selectedStateUpdaterProfileId,
+    setSelectedStateUpdaterProfileId,
+    selectedRepairProfileId,
+    setSelectedRepairProfileId,
+    useNarratorProviderForUpdater,
+    setUseNarratorProviderForUpdater,
+    devOverrideActive,
+    setDevOverrideActive,
+    apiSettings,
+    setApiSettings,
+    stateUpdaterSettings,
+    setStateUpdaterSettings,
+    generationPreferences,
+    setGenerationPreferences,
+    readingPreferences,
+    setReadingPreferences,
+    effectiveNarratorSettings,
+    evaluatorExecutionMode,
+    updateEvaluatorExecutionMode,
+    structuredEvaluatorTransport,
+    updateStructuredEvaluatorTransport,
+  } = useProviderSettings();
   const [retryRepairBusy, setRetryRepairBusy] = useState(false);
   const [formEvalBusy, setFormEvalBusy] = useState(false);
   const [formEvalReport, setFormEvalReport] = useState<SessionFormEvalReport | null>(null);
   // The permanent dev-shell side panel toggles between dev features (default) and
   // settings, so both are reachable without leaving the session.
   const [devPanelTab, setDevPanelTab] = useState<"dev" | "settings" | "benchmarks">("dev");
-  const [appDialog, setAppDialog] = useState<AppDialogState | null>(null);
-  const appDialogResolverRef = useRef<((result: AppDialogResult) => void) | null>(null);
-  // Mirror the path into a ref so the (once-registered) repair listener can
-  // auto-start the model without a stale closure.
-  const embeddedModelPathRef = useRef(embeddedModelPath);
-  useEffect(() => {
-    embeddedModelPathRef.current = embeddedModelPath;
-  }, [embeddedModelPath]);
-  // Shared in-flight start, so concurrent repair triggers don't each spawn a
-  // model (start kills the prior instance, which would thrash).
-  const localModelReadyPromiseRef = useRef<Promise<boolean> | null>(null);
-  const [useNarratorProviderForUpdater, setUseNarratorProviderForUpdater] = useState(
-    () => localStorage.getItem(USE_NARRATOR_FOR_UPDATER_STORAGE_KEY) !== "false",
-  );
-  const [devOverrideActive, setDevOverrideActive] = useState(false);
-  const [apiSettings, setApiSettings] = useState<ApiProviderSettings>({
-    base_url: "https://api.openai.com/v1",
-    api_key: "",
-    model: "",
-    system_prompt: loadStoredCustomNarratorPrompt(),
-    narrator_timeout_ms: null,
-    evaluator_timeout_ms: 25_000,
-    structured_evaluator_timeout_ms: 90_000,
-    diagnostic_evaluator_timeout_ms: 60_000,
-    evaluator_timeout_mode: "finite",
-    evaluator_mode: "evaluator_form_v1",
-    structured_evaluator_policy: "prefer",
-    structured_evaluator_max_retries: 1,
-    wait_for_evaluator_before_next_turn: true,
-    allow_send_with_stale_state: false,
-    evaluator_background_enabled: false,
-    anti_replay_forced_retry_enabled: false,
-  });
-  const [stateUpdaterSettings, setStateUpdaterSettings] = useState<ApiProviderSettings>({
-    base_url: "https://api.openai.com/v1",
-    api_key: "",
-    model: "",
-    system_prompt: "",
-    narrator_timeout_ms: null,
-    evaluator_timeout_ms: 25_000,
-    structured_evaluator_timeout_ms: 90_000,
-    diagnostic_evaluator_timeout_ms: 60_000,
-    evaluator_timeout_mode: "finite",
-    evaluator_mode: "evaluator_form_v1",
-    structured_evaluator_policy: "prefer",
-    structured_evaluator_max_retries: 1,
-    wait_for_evaluator_before_next_turn: true,
-    allow_send_with_stale_state: false,
-    evaluator_background_enabled: false,
-    anti_replay_forced_retry_enabled: false,
-  });
-  const [evaluatorExecutionMode, setEvaluatorExecutionMode] = useState<string>(
-    () => localStorage.getItem(EVALUATOR_EXECUTION_MODE_STORAGE_KEY) ?? "balanced",
-  );
-  const updateEvaluatorExecutionMode = (mode: string) => {
-    setEvaluatorExecutionMode(mode);
-    localStorage.setItem(EVALUATOR_EXECUTION_MODE_STORAGE_KEY, mode);
-  };
-  const [structuredEvaluatorTransport, setStructuredEvaluatorTransport] = useState<string>(
-    () => localStorage.getItem(STRUCTURED_EVALUATOR_TRANSPORT_STORAGE_KEY) ?? "auto",
-  );
-  const updateStructuredEvaluatorTransport = (transport: string) => {
-    setStructuredEvaluatorTransport(transport);
-    localStorage.setItem(STRUCTURED_EVALUATOR_TRANSPORT_STORAGE_KEY, transport);
-  };
+  const {
+    dialog: appDialog,
+    resolve: resolveAppDialog,
+    alert: alertDialog,
+    confirm: confirmDialog,
+    prompt: promptDialog,
+  } = useAppDialogs();
   const [lastTurnDebug, setLastTurnDebug] = useState<TurnDebug | null>(null);
   const [view, setView] = useState<AppView>("home"); // v2 overhaul: rail-driven views
   const [railCollapsed, setRailCollapsed] = useState(false);
@@ -757,6 +519,20 @@ export function App() {
   const [providerAlert, setProviderAlert] = useState<
     { title: string; detail?: string; hint?: string } | null
   >(null);
+  const {
+    path: embeddedModelPath,
+    setPath: setEmbeddedModelPath,
+    model: embeddedModel,
+    busy: embeddedModelBusy,
+    error: embeddedModelError,
+    setError: setEmbeddedModelError,
+    start: handleStartEmbeddedModel,
+    stop: handleStopEmbeddedModel,
+    ensureReady: ensureLocalRepairModelReady,
+  } = useEmbeddedRepairModel({
+    onStatus: setStatus,
+    onAlert: setProviderAlert,
+  });
   const [payloadCopied, setPayloadCopied] = useState(false);
   const [exportFeedback, setExportFeedback] = useState("");
   const [settingsDrawerOpen, setSettingsDrawerOpen] = useState(false);
@@ -767,81 +543,62 @@ export function App() {
   const [devCommandRunning, setDevCommandRunning] = useState(false);
   const [devCommandResult, setDevCommandResult] = useState<string | null>(null);
   const [devCommandError, setDevCommandError] = useState<string | null>(null);
-  const [structuredDiagnosticRunning, setStructuredDiagnosticRunning] = useState(false);
-  const [structuredDiagnosticResult, setStructuredDiagnosticResult] =
-    useState<StructuredEvaluatorDiagnosticSummary | null>(null);
-  const [structuredDiagnosticError, setStructuredDiagnosticError] = useState<string | null>(null);
-  const [benchmarkType, setBenchmarkType] = useState<BenchmarkType>("visible_ai_chat");
-  const [benchmarkTarget, setBenchmarkTarget] = useState<BenchmarkTarget>("current_session");
-  const [benchmarkTurnCount, setBenchmarkTurnCount] = useState(5);
-  const [benchmarkPlayerProfileId, setBenchmarkPlayerProfileId] = useState("");
-  const [benchmarkPlayerGoal, setBenchmarkPlayerGoal] = useState(
-    "Build cautious trust with the active Soul while respecting boundaries.",
-  );
-  // Default OFF: a live Visible AI Chat run should mirror a turn you typed so
-  // exported payloads/session show the real pipeline. Strict mode is an opt-in
-  // probe that pins the evaluator to structured tool-calling.
-  const [benchmarkStrictToolEvaluator, setBenchmarkStrictToolEvaluator] = useState(false);
-  const [benchmarkTransport, setBenchmarkTransport] = useState<ApiProviderSettings["structured_evaluator_transport"]>("tool_call");
-  const [benchmarkWaitForEvaluator, setBenchmarkWaitForEvaluator] = useState(true);
-  // Comparison benchmark: drive the opposing/user side with the traditional RP
-  // engine (full chat, no memory) so you watch it converse with your memory
-  // system live and compare continuity.
-  const [benchmarkTraditionalOpponent, setBenchmarkTraditionalOpponent] = useState(false);
-  const [benchmarkRunning, setBenchmarkRunning] = useState(false);
-  const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkSummary | null>(null);
-  const [benchmarkError, setBenchmarkError] = useState<string | null>(null);
-  // Live self-play: drives one visible `executeTurn` per turn via an effect so
-  // the AI-vs-AI exchange streams into the real chat instead of running headless.
-  const [benchmarkLiveActive, setBenchmarkLiveActive] = useState(false);
-  const [benchmarkTurnsRemaining, setBenchmarkTurnsRemaining] = useState(0);
-  const [benchmarkLivePhase, setBenchmarkLivePhase] = useState<BenchmarkTurnPhase | "idle" | "preparing" | "finalizing" | "stopping" | "failed">("idle");
-  const benchmarkCtxRef = useRef<BenchmarkLiveContext | null>(null);
-  const benchmarkTurnInFlightRef = useRef(false);
-  const benchmarkStopRef = useRef(false);
+  const {
+    jobsById: devJobsById,
+    dismissedJobIds: dismissedDevJobIds,
+    startJob: startTrackedDevJob,
+    updateJob: updateTrackedDevJob,
+    finishJob: finishTrackedDevJob,
+    appendHistory: appendTrackedDevJobHistory,
+    dismissJob: dismissTrackedDevJob,
+    ingestJob: ingestTrackedDevJob,
+    runOperation: runTrackedBackgroundOperation,
+  } = useDevJobs();
+  const {
+    liveBenchmarkJobIdRef,
+    structuredDiagnosticRunning,
+    setStructuredDiagnosticRunning,
+    structuredDiagnosticResult,
+    setStructuredDiagnosticResult,
+    structuredDiagnosticError,
+    setStructuredDiagnosticError,
+    benchmarkType,
+    setBenchmarkType,
+    benchmarkTarget,
+    setBenchmarkTarget,
+    benchmarkTurnCount,
+    setBenchmarkTurnCount,
+    benchmarkPlayerProfileId,
+    setBenchmarkPlayerProfileId,
+    benchmarkPlayerGoal,
+    setBenchmarkPlayerGoal,
+    benchmarkStrictToolEvaluator,
+    setBenchmarkStrictToolEvaluator,
+    benchmarkTransport,
+    setBenchmarkTransport,
+    benchmarkWaitForEvaluator,
+    setBenchmarkWaitForEvaluator,
+    benchmarkTraditionalOpponent,
+    setBenchmarkTraditionalOpponent,
+    benchmarkRunning,
+    setBenchmarkRunning,
+    benchmarkResult,
+    setBenchmarkResult,
+    benchmarkError,
+    setBenchmarkError,
+    benchmarkLiveActive,
+    setBenchmarkLiveActive,
+    benchmarkTurnsRemaining,
+    setBenchmarkTurnsRemaining,
+    benchmarkLivePhase,
+    setBenchmarkLivePhase,
+    benchmarkCtxRef,
+    benchmarkTurnInFlightRef,
+    benchmarkStopRef,
+  } = useBenchmarkController();
   // Latest evaluator/repair endpoint settings, kept fresh so the background
   // op-repair listener (registered once) always uses current config.
   const repairSettingsRef = useRef<ApiProviderSettings | null>(null);
-  function openAppDialog(dialog: AppDialogState): Promise<AppDialogResult> {
-    return new Promise((resolve) => {
-      appDialogResolverRef.current = resolve;
-      setAppDialog(dialog);
-    });
-  }
-  function resolveAppDialog(result: AppDialogResult) {
-    const resolver = appDialogResolverRef.current;
-    appDialogResolverRef.current = null;
-    setAppDialog(null);
-    resolver?.(result);
-  }
-  async function alertDialog(title: string, message?: string, terminal = false) {
-    await openAppDialog({ mode: "alert", title, message, terminal });
-  }
-  async function confirmDialog(title: string, message?: string, destructive = false, terminal = false) {
-    return (await openAppDialog({
-      mode: "confirm",
-      title,
-      message,
-      destructive,
-      terminal,
-      confirmLabel: destructive ? "Confirm" : "Continue",
-    })) === true;
-  }
-  async function promptDialog(
-    title: string,
-    defaultValue = "",
-    options: { message?: string; textarea?: boolean; placeholder?: string; confirmLabel?: string } = {},
-  ) {
-    const result = await openAppDialog({
-      mode: options.textarea ? "textarea" : "prompt",
-      title,
-      message: options.message,
-      defaultValue,
-      placeholder: options.placeholder,
-      confirmLabel: options.confirmLabel,
-    });
-    return typeof result === "string" ? result : null;
-  }
   const [disclaimerMode, setDisclaimerMode] = useState<DisclaimerMode>(() =>
     hasAcceptedDisclaimerVersion() ? null : "launch",
   );
@@ -860,17 +617,6 @@ export function App() {
   const settingImportInputRef = useRef<HTMLInputElement>(null);
   const avatarInputRef = useRef<HTMLInputElement>(null);
   const chatImageInputRef = useRef<HTMLInputElement>(null);
-  const generationAbortRef = useRef<AbortController | null>(null);
-  const generationIdRef = useRef(0);
-  const activeGenerationRef = useRef<ActiveGeneration | null>(null);
-  const chatOnlyBodyRef = useRef<HTMLElement>(null);
-  const chatBottomRef = useRef<HTMLDivElement>(null);
-  const isPinnedToBottomRef = useRef(true);
-  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
-  const [chatMoreMenuOpen, setChatMoreMenuOpen] = useState(false);
-  const chatMoreMenuRef = useRef<HTMLDivElement | null>(null);
-  const chatMoreButtonRef = useRef<HTMLButtonElement | null>(null);
-  const personaModalRef = useRef<HTMLDivElement | null>(null);
   // In-session Dev Mode: a terminal-CLI re-skin of the session (matrix/phosphor).
   const [devModeActive, setDevModeActive] = useState(false);
   const [devTerminalInput, setDevTerminalInput] = useState("");
@@ -883,6 +629,28 @@ export function App() {
     [setting?.setting_id, soul?.character_id],
   );
   const currentConversationId = activeConversationId ?? defaultConversationId;
+  const {
+    generationAbortRef,
+    generationIdRef,
+    activeGenerationRef,
+    chatOnlyBodyRef,
+    chatBottomRef,
+    isPinnedToBottomRef,
+    showJumpToLatest,
+    setShowJumpToLatest,
+    chatMoreMenuOpen,
+    setChatMoreMenuOpen,
+    chatMoreMenuRef,
+    chatMoreButtonRef,
+    personaModalRef,
+    scrollChatToBottom,
+    handleChatScroll,
+    jumpToLatest,
+  } = useChatController({
+    active: view === "chat",
+    conversationId: currentConversationId,
+    messages,
+  });
   const currentConversationIdRef = useRef(currentConversationId);
   const visibleConversations = useMemo(
     () =>
@@ -951,69 +719,6 @@ export function App() {
     }
   });
 
-  // Poll embedded model status on mount and while it's starting (running but not
-  // ready), until it's ready or stopped.
-  useEffect(() => {
-    let active = true;
-    let timer: number | undefined;
-    const tick = async () => {
-      try {
-        const status = await embeddedRepairModelStatus();
-        if (!active) return;
-        setEmbeddedModel(status);
-        if (status.running && !status.ready) {
-          timer = window.setTimeout(() => void tick(), 2000);
-        }
-      } catch {
-        // leave last-known status in place
-      }
-    };
-    void tick();
-    return () => {
-      active = false;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, [embeddedModel.running]);
-
-  async function handleStartEmbeddedModel() {
-    if (!embeddedModelPath.trim()) {
-      setEmbeddedModelError("Set the path to your llamafile first.");
-      return;
-    }
-    setEmbeddedModelBusy(true);
-    setEmbeddedModelError(null);
-    try {
-      const status = await startEmbeddedRepairModel(embeddedModelPath.trim(), 8080, null);
-      setEmbeddedModel(status);
-      setStatus("Embedded repair model starting...");
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      setEmbeddedModelError(detail);
-      setProviderAlert({
-        title: "Local repair model failed to start",
-        detail,
-        hint: "Check the llamafile path in Settings, or that the file is runnable.",
-      });
-    } finally {
-      setEmbeddedModelBusy(false);
-    }
-  }
-
-  async function handleStopEmbeddedModel() {
-    setEmbeddedModelBusy(true);
-    try {
-      await stopEmbeddedRepairModel();
-      setEmbeddedModel({ running: false, ready: false, url: null, model: null });
-    } catch (error) {
-      setEmbeddedModelError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setEmbeddedModelBusy(false);
-    }
-  }
-
-  // Re-run local repair (re-extraction) on every turn of the current session,
-  // using the configured repair endpoint. Lets the user recover state that was
-  // dropped when repair was unavailable without re-running the whole benchmark.
   async function handleRetrySessionRepair() {
     const settings = repairSettingsRef.current;
     const conversationId = currentConversationId;
@@ -1026,6 +731,10 @@ export function App() {
       return;
     }
     setRetryRepairBusy(true);
+    const repairJobId = startTrackedDevJob("repair", "Session Repair", {
+      phase: "loading_turns",
+      detail: "Preparing active assistant turns for re-extraction",
+    });
     try {
       const targetsLocal = /\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)/i.test(settings.base_url ?? "");
       if (targetsLocal) {
@@ -1044,74 +753,69 @@ export function App() {
         (message) => message.role === "assistant" && message.status === "active",
       );
       let fired = 0;
-      for (const message of assistantTurns) {
+      updateTrackedDevJob(repairJobId, {
+        total: assistantTurns.length,
+        phase: "reextracting",
+        detail: `${assistantTurns.length} turn(s) eligible for repair`,
+      });
+      for (const [index, message] of assistantTurns.entries()) {
         try {
           // reextract: re-derive durable state for the turn; turns without a
           // baseline patch (e.g. the opening message) error out and are skipped.
           await repairEvaluatorOps(conversationId, message.id, [], settings, "reextract");
           fired += 1;
-        } catch {
+          appendTrackedDevJobHistory(
+            repairJobId,
+            {
+              index: index + 1,
+              label: `Turn ${message.turn_id ?? message.id}`,
+              status: "succeeded",
+              detail: "Repair queued",
+              elapsed_ms: null,
+            },
+            {
+              current: index + 1,
+              succeeded: fired,
+              recovered: fired,
+              phase: "reextracting",
+            },
+          );
+        } catch (error) {
           // skip turns that can't be repaired
+          appendTrackedDevJobHistory(
+            repairJobId,
+            {
+              index: index + 1,
+              label: `Turn ${message.turn_id ?? message.id}`,
+              status: "skipped",
+              detail: error instanceof Error ? error.message : String(error),
+              elapsed_ms: null,
+            },
+            {
+              current: index + 1,
+              succeeded: fired,
+              recovered: fired,
+            },
+          );
         }
       }
       setStatus(`Retry repair fired for ${fired} turn(s); state updates in the background.`);
+      finishTrackedDevJob(repairJobId, "succeeded", {
+        current: assistantTurns.length,
+        total: assistantTurns.length,
+        succeeded: fired,
+        recovered: fired,
+        detail: `Repair queued for ${fired}/${assistantTurns.length} turn(s)`,
+      });
     } catch (error) {
       reportError(error, "Retry session repair failed", "state_updater");
+      finishTrackedDevJob(repairJobId, "failed", {
+        failed: 1,
+        detail: error instanceof Error ? error.message : String(error),
+      });
     } finally {
       setRetryRepairBusy(false);
     }
-  }
-
-  // Ensure the embedded repair model is actually answering: return true if ready,
-  // otherwise auto-start it (if a path is configured) and poll until ready or
-  // timeout. Concurrent callers share one start via localModelReadyPromiseRef so
-  // we never spawn duplicate servers. Reads the path from a ref to stay valid in
-  // the once-registered repair listener.
-  function ensureLocalRepairModelReady(timeoutMs = 90000): Promise<boolean> {
-    if (!localModelReadyPromiseRef.current) {
-      localModelReadyPromiseRef.current = (async () => {
-        let status: EmbeddedModelStatus | null = null;
-        try {
-          status = await embeddedRepairModelStatus();
-        } catch {
-          status = null;
-        }
-        if (status?.ready) return true;
-        // CRITICAL: only spawn when nothing is running. A running-but-not-ready
-        // model is loading or just busy under load, and start_embedded_repair_model
-        // KILLS the existing instance first. Restarting a busy model mid-repair is a
-        // death spiral on slow CPUs (a /health timeout during generation looks like
-        // "not ready", we kill it, the in-flight repair hits a dead port). So if it's
-        // already running, just wait for it.
-        if (!status?.running) {
-          const path = embeddedModelPathRef.current.trim();
-          if (!path) return false;
-          try {
-            await startEmbeddedRepairModel(path, 8080, null);
-            setStatus("Starting local repair model...");
-          } catch (error) {
-            setEmbeddedModelError(error instanceof Error ? error.message : String(error));
-            return false;
-          }
-        }
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-          try {
-            const status = await embeddedRepairModelStatus();
-            setEmbeddedModel(status);
-            if (status.ready) return true;
-            if (!status.running) return false; // child died (e.g. bad flag / crash)
-          } catch {
-            // keep polling until the deadline
-          }
-        }
-        return false;
-      })().finally(() => {
-        localModelReadyPromiseRef.current = null;
-      });
-    }
-    return localModelReadyPromiseRef.current;
   }
 
   // Auto-fire background op-repair: when the evaluator drops ops (its own
@@ -1263,54 +967,6 @@ export function App() {
     };
   }, [providerProfiles]);
 
-  function scrollChatToBottom() {
-    const body = chatOnlyBodyRef.current;
-    if (!body) return;
-    body.scrollTop = body.scrollHeight;
-    chatBottomRef.current?.scrollIntoView({ block: "end" });
-  }
-
-  function handleChatScroll() {
-    const body = chatOnlyBodyRef.current;
-    if (!body) return;
-    const distanceFromBottom = body.scrollHeight - body.scrollTop - body.clientHeight;
-    const pinned = distanceFromBottom <= 80;
-    isPinnedToBottomRef.current = pinned;
-    setShowJumpToLatest((prev) => (prev === !pinned ? prev : !pinned));
-  }
-
-  function jumpToLatest() {
-    isPinnedToBottomRef.current = true;
-    setShowJumpToLatest(false);
-    scrollChatToBottom();
-  }
-
-  // Entering a chat / switching sessions snaps to bottom and re-pins.
-  useLayoutEffect(() => {
-    if (view !== "chat") return;
-    const body = chatOnlyBodyRef.current;
-    if (!body) return;
-    isPinnedToBottomRef.current = true;
-    setShowJumpToLatest(false);
-    let secondFrame = 0;
-    scrollChatToBottom();
-    const frame = window.requestAnimationFrame(() => {
-      scrollChatToBottom();
-      secondFrame = window.requestAnimationFrame(scrollChatToBottom);
-    });
-    return () => {
-      window.cancelAnimationFrame(frame);
-      window.cancelAnimationFrame(secondFrame);
-    };
-  }, [view, currentConversationId]);
-
-  // Magnetic follow: track newest output (incl. streaming) only while pinned.
-  useLayoutEffect(() => {
-    if (view !== "chat") return;
-    if (!isPinnedToBottomRef.current) return;
-    scrollChatToBottom();
-  }, [view, messages]);
-
   useEffect(() => {
     if (!devModeActive) return;
     const el = devStreamRef.current;
@@ -1343,6 +999,20 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(CUSTOM_NARRATOR_PROMPT_STORAGE_KEY, apiSettings.system_prompt);
   }, [apiSettings.system_prompt]);
+
+  useEffect(() => {
+    localStorage.setItem(GENERATION_PREFERENCES_STORAGE_KEY, JSON.stringify(generationPreferences));
+  }, [generationPreferences]);
+
+  useEffect(() => {
+    localStorage.setItem(READING_PREFERENCES_STORAGE_KEY, JSON.stringify(readingPreferences));
+    const root = document.documentElement;
+    root.style.setProperty("--chat-reading-size", `${readingPreferences.proseSize}px`);
+    root.style.setProperty("--chat-reading-line-height", String(readingPreferences.lineHeight));
+    root.style.setProperty("--chat-reading-width", `${readingPreferences.columnWidth}px`);
+    root.style.setProperty("--chat-message-gap", readingPreferences.compactSpacing ? "10px" : "16px");
+    root.style.setProperty("--chat-message-padding-y", readingPreferences.compactSpacing ? "10px" : "14px");
+  }, [readingPreferences]);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS_DRAWER_TAB_STORAGE_KEY, settingsTab);
@@ -1469,6 +1139,11 @@ export function App() {
     apiSettings.base_url,
     apiSettings.model,
     apiSettings.system_prompt,
+    generationPreferences.temperature,
+    generationPreferences.topP,
+    generationPreferences.frequencyPenalty,
+    generationPreferences.presencePenalty,
+    generationPreferences.maxTokens,
     stateUpdaterSettings.base_url,
     stateUpdaterSettings.model,
     contextMode,
@@ -1590,6 +1265,50 @@ export function App() {
       if (!active) return;
       if (job.conversation_id !== currentConversationIdRef.current) return;
       setActiveEvaluatorJob(job);
+      const evaluatorStatus =
+        job.status === "pending" || job.status === "running"
+          ? "running"
+          : job.status === "canceled"
+            ? "canceled"
+            : evaluatorJobRefreshesState(job)
+              ? "succeeded"
+              : "failed";
+      const evaluatorTerminal = evaluatorStatus !== "running";
+      const evaluatorProgress: BackgroundJobProgress = {
+        job_id: `evaluator:${job.evaluator_job_id}`,
+        kind: "evaluator",
+        label: "State Evaluator",
+        status: evaluatorStatus,
+        phase: job.status,
+        current: evaluatorTerminal ? 1 : 0,
+        total: 1,
+        succeeded: evaluatorStatus === "succeeded" ? 1 : 0,
+        failed: evaluatorStatus === "failed" ? 1 : 0,
+        recovered: job.status === "partial_success" ? 1 : 0,
+        started_at: job.started_at,
+        updated_at: job.completed_at ?? Math.floor(Date.now() / 1_000),
+        elapsed_ms: job.elapsed_ms ?? 0,
+        estimated_remaining_ms:
+          evaluatorTerminal || !job.timeout_ms
+            ? evaluatorTerminal
+              ? 0
+              : null
+            : Math.max(0, job.timeout_ms - (job.elapsed_ms ?? 0)),
+        detail: job.error_message ?? `${job.provider ?? "provider"} / ${job.model ?? "model"}`,
+        cancellable: !evaluatorTerminal,
+        history: evaluatorTerminal
+          ? [
+              {
+                index: 1,
+                label: "Evaluator",
+                status: evaluatorStatus,
+                detail: job.error_message ?? null,
+                elapsed_ms: job.elapsed_ms ?? null,
+              },
+            ]
+          : [],
+      };
+      ingestTrackedDevJob(evaluatorProgress);
       if (job.status === "running" || job.status === "pending") {
         setStatus("Updating memory/state...");
       } else if (evaluatorJobRefreshesState(job)) {
@@ -1642,6 +1361,24 @@ export function App() {
       if (cleanupFn) {
         cleanupFn();
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let cleanupFn: (() => void) | undefined;
+
+    void listenBackgroundJobProgress((progress) => {
+      if (!active) return;
+      ingestTrackedDevJob(progress);
+    }).then((cleanup) => {
+      cleanupFn = cleanup;
+      if (!active) cleanup();
+    });
+
+    return () => {
+      active = false;
+      cleanupFn?.();
     };
   }, []);
 
@@ -2014,7 +1751,7 @@ export function App() {
         soulId,
         userText,
         mode,
-        apiSettings,
+        effectiveNarratorSettings,
         provider,
         contextMode,
       );
@@ -2210,7 +1947,7 @@ export function App() {
               soul.character_id,
               text,
               mode,
-              apiSettings,
+              effectiveNarratorSettings,
               {
                 ...(useNarratorProviderForUpdater ? apiSettings : stateUpdaterSettings),
                 evaluator_execution_mode: evaluatorExecutionMode,
@@ -2636,7 +2373,15 @@ export function App() {
     if (!path) return;
     try {
       setStatus("Validating bundle...");
-      const report = await validateMneBundle(path);
+      const report = await runTrackedBackgroundOperation(
+        "validation",
+        "Validate .mne bundle",
+        () => validateMneBundle(path),
+        {
+          detail: path,
+          successDetail: (result) => result.valid ? "Bundle is valid" : "Bundle validation failed",
+        },
+      );
       logDev("info", "app", "MNE Validation Report", report);
       if (report.valid) {
         await alertDialog("Bundle is valid", `Soul: ${report.summary.soul_name || "N/A"}\nWorld: ${report.summary.world_name || "N/A"}\nMessages: ${report.summary.message_count}\nMemories: ${report.summary.memory_count}\nRelationships: ${report.summary.relationship_count}`);
@@ -2659,7 +2404,16 @@ export function App() {
     if (!path) return;
     try {
       setStatus("Previewing bundle...");
-      const report = await previewMneImport(path);
+      const report = await runTrackedBackgroundOperation(
+        "import",
+        "Preview .mne import",
+        () => previewMneImport(path),
+        {
+          detail: path,
+          successDetail: (result) =>
+            `${result.summary.message_count} messages; ${result.summary.memory_count} memories`,
+        },
+      );
       logDev("info", "app", "MNE Preview Report", report);
       await alertDialog("MNE preview", `Soul: ${report.summary.soul_name || "N/A"} (${report.summary.soul_id || "N/A"})\nWorld: ${report.summary.world_name || "N/A"} (${report.summary.world_id || "N/A"})\nMessages: ${report.summary.message_count}\nMemories: ${report.summary.memory_count}\nObject States: ${report.summary.object_state_count}\nRelationships: ${report.summary.relationship_count}\nPayload Logs: ${report.summary.payload_log_count}`);
     } catch (err: any) {
@@ -2678,7 +2432,15 @@ export function App() {
     if (!path) return;
     try {
       setStatus("Importing bundle...");
-      const result = await importMneAsNew(path);
+      const result = await runTrackedBackgroundOperation(
+        "import",
+        "Import .mne as new copy",
+        () => importMneAsNew(path),
+        {
+          detail: path,
+          successDetail: (importResult) => importResult.summary,
+        },
+      );
       logDev("info", "app", "MNE Import Result", result);
       await alertDialog("Import successful", `Summary: ${result.summary}\nRemapped IDs count: ${Object.keys(result.remapped_ids).length}`);
       setSouls(await listSouls());
@@ -2698,7 +2460,15 @@ export function App() {
       logDev("info", "app", "Visible chat export started", {
         conversation_id: currentConversationId,
       });
-      const result = await exportVisibleChatLog(currentConversationId);
+      const result = await runTrackedBackgroundOperation(
+        "export",
+        "Export visible chat log",
+        () => exportVisibleChatLog(currentConversationId),
+        {
+          detail: `Session ${currentConversationId}`,
+          successDetail: (exportResult) => exportResult.path,
+        },
+      );
       const message = `${result.message} ${result.path}`;
       setExportFeedback(message);
       setStatus(message);
@@ -2721,7 +2491,15 @@ export function App() {
       logDev("info", "app", "LLM payload history export started", {
         conversation_id: currentConversationId,
       });
-      const result = await exportLlmPayloadHistory(currentConversationId);
+      const result = await runTrackedBackgroundOperation(
+        "export",
+        "Export LLM payload history",
+        () => exportLlmPayloadHistory(currentConversationId),
+        {
+          detail: `Session ${currentConversationId}`,
+          successDetail: (exportResult) => exportResult.path,
+        },
+      );
       const message = `${result.message} ${result.path}`;
       setExportFeedback(message);
       setStatus(message);
@@ -2761,43 +2539,9 @@ export function App() {
     await refreshAssistantVariants(conversationId, nextMessages);
   }
 
-  function parseDevCommandArgs(): Record<string, unknown> {
-    const trimmed = devCommandArgs.trim();
-    if (!trimmed) return {};
-    const parsed = JSON.parse(trimmed) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("JSON args must be an object.");
-    }
-    return parsed as Record<string, unknown>;
-  }
-
-  function devStringArg(args: Record<string, unknown>, ...keys: string[]) {
-    for (const key of keys) {
-      const value = args[key];
-      if (typeof value === "string" && value.trim()) return value.trim();
-    }
-    return null;
-  }
-
-  function devNumberArg(args: Record<string, unknown>, key: string, fallback: number) {
-    const value = args[key];
-    const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
-    return Number.isFinite(parsed) ? parsed : fallback;
-  }
-
-  function devBooleanArg(args: Record<string, unknown>, key: string, fallback: boolean) {
-    const value = args[key];
-    if (typeof value === "boolean") return value;
-    if (typeof value === "string") {
-      if (value.toLowerCase() === "true") return true;
-      if (value.toLowerCase() === "false") return false;
-    }
-    return fallback;
-  }
-
   async function runWhitelistedDevCommand(commandName: DevCommandName, argsOverride?: Record<string, unknown>) {
     if (!import.meta.env.DEV) return;
-    const args = argsOverride ?? parseDevCommandArgs();
+    const args = argsOverride ?? parseDevCommandArgs(devCommandArgs);
     const conversationId =
       typeof args.conversationId === "string" && args.conversationId.trim()
         ? args.conversationId.trim()
@@ -2908,7 +2652,7 @@ export function App() {
           devStringArg(args, "soul_id", "soulId") ?? soul.character_id,
           devStringArg(args, "setting_id", "settingId") ?? setting?.setting_id ?? null,
           devStringArg(args, "provider") ?? provider,
-          apiSettings,
+          effectiveNarratorSettings,
           updaterSettings,
           benchmarkSettings,
         );
@@ -2932,6 +2676,13 @@ export function App() {
     setDevCommandRunning(true);
     setDevCommandResult(null);
     setDevCommandError(null);
+    const devJobId =
+      commandName === "run_benchmark"
+        ? null
+        : startTrackedDevJob("dev_command", commandName.replace(/_/g, " "), {
+            phase: "running",
+            detail: conversationId ? `Session ${conversationId}` : "Global command",
+          });
     try {
       const result = await runWhitelistedDevCommand(commandName, argsOverride);
       const formatted = JSON.stringify(result, null, 2);
@@ -2967,6 +2718,12 @@ export function App() {
       } else if (conversationId) {
         await refreshActiveSessionAfterDevCommand(conversationId);
       }
+      finishTrackedDevJob(devJobId, "succeeded", {
+        current: 1,
+        total: 1,
+        succeeded: 1,
+        detail: `Completed ${commandName}`,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setDevCommandError(message);
@@ -2975,6 +2732,12 @@ export function App() {
         command: commandName,
         conversation_id: conversationId,
         error: message,
+      });
+      finishTrackedDevJob(devJobId, "failed", {
+        current: 1,
+        total: 1,
+        failed: 1,
+        detail: message,
       });
     } finally {
       setDevCommandRunning(false);
@@ -3942,7 +3705,7 @@ export function App() {
         soul.character_id,
         setting?.setting_id ?? null,
         provider,
-        apiSettings,
+        effectiveNarratorSettings,
         updaterSettings,
         settingsPayload,
       );
@@ -3983,33 +3746,6 @@ export function App() {
   //   - "Strict Tool Evaluator": opt-in probe that pins the evaluator to
   //     structured tool-calling. OFF (default for faithful repro) = your exact
   //     chat evaluator settings flow through untouched.
-  function benchmarkLiveUpdaterOverride(settings: BenchmarkSettings): Partial<ApiProviderSettings> {
-    const waitOverride: Partial<ApiProviderSettings> = settings.wait_for_evaluator_each_turn
-      ? {
-          // Background so a job row is created and `evaluator_job_status_changed`
-          // events fire, the tracker UI updates. The loop (waitForBenchmark-
-          // EvaluatorJob) blocks on the job before capturing the turn summary
-          // and the next message, so state is committed in order.
-          evaluator_background_enabled: true,
-          // The frontend waits for the primary evaluator job below. Do not also
-          // block the next narrator on best-effort repair jobs that may outlive it.
-          wait_for_evaluator_before_next_turn: false,
-          allow_send_with_stale_state: true,
-        }
-      : {};
-    if (!settings.strict_tool_evaluator) {
-      // Faithful repro: no evaluator overrides, just the turn sequencing.
-      return waitOverride;
-    }
-    return {
-      ...waitOverride,
-      evaluator_mode: settings.evaluator_mode ?? undefined,
-      structured_evaluator_transport: settings.structured_evaluator_transport ?? undefined,
-      structured_evaluator_policy: settings.structured_evaluator_policy ?? undefined,
-      structured_evaluator_max_retries: settings.structured_evaluator_max_retries ?? undefined,
-    };
-  }
-
   // Wait between live benchmark turns until the background evaluator has
   // committed. EVENT-DRIVEN: resolves the instant the job's completion event
   // arrives (no poll lag), which is why this is much faster than the old 700ms
@@ -4072,6 +3808,12 @@ export function App() {
     updaterSettings: ApiProviderSettings,
   ) {
     if (!soul) return;
+    liveBenchmarkJobIdRef.current = startTrackedDevJob("benchmark", "Live Benchmark", {
+      total: settingsPayload.turn_count,
+      phase: "preparing",
+      detail: `${benchmarkType} / ${benchmarkTarget}`,
+      cancellable: true,
+    });
     setBenchmarkRunning(true);
     setBenchmarkResult(null);
     setBenchmarkError(null);
@@ -4082,6 +3824,10 @@ export function App() {
     // instead of silently connection-refusing. Non-fatal: if it won't start, we
     // warn and run anyway (the scorecard reports local_repair_unavailable).
     if (embeddedModelPath.trim()) {
+      updateTrackedDevJob(liveBenchmarkJobIdRef.current, {
+        phase: "repair_model_startup",
+        detail: "Ensuring the local repair model is ready",
+      });
       setStatus("Ensuring local repair model is up...");
       // Single shared implementation (also used by the repair listener): starts
       // the model if needed and waits for it to actually answer before turn 1.
@@ -4117,7 +3863,7 @@ export function App() {
         playerGoal: settingsPayload.player_goal,
         traditionalOpponent: benchmarkTraditionalOpponent,
         settings: settingsPayload,
-        narratorSettings: apiSettings,
+        narratorSettings: effectiveNarratorSettings,
         updaterSettings: liveUpdaterSettings,
         initialMemoryCount: init.initial_memory_count,
         initialObjectCount: init.initial_object_count,
@@ -4138,6 +3884,10 @@ export function App() {
       setBenchmarkTurnsRemaining(settingsPayload.turn_count);
       setBenchmarkLiveActive(true);
       setBenchmarkLivePhase("player_generation");
+      updateTrackedDevJob(liveBenchmarkJobIdRef.current, {
+        phase: "player_generation",
+        detail: `Starting cycle 1/${settingsPayload.turn_count}`,
+      });
       setStatus(`Live benchmark running: 0/${settingsPayload.turn_count} turns`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4147,43 +3897,12 @@ export function App() {
       reportError(error, "Benchmark failed", "app");
       setBenchmarkRunning(false);
       setBenchmarkLivePhase("failed");
+      finishTrackedDevJob(liveBenchmarkJobIdRef.current, "failed", {
+        phase: "preparing",
+        failed: 1,
+        detail: message,
+      });
     }
-  }
-
-  function turnResultEvaluatorCompletedOrSkipped(result: any): boolean {
-    const status = result?.debug?.state_updater_status;
-    if (!status) return false;
-    return status.startsWith("background_") || ["completed", "partial_success", "some_rows_rejected", "stale_skipped"].includes(status);
-  }
-
-  function benchmarkEvaluatorJobCompletedOrSkipped(job: any): boolean {
-    if (!job) return false;
-    return ["completed", "partial_success", "some_rows_rejected", "stale_skipped"].includes(job.status);
-  }
-
-  function fallbackBenchmarkTurnSummary(
-    turnIndex: number,
-    stage: string,
-    userText: string,
-    error: string,
-    stateUpdaterSettings: any,
-  ): BenchmarkTurnSummary {
-    return {
-      turn_index: turnIndex,
-      stage,
-      simulated_user_message: userText,
-      narrator_response_present: false,
-      narrator_error: error,
-      evaluator_mode: stateUpdaterSettings.evaluator_mode || "evaluator_form_v1",
-      tool_calls_present: false,
-      tool_call_count: 0,
-      structured_retry_count: 0,
-      fallback_path: [],
-      syntactic_repair_used: false,
-      memory_count_after: 0,
-      object_count_after: 0,
-      relationship_summary_after: "",
-    };
   }
 
   async function runOneBenchmarkTurn() {
@@ -4199,6 +3918,11 @@ export function App() {
     try {
       const opponentLabel = ctx.traditionalOpponent ? "Traditional RP" : "AI player";
       setBenchmarkLivePhase("player_generation");
+      updateTrackedDevJob(liveBenchmarkJobIdRef.current, {
+        phase: "player_generation",
+        current: turnIndex,
+        detail: `${turnLabel}: ${opponentLabel} thinking`,
+      });
       setStatus(`${turnLabel}: ${opponentLabel} thinking...`);
       const generate = ctx.traditionalOpponent
         ? generateTraditionalRpMessage
@@ -4217,6 +3941,10 @@ export function App() {
       // Send as a visible user turn; the narrator streams its reply live.
       phase = "execute_turn";
       setBenchmarkLivePhase("execute_turn");
+      updateTrackedDevJob(liveBenchmarkJobIdRef.current, {
+        phase: "turn_pipeline",
+        detail: `${turnLabel}: narrator and evaluator pipeline`,
+      });
       const result = await executeTurn(
         playerText,
         turnLabel,
@@ -4245,6 +3973,10 @@ export function App() {
       ) {
         phase = "evaluator_wait";
         setBenchmarkLivePhase("evaluator_wait");
+        updateTrackedDevJob(liveBenchmarkJobIdRef.current, {
+          phase: "evaluator_wait",
+          detail: `${turnLabel}: waiting for state commit`,
+        });
         setStatus(`${turnLabel}: waiting for evaluator...`);
         const evaluatorJob = await waitForBenchmarkEvaluatorJob(ctx.conversationId);
         if (benchmarkStopRef.current) {
@@ -4275,6 +4007,28 @@ export function App() {
       phase = "completed";
       setBenchmarkLivePhase("completed");
       setBenchmarkTurnsRemaining((remaining) => remaining - 1);
+      const liveElapsedMs = Math.max(0, Date.now() - ctx.startedAt * 1_000);
+      const averageCycleMs = liveElapsedMs / Math.max(1, ctx.completedTurns);
+      appendTrackedDevJobHistory(
+        liveBenchmarkJobIdRef.current,
+        {
+          index: turnIndex + 1,
+          label: `Cycle ${turnIndex + 1}`,
+          status: "succeeded",
+          detail: "Narrator and evaluator pipeline completed",
+          elapsed_ms: null,
+        },
+        {
+          phase: "cycle_complete",
+          current: ctx.completedTurns,
+          succeeded: ctx.completedTurns,
+          estimated_remaining_ms: Math.max(
+            0,
+            Math.round(averageCycleMs * (ctx.settings.turn_count - ctx.completedTurns)),
+          ),
+          detail: `Completed cycle ${ctx.completedTurns}/${ctx.settings.turn_count}`,
+        },
+      );
       setStatus(`Live benchmark running: ${ctx.completedTurns}/${ctx.settings.turn_count} turns`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4363,6 +4117,26 @@ export function App() {
       benchmarkStopRef.current = true;
       setBenchmarkTurnsRemaining(0);
       setBenchmarkLivePhase("failed");
+      appendTrackedDevJobHistory(
+        liveBenchmarkJobIdRef.current,
+        {
+          index: turnIndex + 1,
+          label: `Cycle ${turnIndex + 1}`,
+          status: "failed",
+          detail: message,
+          elapsed_ms: null,
+        },
+        {
+          status: "failed",
+          phase: stage,
+          current: ctx.completedTurns,
+          succeeded: ctx.completedTurns,
+          failed: 1,
+          estimated_remaining_ms: 0,
+          cancellable: false,
+          detail: message,
+        },
+      );
       logDev("warn", "app", "Live benchmark turn failed", {
         conversation_id: ctx.conversationId,
         turn_index: turnIndex,
@@ -4380,6 +4154,10 @@ export function App() {
     benchmarkTurnInFlightRef.current = true;
     setBenchmarkLiveActive(false);
     setBenchmarkLivePhase("finalizing");
+    updateTrackedDevJob(liveBenchmarkJobIdRef.current, {
+      phase: "finalizing",
+      detail: "Exporting artifacts and computing scorecard",
+    });
     setStatus("Finalizing benchmark...");
     try {
       const summary = await finalizeBenchmark(
@@ -4413,17 +4191,37 @@ export function App() {
         failure_reasons: summary.scorecard.failure_reasons,
         summary_json_path: summary.summary_json_path,
       });
+      finishTrackedDevJob(
+        liveBenchmarkJobIdRef.current,
+        summary.scorecard.pass ? "succeeded" : "failed",
+        {
+          current: summary.turn_count_completed,
+          total: summary.turn_count_requested,
+          succeeded: summary.turn_count_completed,
+          failed: summary.scorecard.pass ? 0 : Math.max(1, summary.narrator_failures + summary.evaluator_failures),
+          recovered: summary.retry_success_count,
+          detail: summary.scorecard.pass
+            ? "Benchmark passed"
+            : summary.scorecard.failure_reasons.join("; "),
+        },
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setBenchmarkError(message);
       setStatus(`Benchmark failed: ${message}`);
       reportError(error, "Benchmark failed", "app");
+      finishTrackedDevJob(liveBenchmarkJobIdRef.current, "failed", {
+        phase: "finalizing",
+        failed: 1,
+        detail: message,
+      });
     } finally {
       benchmarkCtxRef.current = null;
       benchmarkStopRef.current = false;
       benchmarkTurnInFlightRef.current = false;
       setBenchmarkRunning(false);
       setBenchmarkLivePhase("idle");
+      liveBenchmarkJobIdRef.current = null;
     }
   }
 
@@ -4432,6 +4230,11 @@ export function App() {
     benchmarkStopRef.current = true;
     setBenchmarkLivePhase("stopping");
     setBenchmarkTurnsRemaining(0);
+    updateTrackedDevJob(liveBenchmarkJobIdRef.current, {
+      status: "stopping",
+      phase: "stopping",
+      detail: "Cancel requested; waiting for the active call to stop",
+    });
     // Abort any in-flight narrator stream so Stop takes effect immediately
     // rather than waiting out the current turn's network call. (A player-line
     // call already in flight is a backend command and can't be aborted, but its
@@ -4712,7 +4515,15 @@ export function App() {
     if (!soul) return;
     setBusy(true);
     try {
-      const result = await exportCharacterSoulMne(soul.character_id, "");
+      const result = await runTrackedBackgroundOperation(
+        "export",
+        "Export Soul .mne",
+        () => exportCharacterSoulMne(soul.character_id, ""),
+        {
+          detail: soul.character_name,
+          successDetail: (exportResult) => exportResult.path,
+        },
+      );
       setStatus(`Soul .mne exported: ${result.path}`);
       logDev("success", "app", "Soul .mne exported", {
         path: result.path,
@@ -4734,7 +4545,15 @@ export function App() {
       const nextSetting = applySettingFields(setting);
       await upsertSetting(nextSetting);
       setSetting(nextSetting);
-      const result = await exportWorldSettingMne(nextSetting.setting_id, "");
+      const result = await runTrackedBackgroundOperation(
+        "export",
+        "Export World .mne",
+        () => exportWorldSettingMne(nextSetting.setting_id, ""),
+        {
+          detail: nextSetting.setting_name,
+          successDetail: (exportResult) => exportResult.path,
+        },
+      );
       setSettings(await listSettings());
       setStatus(`World .mne exported: ${result.path}`);
       logDev("success", "app", "World .mne exported", {
@@ -4754,7 +4573,15 @@ export function App() {
     if (!soul || !setting) return;
     setBusy(true);
     try {
-      const result = await exportScenarioBundleMne(soul.character_id, setting.setting_id, "");
+      const result = await runTrackedBackgroundOperation(
+        "export",
+        "Export Scenario .mne",
+        () => exportScenarioBundleMne(soul.character_id, setting.setting_id, ""),
+        {
+          detail: `${soul.character_name} in ${setting.setting_name}`,
+          successDetail: (exportResult) => exportResult.path,
+        },
+      );
       setStatus(`Scenario .mne exported: ${result.path}`);
       logDev("success", "app", "Scenario .mne exported", {
         path: result.path,
@@ -4774,7 +4601,15 @@ export function App() {
     if (!currentConversationId) return;
     setBusy(true);
     try {
-      const result = await exportCurrentSessionCheckpointMne(currentConversationId, "");
+      const result = await runTrackedBackgroundOperation(
+        "export",
+        "Export session checkpoint",
+        () => exportCurrentSessionCheckpointMne(currentConversationId, ""),
+        {
+          detail: `Session ${currentConversationId}`,
+          successDetail: (exportResult) => exportResult.path,
+        },
+      );
       setStatus(`Session checkpoint .mne exported: ${result.path}`);
       logDev("success", "app", "Session checkpoint .mne exported", {
         path: result.path,
@@ -4799,7 +4634,15 @@ export function App() {
     if (!filePath) return;
     setBusy(true);
     try {
-      const result = await importMneBundle(filePath);
+      const result = await runTrackedBackgroundOperation(
+        "import",
+        "Import .mne bundle",
+        () => importMneBundle(filePath),
+        {
+          detail: filePath,
+          successDetail: (importResult) => importResult.summary,
+        },
+      );
       setSouls(await listSouls());
       setSettings(await listSettings());
       setStatus(result.summary);
@@ -4838,26 +4681,37 @@ export function App() {
 
     setBusy(true);
     try {
-      const text = await file.text();
-      let raw: any;
-      if (file.name.endsWith(".md") || !text.trim().startsWith("{")) {
-        raw = parseMarkdownSoul(text, file.name);
-      } else {
-        raw = JSON.parse(text);
-      }
-      const importedSoul = await soulFromImport(raw, file.name);
-      await upsertSoul(importedSoul);
-      setSoul(importedSoul);
-      setSelectedCharacterIds((current) =>
-        current.includes(importedSoul.character_id)
-          ? [importedSoul.character_id, ...current.filter((id) => id !== importedSoul.character_id)]
-          : [importedSoul.character_id, ...current],
+      const importedSoul = await runTrackedBackgroundOperation(
+        "import",
+        "Import Soul file",
+        async () => {
+          const text = await file.text();
+          let raw: any;
+          if (file.name.endsWith(".md") || !text.trim().startsWith("{")) {
+            raw = parseMarkdownSoul(text, file.name);
+          } else {
+            raw = JSON.parse(text);
+          }
+          const nextSoul = await soulFromImport(raw, file.name);
+          await upsertSoul(nextSoul);
+          setSoul(nextSoul);
+          setSelectedCharacterIds((current) =>
+            current.includes(nextSoul.character_id)
+              ? [nextSoul.character_id, ...current.filter((id) => id !== nextSoul.character_id)]
+              : [nextSoul.character_id, ...current],
+          );
+          setActiveConversationId(null);
+          setCurrentSessionTitle("New Session");
+          setCreatorFieldsFromSoul(nextSoul);
+          setMessages([]);
+          setSouls(await listSouls());
+          return nextSoul;
+        },
+        {
+          detail: file.name,
+          successDetail: (result) => `Imported ${result.character_name}`,
+        },
       );
-      setActiveConversationId(null);
-      setCurrentSessionTitle("New Session");
-      setCreatorFieldsFromSoul(importedSoul);
-      setMessages([]);
-      setSouls(await listSouls());
       setStatus(`Imported ${importedSoul.character_name}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -4873,14 +4727,25 @@ export function App() {
 
     setBusy(true);
     try {
-      const raw = JSON.parse(await file.text());
-      const importedSetting = settingFromImport(raw, file.name);
-      await upsertSetting(importedSetting);
-      setSetting(importedSetting);
-      setEditorFieldsFromSetting(importedSetting);
-      setSettings(await listSettings());
-      setActiveConversationId(null);
-      setMessages([]);
+      const importedSetting = await runTrackedBackgroundOperation(
+        "import",
+        "Import World file",
+        async () => {
+          const raw = JSON.parse(await file.text());
+          const nextSetting = settingFromImport(raw, file.name);
+          await upsertSetting(nextSetting);
+          setSetting(nextSetting);
+          setEditorFieldsFromSetting(nextSetting);
+          setSettings(await listSettings());
+          setActiveConversationId(null);
+          setMessages([]);
+          return nextSetting;
+        },
+        {
+          detail: file.name,
+          successDetail: (result) => `Imported ${result.setting_name}`,
+        },
+      );
       setStatus(`Imported ${importedSetting.setting_name}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
@@ -4984,6 +4849,27 @@ export function App() {
       </label>
     </div>
   );
+  const applyGenerationPreset = (preset: GenerationPresetName) => {
+    if (preset === "custom") {
+      setGenerationPreferences((current) => ({ ...current, preset }));
+      return;
+    }
+    setGenerationPreferences((current) => ({
+      ...current,
+      ...GENERATION_PRESETS[preset],
+      preset,
+    }));
+  };
+  const updateGenerationSampler = (
+    key: "temperature" | "topP" | "frequencyPenalty" | "presencePenalty",
+    value: number,
+  ) => {
+    setGenerationPreferences((current) => ({
+      ...current,
+      [key]: value,
+      preset: "custom",
+    }));
+  };
   const benchmarkStopReason = benchmarkResult?.scorecard.stop_reason ?? null;
   const benchmarkFailStoppedBeforeCompletion = Boolean(
     benchmarkResult &&
@@ -5335,598 +5221,196 @@ export function App() {
           </button>
         </div>
         <p className="settings-note">API presets are saved in the existing local provider profile store.</p>
-        {providerModeControls}
       </section>
 
       {provider === "API" ? (
         <>
-          <section className="settings-section provider-pass-card">
-            <div className="provider-pass-heading">
-              <div>
-                <h3>Narrator Provider</h3>
-                <p>Narrator pass: writes visible RP response.</p>
-              </div>
-              <span className="provider-status-pill">{apiSettings.model || "No model"}</span>
-            </div>
-            <div className="provider-pass-grid">
-              <label className="field">
-                <span>Narrator Provider</span>
-                <select
-                  value={selectedProviderProfileId}
-                  onChange={(event) => void handleSelectProviderProfile(event.target.value)}
-                  disabled={busy}
-                >
-                  <option value="">Unsaved narrator profile</option>
-                  {providerProfiles.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="field">
-                <span>Profile Name</span>
-                <input
-                  value={narratorProviderProfileName}
-                  onChange={(event) => setNarratorProviderProfileName(event.target.value)}
-                  placeholder="Narrator API"
-                  disabled={busy}
-                />
-              </label>
-              <label className="field">
-                <span>Base URL</span>
-                <input
-                  value={apiSettings.base_url}
-                  onChange={(event) =>
-                    setApiSettings((current) => ({ ...current, base_url: event.target.value }))
-                  }
-                  placeholder="https://api.openai.com/v1"
-                  disabled={busy}
-                />
-              </label>
-              <label className="field">
-                <span>Model</span>
-                <input
-                  value={apiSettings.model}
-                  list="mnemosyne-models"
-                  onChange={(event) =>
-                    setApiSettings((current) => ({ ...current, model: event.target.value }))
-                  }
-                  onBlur={(event) => rememberModel(event.target.value)}
-                  placeholder="Type or pick a model"
-                  disabled={busy}
-                />
-                <datalist id="mnemosyne-models">
-                  {knownModels.map((m) => (
-                    <option key={m} value={m} />
-                  ))}
-                </datalist>
-                <small className="field-hint">{knownModels.length} saved - type a new id and it's remembered</small>
-              </label>
-              <label className="field">
-                <span>Narrator Timeout (seconds)</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={apiSettings.narrator_timeout_ms ? Math.round(apiSettings.narrator_timeout_ms / 1000) : ""}
-                  onChange={(event) =>
-                    setApiSettings((current) => ({
-                      ...current,
-                      narrator_timeout_ms:
-                        Number(event.target.value) > 0 ? Number(event.target.value) * 1000 : null,
-                    }))
-                  }
-                  placeholder="None / provider default"
-                  disabled={busy}
-                />
-              </label>
-              <label className="field">
-                <span>API Key</span>
-                <input
-                  type="password"
-                  value={apiSettings.api_key}
-                  onChange={(event) =>
-                    setApiSettings((current) => ({ ...current, api_key: event.target.value }))
-                  }
-                  placeholder="Stored locally with profile"
-                  disabled={busy}
-                />
-              </label>
-              {mode === "Custom" ? (
-                <label className="field custom-prompt-field">
-                  <span>Custom Narrator Prompt</span>
-                  <textarea
-                    value={apiSettings.system_prompt}
-                    onChange={(event) =>
-                      setApiSettings((current) => ({
-                        ...current,
-                        system_prompt: event.target.value,
-                      }))
-                    }
-                    placeholder="Replaces default narrator + mode prompts when filled. Use Custom mode. Leave empty for default Reader narration."
-                    disabled={busy}
-                  />
-                </label>
-              ) : null}
-            </div>
-            <div className="button-row">
-              <button
-                type="button"
-                className="ghost-action"
-                onClick={handleSaveNarratorProviderProfile}
-                disabled={busy}
-              >
-                <Save size={16} />
-                <span>Save Narrator Profile</span>
-              </button>
-              <button
-                type="button"
-                className="ghost-action"
-                onClick={handleDeleteNarratorProviderProfile}
-                disabled={busy || !selectedProviderProfileId}
-              >
-                <Archive size={16} />
-                <span>Archive Profile</span>
-              </button>
-            </div>
-          </section>
+          <NarratorProviderPanel
+            apiSettings={apiSettings}
+            busy={busy}
+            knownModels={knownModels}
+            mode={mode}
+            onArchive={() => void handleDeleteNarratorProviderProfile()}
+            onNameChange={setNarratorProviderProfileName}
+            onRememberModel={rememberModel}
+            onSave={() => void handleSaveNarratorProviderProfile()}
+            onSelectProfile={(profileId) => void handleSelectProviderProfile(profileId)}
+            onSettingsChange={(update) =>
+              setApiSettings((current) => ({ ...current, ...update }))
+            }
+            profileName={narratorProviderProfileName}
+            profiles={providerProfiles}
+            selectedProfileId={selectedProviderProfileId}
+          />
 
-          <section className="settings-section provider-pass-card">
-            <div className="provider-pass-heading">
-              <div>
-                <h3>State Updater Provider</h3>
-                <p>State updater pass: updates Soul/World/Memory.</p>
-              </div>
-              <span className="provider-status-pill">
-                {useNarratorProviderForUpdater
-                  ? "Using narrator provider"
-                  : stateUpdaterSettings.model || "No model"}
-              </span>
-            </div>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={useNarratorProviderForUpdater}
-                onChange={(event) => setUseNarratorProviderForUpdater(event.target.checked)}
-                disabled={busy}
-              />
-              <span>Use narrator provider for state updater</span>
-            </label>
-            <div className="provider-pass-grid">
-              <label className="field">
-                <span>State Updater Timeout (seconds)</span>
-                <input
-                  type="number"
-                  min="0"
-                  value={Math.round((effectiveStateUpdaterSettings.evaluator_timeout_ms ?? 25_000) / 1000)}
-                  onChange={(event) =>
-                    updateEffectiveStateUpdaterSettings({
-                      evaluator_timeout_ms: Math.max(0, Number(event.target.value) || 0) * 1000,
-                    })
-                  }
-                  disabled={busy}
-                />
-              </label>
-              <label className="field">
-                <span>Timeout Mode</span>
-                <select
-                  value={effectiveStateUpdaterSettings.evaluator_timeout_mode ?? "finite"}
-                  onChange={(event) =>
-                    updateEffectiveStateUpdaterSettings({
-                      evaluator_timeout_mode: event.target.value,
-                    })
-                  }
-                  disabled={busy}
-                >
-                  <option value="finite">Finite app timeout</option>
-                  <option value="no_app_timeout">No app timeout</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>Evaluator Mode</span>
-                <select
-                  value={effectiveStateUpdaterSettings.evaluator_mode ?? "evaluator_form_v1"}
-                  onChange={(event) =>
-                    updateEffectiveStateUpdaterSettings({
-                      evaluator_mode: event.target.value,
-                    })
-                  }
-                  disabled={busy}
-                >
-                  <option value="evaluator_form_v1">Legacy Form Evaluator</option>
-                  <option value="evaluator_structured_v1">Structured Ops Evaluator</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>Structured Evaluator Policy</span>
-                <select
-                  value={effectiveStateUpdaterSettings.structured_evaluator_policy ?? "prefer"}
-                  onChange={(event) =>
-                    updateEffectiveStateUpdaterSettings({
-                      structured_evaluator_policy: event.target.value,
-                    })
-                  }
-                  disabled={busy}
-                >
-                  <option value="required">required</option>
-                  <option value="prefer">prefer</option>
-                  <option value="allow_fallback">allow_fallback</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>Structured Evaluator Transport</span>
-                <select
-                  value={structuredEvaluatorTransport}
-                  onChange={(event) => updateStructuredEvaluatorTransport(event.target.value)}
-                  disabled={busy}
-                >
-                  <option value="auto">Auto - tool calls first, then JSON schema</option>
-                  <option value="tool_call">Tool calls (require real function calls)</option>
-                  <option value="json_schema">JSON schema (response_format)</option>
-                  <option value="json_object">JSON object</option>
-                  <option value="prompt_json">Prompt-only JSON</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>Execution Mode</span>
-                <select
-                  value={evaluatorExecutionMode}
-                  onChange={(event) => updateEvaluatorExecutionMode(event.target.value)}
-                  disabled={busy}
-                >
-                  <option value="balanced">Balanced - evaluate every turn</option>
-                  <option value="fast">Fast - skip dialogue-only turns, catch up later</option>
-                  <option value="long_context">Long Context - evaluate every turn</option>
-                </select>
-              </label>
-            </div>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={effectiveStateUpdaterSettings.evaluator_background_enabled ?? false}
-                onChange={(event) =>
-                  updateEffectiveStateUpdaterSettings({
-                    evaluator_background_enabled: event.target.checked,
-                  })
-                }
-                disabled={busy}
-              />
-              <span>Run evaluator in background</span>
-            </label>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={effectiveStateUpdaterSettings.wait_for_evaluator_before_next_turn ?? true}
-                onChange={(event) =>
-                  updateEffectiveStateUpdaterSettings({
-                    wait_for_evaluator_before_next_turn: event.target.checked,
-                  })
-                }
-                disabled={busy}
-              />
-              <span>Wait for state update before next turn</span>
-            </label>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={effectiveStateUpdaterSettings.allow_send_with_stale_state ?? false}
-                onChange={(event) =>
-                  updateEffectiveStateUpdaterSettings({
-                    allow_send_with_stale_state: event.target.checked,
-                  })
-                }
-                disabled={busy}
-              />
-              <span>Allow send with stale state</span>
-            </label>
-            <label className="toggle-row">
-              <input
-                type="checkbox"
-                checked={devOverrideActive}
-                onChange={(event) => setDevOverrideActive(event.target.checked)}
-                disabled={busy}
-              />
-              <span>Developer override (skip evaluator gates)</span>
-            </label>
-            {useNarratorProviderForUpdater ? (
-              <p className="provider-note">
-                Using narrator provider: {apiSettings.base_url || "No base URL"} / {apiSettings.model || "No model"}
-              </p>
-            ) : (
-              <>
-                <div className="provider-pass-grid">
-                  <label className="field">
-                    <span>State Updater Provider</span>
-                    <select
-                      value={selectedStateUpdaterProfileId}
-                      onChange={(event) => void handleSelectStateUpdaterProfile(event.target.value)}
-                      disabled={busy}
-                    >
-                      <option value="">Unsaved updater profile</option>
-                      {providerProfiles.map((profile) => (
-                        <option key={profile.id} value={profile.id}>
-                          {profile.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="field">
-                    <span>Profile Name</span>
-                    <input
-                      value={updaterProviderProfileName}
-                      onChange={(event) => setUpdaterProviderProfileName(event.target.value)}
-                      placeholder="Updater API"
-                      disabled={busy}
-                    />
-                  </label>
-                  <label className="field">
-                    <span>Base URL</span>
-                    <input
-                      value={stateUpdaterSettings.base_url}
-                      onChange={(event) =>
-                        setStateUpdaterSettings((current) => ({
-                          ...current,
-                          base_url: event.target.value,
-                        }))
-                      }
-                      placeholder="http://localhost:11434/v1"
-                      disabled={busy}
-                    />
-                  </label>
-                  <label className="field">
-                    <span>Model</span>
-                    <input
-                      value={stateUpdaterSettings.model}
-                      list="mnemosyne-models"
-                      onChange={(event) =>
-                        setStateUpdaterSettings((current) => ({
-                          ...current,
-                          model: event.target.value,
-                        }))
-                      }
-                      onBlur={(event) => rememberModel(event.target.value)}
-                      placeholder="Type or pick a model"
-                      disabled={busy}
-                    />
-                  </label>
-                  <label className="field">
-                    <span>API Key</span>
-                    <input
-                      type="password"
-                      value={stateUpdaterSettings.api_key}
-                      onChange={(event) =>
-                        setStateUpdaterSettings((current) => ({
-                          ...current,
-                          api_key: event.target.value,
-                        }))
-                      }
-                      placeholder="Stored locally with profile"
-                      disabled={busy}
-                    />
-                  </label>
-                </div>
-                <div className="button-row">
-                  <button
-                    type="button"
-                    className="ghost-action"
-                    onClick={handleSaveStateUpdaterProviderProfile}
-                    disabled={busy}
-                  >
-                    <Save size={16} />
-                    <span>Save Updater Profile</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost-action"
-                    onClick={handleDeleteStateUpdaterProviderProfile}
-                    disabled={busy || !selectedStateUpdaterProfileId}
-                  >
-                    <Archive size={16} />
-                    <span>Archive Profile</span>
-                  </button>
-                </div>
-              </>
-            )}
-          </section>
+          <StateUpdaterProviderPanel
+            apiSettings={apiSettings}
+            busy={busy}
+            effectiveSettings={effectiveStateUpdaterSettings}
+            evaluatorExecutionMode={evaluatorExecutionMode}
+            onArchive={() => void handleDeleteStateUpdaterProviderProfile()}
+            onExecutionModeChange={updateEvaluatorExecutionMode}
+            onNameChange={setUpdaterProviderProfileName}
+            onRememberModel={rememberModel}
+            onSave={() => void handleSaveStateUpdaterProviderProfile()}
+            onSelectProfile={(profileId) => void handleSelectStateUpdaterProfile(profileId)}
+            onSettingsChange={updateEffectiveStateUpdaterSettings}
+            onToggleUseNarrator={setUseNarratorProviderForUpdater}
+            onUpdaterSettingsChange={(update) =>
+              setStateUpdaterSettings((current) => ({ ...current, ...update }))
+            }
+            profileName={updaterProviderProfileName}
+            profiles={providerProfiles}
+            selectedProfileId={selectedStateUpdaterProfileId}
+            stateUpdaterSettings={stateUpdaterSettings}
+            useNarratorProvider={useNarratorProviderForUpdater}
+          />
 
-          <section className="settings-section provider-pass-card">
-            <div className="provider-pass-heading">
-              <div>
-                <h3>Repair Model</h3>
-                <p>Focused background repair for evaluator ops rejected by validation.</p>
-              </div>
-              <span className="provider-status-pill">
-                {selectedRepairProfileId === REPAIR_MODEL_EMBEDDED
-                  ? embeddedModel.ready
-                    ? "Embedded local ready"
-                    : "Embedded local not ready"
-                  : selectedRepairProfileId === REPAIR_MODEL_EVALUATOR
-                    ? "Same as evaluator"
-                    : selectedRepairProfileId
-                      ? providerProfiles.find((profile) => profile.id === selectedRepairProfileId)?.name ?? "Profile missing"
-                      : embeddedModel.ready
-                        ? "Auto: embedded local"
-                        : "Auto: evaluator"}
-              </span>
-            </div>
-            <div className="provider-pass-grid">
-              <label className="field">
-                <span>Repair Model (light/local)</span>
-                <select
-                  value={selectedRepairProfileId}
-                  onChange={(event) => setSelectedRepairProfileId(event.target.value)}
-                  disabled={busy}
-                >
-                  <option value={REPAIR_MODEL_AUTO}>Automatic (local when ready, otherwise evaluator)</option>
-                  <option value={REPAIR_MODEL_EMBEDDED}>Embedded local model</option>
-                  <option value={REPAIR_MODEL_EVALUATOR}>Same as evaluator</option>
-                  {providerProfiles.map((profile) => (
-                    <option key={profile.id} value={profile.id}>
-                      {profile.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-            <div className="provider-pass-grid">
-              <label className="field">
-                <span>Embedded model file (llamafile path)</span>
-                <input
-                  value={embeddedModelPath}
-                  onChange={(event) => setEmbeddedModelPath(event.target.value)}
-                  placeholder="C:\path\to\your-model.llamafile.exe"
-                  disabled={embeddedModelBusy}
-                />
-              </label>
-            </div>
-            <div className="button-row">
-              <button
-                type="button"
-                className="ghost-action"
-                onClick={() => void handleStartEmbeddedModel()}
-                disabled={embeddedModelBusy || embeddedModel.running}
-              >
-                <span>
-                  {embeddedModel.running
-                    ? embeddedModel.ready
-                      ? "Embedded model running"
-                      : "Starting..."
-                    : "Start embedded model"}
-                </span>
-              </button>
-              <button
-                type="button"
-                className="ghost-action"
-                onClick={() => void handleStopEmbeddedModel()}
-                disabled={embeddedModelBusy || !embeddedModel.running}
-              >
-                <span>Stop</span>
-              </button>
-            </div>
-            <p className="provider-note">
-              {embeddedModel.ready
-                ? `Embedded model ready at ${embeddedModel.url} - repair uses it automatically when no profile is selected above.`
-                : embeddedModel.running
-                  ? "Embedded model loading - large models can take a minute."
-                  : "Drop a single-file llamafile in your project, put its full path above, and Start. Repair will use it automatically."}
-              {embeddedModelError ? ` - ${embeddedModelError}` : ""}
-            </p>
-            <p className="provider-note">
-              Pick a saved local/light profile above to point repair at your own endpoint instead.
-            </p>
-          </section>
+          <RepairModelPanel
+            busy={embeddedModelBusy}
+            embeddedModel={embeddedModel}
+            embeddedModelError={embeddedModelError}
+            embeddedModelPath={embeddedModelPath}
+            onEmbeddedModelPathChange={setEmbeddedModelPath}
+            onSelectProfile={setSelectedRepairProfileId}
+            onStart={() => void handleStartEmbeddedModel()}
+            onStop={() => void handleStopEmbeddedModel()}
+            profiles={providerProfiles}
+            selectedProfileId={selectedRepairProfileId}
+          />
 
-          <section className="settings-section provider-pass-card">
-            <div className="settings-section-heading">
-              <div>
-                <span className="eyebrow">Profiles</span>
-                <h3>Saved Provider Profiles</h3>
-              </div>
-            </div>
-            
-            {providerProfiles.length === 0 && archivedProviderProfiles.length === 0 ? (
-              <p className="settings-note">No profiles saved yet.</p>
-            ) : (
-              <div className="provider-profiles-list" style={{ marginTop: "1rem" }}>
-                {providerProfiles.map((p) => {
-                  const isNarratorActive = selectedProviderProfileId === p.id;
-                  const isUpdaterActive = selectedStateUpdaterProfileId === p.id;
-                  const isRepairActive = selectedRepairProfileId === p.id;
-                  const isActive = isNarratorActive || isUpdaterActive || isRepairActive;
-                  return (
-                    <div key={p.id} className="profile-list-item" style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      padding: "0.5rem 0",
-                      borderBottom: "1px solid var(--border-color, #333)",
-                    }}>
-                      <div>
-                        <strong style={{ color: "var(--text-color, #eee)" }}>{p.name}</strong>
-                        <span style={{ fontSize: "0.8rem", color: "var(--text-muted, #888)", marginLeft: "0.5rem" }}>
-                          ({p.model})
-                        </span>
-                        {isNarratorActive && <span className="provider-status-pill" style={{ marginLeft: "0.5rem", fontSize: "0.7rem", padding: "2px 6px" }}>Active Narrator</span>}
-                        {isUpdaterActive && <span className="provider-status-pill" style={{ marginLeft: "0.5rem", fontSize: "0.7rem", padding: "2px 6px" }}>Active Updater</span>}
-                        {isRepairActive && <span className="provider-status-pill" style={{ marginLeft: "0.5rem", fontSize: "0.7rem", padding: "2px 6px" }}>Active Repair</span>}
-                        <span style={{
-                          fontSize: "0.75rem",
-                          marginLeft: "0.5rem",
-                          padding: "1px 6px",
-                          borderRadius: "4px",
-                          backgroundColor: "rgba(255,255,255,0.05)",
-                          color: p.evaluator_compatibility_status === 1 ? "#4caf50" : p.evaluator_compatibility_status === 2 ? "#f44336" : "var(--text-muted, #888)",
-                          border: `1px solid ${p.evaluator_compatibility_status === 1 ? "#4caf50" : p.evaluator_compatibility_status === 2 ? "#f44336" : "#888888"}33`
-                        }}>
-                          Evaluator: {p.evaluator_compatibility_status === 1 ? "Schema enforced" : p.evaluator_compatibility_status === 3 ? "JSON object only" : p.evaluator_compatibility_status === 2 ? "Failed" : p.evaluator_compatibility_status === 4 ? "Stale prompt" : "Untested"}
-                        </span>
-                      </div>
-                      <div style={{ display: "flex", gap: "0.5rem" }}>
-                        <button
-                          type="button"
-                          className="ghost-action compact-ghost"
-                          onClick={() => void handleRunContractTest(p.id)}
-                          disabled={busy}
-                          title="Run compatibility contract test"
-                          style={{ fontSize: "0.8rem", padding: "2px 8px" }}
-                        >
-                          <Play size={12} style={{ marginRight: "4px" }} />
-                          <span>Test</span>
-                        </button>
-                        <button
-                          type="button"
-                          className="ghost-action compact-ghost"
-                          onClick={() => handleArchiveProviderProfile(p.id)}
-                          disabled={busy || isActive}
-                          title={isActive ? "Cannot archive active profile" : "Archive profile"}
-                          style={{ fontSize: "0.8rem", padding: "2px 8px" }}
-                        >
-                          <Archive size={12} style={{ marginRight: "4px" }} />
-                          <span>Archive</span>
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-
-                {archivedProviderProfiles.length > 0 && (
-                  <div style={{ marginTop: "1.5rem" }}>
-                    <span className="eyebrow">Archived</span>
-                    <h4 style={{ margin: "0.5rem 0", color: "var(--text-muted, #888)" }}>Archived Profiles</h4>
-                    {archivedProviderProfiles.map((p) => (
-                      <div key={p.id} className="profile-list-item" style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        padding: "0.5rem 0",
-                        borderBottom: "1px solid var(--border-color, #333)",
-                      }}>
-                        <div>
-                          <span style={{ color: "var(--text-muted, #888)", textDecoration: "line-through" }}>{p.name}</span>
-                          <span style={{ fontSize: "0.8rem", color: "var(--text-muted, #666)", marginLeft: "0.5rem" }}>
-                            ({p.model})
-                          </span>
-                        </div>
-                        <button
-                          type="button"
-                          className="ghost-action compact-ghost"
-                          onClick={() => handleRestoreProviderProfile(p.id)}
-                          disabled={busy}
-                          style={{ fontSize: "0.8rem", padding: "2px 8px" }}
-                        >
-                          <RefreshCcw size={12} style={{ marginRight: "4px" }} />
-                          <span>Restore</span>
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-          </section>
+          <ProviderProfilesPanel
+            archivedProfiles={archivedProviderProfiles}
+            busy={busy}
+            onArchive={(profileId) => void handleArchiveProviderProfile(profileId)}
+            onRestore={(profileId) => void handleRestoreProviderProfile(profileId)}
+            profiles={providerProfiles}
+            selectedNarratorProfileId={selectedProviderProfileId}
+            selectedRepairProfileId={selectedRepairProfileId}
+            selectedUpdaterProfileId={selectedStateUpdaterProfileId}
+          />
         </>
       ) : null}
     </div>
+  );
+  const devEvaluatorSettingsPanel = (
+    <section className="settings-section dev-only-settings">
+      <div className="settings-section-heading">
+        <div>
+          <span className="eyebrow">Dev Only</span>
+          <h3>Evaluator Contract</h3>
+        </div>
+      </div>
+      <div className="settings-grid">
+        <label className="field">
+          <span>Evaluator Mode</span>
+          <select
+            value={effectiveStateUpdaterSettings.evaluator_mode ?? "evaluator_form_v1"}
+            onChange={(event) =>
+              updateEffectiveStateUpdaterSettings({
+                evaluator_mode: event.target.value,
+              })
+            }
+            disabled={busy}
+          >
+            <option value="evaluator_form_v1">Legacy Form Evaluator</option>
+            <option value="evaluator_perception_v2">Perception V2 (Preview)</option>
+            <option value="evaluator_structured_v1">Structured Ops Evaluator</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>Structured Policy</span>
+          <select
+            value={effectiveStateUpdaterSettings.structured_evaluator_policy ?? "prefer"}
+            onChange={(event) =>
+              updateEffectiveStateUpdaterSettings({
+                structured_evaluator_policy: event.target.value,
+              })
+            }
+            disabled={busy}
+          >
+            <option value="required">required</option>
+            <option value="prefer">prefer</option>
+            <option value="allow_fallback">allow_fallback</option>
+          </select>
+        </label>
+        <label className="field">
+          <span>Structured Transport</span>
+          <select
+            value={structuredEvaluatorTransport}
+            onChange={(event) => updateStructuredEvaluatorTransport(event.target.value)}
+            disabled={busy}
+          >
+            <option value="auto">Auto - tool calls first, then JSON schema</option>
+            <option value="tool_call">Tool calls (require real function calls)</option>
+            <option value="json_schema">JSON schema (response_format)</option>
+            <option value="json_object">JSON object</option>
+            <option value="prompt_json">Prompt-only JSON</option>
+          </select>
+        </label>
+      </div>
+      <label className="toggle-row">
+        <input
+          type="checkbox"
+          checked={effectiveStateUpdaterSettings.evaluator_background_enabled ?? false}
+          onChange={(event) =>
+            updateEffectiveStateUpdaterSettings({
+              evaluator_background_enabled: event.target.checked,
+            })
+          }
+          disabled={busy}
+        />
+        <span>Run evaluator in background</span>
+      </label>
+      <label className="toggle-row">
+        <input
+          type="checkbox"
+          checked={effectiveStateUpdaterSettings.wait_for_evaluator_before_next_turn ?? true}
+          onChange={(event) =>
+            updateEffectiveStateUpdaterSettings({
+              wait_for_evaluator_before_next_turn: event.target.checked,
+            })
+          }
+          disabled={busy}
+        />
+        <span>Wait for state update before next turn</span>
+      </label>
+      <label className="toggle-row">
+        <input
+          type="checkbox"
+          checked={effectiveStateUpdaterSettings.allow_send_with_stale_state ?? false}
+          onChange={(event) =>
+            updateEffectiveStateUpdaterSettings({
+              allow_send_with_stale_state: event.target.checked,
+            })
+          }
+          disabled={busy}
+        />
+        <span>Allow send with stale state</span>
+      </label>
+    </section>
+  );
+  const generationSettingsPanel = (
+    <GenerationSettingsPanel
+      busy={busy}
+      generationPreferences={generationPreferences}
+      onApplyPreset={applyGenerationPreset}
+      onReset={() => setGenerationPreferences(DEFAULT_GENERATION_PREFERENCES)}
+      onSetMaxTokens={(maxTokens) =>
+        setGenerationPreferences((current) => ({ ...current, maxTokens }))
+      }
+      onUpdateSampler={updateGenerationSampler}
+      providerModeControls={providerModeControls}
+    />
+  );
+  const readingSettingsPanel = (
+    <ReadingSettingsPanel
+      onChange={(update) =>
+        setReadingPreferences((current) => ({ ...current, ...update }))
+      }
+      onReset={() => setReadingPreferences(DEFAULT_READING_PREFERENCES)}
+      readingPreferences={readingPreferences}
+    />
   );
   const settingsDrawerToggle = (
     <button
@@ -5941,137 +5425,48 @@ export function App() {
     </button>
   );
   const dataSettingsPanel = (
-    <div className="settings-tab-panel">
-      <section className="settings-section">
-        <div className="settings-section-heading">
-          <div>
-            <span className="eyebrow">Sessions</span>
-            <h3>Session Defaults</h3>
-          </div>
-        </div>
-        <div className="chat-start-options settings-radio-group" role="radiogroup" aria-label="Default session start mode">
-          <label>
-            <input
-              type="radio"
-              name="settings-chat-start-mode"
-              value="continue"
-              checked={chatStartMode === "continue"}
-              onChange={() => setChatStartMode("continue")}
-              disabled={busy}
-            />
-            <span>Continue Soul continuity</span>
-          </label>
-          <label>
-            <input
-              type="radio"
-              name="settings-chat-start-mode"
-              value="fresh"
-              checked={chatStartMode === "fresh"}
-              onChange={() => setChatStartMode("fresh")}
-              disabled={busy}
-            />
-            <span>New isolated Session</span>
-          </label>
-        </div>
-        <label className="toggle-row">
-          <input
-            type="checkbox"
-            checked={showArchivedSessions}
-            onChange={(event) => setShowArchivedSessions(event.target.checked)}
-          />
-          <span>Show archived sessions by default</span>
-        </label>
-      </section>
-      <section className="settings-section">
-        <div className="settings-section-heading">
-          <div>
-            <span className="eyebrow">Data</span>
-            <h3>Storage & Imports</h3>
-          </div>
-        </div>
-        <p className="settings-note">Session data lives locally. Import, export, and archive workflows stay in Library and Dev Mode so this page remains a clean preferences surface.</p>
-        <div className="button-row">
-          <button type="button" className="ghost-action" onClick={() => void openSessionDataLocation()} disabled={busy}>
-            <FolderOpen size={16} />
-            <span>Open Data Folder</span>
-          </button>
-        </div>
-      </section>
-    </div>
+    <DataSettingsPanel
+      busy={busy}
+      chatStartMode={chatStartMode}
+      onChatStartModeChange={setChatStartMode}
+      onOpenDataFolder={() => void openSessionDataLocation()}
+      onShowArchivedSessionsChange={setShowArchivedSessions}
+      showArchivedSessions={showArchivedSessions}
+    />
   );
-  const aboutSettingsPanel = (
-    <div className="settings-tab-panel">
-      <section className="settings-section">
-        <div className="settings-section-heading">
-          <div>
-            <span className="eyebrow">About</span>
-            <h3>Mnemosyne</h3>
-          </div>
-        </div>
-        <p className="settings-note">Mnemosyne is an experimental AI roleplay state engine. Human-facing surfaces stay paper/editorial; raw machine inspection stays in terminal Dev Mode.</p>
-        <div className="button-row">
-          <button type="button" className="ghost-action" onClick={handleViewDisclaimer}>
-            <Clipboard size={16} />
-            <span>View Disclaimer</span>
-          </button>
-        </div>
-      </section>
-    </div>
-  );
+  const aboutSettingsPanel = <AboutSettingsPanel onViewDisclaimer={handleViewDisclaimer} />;
   const activeSettingsPanel =
     settingsTab === "ai"
       ? providerSettingsPanel
-      : settingsTab === "data"
-        ? dataSettingsPanel
-        : aboutSettingsPanel;
-  const settingsCategoryItems: Array<{ id: SettingsTab; label: string; icon: JSX.Element }> = [
-    { id: "ai", label: "AI", icon: <Sparkles size={18} /> },
-    { id: "data", label: "Data", icon: <FolderOpen size={18} /> },
-    { id: "about", label: "About", icon: <Clipboard size={18} /> },
-  ];
+      : settingsTab === "generation"
+        ? generationSettingsPanel
+        : settingsTab === "reading"
+          ? readingSettingsPanel
+          : settingsTab === "data"
+            ? dataSettingsPanel
+            : aboutSettingsPanel;
   const settingsDrawerContent = (
-    <div className="settings-drawer-main">
-      <nav className="settings-drawer-tabs" aria-label="Settings categories">
-        {settingsCategoryItems.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            className={settingsTab === tab.id ? "selected" : ""}
-            onClick={() => setSettingsTab(tab.id)}
-            title={tab.label}
-          >
-            {tab.icon}
-            <span>{tab.label}</span>
-          </button>
-        ))}
-      </nav>
-      <div className="settings-drawer-body">{activeSettingsPanel}</div>
-    </div>
-  );
-  const settingsPageContent = (
-    <div className="settings-page-layout">
-      <aside className="settings-page-nav" aria-label="Settings categories">
-        {settingsCategoryItems.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            className={settingsTab === tab.id ? "selected" : ""}
-            onClick={() => setSettingsTab(tab.id)}
-          >
-            {tab.icon}
-            <span>{tab.label}</span>
-          </button>
-        ))}
-      </aside>
-      <section className="settings-page-panel">{activeSettingsPanel}</section>
-    </div>
+    <QuickSettingsPanel
+      busy={busy}
+      generationPreferences={generationPreferences}
+      onApplyPreset={applyGenerationPreset}
+      onOpenFullSettings={() => {
+        setSettingsDrawerOpen(false);
+        setView("settings");
+      }}
+      onSetMaxTokens={(maxTokens) =>
+        setGenerationPreferences((current) => ({ ...current, maxTokens }))
+      }
+      onUpdateSampler={updateGenerationSampler}
+      providerModeControls={providerModeControls}
+    />
   );
   const settingsDrawerPanel = settingsDrawerOpen ? (
     <aside className="settings-drawer-panel" aria-label="Settings">
       <header className="settings-drawer-header">
         <div>
-          <span className="eyebrow">Preferences</span>
-          <h2>Settings</h2>
+          <span className="eyebrow">Play</span>
+          <h2>Quick Settings</h2>
         </div>
         <button type="button" onClick={() => setSettingsDrawerOpen(false)}>
           Close
@@ -6088,9 +5483,9 @@ export function App() {
   const railShellClass = railCollapsed ? " rail-collapsed" : "";
   const railNav = (
     <nav className={`app-rail${railShellClass}`} aria-label="Primary navigation">
-      <div className="app-rail-brand" title="Mnemosyne">
-        <strong>Mnemosyne</strong>
-        <span>the narrator writes / the state map remembers</span>
+      <div className="app-rail-brand" role="img" aria-label="Mnemosyne" title="Mnemosyne">
+        <strong aria-hidden="true">Mnemosyne</strong>
+        <span aria-hidden="true">the narrator writes / the state map remembers</span>
       </div>
       <button
         type="button"
@@ -6101,23 +5496,23 @@ export function App() {
       >
         {railCollapsed ? <PanelLeftOpen size={16} aria-hidden="true" /> : <PanelLeftClose size={16} aria-hidden="true" />}
       </button>
-      <button type="button" className={`app-rail-item${view === "home" ? " is-active" : ""}`} onClick={() => setView("home")}>
+      <button type="button" className={`app-rail-item${view === "home" ? " is-active" : ""}`} aria-label="Home" title="Home" onClick={() => setView("home")}>
         <Home size={18} aria-hidden="true" />
         <span>Home</span>
       </button>
-      <button type="button" className={`app-rail-item${view === "chat" ? " is-active" : ""}`} onClick={() => void handleOpenMostRecentChat()}>
+      <button type="button" className={`app-rail-item${view === "chat" ? " is-active" : ""}`} aria-label="Play" title="Play" onClick={() => void handleOpenMostRecentChat()}>
         <Play size={18} aria-hidden="true" />
         <span>Play</span>
       </button>
-      <button type="button" className={`app-rail-item${view === "statemap" ? " is-active" : ""}`} onClick={() => { setView("statemap"); void refreshSessionStateHub(); }}>
+      <button type="button" className={`app-rail-item${view === "statemap" ? " is-active" : ""}`} aria-label="State Map" title="State Map" onClick={() => { setView("statemap"); void refreshSessionStateHub(); }}>
         <Brain size={18} aria-hidden="true" />
         <span>State Map</span>
       </button>
-      <button type="button" className={`app-rail-item${view === "editor" || view === "library" ? " is-active" : ""}`} onClick={() => setView("library")}>
+      <button type="button" className={`app-rail-item${view === "editor" || view === "library" ? " is-active" : ""}`} aria-label="Library" title="Library" onClick={() => setView("library")}>
         <FolderOpen size={18} aria-hidden="true" />
         <span>Library</span>
       </button>
-      <button type="button" className={`app-rail-item${view === "settings" ? " is-active" : ""}`} onClick={() => { setSettingsDrawerOpen(false); setView("settings"); }}>
+      <button type="button" className={`app-rail-item${view === "settings" ? " is-active" : ""}`} aria-label="Settings" title="Settings" onClick={() => { setSettingsDrawerOpen(false); setView("settings"); }}>
         <SettingsIcon size={18} aria-hidden="true" />
         <span>Settings</span>
       </button>
@@ -6151,10 +5546,7 @@ export function App() {
       : "Idle / awaiting input";
 
     if (devModeActive) {
-      const devStream: Array<
-        | { kind: "chat"; key: string; t: number; role: string; content: string }
-        | { kind: "log"; key: string; t: number; level: string; category: string; message: string }
-      > = [
+      const devStream: DevStreamItem[] = [
         ...activeMessages.map((m) => ({
           kind: "chat" as const,
           key: `c${m.id}`,
@@ -6172,151 +5564,31 @@ export function App() {
         })),
       ].sort((a, b) => a.t - b.t);
 
-      const stageGlyph = (status: string) => {
-        if (status === "failed") return { sym: "[ERR]", cls: "err" };
-        if (status === "warning") return { sym: "[WRN]", cls: "warn" };
-        if (status === "skipped") return { sym: "[--]", cls: "skip" };
-        if (status === "running" || status === "pending" || status === "in_progress")
-          return { sym: "[...]", cls: "run" };
-        return { sym: "[OK]", cls: "ok" };
+      const monitoredJobs = Object.values(devJobsById).filter(
+        (job) => !dismissedDevJobIds.has(job.job_id),
+      );
+      const cancelMonitoredJob = (job: BackgroundJobProgress) => {
+        if (job.kind === "benchmark" && benchmarkLiveActive) {
+          handleStopBenchmark();
+          return;
+        }
+        if (job.kind === "evaluator" && activeEvaluatorJobIsLive) {
+          void handleCancelEvaluatorJob();
+        }
       };
-      const benchmarkCtx = benchmarkCtxRef.current;
-      const benchmarkRows = benchmarkCtx?.perTurn ?? benchmarkResult?.per_turn ?? [];
-      const benchmarkRequested =
-        benchmarkCtx?.settings.turn_count ?? benchmarkResult?.turn_count_requested ?? benchmarkTurnCount;
-      const benchmarkCompleted = benchmarkCtx?.completedTurns ?? benchmarkResult?.turn_count_completed ?? 0;
-      const benchmarkSucceeded = benchmarkRows.filter(
-        (turn) => turn.stage === "completed" && turn.narrator_response_present && !turn.narrator_error,
-      ).length;
-      const benchmarkFailed = benchmarkRows.filter(
-        (turn) => turn.stage !== "completed" || Boolean(turn.narrator_error),
-      ).length;
-      const benchmarkCurrentTurn = benchmarkLiveActive
-        ? Math.min(benchmarkRequested, benchmarkCompleted + (benchmarkTurnInFlightRef.current ? 1 : 0))
-        : benchmarkCompleted;
-      const benchmarkProgressPct =
-        benchmarkRequested > 0 ? Math.min(100, Math.round((benchmarkCompleted / benchmarkRequested) * 100)) : 0;
-      const backgroundJobs = [
-        {
-          key: "benchmark",
-          active: benchmarkRunning,
-          label: "benchmark",
-          detail: benchmarkLiveActive
-            ? `${benchmarkLivePhase} ${benchmarkCurrentTurn}/${benchmarkRequested}`
-            : benchmarkRunning
-              ? `${benchmarkType} running`
-              : benchmarkResult
-                ? `${benchmarkResult.scorecard.pass ? "pass" : "fail"} ${benchmarkResult.turn_count_completed}/${benchmarkResult.turn_count_requested}`
-                : "idle",
-          cls: benchmarkError || benchmarkLivePhase === "failed" ? "err" : benchmarkRunning ? "run" : benchmarkResult?.scorecard.pass ? "ok" : "skip",
-        },
-        {
-          key: "form-eval",
-          active: formEvalBusy || Boolean(formEvalReport),
-          label: "form-eval",
-          detail: formEvalBusy
-            ? "running"
-            : formEvalReport
-              ? `${formEvalReport.form_passed}/${formEvalReport.turns_total} pass, ${formEvalReport.form_failed} fail`
-              : "idle",
-          cls: formEvalBusy ? "run" : formEvalReport?.form_failed ? "warn" : formEvalReport ? "ok" : "skip",
-        },
-        {
-          key: "evaluator",
-          active: activeEvaluatorJobIsLive || Boolean(activeEvaluatorJob),
-          label: "evaluator",
-          detail: activeEvaluatorJob
-            ? `${activeEvaluatorJob.status}${activeEvaluatorJob.elapsed_ms ? ` ${activeEvaluatorJob.elapsed_ms}ms` : ""}`
-            : "idle",
-          cls: activeEvaluatorJob?.status === "failed" ? "err" : activeEvaluatorJobIsLive ? "run" : activeEvaluatorJob ? "ok" : "skip",
-        },
-        {
-          key: "state",
-          active: stateUpdating,
-          label: "state",
-          detail: stateUpdating ? "updating" : "idle",
-          cls: stateUpdating ? "run" : "skip",
-        },
-      ].filter((job) => job.active);
 
       const devPipelineRail = (
-            <aside className="cli-rail" aria-label="Pipeline">
-              <div className="cli-rail-title">// JOBS</div>
-              {backgroundJobs.length ? (
-                <div className="cli-job-list">
-                  {backgroundJobs.map((job) => (
-                    <div className={`cli-job ${job.cls}`} key={job.key}>
-                      <span>{job.label}</span>
-                      <strong>{job.detail}</strong>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="cli-rail-empty">no background jobs_</div>
-              )}
-
-              <div className="cli-rail-title">// BENCHMARK</div>
-              <div className="cli-benchmark-meter" aria-label="Benchmark progress">
-                <div className="cli-meter-line">
-                  <span>{benchmarkRunning ? benchmarkLivePhase : benchmarkResult ? "complete" : "idle"}</span>
-                  <strong>{benchmarkCurrentTurn}/{benchmarkRequested}</strong>
-                </div>
-                <div className="cli-meter-track">
-                  <span style={{ width: `${benchmarkProgressPct}%` }} />
-                </div>
-                <div className="cli-meter-grid">
-                  <span>ok {benchmarkSucceeded}</span>
-                  <span>fail {benchmarkFailed}</span>
-                  <span>left {benchmarkRunning ? benchmarkTurnsRemaining : Math.max(0, benchmarkRequested - benchmarkCompleted)}</span>
-                  <span>{benchmarkStopRef.current ? "stopping" : benchmarkRunning ? "running" : "ready"}</span>
-                </div>
-                {benchmarkError ? <div className="cli-rail-error">{benchmarkError}</div> : null}
-              </div>
-
-              <div className="cli-rail-title">// LAST TURN PIPELINE</div>
-              {latestPipelineTrace ? (
-                <>
-                  <div className="cli-rail-status">
-                    {latestPipelineTrace.final_status} - {latestPipelineTrace.total_elapsed_ms}ms
-                  </div>
-                  {latestPipelineTrace.stages.map((stage) => {
-                    const { sym, cls } = stageGlyph(stage.status);
-                    return (
-                      <div className={`cli-stage ${cls}`} key={stage.stage_name} title={stage.error_message ?? ""}>
-                        <span className="cli-stage-sym">{sym}</span>
-                        <span className="cli-stage-name">{stage.stage_name}</span>
-                        <span className="cli-stage-ms">{stage.elapsed_ms}ms</span>
-                      </div>
-                    );
-                  })}
-                </>
-              ) : (
-                <div className="cli-rail-empty">awaiting first turn_</div>
-              )}
-            </aside>
+        <DevPipelinePanel
+          hasPipelineTrace={Boolean(latestPipelineTrace)}
+          jobs={monitoredJobs}
+          onCancelJob={cancelMonitoredJob}
+          onDismissJob={dismissTrackedDevJob}
+          pipelineStages={pipelineSteps}
+          pipelineSummary={pipelineSummary}
+        />
       );
       const devStreamPanel = (
-            <section className="cli-stream" ref={devStreamRef} aria-label="Stream">
-              {devStream.length === 0 ? (
-                <div className="cli-line muted">// stream empty - type /chat &lt;message&gt; to begin</div>
-              ) : (
-                devStream.map((item) =>
-                  item.kind === "chat" ? (
-                    <div className="cli-line chatlog" key={item.key}>
-                      <span className="cli-tag">chatlog=</span>
-                      <span className="cli-role">{item.role}:</span>
-                      <span className="cli-text">{item.content}</span>
-                    </div>
-                  ) : (
-                    <div className={`cli-line log ${item.level}`} key={item.key}>
-                      <span className="cli-tag">log=</span>
-                      <span className="cli-cat">[{item.category}]</span>
-                      <span className="cli-text">{item.message}</span>
-                    </div>
-                  ),
-                )
-              )}
-            </section>
+        <DevStreamPanel items={devStream} streamRef={devStreamRef} />
       );
       const devDiagnosticsPanel = (
             <aside className="cli-diagnostics" aria-label="Dev and settings panel">
@@ -6344,7 +5616,30 @@ export function App() {
                 </button>
               </div>
               {devPanelTab === "settings" ? (
-                <div className="cli-embedded-settings">{providerSettingsPanel}</div>
+                <div className="cli-embedded-settings">
+                  {devEvaluatorSettingsPanel}
+                  <section className="settings-section dev-only-settings">
+                    <div className="settings-section-heading">
+                      <div>
+                        <span className="eyebrow">Dev Only</span>
+                        <h3>Evaluator Gates</h3>
+                      </div>
+                    </div>
+                    <label className="toggle-row">
+                      <input
+                        type="checkbox"
+                        checked={devOverrideActive}
+                        onChange={(event) => setDevOverrideActive(event.target.checked)}
+                      />
+                      <span>Allow untested or incompatible evaluator profiles</span>
+                    </label>
+                    <p className="settings-note">
+                      This bypass only lasts for the current app run. Compatibility tests and raw evaluator
+                      diagnostics remain in the DEV tab.
+                    </p>
+                  </section>
+                  {providerSettingsPanel}
+                </div>
               ) : devPanelTab === "benchmarks" ? (
                 <div className="cli-embedded-settings">{benchmarkRunnerPanel}</div>
               ) : (
@@ -6411,6 +5706,7 @@ export function App() {
                   <button
                     type="button"
                     className="cli-mini-btn"
+                    title="Run Structured Evaluator Diagnostic"
                     onClick={() => void handleRunStructuredDiagnostic()}
                     disabled={busy || structuredDiagnosticRunning || (!selectedStateUpdaterProfileId && !selectedProviderProfileId)}
                   >
@@ -6498,32 +5794,15 @@ export function App() {
         railNav={railNav}
         railShellClass={railShellClass}
       >
-      <main className="chat-only-shell">
-        <header className="chat-only-header">
-          <button className="ghost-action chat-back-mobile" onClick={() => setView("library")}>
-            <ArrowLeft size={18} />
-            <span>Library</span>
-          </button>
-          <SoulAvatar soulName={soul?.character_name ?? "Mnemosyne"} asset={selectedAvatarAsset} />
-          <div className="chat-header-info">
-            <span className="eyebrow">
-              {setting?.setting_name ?? "Local Setting"} / {provider} / {mode}
-            </span>
-            <h1>
-              {currentSessionTitle || "New Session"}
-              <button
-                className="inline-icon-button"
-                type="button"
-                title="Rename session"
-                onClick={handleRenameCurrentSession}
-                disabled={busy}
-              >
-                <Pencil size={14} />
-              </button>
-            </h1>
-            <p className="session-state-label">{soul?.character_name ?? "Mnemosyne"} - {sessionContinuityLabel}</p>
-          </div>
-          <div className="chat-top-actions">
+        <ChatWorkspaceHeader
+          avatar={selectedAvatarAsset}
+          busy={busy}
+          characterName={soul?.character_name ?? "Mnemosyne"}
+          contextTokens={context?.estimated_tokens ?? 0}
+          devLogCount={devLogs.length}
+          hasConversation={Boolean(currentConversationId)}
+          mode={mode}
+          moreMenu={
             <ChatMoreMenu
               activeMessageCount={activeMessages.length}
               busy={busy}
@@ -6540,218 +5819,51 @@ export function App() {
               setMenuOpen={setChatMoreMenuOpen}
               triggerRef={chatMoreButtonRef}
             />
-            <div className="token-pill">
-              {context?.estimated_tokens ?? 0}
-              <span>tok</span>
-            </div>
-            {settingsDrawerToggle}
-            <button
-              type="button"
-              className="dev-mode-toggle"
-              onClick={() => setDevModeActive(true)}
-              disabled={!currentConversationId}
-              title="Enter terminal Dev Mode"
-            >
-              <Terminal size={16} />
-              <span>Dev Mode</span>
-              <strong>{devLogs.length}</strong>
-            </button>
-          </div>
-        </header>
+          }
+          onBackToLibrary={() => setView("library")}
+          onOpenDevMode={() => setDevModeActive(true)}
+          onRename={() => void handleRenameCurrentSession()}
+          provider={provider}
+          sessionContinuityLabel={sessionContinuityLabel}
+          sessionTitle={currentSessionTitle || "New Session"}
+          settingName={setting?.setting_name ?? "Local Setting"}
+          settingsToggle={settingsDrawerToggle}
+        />
 
-        <section className="chat-only-scroll" ref={chatOnlyBodyRef} onScroll={handleChatScroll}>
-          <div className="chat-only-body" aria-live="polite" aria-atomic="false">
-          {activeMessages.length === 0 ? (
-            <div className="empty-state chat-empty">
-              <SoulAvatar soulName={soul?.character_name ?? "Mnemosyne"} asset={selectedAvatarAsset} />
-              <h2>Start the scene with {soul?.character_name ?? "your character"}</h2>
-              <p>
-                Type an action or a line of dialogue below to begin. Mnemosyne tracks memory, mood, and
-                relationships as the story unfolds.
-              </p>
-              <ul className="chat-empty-hints">
-                <li><code>*you step inside, still damp from the rain*</code> - narrate an action</li>
-                <li><code>/ooc &lt;message&gt;</code> - talk out of character</li>
-                <li><code>/help</code> - list every command</li>
-              </ul>
-            </div>
-          ) : (
-            activeMessages.map((message) => {
-              const variants = variantsByMessage[message.id] ?? [];
-              const selectedIndex = selectedVariantIndex(variants);
-              const canSelectVariant = true;
-              const canGenerateFromUser = canGenerateFromUserMessage(message);
-              const olderGenerationTitle =
-                "Regenerating older messages requires branch rewind and will be added later.";
+        <ChatTranscript
+          avatar={selectedAvatarAsset}
+          bodyRef={chatOnlyBodyRef}
+          bottomRef={chatBottomRef}
+          busy={busy}
+          canGenerateFromUserMessage={canGenerateFromUserMessage}
+          characterName={soul?.character_name ?? "Mnemosyne"}
+          messages={activeMessages}
+          onDeleteMessage={(message) => void handleDeleteChatMessage(message)}
+          onEditMessage={(message) => void handleEditUserMessage(message)}
+          onFixMessage={(message) => void handleFixFromUserMessage(message)}
+          onJumpToLatest={jumpToLatest}
+          onPreviewImage={setPreviewImageAsset}
+          onRegenerateMessage={(message) => void handleRegenerateFromUserMessage(message)}
+          onScroll={handleChatScroll}
+          onSelectVariant={(message, direction) => void handleSelectVariant(message, direction)}
+          showJumpToLatest={showJumpToLatest}
+          turnInProgress={turnInProgress}
+          variantsByMessage={variantsByMessage}
+        />
 
-              return (
-                <article className={`message ${message.role}`} key={message.id}>
-                  <div className="message-heading">
-                    <span>
-                      {message.channel?.startsWith("command_")
-                        ? "Command"
-                        : message.role === "user"
-                          ? "User"
-                          : "Narrator"}
-                    </span>
-                    {message.role === "assistant" ? (
-                      <div className="message-tools">
-                        <div className="variant-switcher" aria-label="Response variants">
-                          <button
-                            title="Previous variant"
-                            onClick={() => handleSelectVariant(message, -1)}
-                            disabled={turnInProgress || !canSelectVariant || variants.length <= 1 || selectedIndex <= 0}
-                          >
-                            <ArrowLeft size={13} />
-                          </button>
-                          <span>
-                            {variants.length ? selectedIndex + 1 : 1} / {Math.max(variants.length, 1)}
-                          </span>
-                          <button
-                            title="Next variant"
-                            onClick={() => handleSelectVariant(message, 1)}
-                            disabled={
-                              turnInProgress ||
-                              !canSelectVariant ||
-                              variants.length <= 1 ||
-                              selectedIndex >= variants.length - 1
-                            }
-                          >
-                            <ArrowRight size={13} />
-                          </button>
-                        </div>
-                        <button
-                          title="Hide/Rewind response"
-                          onClick={() => handleDeleteChatMessage(message)}
-                          disabled={turnInProgress}
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="message-tools">
-                        <button
-                          className="message-tool-action"
-                          title={canGenerateFromUser ? "Regenerate response from this user message" : olderGenerationTitle}
-                          onClick={() => handleRegenerateFromUserMessage(message)}
-                          disabled={turnInProgress || !canGenerateFromUser}
-                        >
-                          <RefreshCcw size={14} />
-                          <span>Regenerate</span>
-                        </button>
-                        <button
-                          className="message-tool-action"
-                          title={canGenerateFromUser ? "Fix response with instruction" : olderGenerationTitle}
-                          onClick={() => handleFixFromUserMessage(message)}
-                          disabled={turnInProgress || !canGenerateFromUser}
-                        >
-                          <span>Fix</span>
-                        </button>
-                        <button
-                          title="Edit this message"
-                          onClick={() => handleEditUserMessage(message)}
-                          disabled={turnInProgress}
-                        >
-                          <Pencil size={14} />
-                        </button>
-                        <button
-                          title="Hide/Rewind message"
-                          onClick={() => handleDeleteChatMessage(message)}
-                          disabled={turnInProgress}
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                  {message.role === "assistant" ? (
-                    <pre style={{ whiteSpace: "pre-wrap", margin: 0, fontFamily: "inherit" }}>
-                      {normalizeAssistantDisplay(message.content)}
-                    </pre>
-                  ) : (
-                    <p>{message.content}</p>
-                  )}
-                  {message.attachments?.length ? (
-                    <div className="message-attachments">
-                      {message.attachments.map((attachment) => (
-                        <button
-                          className="image-attachment"
-                          type="button"
-                          key={attachment.id}
-                          onClick={() => setPreviewImageAsset(attachment.image)}
-                          title="Open image preview"
-                        >
-                          <AssetImage asset={attachment.image} alt="Chat attachment" />
-                          <span>
-                            {attachment.image.source}
-                            {attachment.image.width && attachment.image.height
-                              ? ` / ${attachment.image.width}x${attachment.image.height}`
-                              : ""}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                </article>
-              );
-            })
-          )}
-          {busy && activeMessages.length > 0 ? (
-            <div className="typing-indicator" aria-label={`${soul?.character_name ?? "Narrator"} is writing`}>
-              <span />
-              <span />
-              <span />
-            </div>
-          ) : null}
-          <div ref={chatBottomRef} aria-hidden="true" />
-          </div>
-          {showJumpToLatest ? (
-            <button type="button" className="jump-to-latest" onClick={jumpToLatest}>
-              <ChevronDown size={16} />
-              <span>Jump to latest</span>
-            </button>
-          ) : null}
-        </section>
-
-        {showEvaluatorJobBanner && activeEvaluatorJob ? (
-          <section className={`evaluator-job-banner ${activeEvaluatorJob.status}`}>
-            <button
-              type="button"
-              className="evaluator-job-banner-close"
-              aria-label="Close state updater status"
-              title="Close"
-              onClick={handleDismissEvaluatorJobBanner}
-            >
-              <X size={14} />
-            </button>
-            <div>
-              <strong>{evaluatorJobBannerTitle(activeEvaluatorJob)}</strong>
-              <span>
-                {activeEvaluatorJob.model || "Evaluator"} / {activeEvaluatorJob.status}
-                {activeEvaluatorJob.elapsed_ms ? ` / ${activeEvaluatorJob.elapsed_ms}ms` : ""}
-              </span>
-              {activeEvaluatorJob.error_message ? <small>{activeEvaluatorJob.error_message}</small> : null}
-            </div>
-            <div className="evaluator-job-actions">
-              {activeEvaluatorJobIsLive ? (
-                <button type="button" onClick={handleCancelEvaluatorJob}>
-                  Cancel
-                </button>
-              ) : null}
-              {activeEvaluatorJob.status === "failed" ||
-              activeEvaluatorJob.status === "canceled" ||
-              activeEvaluatorJob.status === "timed_out" ? (
-                <button type="button" onClick={handleRetryEvaluatorJob}>
-                  Retry
-                </button>
-              ) : null}
-              {activeEvaluatorJobIsLive && effectiveStateUpdaterSettings.allow_send_with_stale_state ? (
-                <button type="button" onClick={handleProceedWithStaleState}>
-                  Proceed
-                </button>
-              ) : null}
-            </div>
-          </section>
+        {showEvaluatorJobBanner ? (
+          <EvaluatorStatusBanner
+            allowProceedWithStaleState={
+              effectiveStateUpdaterSettings.allow_send_with_stale_state ?? false
+            }
+            isLive={activeEvaluatorJobIsLive}
+            job={activeEvaluatorJob}
+            onCancel={() => void handleCancelEvaluatorJob()}
+            onClose={handleDismissEvaluatorJobBanner}
+            onProceed={handleProceedWithStaleState}
+            onRetry={() => void handleRetryEvaluatorJob()}
+            title={activeEvaluatorJob ? evaluatorJobBannerTitle(activeEvaluatorJob) : ""}
+          />
         ) : null}
 
         {personaModalMode ? (
@@ -6778,70 +5890,25 @@ export function App() {
           />
         ) : null}
 
-        <form className="chat-only-composer" onSubmit={handleSubmit}>
-          <input
-            ref={chatImageInputRef}
-            className="hidden-file"
-            type="file"
-            accept="image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif"
-            onChange={handleChatImageSelected}
-          />
-          <div className="composer-input-shell">
-            <textarea
-              value={draft}
-              onChange={(event) => handleDraftChange(event.target.value)}
-              onKeyDown={handleComposerKeyDown}
-              placeholder={`Message ${soul?.character_name ?? "Mnemosyne"} - narrate an action or speak. "/" for commands, Enter to send`}
-              disabled={busy}
-              rows={2}
-              aria-autocomplete="list"
-              aria-controls="slash-command-menu"
-              aria-expanded={slashMenuOpen}
-            />
-            {slashMenuOpen ? (
-              <div id="slash-command-menu" className="slash-command-menu" role="listbox">
-                {slashSuggestions.map((item, index) => (
-                  <button
-                    key={item.command}
-                    type="button"
-                    className={index === slashSelectedIndex ? "selected" : ""}
-                    role="option"
-                    aria-selected={index === slashSelectedIndex}
-                    onMouseDown={(event) => event.preventDefault()}
-                    onClick={() => insertSlashCommand(item.command)}
-                  >
-                    <strong>{item.command}</strong>
-                    <span>{item.usage}</span>
-                    <small>{item.description}</small>
-                  </button>
-                ))}
-              </div>
-            ) : null}
-          </div>
-          {busy ? (
-            <button type="button" aria-label="Stop generation" onClick={handleStopGeneration}>
-              <Square size={16} />
-            </button>
-          ) : (
-            <>
-              <button
-                type="button"
-                aria-label="Attach image"
-                title="Attach image"
-                onClick={() => chatImageInputRef.current?.click()}
-                disabled={!soul || stateUpdating}
-              >
-                <ImageIcon size={18} />
-              </button>
-              <button aria-label="Send message" disabled={!draft.trim() || !soul || stateUpdating}>
-                <Play size={18} />
-              </button>
-            </>
-          )}
-        </form>
+        <ChatComposer
+          busy={busy}
+          characterName={soul?.character_name ?? "Mnemosyne"}
+          draft={draft}
+          imageInputRef={chatImageInputRef}
+          onDraftChange={handleDraftChange}
+          onImageSelected={handleChatImageSelected}
+          onInsertSlashCommand={insertSlashCommand}
+          onKeyDown={handleComposerKeyDown}
+          onStopGeneration={handleStopGeneration}
+          onSubmit={handleSubmit}
+          selectedSlashIndex={slashSelectedIndex}
+          slashMenuOpen={slashMenuOpen}
+          slashSuggestions={slashSuggestions}
+          soulAvailable={Boolean(soul)}
+          stateUpdating={stateUpdating}
+        />
         <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
         {settingsDrawerPanel}
-      </main>
       </ChatView>
     );
   }
@@ -6877,10 +5944,12 @@ export function App() {
   if (view === "settings") {
     return (
       <SettingsPageView
+        activePanel={activeSettingsPanel}
         appDialogNode={appDialogNode}
+        onTabChange={setSettingsTab}
         railNav={railNav}
         railShellClass={railShellClass}
-        settingsPageContent={settingsPageContent}
+        settingsTab={settingsTab}
       />
     );
   }
@@ -7554,884 +6623,4 @@ export function App() {
       <ImagePreviewModal asset={previewImageAsset} onClose={() => setPreviewImageAsset(null)} />
     </LibraryView>
   );
-}
-
-function hasAcceptedDisclaimerVersion() {
-  try {
-    const raw = localStorage.getItem(DISCLAIMER_STORAGE_KEY);
-    if (!raw) return false;
-    const parsed = JSON.parse(raw) as {
-      accepted?: boolean;
-      disclaimer_version?: number;
-    };
-    return parsed.accepted === true && (parsed.disclaimer_version ?? 0) >= DISCLAIMER_VERSION;
-  } catch {
-    return false;
-  }
-}
-
-function loadStoredCustomNarratorPrompt() {
-  try {
-    return localStorage.getItem(CUSTOM_NARRATOR_PROMPT_STORAGE_KEY) ?? "";
-  } catch {
-    return "";
-  }
-}
-
-function loadStoredBoolean(key: string, fallback: boolean) {
-  try {
-    const raw = localStorage.getItem(key);
-    if (raw === null) return fallback;
-    return raw === "true";
-  } catch {
-    return fallback;
-  }
-}
-
-function loadStoredChatStartMode(): ChatStartMode {
-  try {
-    const raw = localStorage.getItem(CHAT_START_MODE_STORAGE_KEY);
-    return raw === "continue" || raw === "fresh" ? raw : "fresh";
-  } catch {
-    return "fresh";
-  }
-}
-
-function loadStoredSettingsTab(): SettingsTab {
-  try {
-    const raw = localStorage.getItem(SETTINGS_DRAWER_TAB_STORAGE_KEY);
-    if (raw === "chat") {
-      return "data";
-    }
-    return raw === "ai" || raw === "data" || raw === "about" ? raw : "ai";
-  } catch {
-    return "ai";
-  }
-}
-
-function formatLlmPayloadDebugBlock(payload: LlmPayloadPreview) {
-  const chatMessages =
-    payload.context_mode === "full_chat"
-      ? `\n\n=== FULL CHAT MESSAGES SENT ===\n${payload.messages
-          .map((message) => `${message.role}: ${message.content}`)
-          .join("\n\n")}`
-      : "";
-  const memorySlotDebug = payload.memory_slot_debug?.length
-    ? `\n\n=== MEMORY SLOT DEBUG ===\n${payload.memory_slot_debug
-        .filter((trace) => trace.action === "selected")
-        .map(
-          (trace) =>
-            `${trace.slot}: ${trace.memory_id} / ${trace.reason} / score ${Math.round(trace.final_score)} / ${trace.source_type} / ${trace.truth_status}`,
-        )
-        .join("\n")}`
-    : "";
-  return `=== SYSTEM MESSAGE ===
-${payload.system_message}
-
-=== CONTEXT, already included inside SYSTEM MESSAGE ===
-${payload.context}
-${memorySlotDebug}
-${chatMessages}
-
-=== USER MESSAGE ===
-${payload.user_message}
-
-=== ESTIMATED TOKENS ===
-System: ${payload.estimated_tokens.system}
-Context: ${payload.estimated_tokens.context}
-User: ${payload.estimated_tokens.user}
-Total: ${payload.estimated_tokens.total}
-
-=== PROVIDER ===
-Provider: ${payload.provider}
-Mode: ${payload.mode}
-Custom Prompt: ${payload.custom_prompt_status}
-Context Mode: ${payload.context_mode}
-Truncated: ${payload.truncated}
-Model: ${payload.model || "-"}
-Base URL: ${payload.base_url || "-"}`;
-}
-
-function makeDevLogEntry(
-  level: DevLogLevel,
-  category: DevLogCategory,
-  message: string,
-  details?: Record<string, unknown>,
-): DevLogEntry {
-  const id =
-    typeof crypto !== "undefined" && "randomUUID" in crypto
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  return sanitizeDevLogEntry({
-    id,
-    timestamp: Math.floor(Date.now() / 1000),
-    level,
-    category,
-    message,
-    details: details ?? null,
-  });
-}
-
-function sanitizeDevLogEntry(entry: DevLogEntry): DevLogEntry {
-  return {
-    ...entry,
-    details: sanitizeDevLogDetails(entry.details) as Record<string, unknown> | null | undefined,
-  };
-}
-
-function sanitizeDevLogDetails(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sanitizeDevLogDetails);
-  if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>).map(([key, nested]) => {
-      const lowered = key.toLowerCase();
-      const shouldRedact =
-        lowered.includes("api_key") ||
-        lowered === "authorization" ||
-        lowered.includes("secret") ||
-        lowered === "token" ||
-        lowered.endsWith("_token") ||
-        lowered.includes("bearer");
-      return [key, shouldRedact ? "[redacted]" : sanitizeDevLogDetails(nested)];
-    }),
-  );
-}
-
-function selectedVariantIndex(variants: AssistantMessageVariant[]) {
-  const index = variants.findIndex((variant) => variant.is_selected);
-  return index >= 0 ? index : 0;
-}
-
-function formatDebugDelta(value: number | null | undefined) {
-  if (value === null || value === undefined) return "-";
-  return value > 0 ? `+${value}` : String(value);
-}
-
-function seedStreamingTurn(
-  messages: ChatMessage[],
-  conversationId: string,
-  userText: string,
-  replacementAssistantId?: number,
-) {
-  const now = Math.floor(Date.now() / 1000);
-  const seeded = replacementAssistantId
-    ? messages.map((message) =>
-        message.id === replacementAssistantId && message.role === "assistant"
-          ? { ...message, content: "", pending: true }
-          : message,
-      )
-    : [
-        ...messages,
-        {
-          id: -Date.now(),
-          conversation_id: conversationId,
-          role: "user" as const,
-          content: userText,
-          created_at: now,
-        },
-        {
-          id: -Date.now() - 1,
-          conversation_id: conversationId,
-          role: "assistant" as const,
-          content: "",
-          created_at: now,
-          pending: true,
-        },
-      ];
-
-  if (
-    replacementAssistantId &&
-    !seeded.some((message) => message.id === replacementAssistantId && message.role === "assistant")
-  ) {
-    seeded.push({
-      id: -Date.now() - 1,
-      conversation_id: conversationId,
-      role: "assistant",
-      content: "",
-      created_at: now,
-      pending: true,
-    });
-  }
-
-  return seeded;
-}
-
-function appendStreamingChunk(messages: ChatMessage[], conversationId: string, chunk: string) {
-  const next = [...messages];
-  for (let index = next.length - 1; index >= 0; index -= 1) {
-    const message = next[index];
-    if (message.conversation_id === conversationId && message.role === "assistant") {
-      next[index] = { ...message, content: `${message.content}${chunk}` };
-      return next;
-    }
-  }
-
-  next.push({
-    id: -Date.now(),
-    conversation_id: conversationId,
-    role: "assistant",
-    content: chunk,
-    created_at: Math.floor(Date.now() / 1000),
-  });
-  return next;
-}
-
-function upsertSavedChatMessage(messages: ChatMessage[], savedMessage: ChatMessage) {
-  const existingIndex = messages.findIndex(
-    (message) =>
-      message.conversation_id === savedMessage.conversation_id && message.id === savedMessage.id,
-  );
-  let pendingAssistantReplacedBySaved = 0;
-  if (existingIndex >= 0) {
-    const next = [...messages];
-    next[existingIndex] = savedMessage;
-    const cleaned = removeDuplicateStreamingAssistants(next, savedMessage.conversation_id, savedMessage.id);
-    return {
-      messages: cleaned,
-      trace: messageRenderTrace(cleaned, messages.length - cleaned.length, 0),
-    };
-  }
-
-  if (savedMessage.role === "assistant") {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
-      if (
-        message.conversation_id === savedMessage.conversation_id &&
-        message.role === "assistant" &&
-        message.pending &&
-        pendingMatchesSavedAssistant(message, savedMessage, null)
-      ) {
-        const next = [...messages];
-        next[index] = savedMessage;
-        pendingAssistantReplacedBySaved = 1;
-        const cleaned = removeDuplicateStreamingAssistants(next, savedMessage.conversation_id, savedMessage.id);
-        return {
-          messages: cleaned,
-          trace: messageRenderTrace(cleaned, messages.length - cleaned.length, pendingAssistantReplacedBySaved),
-        };
-      }
-    }
-  }
-
-  const cleaned = removeDuplicateStreamingAssistants(
-    [...messages, savedMessage].sort((left, right) => left.id - right.id),
-    savedMessage.conversation_id,
-    savedMessage.id,
-  );
-  return {
-    messages: cleaned,
-    trace: messageRenderTrace(cleaned, messages.length + 1 - cleaned.length, pendingAssistantReplacedBySaved),
-  };
-}
-
-function pendingMatchesSavedAssistant(
-  pending: ChatMessage,
-  savedMessage: ChatMessage,
-  activeGeneration?: ActiveGeneration | null,
-) {
-  if (!pending.pending && pending.id > 0) return false;
-  if (pending.assistant_message_id && pending.assistant_message_id === savedMessage.id) return true;
-  if (pending.request_id && savedMessage.request_id && pending.request_id === savedMessage.request_id) return true;
-  if (
-    activeGeneration &&
-    pending.generation_id === activeGeneration.id &&
-    activeGeneration.conversationId === savedMessage.conversation_id &&
-    !activeGeneration.knownAssistantIds.has(savedMessage.id)
-  ) {
-    return true;
-  }
-  return pending.id < 0 && savedMessage.id > 0;
-}
-
-function messageRenderTrace(
-  messages: ChatMessage[],
-  duplicateSavedSuppressed: number,
-  pendingAssistantReplacedBySaved: number,
-): MessageRenderTrace {
-  return buildMessageRenderTrace(messages, {
-    activeListenerCount: 0,
-    duplicateSavedSuppressed,
-    duplicatePendingSuppressed: 0,
-    pendingReplacedBySaved: pendingAssistantReplacedBySaved,
-  });
-}
-
-function removeDuplicateStreamingAssistants(
-  messages: ChatMessage[],
-  conversationId: string,
-  savedMessageId: number,
-) {
-  return messages.filter(
-    (message) =>
-      !(
-        message.conversation_id === conversationId &&
-        message.role === "assistant" &&
-        message.pending &&
-        savedMessageId > 0
-      ),
-  );
-}
-
-function prepareMessagesForRender(messages: ChatMessage[], activeListenerCount: number = 0) {
-  const active = messages.filter((message) => message.role !== "system");
-
-  // First, split active into saved and pending
-  const saved = active.filter((msg) => msg.id > 0 && !msg.pending);
-  const pending = active.filter((msg) => msg.pending || msg.id < 0);
-
-  const dedupedSaved: ChatMessage[] = [];
-  const seenSavedIds = new Set<number>();
-  const seenSavedRequestIds = new Set<string>();
-  let duplicateSavedSuppressed = 0;
-  let duplicateSavedDbAssistantDetected = false;
-
-  for (const msg of saved) {
-    if (seenSavedIds.has(msg.id)) {
-      duplicateSavedSuppressed += 1;
-      continue;
-    }
-    seenSavedIds.add(msg.id);
-
-    if (msg.request_id) {
-      if (seenSavedRequestIds.has(msg.request_id)) {
-        if (msg.role === "assistant") {
-          duplicateSavedDbAssistantDetected = true;
-        } else {
-          duplicateSavedSuppressed += 1;
-          continue;
-        }
-      }
-      seenSavedRequestIds.add(msg.request_id);
-    }
-
-    const isCloseDuplicate = dedupedSaved.some(
-      (existing) =>
-        existing.role === msg.role &&
-        existing.content === msg.content &&
-        Math.abs(existing.created_at - msg.created_at) < 10
-    );
-    if (isCloseDuplicate) {
-      if (msg.role === "assistant" && msg.id !== dedupedSaved.find((existing) => existing.content === msg.content)?.id) {
-        duplicateSavedDbAssistantDetected = true;
-      } else {
-        duplicateSavedSuppressed += 1;
-        continue;
-      }
-    }
-
-    dedupedSaved.push(msg);
-  }
-
-  const visiblePending: ChatMessage[] = [];
-  let duplicatePendingSuppressed = 0;
-  let pendingReplacedBySaved = 0;
-
-  for (const pendingMsg of pending) {
-    const hasMatchingSaved = dedupedSaved.some((savedMsg) => {
-      if (pendingMsg.assistant_message_id && pendingMsg.assistant_message_id === savedMsg.id) {
-        return true;
-      }
-      if (pendingMsg.request_id && savedMsg.request_id && pendingMsg.request_id === savedMsg.request_id) {
-        return true;
-      }
-      if (
-        pendingMsg.role === savedMsg.role &&
-        pendingMsg.content.trim() &&
-        contentHash(pendingMsg.content) === contentHash(savedMsg.content)
-      ) {
-        return true;
-      }
-      return false;
-    });
-
-    if (hasMatchingSaved) {
-      pendingReplacedBySaved += 1;
-      continue;
-    }
-
-    const isPendingDuplicate = visiblePending.some(
-      (existing) =>
-        (pendingMsg.assistant_message_id &&
-          existing.assistant_message_id &&
-          pendingMsg.assistant_message_id === existing.assistant_message_id) ||
-        (pendingMsg.request_id && existing.request_id && pendingMsg.request_id === existing.request_id) ||
-        (pendingMsg.role === existing.role &&
-          pendingMsg.content === existing.content &&
-          Math.abs(pendingMsg.created_at - existing.created_at) < 10)
-    );
-    if (isPendingDuplicate) {
-      duplicatePendingSuppressed += 1;
-      continue;
-    }
-
-    visiblePending.push(pendingMsg);
-  }
-
-  const rendered = [...dedupedSaved, ...visiblePending].sort((left, right) => {
-    if (left.id < 0 && right.id > 0) return 1;
-    if (left.id > 0 && right.id < 0) return -1;
-    if (left.id < 0 && right.id < 0) {
-      return left.created_at - right.created_at;
-    }
-    return left.id - right.id;
-  });
-
-  const savedMessageCount = dedupedSaved.length;
-  const pendingMessageCount = visiblePending.length;
-  const renderedMessageCount = rendered.length;
-  const trace = buildMessageRenderTrace(rendered, {
-    activeListenerCount,
-    duplicateSavedSuppressed,
-    duplicatePendingSuppressed,
-    pendingReplacedBySaved,
-    savedMessageCount,
-    pendingMessageCount,
-    renderedMessageCount,
-    duplicateSavedDbAssistantDetected,
-  });
-
-  return {
-    messages: rendered,
-    trace,
-  };
-}
-
-function contentHash(content: string) {
-  let hash = 5381;
-  const normalized = content.trim().replace(/\s+/g, " ");
-  for (let index = 0; index < normalized.length; index += 1) {
-    hash = (hash * 33) ^ normalized.charCodeAt(index);
-  }
-  return `h${(hash >>> 0).toString(16)}`;
-}
-
-function renderSourceForMessage(message: ChatMessage): VisibleBubbleRenderSource {
-  if (message.id > 0 && !message.pending) return "saved_db";
-  if (message.role === "assistant" && message.pending && message.content.trim()) return "streaming_overlay";
-  if (message.role === "assistant" && message.pending) return "pending_overlay";
-  if (message.id < 0) return "local_optimistic";
-  return "unknown";
-}
-
-function buildVisibleBubbleTrace(messages: ChatMessage[]) {
-  const trace: VisibleBubbleTraceRow[] = messages.map((message, index) => ({
-    render_index: index,
-    role: message.role,
-    render_source: renderSourceForMessage(message),
-    message_id: message.id,
-    request_id: message.request_id ?? undefined,
-    assistant_message_id: message.assistant_message_id ?? (message.role === "assistant" && message.id > 0 ? message.id : undefined),
-    turn_id: message.turn_id ?? undefined,
-    content_hash: contentHash(message.content),
-    created_at: message.created_at,
-    status: message.status,
-    origin: message.origin,
-  }));
-
-  const assistantGroups = new Map<string, VisibleBubbleTraceRow[]>();
-  for (const row of trace) {
-    if (row.role !== "assistant") continue;
-    const keys = [
-      row.assistant_message_id ? `assistant:${row.assistant_message_id}` : "",
-      row.content_hash ? `hash:${row.content_hash}` : "",
-    ].filter(Boolean);
-    for (const key of keys) {
-      const group = assistantGroups.get(key) ?? [];
-      group.push(row);
-      assistantGroups.set(key, group);
-    }
-  }
-  for (const group of assistantGroups.values()) {
-    if (group.length < 2) continue;
-    const sources = [...new Set(group.map((row) => row.render_source))];
-    for (const row of group) {
-      row.duplicate_visual_pair = true;
-      row.duplicate_render_sources = sources;
-    }
-  }
-  return trace;
-}
-
-function buildMessageRenderTrace(
-  messages: ChatMessage[],
-  options: {
-    activeListenerCount: number;
-    duplicateSavedSuppressed: number;
-    duplicatePendingSuppressed: number;
-    pendingReplacedBySaved: number;
-    savedMessageCount?: number;
-    pendingMessageCount?: number;
-    renderedMessageCount?: number;
-    duplicateSavedDbAssistantDetected?: boolean;
-  },
-): MessageRenderTrace {
-  const rendered = messages.filter((message) => message.role !== "system");
-  const pendingAssistantCount = rendered.filter((message) => message.role === "assistant" && message.pending).length;
-  const renderedSavedMessageCount = rendered.filter((message) => message.id > 0 && !message.pending).length;
-  const renderedPendingMessageCount = rendered.filter((message) => message.pending || message.id < 0).length;
-  const visibleBubbleTrace = buildVisibleBubbleTrace(rendered);
-  return {
-    frontend_message_render_count: options.renderedMessageCount ?? rendered.length,
-    saved_message_count: options.savedMessageCount ?? renderedSavedMessageCount,
-    pending_message_count: options.pendingMessageCount ?? renderedPendingMessageCount,
-    rendered_message_count: options.renderedMessageCount ?? rendered.length,
-    duplicate_saved_suppressed: options.duplicateSavedSuppressed,
-    duplicate_pending_suppressed: options.duplicatePendingSuppressed,
-    pending_replaced_by_saved: options.pendingReplacedBySaved,
-    pending_assistant_replaced_by_saved: options.pendingReplacedBySaved,
-    active_listener_count: options.activeListenerCount,
-    pending_assistant_count: pendingAssistantCount,
-    rendered_saved_message_count: renderedSavedMessageCount,
-    rendered_pending_message_count: renderedPendingMessageCount,
-    duplicate_render_suppressed_count:
-      options.duplicateSavedSuppressed + options.duplicatePendingSuppressed + options.pendingReplacedBySaved,
-    duplicate_visual_pair: visibleBubbleTrace.some((row) => row.duplicate_visual_pair),
-    duplicate_saved_db_assistant_detected: options.duplicateSavedDbAssistantDetected ?? false,
-    visible_bubble_trace: visibleBubbleTrace,
-  };
-}
-
-function reconcilePersistedMessages(current: ChatMessage[], persisted: ChatMessage[]) {
-  if (!persisted.length) return current;
-  const persistedConversationId = persisted[0].conversation_id;
-  return [
-    ...current.filter((message) => message.conversation_id !== persistedConversationId),
-    ...persisted,
-  ].sort((left, right) => left.id - right.id);
-}
-
-function hasSavedAssistantForGeneration(messages: ChatMessage[], activeGeneration: ActiveGeneration) {
-  if (activeGeneration.replacementAssistantId) {
-    const replacement = messages.find(
-      (message) =>
-        message.id === activeGeneration.replacementAssistantId && message.role === "assistant",
-    );
-    return Boolean(
-      replacement &&
-        !replacement.pending &&
-        replacement.content.trim() &&
-        replacement.content !== activeGeneration.replacementOriginalContent,
-    );
-  }
-
-  return messages.some(
-    (message) =>
-      message.role === "assistant" &&
-      message.id > 0 &&
-      !message.pending &&
-      message.content.trim() &&
-      !activeGeneration.knownAssistantIds.has(message.id),
-  );
-}
-
-function clearFailedStreamingTurn(
-  messages: ChatMessage[],
-  conversationId: string,
-  replacementAssistantId?: number,
-  replacementOriginalContent?: string,
-) {
-  return messages.flatMap((message) => {
-    if (message.conversation_id !== conversationId || message.role !== "assistant") {
-      return [message];
-    }
-    if (replacementAssistantId && message.id === replacementAssistantId) {
-      return [{ ...message, content: replacementOriginalContent ?? message.content }];
-    }
-    if (message.id < 0) {
-      return [];
-    }
-    return [message];
-  });
-}
-
-function normalizeAssistantDisplay(content: string) {
-  const withoutHidden = stripHiddenStateBlocks(content);
-  return normalizeTrailingStatusBlock(withoutHidden);
-}
-
-function stripHiddenStateBlocks(content: string) {
-  let cleaned = content;
-  cleaned = cleaned.replace(/\[HIDDEN STATE\][\s\S]*?(?:\[\/HIDDEN STATE\]|$)/g, "");
-  cleaned = cleaned.replace(/\[HIDDEN STATE[\s\S]*$/g, "");
-  cleaned = cleaned.replace(/\[HIDDEN_STATE\][\s\S]*$/g, "");
-  cleaned = cleaned.replace(/\[HIDDEN_STATE[\s\S]*$/g, "");
-  cleaned = cleaned.replace(/\[\/HIDDEN STATE[\s\S]*$/g, "");
-  cleaned = cleaned.replace(/\[\/HIDDEN_STATE[\s\S]*$/g, "");
-  cleaned = cleaned.replace(/\[\s*$/g, "");
-  return cleaned.trimEnd();
-}
-
-function normalizeTrailingStatusBlock(content: string) {
-  const statusBlocks = [...content.matchAll(/```status[\s\S]*?```/gi)];
-  if (!statusBlocks.length) return content;
-  const status = statusBlocks[statusBlocks.length - 1][0].trim();
-  const body = content.replace(/```status[\s\S]*?```/gi, "").trimEnd();
-  return body ? `${body}\n\n${status}` : status;
-}
-
-function conversationIdForSoul(soulId: string) {
-  return `local-mock-${soulId}`;
-}
-
-function conversationIdForSettingAndSoul(settingId: string, soulId: string) {
-  return `local-mock-${settingId}-${soulId}`;
-}
-
-function psycheFromSoul(soul: Soul): PsycheDraft {
-  const relationship = soul.relationships.user ?? PSYCHE_PRESETS.Custom.relationship;
-  return {
-    global: {
-      fear_baseline: soul.global.fear_baseline,
-      resolve: soul.global.resolve,
-      shame: soul.global.shame,
-      openness: soul.global.openness,
-    },
-    maslow: [
-      soul.global.maslow[0] ?? 60,
-      soul.global.maslow[1] ?? 50,
-      soul.global.maslow[2] ?? 40,
-      soul.global.maslow[3] ?? 30,
-      soul.global.maslow[4] ?? 20,
-    ],
-    sdt: [soul.global.sdt[0] ?? 70, soul.global.sdt[1] ?? 40, soul.global.sdt[2] ?? 10],
-    trauma: {
-      phase: soul.trauma.phase,
-      hypervigilance: soul.trauma.symptoms.hypervigilance ?? 10,
-      flashbacks: soul.trauma.symptoms.flashbacks ?? 10,
-      numbing: soul.trauma.symptoms.numbing ?? 10,
-      avoidance: soul.trauma.symptoms.avoidance ?? 10,
-    },
-    relationship: {
-      trust: relationship.trust,
-      affection: relationship.affection,
-      intimacy: relationship.intimacy,
-      passion: relationship.passion,
-      commitment: relationship.commitment,
-      fear: relationship.fear,
-      desire: relationship.desire,
-    },
-  };
-}
-
-function worldDraftFromSoul(soul: Soul): WorldDraft {
-  return {
-    location: soul.world.location || "Unspecified starting scene.",
-    activePlots: soul.world.active_plots.join("\n") || "Establish the first scene",
-    keyObjects: soul.world.key_objects.join("\n"),
-    timeElapsed: soul.world.time_elapsed || "Session start",
-  };
-}
-
-function worldDraftFromSetting(setting: SettingSoul): WorldDraft {
-  return {
-    location: setting.world.location || "Unspecified starting scene.",
-    activePlots: setting.world.active_plots.join("\n") || "Establish the first scene",
-    keyObjects: setting.world.key_objects.join("\n"),
-    timeElapsed: setting.world.time_elapsed || "Session start",
-  };
-}
-
-function normalizeWorldDraft(world: WorldDraft) {
-  return {
-    location: world.location.trim() || "Unspecified starting scene.",
-    activePlots: linesFromText(world.activePlots, ["Establish the first scene"]),
-    keyObjects: linesFromText(world.keyObjects, []),
-    timeElapsed: world.timeElapsed.trim() || "Session start",
-  };
-}
-
-function cloneForUi<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
-}
-
-function parseMarkdownSoul(text: string, filename: string): any {
-  const lines = text.split(/\r?\n/);
-  let name = filename.replace(/\.[^.]+$/, "");
-  for (const line of lines) {
-    const match = line.match(/^#\s+(.+)$/);
-    if (match) {
-      name = match[1].trim();
-      break;
-    }
-  }
-
-  let currentSection = "";
-  const sections: Record<string, string[]> = {
-    description: [],
-    personality: [],
-    appearance: [],
-    scenario: [],
-    first_message: []
-  };
-
-  for (const line of lines) {
-    if (line.startsWith("# ")) {
-      currentSection = "description";
-      continue;
-    }
-    const headingMatch = line.match(/^##\s+(.+)$/);
-    if (headingMatch) {
-      const heading = headingMatch[1].toLowerCase().trim();
-      if (heading.includes("personality") || heading.includes("psyche") || heading.includes("trait")) {
-        currentSection = "personality";
-      } else if (heading.includes("appearance") || heading.includes("look") || heading.includes("visual")) {
-        currentSection = "appearance";
-      } else if (heading.includes("scenario") || heading.includes("setting") || heading.includes("world")) {
-        currentSection = "scenario";
-      } else if (heading.includes("first") || heading.includes("greeting") || heading.includes("opening") || heading.includes("message") || heading.includes("start")) {
-        currentSection = "first_message";
-      } else if (heading.includes("description") || heading.includes("about") || heading.includes("backstory") || heading.includes("summary")) {
-        currentSection = "description";
-      } else {
-        currentSection = "description";
-      }
-      continue;
-    }
-
-    if (currentSection) {
-      sections[currentSection].push(line);
-    } else {
-      sections.description.push(line);
-    }
-  }
-
-  return {
-    character_name: name,
-    profile: {
-      description: sections.description.join("\n").trim(),
-      personality: sections.personality.join("\n").trim(),
-      appearance: sections.appearance.join("\n").trim(),
-      scenario: sections.scenario.join("\n").trim(),
-      opening_narrator_message: sections.first_message.join("\n").trim(),
-    }
-  };
-}
-
-function formatSnapshotTimestamp(date: Date) {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
-    date.getHours(),
-  )}${pad(date.getMinutes())}`;
-}
-
-async function soulFromImport(raw: unknown, fallbackName: string) {
-  const record = isRecord(raw) && isRecord(raw.soul) ? raw.soul : raw;
-  if (!isRecord(record)) {
-    throw new Error("Import file must be a Soul JSON object or package with a soul field");
-  }
-
-  const importedName = stringFrom(record.character_name) || stringFrom(record.name);
-  const base = await createDefaultSoul(importedName || fallbackName.replace(/\.[^.]+$/, ""));
-  const profile = isRecord(record.profile) ? record.profile : {};
-  const world = isRecord(record.world) ? record.world : {};
-  const memory = isRecord(record.memory) ? record.memory : {};
-  const description =
-    stringFrom(profile.description) || stringFrom(record.description) || stringFrom(record.persona);
-  const appearance = stringFrom(profile.appearance) || stringFrom(record.appearance);
-  const personality = stringFrom(profile.personality) || stringFrom(record.personality);
-  const scenario =
-    stringFrom(profile.scenario) || stringFrom(record.scenario) || stringFrom(record.setting);
-  const openingNarratorMessage =
-    stringFrom(profile.opening_narrator_message) ||
-    stringFrom(record.opening_narrator_message) ||
-    stringFrom(record.first_message) ||
-    stringFrom(record.initial_message);
-  const avatarImageId = stringFrom(profile.avatar_image_id) || stringFrom(record.avatar_image_id);
-  const location = stringFrom(world.location) || scenario || base.world.location;
-  const core = stringArrayFrom(isRecord(memory) ? memory.core : undefined);
-
-  return {
-    ...base,
-    ...record,
-    schema_version: Number(record.schema_version) || base.schema_version,
-    character_id: stringFrom(record.character_id) || base.character_id,
-    character_name: importedName || base.character_name,
-    soul_kind: stringFrom(record.soul_kind) || "imported_package",
-    source_soul_id: stringFrom(record.source_soul_id) || null,
-    source_savepoint_id: stringFrom(record.source_savepoint_id) || null,
-    created_from_name: stringFrom(record.created_from_name) || null,
-    profile: {
-      description,
-      appearance,
-      personality,
-      scenario,
-      opening_narrator_message: openingNarratorMessage,
-      avatar_image_id: avatarImageId || null,
-    },
-    memory: {
-      ...base.memory,
-      ...(isRecord(memory) ? memory : {}),
-      core: core.length
-        ? core
-        : [
-            ...base.memory.core,
-            description ? `Profile: ${description}` : "",
-            appearance ? `Appearance: ${appearance}` : "",
-            personality ? `Personality: ${personality}` : "",
-          ].filter(Boolean),
-    },
-    world: {
-      ...base.world,
-      ...(isRecord(world) ? world : {}),
-      location,
-      active_plots: stringArrayFrom(world.active_plots).length
-        ? stringArrayFrom(world.active_plots)
-        : base.world.active_plots,
-    },
-  } as Soul;
-}
-
-function settingFromImport(raw: unknown, fallbackName: string): SettingSoul {
-  const record = isRecord(raw) && isRecord(raw.setting) ? raw.setting : raw;
-  if (!isRecord(record)) {
-    throw new Error("Import file must be a Setting JSON object or package with a setting field");
-  }
-
-  const world = isRecord(record.world) ? record.world : record;
-  const fallbackSettingName = fallbackName.replace(/\.[^.]+$/, "");
-  return {
-    schema_version: Number(record.schema_version) || 1,
-    setting_id: stringFrom(record.setting_id) || crypto.randomUUID(),
-    setting_name:
-      stringFrom(record.setting_name) || stringFrom(record.name) || fallbackSettingName,
-    scenario: stringFrom(record.scenario) || stringFrom(world.scenario),
-    last_updated: Math.floor(Date.now() / 1000),
-    turn_counter: Number(record.turn_counter) || 0,
-    world: {
-      location:
-        stringFrom(world.location) ||
-        stringFrom(record.location) ||
-        "Unspecified starting scene.",
-      active_plots: stringArrayFrom(world.active_plots).length
-        ? stringArrayFrom(world.active_plots)
-        : stringArrayFrom(record.active_plots).length
-          ? stringArrayFrom(record.active_plots)
-          : ["Establish the first scene"],
-      recent_events: stringArrayFrom(world.recent_events),
-      key_objects: stringArrayFrom(world.key_objects),
-      time_elapsed: stringFrom(world.time_elapsed) || "Session start",
-    },
-  };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function stringFrom(value: unknown) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function stringArrayFrom(value: unknown) {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : [];
-}
-
-function linesFromText(text: string, fallback: string[]) {
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  return lines.length ? lines : fallback;
 }

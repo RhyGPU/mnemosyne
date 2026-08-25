@@ -610,7 +610,8 @@ impl SoulPatch {
                     // Reinforcement: a recurring moment climbs in importance (so
                     // repeated kindness can become trust, repeated silence
                     // abandonment) and is refreshed in mind, resetting its fade.
-                    existing.salience = (existing.salience.max(55.0) + MEMORY_REINFORCE_CLIMB).min(100.0);
+                    existing.salience =
+                        (existing.salience.max(55.0) + MEMORY_REINFORCE_CLIMB).min(100.0);
                     existing.retrieval_strength = existing.retrieval_strength.max(70.0).min(100.0);
                     // If reinforcement just pushed it into core, un-fade it.
                     if is_core_memory(existing) && existing.archived {
@@ -2568,7 +2569,11 @@ mod tests {
         low.id = "low".into();
         low.salience = 30.0;
         low.retrieval_strength = 80.0;
-        let mut high = create_scored_memory(&soul, "Aurora admitted a private fear to the user.", "bonding");
+        let mut high = create_scored_memory(
+            &soul,
+            "Aurora admitted a private fear to the user.",
+            "bonding",
+        );
         high.id = "high".into();
         high.salience = 75.0;
         high.retrieval_strength = 80.0;
@@ -3009,6 +3014,7 @@ mod tests {
         assert!(world.recent_events.is_empty());
     }
 
+    #[test]
     fn apply_to_session_legacy_fallback_mutates_soul_world_without_session_world() {
         let mut soul = Soul::default_for_character("Echo-0");
         soul.world.location = "Legacy room".into();

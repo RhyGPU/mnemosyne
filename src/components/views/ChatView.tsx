@@ -18,7 +18,7 @@ export function ChatView({
       {appDialogNode}
       {railNav}
       {pipelineRail}
-      {children}
+      <main className="chat-only-shell">{children}</main>
     </div>
   );
 }
