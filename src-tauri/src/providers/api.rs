@@ -1887,7 +1887,12 @@ pub fn build_state_updater_prompt(soul: &Soul, session_world: Option<&SessionWor
                 "participants": [active_soul_id, "default_player"],
                 "last_user_action": "latest user action",
                 "pressure_point": "next decision point",
-                "continuity_note": "object/retcon note"
+                "continuity_note": "object/retcon note",
+                "positions": ["who is where"],
+                "room_state": "door/room truth or null",
+                "current_misunderstanding": "false belief or null",
+                "active_object": "or null",
+                "open_question": "or null"
             },
             "event_operations": [{
                 "operation": "add_recent_event | replace_recent_event | invalidate_recent_event | clear_recent_event_matching | add_correction_note | no_op",
@@ -1965,6 +1970,7 @@ Use exact evidence_quote substrings from the latest exchange. Do not invent fact
 If nothing durable changed, return ops: [] with a specific nonempty no_op_reason.\n\
 Do not return empty ops for entering/leaving a location, object movement/condition changes, relationship-significant actions, or explicit scene changes.\n\
 Use only fields defined for each op. Never put confidence on update_scene_state; confidence is allowed only on add_memory.\n\
+update_scene_state is current truth, not history: restate its continuity fields each turn, and send null once one is resolved or leaves play.\n\
 Resolve user-controlled \"I\" to the active player persona. Prefer aliases instead of copying raw UUIDs when valid: active_soul, active_player, latest_speaker, session_world.\n\
 Current truth comes from the compact state JSON below; Rust validates semantics and applies the ledger.\n\n{}",
         structured_evaluator_current_state_block(
@@ -2180,7 +2186,9 @@ pub fn evaluator_patch_json_schema() -> serde_json::Value {
         "additionalProperties": false,
         "required": [
             "scene_state_id", "current_scene", "resolved_active_plot", "focus",
-            "participants", "last_user_action", "pressure_point", "continuity_note"
+            "participants", "last_user_action", "pressure_point", "continuity_note",
+            "positions", "room_state", "current_misunderstanding", "active_object",
+            "open_question"
         ],
         "properties": {
             "scene_state_id": nullable_string,
@@ -2190,7 +2198,12 @@ pub fn evaluator_patch_json_schema() -> serde_json::Value {
             "participants": { "type": "array", "items": { "type": "string" } },
             "last_user_action": nullable_string,
             "pressure_point": nullable_string,
-            "continuity_note": nullable_string
+            "continuity_note": nullable_string,
+            "positions": { "type": "array", "items": { "type": "string" } },
+            "room_state": nullable_string,
+            "current_misunderstanding": nullable_string,
+            "active_object": nullable_string,
+            "open_question": nullable_string
         }
     });
 

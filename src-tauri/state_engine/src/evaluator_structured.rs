@@ -112,6 +112,21 @@ pub struct UpdateSceneStateOp {
     pub last_user_action: String,
     pub pressure_point: String,
     pub continuity_note: String,
+    /// Continuity fields describing current scene truth. Each `update_scene_state`
+    /// restates them in full, so `None` means "there is none right now" and
+    /// clears the stored value rather than leaving a resolved misunderstanding
+    /// or an answered question standing forever. All are `#[serde(default)]` so
+    /// previously captured payloads, written before these existed, stay readable.
+    #[serde(default)]
+    pub positions: Vec<String>,
+    #[serde(default)]
+    pub room_state: Option<String>,
+    #[serde(default)]
+    pub current_misunderstanding: Option<String>,
+    #[serde(default)]
+    pub active_object: Option<String>,
+    #[serde(default)]
+    pub open_question: Option<String>,
     /// Kept optional at the serde boundary so previously captured V1 payloads
     /// remain readable. Semantic compilation requires it for every new scene
     /// update, and the provider schema marks it required.
@@ -314,6 +329,15 @@ pub fn compile_evaluator_ops_to_engine_patch(
                         last_user_action: non_empty(&op.last_user_action),
                         pressure_point: non_empty(&op.pressure_point),
                         continuity_note: non_empty(&op.continuity_note),
+                        positions: op.positions.clone(),
+                        // Always `Some`, so an omitted or null field lands as an
+                        // explicit clear instead of leaving stale scene truth.
+                        room_state: Some(op.room_state.clone().unwrap_or_default()),
+                        current_misunderstanding: Some(
+                            op.current_misunderstanding.clone().unwrap_or_default(),
+                        ),
+                        active_object: Some(op.active_object.clone().unwrap_or_default()),
+                        open_question: Some(op.open_question.clone().unwrap_or_default()),
                         ..SceneStatePatch::default()
                     });
                     accepted_candidate_ids.push(format!("op:{index}:update_scene_state"));
@@ -950,6 +974,9 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
             "current_scene": { "type": "string" }, "focus": { "type": "string" },
             "participants": string_array, "last_user_action": { "type": "string" },
             "pressure_point": { "type": "string" }, "continuity_note": { "type": "string" },
+            "positions": string_array,
+            "room_state": nullable_string, "current_misunderstanding": nullable_string,
+            "active_object": nullable_string, "open_question": nullable_string,
             "evidence_quote": evidence_string
         }),
         &[
@@ -959,6 +986,13 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
             "last_user_action",
             "pressure_point",
             "continuity_note",
+            // Required so a strict schema forces the model to restate current
+            // scene truth every time; `null` is how it says "there is none".
+            "positions",
+            "room_state",
+            "current_misunderstanding",
+            "active_object",
+            "open_question",
             "evidence_quote",
         ],
     );
@@ -1064,6 +1098,90 @@ mod tests {
         let err = serde_json::from_str::<EvaluatorStructuredOutputV1>(raw)
             .expect_err("confidence is not valid on update_scene_state");
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn scene_continuity_fields_survive_the_provider_schema_round_trip() {
+        let raw = r#"{"schema_version":1,"ops":[{"op":"update_scene_state","current_scene":"Apartment doorway","focus":"Aurora and preset_male","participants":["aurora","preset_male"],"last_user_action":"I set the crowbar down.","pressure_point":"Aurora decides whether to open the door.","continuity_note":"Rain continues.","positions":["aurora: behind the chain latch","preset_male: on the landing"],"room_state":"Door open on the chain","current_misunderstanding":"Aurora believes the visitor forced the lock","active_object":"crowbar","open_question":"Who called the building manager?","evidence_quote":"I set the crowbar down."}],"no_op_reason":null}"#;
+        let output: EvaluatorStructuredOutputV1 =
+            serde_json::from_str(raw).expect("scene continuity fields parse");
+        let EvaluatorOp::UpdateSceneState(op) = &output.ops[0] else {
+            panic!("expected scene op");
+        };
+
+        assert_eq!(op.positions.len(), 2);
+        assert_eq!(op.room_state.as_deref(), Some("Door open on the chain"));
+        assert_eq!(
+            op.current_misunderstanding.as_deref(),
+            Some("Aurora believes the visitor forced the lock")
+        );
+        assert_eq!(op.active_object.as_deref(), Some("crowbar"));
+        assert_eq!(
+            op.open_question.as_deref(),
+            Some("Who called the building manager?")
+        );
+    }
+
+    #[test]
+    fn scene_update_lowers_continuity_fields_into_the_world_patch() {
+        let raw = r#"{"schema_version":1,"ops":[{"op":"update_scene_state","current_scene":"Apartment doorway","focus":"Aurora and preset_male","participants":["aurora"],"last_user_action":"I set the crowbar down.","pressure_point":"Aurora decides whether to open the door.","continuity_note":"Rain continues.","positions":["aurora: behind the chain latch"],"room_state":"Door open on the chain","current_misunderstanding":"Aurora believes the visitor forced the lock","active_object":"crowbar","open_question":"Who called the building manager?","evidence_quote":"I set the crowbar down."}],"no_op_reason":null}"#;
+        let output: EvaluatorStructuredOutputV1 = serde_json::from_str(raw).expect("parses");
+        let soul = Soul::default_for_character("Aurora");
+        let converted = compile_evaluator_ops_to_engine_patch(
+            &output,
+            &context("I set the crowbar down.", "Aurora watches the crowbar."),
+            &soul,
+        )
+        .expect("scene op compiles");
+
+        let scene = converted
+            .patch
+            .world_patch
+            .as_ref()
+            .and_then(|world| world.scene_state.as_ref())
+            .expect("scene state patch present");
+        assert_eq!(scene.positions, vec!["aurora: behind the chain latch"]);
+        assert_eq!(scene.room_state.as_deref(), Some("Door open on the chain"));
+        assert_eq!(scene.active_object.as_deref(), Some("crowbar"));
+    }
+
+    #[test]
+    fn omitted_continuity_fields_clear_resolved_scene_truth() {
+        // An earlier turn established a misunderstanding and an open question.
+        let mut soul = Soul::default_for_character("Aurora");
+        soul.world.scene_state = crate::soul::SceneState {
+            current_misunderstanding: "Aurora believes the visitor forced the lock".into(),
+            open_question: "Who called the building manager?".into(),
+            active_object: "crowbar".into(),
+            ..crate::soul::SceneState::default()
+        };
+
+        // The scene resolves both, and the model restates current truth without
+        // them. Legacy payloads omit the keys entirely, which reads the same.
+        let raw = r#"{"schema_version":1,"ops":[{"op":"update_scene_state","current_scene":"Apartment doorway","focus":"Aurora","participants":["aurora"],"last_user_action":"I explain about the locksmith.","pressure_point":"Aurora decides whether to believe it.","continuity_note":"Rain stops.","evidence_quote":"I explain about the locksmith."}],"no_op_reason":null}"#;
+        let output: EvaluatorStructuredOutputV1 = serde_json::from_str(raw).expect("parses");
+        let converted = compile_evaluator_ops_to_engine_patch(
+            &output,
+            &context(
+                "I explain about the locksmith.",
+                "Aurora listens to the explanation.",
+            ),
+            &soul,
+        )
+        .expect("scene op compiles");
+
+        converted
+            .patch
+            .apply_to_soul(&mut soul)
+            .expect("patch applies");
+
+        assert_eq!(soul.world.scene_state.current_misunderstanding, "");
+        assert_eq!(soul.world.scene_state.open_question, "");
+        assert_eq!(soul.world.scene_state.active_object, "");
+        assert_eq!(
+            soul.world.scene_state.current_scene, "Apartment doorway",
+            "clearing resolved truth must not wipe the scene itself"
+        );
     }
 
     #[test]

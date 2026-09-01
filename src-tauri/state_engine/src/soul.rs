@@ -409,7 +409,7 @@ impl Default for WorldLog {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SceneState {
     #[serde(default)]
     pub scene_state_id: String,
@@ -429,22 +429,26 @@ pub struct SceneState {
     pub pressure_point: String,
     #[serde(default)]
     pub continuity_note: String,
-}
-
-impl Default for SceneState {
-    fn default() -> Self {
-        Self {
-            scene_state_id: String::new(),
-            current_scene: String::new(),
-            resolved_active_plot: String::new(),
-            scene_branch: String::new(),
-            focus: String::new(),
-            participants: Vec::new(),
-            last_user_action: String::new(),
-            pressure_point: String::new(),
-            continuity_note: String::new(),
-        }
-    }
+    /// Where each participant physically is, one entry per participant
+    /// ("Aurora: seated on the desk edge"). Positions are current truth, not
+    /// history, so a stale entry is worse than an absent one.
+    #[serde(default)]
+    pub positions: Vec<String>,
+    /// Door/window/room state that a narrator keeps contradicting across long
+    /// sessions ("door closed but unlocked, blinds half-drawn").
+    #[serde(default)]
+    pub room_state: String,
+    /// What one participant currently believes that is false. Tracked here
+    /// rather than in memory because it is resolved by the scene, not retained.
+    #[serde(default)]
+    pub current_misunderstanding: String,
+    /// The object currently in play in the scene, distinct from the world's
+    /// long-lived key objects.
+    #[serde(default)]
+    pub active_object: String,
+    /// The question the scene has raised and not yet answered.
+    #[serde(default)]
+    pub open_question: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

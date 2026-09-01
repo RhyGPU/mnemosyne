@@ -350,6 +350,7 @@ fn compile_context_with_budget_and_options(
     let mut truncated = false;
     let mut section_builders = vec![
         build_controlled_entities_section(soul, player_persona, budget),
+        build_scene_continuity_section(soul, session_world, budget),
         build_world_section(soul, session_world, budget, pending_user_text),
         build_profile_section(soul, budget),
         build_memory_section(soul, messages, budget),
@@ -1065,6 +1066,84 @@ fn build_verified_memory_layer_reply_section(soul: &Soul, budget: &ContextBudget
     )
 }
 
+/// The narrator's continuity anchor: what is true *right now* in the scene.
+///
+/// This is deliberately separate from `[WORLD SNAPSHOT]`. The world snapshot
+/// carries durable setting facts (plots, key objects, elapsed time); this
+/// section carries only the volatile truth a long session keeps contradicting —
+/// who is in the room, where they are standing, whether the door is shut, what
+/// someone currently believes that is false, and what was just physically done.
+/// Long-term facts belong in memory; immediate events belong in the timeline.
+///
+/// Emits nothing when the engine has no scene truth yet, so early turns are not
+/// charged for an empty header.
+fn build_scene_continuity_section(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    budget: &ContextBudget,
+) -> BuiltSection {
+    let world = if let Some(session_world) = session_world {
+        session_world.world_log()
+    } else {
+        soul.world.clone()
+    };
+    let scene = &world.scene_state;
+
+    fn push(lines: &mut Vec<String>, label: &str, value: &str) {
+        if let Some(value) = clean(value) {
+            lines.push(format!("{label}: {value}"));
+        }
+    }
+
+    let mut lines = Vec::new();
+    push(&mut lines, "Scene", &scene.current_scene);
+    if !scene.participants.is_empty() {
+        lines.push(format_list("Present", &scene.participants, ""));
+    }
+    if !scene.positions.is_empty() {
+        let positions = scene
+            .positions
+            .iter()
+            .filter_map(|position| clean(position))
+            .collect::<Vec<_>>();
+        if !positions.is_empty() {
+            lines.push(format!("Positions:\n{}", positions.join("\n")));
+        }
+    }
+    push(&mut lines, "Room state", &scene.room_state);
+    push(&mut lines, "Active object", &scene.active_object);
+    push(
+        &mut lines,
+        "Current misunderstanding",
+        &scene.current_misunderstanding,
+    );
+    push(&mut lines, "Open question", &scene.open_question);
+    push(&mut lines, "Last concrete action", &scene.last_user_action);
+    push(&mut lines, "Pressure point", &scene.pressure_point);
+    push(&mut lines, "Continuity note", &scene.continuity_note);
+
+    // `world.location` defaults to a placeholder string, so it is not evidence
+    // that a scene exists. Only the evaluator-written scene state decides
+    // whether there is anything to anchor to; location then rides along as the
+    // first line so the anchor reads as one place.
+    if lines.is_empty() {
+        return BuiltSection {
+            text: String::new(),
+            truncated: false,
+            memory_slot_debug: Vec::new(),
+        };
+    }
+    if let Some(location) = clean(&world.location) {
+        lines.insert(0, format!("Location: {location}"));
+    }
+
+    section_from_lines(
+        "[SCENE CONTINUITY]",
+        lines,
+        budget.scene_state_tokens.min(budget.max_tokens),
+    )
+}
+
 fn build_world_section(
     soul: &Soul,
     session_world: Option<&SessionWorld>,
@@ -1383,6 +1462,10 @@ fn compact_sections_to_budget(sections: &mut Vec<String>, max_tokens: usize) -> 
         "[CHARACTER SNAPSHOT]",
         "[WORLD SNAPSHOT]",
         "[RELATIONSHIPS]",
+        // The continuity anchor is trimmed only after every durable section has
+        // already given up lines, and before nothing except the exchange the
+        // narrator is answering.
+        "[SCENE CONTINUITY]",
         "[LATEST EXCHANGE, HIGH PRIORITY]",
     ];
 
@@ -2553,6 +2636,92 @@ mod tests {
         assert!(world_section.contains("Session lab"));
         assert!(world_section.contains("Objective debug room."));
         assert!(!world_section.contains("Wrong character-embedded room"));
+    }
+
+    #[test]
+    fn scene_continuity_section_is_absent_until_the_engine_has_scene_truth() {
+        let soul = new_default_soul("Echo-0");
+
+        let preview = compile_context_for_session(&soul, None, &[]);
+
+        assert!(!preview.text.contains("[SCENE CONTINUITY]"));
+    }
+
+    #[test]
+    fn scene_continuity_section_carries_current_scene_truth() {
+        let mut soul = new_default_soul("Echo-0");
+        soul.world.location = "Observation deck".into();
+        soul.world.scene_state = crate::soul::SceneState {
+            current_scene: "Standoff over the sealed crate".into(),
+            participants: vec!["Echo-0".into(), "Operator".into()],
+            positions: vec![
+                "Echo-0: braced against the rail".into(),
+                "Operator: blocking the hatch".into(),
+            ],
+            room_state: "Hatch closed, not yet locked".into(),
+            active_object: "sealed crate".into(),
+            current_misunderstanding: "Echo-0 believes the operator opened the crate".into(),
+            open_question: "Who broke the seal?".into(),
+            last_user_action: "The operator set the crowbar down".into(),
+            ..crate::soul::SceneState::default()
+        };
+
+        let preview = compile_context_for_session(&soul, None, &[]);
+        let scene = section_text(&preview.text, "[SCENE CONTINUITY]");
+
+        assert!(scene.contains("Location: Observation deck"));
+        assert!(scene.contains("Standoff over the sealed crate"));
+        assert!(scene.contains("Echo-0: braced against the rail"));
+        assert!(scene.contains("Hatch closed, not yet locked"));
+        assert!(scene.contains("Active object: sealed crate"));
+        assert!(scene.contains("Echo-0 believes the operator opened the crate"));
+        assert!(scene.contains("Who broke the seal?"));
+        assert!(scene.contains("The operator set the crowbar down"));
+    }
+
+    #[test]
+    fn scene_continuity_is_anchored_ahead_of_the_world_snapshot() {
+        let mut soul = new_default_soul("Echo-0");
+        soul.world.location = "Observation deck".into();
+        soul.world.scene_state = crate::soul::SceneState {
+            current_scene: "Standoff over the sealed crate".into(),
+            ..crate::soul::SceneState::default()
+        };
+
+        let preview = compile_context_for_session(&soul, None, &[]);
+
+        assert_order(&preview.text, "[SCENE CONTINUITY]", "[WORLD SNAPSHOT]");
+    }
+
+    #[test]
+    fn scene_continuity_outlives_the_world_snapshot_under_budget_pressure() {
+        let mut soul = new_default_soul("Echo-0");
+        soul.world.location = "Observation deck".into();
+        soul.world.active_plots = (0..40)
+            .map(|index| format!("Filler plot thread number {index} that pads the world snapshot"))
+            .collect();
+        soul.world.scene_state = crate::soul::SceneState {
+            current_scene: "Standoff over the sealed crate".into(),
+            ..crate::soul::SceneState::default()
+        };
+        let messages = [ContextMessage {
+            role: "user".into(),
+            content: "I step toward the crate.".into(),
+        }];
+
+        let budget = ContextBudget {
+            max_tokens: 420,
+            ..ContextBudget::default()
+        };
+        let preview = compile_context_with_budget(&soul, &messages, &budget);
+
+        assert!(preview.truncated, "budget should have forced trimming");
+        assert!(preview.text.contains("Standoff over the sealed crate"));
+        let world = section_text(&preview.text, "[WORLD SNAPSHOT]");
+        assert!(
+            !world.contains("Filler plot thread number 39"),
+            "world snapshot should give up lines before the continuity anchor"
+        );
     }
 
     #[test]

@@ -196,6 +196,11 @@ pub struct SceneStatePatch {
     pub last_user_action: Option<String>,
     pub pressure_point: Option<String>,
     pub continuity_note: Option<String>,
+    pub positions: Vec<String>,
+    pub room_state: Option<String>,
+    pub current_misunderstanding: Option<String>,
+    pub active_object: Option<String>,
+    pub open_question: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -1626,6 +1631,33 @@ fn apply_scene_state_patch(scene_state: &mut SceneState, patch: &SceneStatePatch
     }
     if let Some(value) = patch.continuity_note.as_deref().and_then(clean_str) {
         scene_state.continuity_note = value.to_string();
+    }
+    let positions = patch
+        .positions
+        .iter()
+        .filter_map(|position| clean_str(position))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !positions.is_empty() {
+        scene_state.positions = positions;
+    }
+    // Continuity fields describe current truth, so the scene that resolves a
+    // misunderstanding or answers an open question has to be able to clear
+    // them. An absent field (`None`) leaves the value alone; a field sent as an
+    // empty string is an explicit clear. The `clean_str` fields above cannot
+    // express a clear, which is correct for them — a scene always has a focus.
+    for (patched, current) in [
+        (&patch.room_state, &mut scene_state.room_state),
+        (
+            &patch.current_misunderstanding,
+            &mut scene_state.current_misunderstanding,
+        ),
+        (&patch.active_object, &mut scene_state.active_object),
+        (&patch.open_question, &mut scene_state.open_question),
+    ] {
+        if let Some(value) = patched.as_deref() {
+            *current = value.trim().to_string();
+        }
     }
     *scene_state != before
 }
