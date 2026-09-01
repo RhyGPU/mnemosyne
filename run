@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Mnemosyne dev launcher (Linux/macOS). The .bat files are Windows-only.
+#
+#   ./run            start the Tauri desktop app
+#   ./run web        start only the Vite frontend (browser preview fallback)
+#   ./run test       run the full test suite
+#   ./run check      typecheck + fmt + clippy
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(pwd)"
+
+say() { printf '[Mnemosyne] %s\n' "$*"; }
+die() { printf '[Mnemosyne] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# rustup installs to ~/.cargo/bin, which non-login shells often miss.
+if [ -f "$HOME/.cargo/env" ]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.cargo/env"
+fi
+
+command -v node >/dev/null 2>&1 || die "node not found. Install Node 18+ and retry."
+command -v cargo >/dev/null 2>&1 || die "cargo not found. Install Rust: https://rustup.rs"
+
+# Tauri links against system webkit2gtk. Checking here turns a wall of linker
+# errors into one actionable line.
+require_gui_deps() {
+  command -v pkg-config >/dev/null 2>&1 || die "pkg-config not found."
+  local missing=()
+  for pkg in webkit2gtk-4.1 javascriptcoregtk-4.1 gtk+-3.0 librsvg-2.0; do
+    pkg-config --exists "$pkg" || missing+=("$pkg")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    printf '[Mnemosyne] ERROR: missing system libraries: %s\n' "${missing[*]}" >&2
+    printf '[Mnemosyne] Install them with:\n\n' >&2
+    printf '  sudo apt install -y libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev\n\n' >&2
+    exit 1
+  fi
+}
+
+# Cargo caches absolute paths to generated Tauri plugin permissions, so a moved
+# or copied checkout can reuse artifacts pointing at the old location.
+drop_stale_build_cache() {
+  local marker="src-tauri/target/.mnemosyne-repo-root.txt"
+  if [ -d "src-tauri/target/debug" ] && [ -f "$marker" ]; then
+    if [ "$(cat "$marker")" != "$REPO_ROOT" ]; then
+      say "Rust dev cache belongs to another checkout - cleaning..."
+      cargo clean --manifest-path src-tauri/Cargo.toml --profile dev
+    fi
+  fi
+  mkdir -p src-tauri/target
+  printf '%s\n' "$REPO_ROOT" > "$marker"
+}
+
+ensure_node_modules() {
+  if [ ! -d node_modules ]; then
+    say "node_modules not found - installing..."
+    if [ -f package-lock.json ]; then npm ci; else npm install; fi
+  fi
+}
+
+case "${1:-app}" in
+  app)
+    require_gui_deps
+    ensure_node_modules
+    drop_stale_build_cache
+    say "Starting Tauri desktop app (first build takes a few minutes)..."
+    exec npm run dev
+    ;;
+  web)
+    ensure_node_modules
+    say "Starting Vite frontend on http://127.0.0.1:1420 (browser preview fallback)."
+    say "Tauri-only features are stubbed in this mode."
+    exec npm run dev:frontend
+    ;;
+  test)
+    ensure_node_modules
+    say "Frontend model + slash tests..."
+    npm run test:models
+    npm run test:slash
+    say "TypeScript..."
+    npm run typecheck
+    say "state_engine..."
+    cargo test --manifest-path src-tauri/state_engine/Cargo.toml
+    say "app..."
+    cargo test --manifest-path src-tauri/Cargo.toml
+    say "All suites passed."
+    ;;
+  check)
+    ensure_node_modules
+    npm run typecheck
+    cargo fmt --manifest-path src-tauri/Cargo.toml --check
+    cargo fmt --manifest-path src-tauri/state_engine/Cargo.toml --check
+    cargo clippy --manifest-path src-tauri/state_engine/Cargo.toml --all-targets
+    ;;
+  *)
+    printf 'Usage: ./run [app|web|test|check]\n' >&2
+    exit 2
+    ;;
+esac

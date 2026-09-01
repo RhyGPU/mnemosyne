@@ -8,8 +8,8 @@ use crate::{
     memory::create_scored_memory,
     setting::SessionWorld,
     soul::{
-        current_timestamp, MemoryEntry, MemorySourceType, ObjectState, Relationship, SceneState,
-        Soul, TruthStatus, WorldEventRecord, WorldLog,
+        current_timestamp, KnowledgeEntry, KnowledgeStatus, MemoryEntry, MemorySourceType,
+        ObjectState, Relationship, SceneState, Soul, TruthStatus, WorldEventRecord, WorldLog,
     },
 };
 
@@ -177,6 +177,7 @@ pub struct WorldPatch {
     pub key_object_add: Vec<String>,
     pub key_object_remove: Vec<String>,
     pub event_operations: Vec<WorldEventOperationPatch>,
+    pub knowledge_operations: Vec<KnowledgeOperationPatch>,
     pub object_observation_operations: Vec<ObjectObservationOperationPatch>,
     pub corrected_object_states: Vec<ObjectState>,
     pub invalidated_recent_event_ids: Vec<String>,
@@ -197,10 +198,27 @@ pub struct SceneStatePatch {
     pub pressure_point: Option<String>,
     pub continuity_note: Option<String>,
     pub positions: Vec<String>,
+    pub outfits: Vec<String>,
     pub room_state: Option<String>,
     pub current_misunderstanding: Option<String>,
     pub active_object: Option<String>,
     pub open_question: Option<String>,
+}
+
+/// A change to who knows what. `operation` is `record` (assert a position) or
+/// `invalidate` (retire one without asserting a replacement).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct KnowledgeOperationPatch {
+    pub operation: String,
+    pub knowledge_id: Option<String>,
+    pub holder_entity_id: Option<String>,
+    pub proposition: Option<String>,
+    pub status: Option<String>,
+    pub counterpart_entity_id: Option<String>,
+    pub actual_truth: Option<String>,
+    pub evidence_quote: Option<String>,
+    pub target_knowledge_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -247,6 +265,28 @@ impl WorldEventOperationPatch {
                 .map_or(true, |value| value.trim().is_empty())
             && self
                 .target_recent_event_id
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+    }
+}
+
+impl KnowledgeOperationPatch {
+    fn is_empty(&self) -> bool {
+        self.operation.trim().is_empty()
+            && self
+                .holder_entity_id
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self
+                .proposition
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self
+                .knowledge_id
+                .as_deref()
+                .map_or(true, |value| value.trim().is_empty())
+            && self
+                .target_knowledge_id
                 .as_deref()
                 .map_or(true, |value| value.trim().is_empty())
     }
@@ -1172,6 +1212,10 @@ impl WorldPatch {
                 .iter()
                 .all(ObjectObservationOperationPatch::is_empty)
             && self
+                .knowledge_operations
+                .iter()
+                .all(KnowledgeOperationPatch::is_empty)
+            && self
                 .corrected_object_states
                 .iter()
                 .all(|object| object.object_id.trim().is_empty())
@@ -1240,6 +1284,9 @@ impl WorldPatch {
 
         for operation in &self.event_operations {
             changed |= apply_world_event_operation(world, operation);
+        }
+        for operation in &self.knowledge_operations {
+            changed |= apply_knowledge_operation(world, operation);
         }
         for operation in &self.object_observation_operations {
             changed |= apply_object_observation_operation(world, operation);
@@ -1641,6 +1688,15 @@ fn apply_scene_state_patch(scene_state: &mut SceneState, patch: &SceneStatePatch
     if !positions.is_empty() {
         scene_state.positions = positions;
     }
+    let outfits = patch
+        .outfits
+        .iter()
+        .filter_map(|outfit| clean_str(outfit))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !outfits.is_empty() {
+        scene_state.outfits = outfits;
+    }
     // Continuity fields describe current truth, so the scene that resolves a
     // misunderstanding or answers an open question has to be able to clear
     // them. An absent field (`None`) leaves the value alone; a field sent as an
@@ -1660,6 +1716,127 @@ fn apply_scene_state_patch(scene_state: &mut SceneState, patch: &SceneStatePatch
         }
     }
     *scene_state != before
+}
+
+fn knowledge_status_from_label(label: &str) -> Option<KnowledgeStatus> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "knows" | "known" => Some(KnowledgeStatus::Knows),
+        "suspects" | "suspect" => Some(KnowledgeStatus::Suspects),
+        "believes_false" | "believes-false" | "false_belief" | "wrong" => {
+            Some(KnowledgeStatus::BelievesFalse)
+        }
+        "unaware" | "ignorant" => Some(KnowledgeStatus::Unaware),
+        "hiding" | "hides" | "concealing" => Some(KnowledgeStatus::Hiding),
+        _ => None,
+    }
+}
+
+/// Identity is holder + proposition, so restating a position updates that line
+/// rather than growing a duplicate. Derived rather than random because ledger
+/// replay has to produce byte-identical projections.
+fn derived_knowledge_id(holder: &str, proposition: &str) -> String {
+    format!(
+        "knowledge:{}:{}",
+        holder.trim().to_ascii_lowercase(),
+        proposition.trim().to_ascii_lowercase()
+    )
+}
+
+fn apply_knowledge_operation(world: &mut WorldLog, operation: &KnowledgeOperationPatch) -> bool {
+    match normalized_operation(&operation.operation).as_str() {
+        "record" | "set" | "update_knowledge" => {
+            let (Some(holder), Some(proposition)) = (
+                operation.holder_entity_id.as_deref().and_then(clean_str),
+                operation.proposition.as_deref().and_then(clean_str),
+            ) else {
+                return false;
+            };
+            let Some(status) = operation
+                .status
+                .as_deref()
+                .and_then(knowledge_status_from_label)
+            else {
+                return false;
+            };
+            let knowledge_id = operation
+                .knowledge_id
+                .as_deref()
+                .and_then(clean_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| derived_knowledge_id(holder, proposition));
+
+            let entry = KnowledgeEntry {
+                knowledge_id: knowledge_id.clone(),
+                holder_entity_id: holder.to_string(),
+                proposition: proposition.to_string(),
+                status,
+                counterpart_entity_id: operation
+                    .counterpart_entity_id
+                    .as_deref()
+                    .and_then(clean_str)
+                    .map(str::to_string),
+                actual_truth: operation
+                    .actual_truth
+                    .as_deref()
+                    .and_then(clean_str)
+                    .map(str::to_string),
+                // Engine-owned: the application stamps the creating turn before
+                // the ledger commit, exactly as it does for memory provenance.
+                established_turn: 0,
+                evidence_quote: operation
+                    .evidence_quote
+                    .as_deref()
+                    .and_then(clean_str)
+                    .map(str::to_string),
+                is_active: true,
+                superseded_by_knowledge_id: None,
+            };
+
+            // The prior position is retired, never deleted: Unaware -> Suspects
+            // -> Knows is the plot, and the turn each step landed stays
+            // answerable.
+            let mut superseded_any = false;
+            for existing in world.knowledge.iter_mut().filter(|existing| {
+                existing.is_active
+                    && existing.holder_entity_id == entry.holder_entity_id
+                    && existing.proposition == entry.proposition
+            }) {
+                if existing.status == entry.status
+                    && existing.counterpart_entity_id == entry.counterpart_entity_id
+                    && existing.actual_truth == entry.actual_truth
+                {
+                    return false;
+                }
+                existing.is_active = false;
+                existing.superseded_by_knowledge_id = Some(knowledge_id.clone());
+                superseded_any = true;
+            }
+            let _ = superseded_any;
+            world.knowledge.push(entry);
+            true
+        }
+        "invalidate" | "clear" => {
+            let target = operation
+                .target_knowledge_id
+                .as_deref()
+                .or(operation.knowledge_id.as_deref())
+                .and_then(clean_str);
+            let Some(target) = target else {
+                return false;
+            };
+            let mut changed = false;
+            for existing in world
+                .knowledge
+                .iter_mut()
+                .filter(|existing| existing.is_active && existing.knowledge_id == target)
+            {
+                existing.is_active = false;
+                changed = true;
+            }
+            changed
+        }
+        _ => false,
+    }
 }
 
 fn apply_world_event_operation(world: &mut WorldLog, operation: &WorldEventOperationPatch) -> bool {
@@ -2935,6 +3112,120 @@ mod tests {
 
         assert_eq!(soul.world.recent_events.len(), 1);
         assert_eq!(soul.world.recent_event_records.len(), 1);
+    }
+
+    #[test]
+    fn knowledge_progression_retires_the_prior_position_without_deleting_it() {
+        let mut soul = new_default_soul("Aurora");
+        let record = |status: &str| EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            world_patch: Some(WorldPatch {
+                knowledge_operations: vec![KnowledgeOperationPatch {
+                    operation: "record".into(),
+                    holder_entity_id: Some("aurora".into()),
+                    proposition: Some("the seal was broken".into()),
+                    status: Some(status.into()),
+                    ..KnowledgeOperationPatch::default()
+                }],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+
+        record("unaware").apply_to_soul(&mut soul).expect("unaware");
+        record("suspects")
+            .apply_to_soul(&mut soul)
+            .expect("suspects");
+        record("knows").apply_to_soul(&mut soul).expect("knows");
+
+        // The whole progression survives: the reveal turn stays answerable.
+        assert_eq!(soul.world.knowledge.len(), 3);
+        let active = soul
+            .world
+            .knowledge
+            .iter()
+            .filter(|entry| entry.is_active)
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, KnowledgeStatus::Knows);
+        assert!(soul
+            .world
+            .knowledge
+            .iter()
+            .filter(|entry| !entry.is_active)
+            .all(|entry| entry.superseded_by_knowledge_id.is_some()));
+    }
+
+    #[test]
+    fn restating_an_unchanged_knowledge_position_changes_nothing() {
+        let mut soul = new_default_soul("Aurora");
+        let patch = EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            world_patch: Some(WorldPatch {
+                knowledge_operations: vec![KnowledgeOperationPatch {
+                    operation: "record".into(),
+                    holder_entity_id: Some("aurora".into()),
+                    proposition: Some("the seal was broken".into()),
+                    status: Some("suspects".into()),
+                    ..KnowledgeOperationPatch::default()
+                }],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        };
+        patch.apply_to_soul(&mut soul).expect("first");
+        patch.apply_to_soul(&mut soul).expect("second");
+
+        assert_eq!(soul.world.knowledge.len(), 1);
+    }
+
+    #[test]
+    fn hiding_records_who_it_is_hidden_from() {
+        let mut soul = new_default_soul("Aurora");
+        EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            world_patch: Some(WorldPatch {
+                knowledge_operations: vec![KnowledgeOperationPatch {
+                    operation: "record".into(),
+                    holder_entity_id: Some("aurora".into()),
+                    proposition: Some("she kept the spare key".into()),
+                    status: Some("hiding".into()),
+                    counterpart_entity_id: Some("visitor".into()),
+                    ..KnowledgeOperationPatch::default()
+                }],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        }
+        .apply_to_soul(&mut soul)
+        .expect("applies");
+
+        let entry = &soul.world.knowledge[0];
+        assert_eq!(entry.status, KnowledgeStatus::Hiding);
+        assert_eq!(entry.counterpart_entity_id.as_deref(), Some("visitor"));
+    }
+
+    #[test]
+    fn unknown_knowledge_status_is_refused() {
+        let mut soul = new_default_soul("Aurora");
+        EnginePatch {
+            schema_version: Some(PATCH_PROTOCOL_VERSION),
+            world_patch: Some(WorldPatch {
+                knowledge_operations: vec![KnowledgeOperationPatch {
+                    operation: "record".into(),
+                    holder_entity_id: Some("aurora".into()),
+                    proposition: Some("something".into()),
+                    status: Some("vibes".into()),
+                    ..KnowledgeOperationPatch::default()
+                }],
+                ..WorldPatch::default()
+            }),
+            ..EnginePatch::default()
+        }
+        .apply_to_soul(&mut soul)
+        .expect("applies");
+
+        assert!(soul.world.knowledge.is_empty());
     }
 
     #[test]

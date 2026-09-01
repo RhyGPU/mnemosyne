@@ -1971,6 +1971,7 @@ If nothing durable changed, return ops: [] with a specific nonempty no_op_reason
 Do not return empty ops for entering/leaving a location, object movement/condition changes, relationship-significant actions, or explicit scene changes.\n\
 Use only fields defined for each op. Never put confidence on update_scene_state; confidence is allowed only on add_memory.\n\
 update_scene_state is current truth, not history: restate its continuity fields each turn, and send null once one is resolved or leaves play.\n\
+Use update_knowledge when the exchange changes who knows, suspects, wrongly believes, is unaware of, or is hiding something; give actual_truth for believes_false and counterpart_entity_id for hiding.\n\
 Resolve user-controlled \"I\" to the active player persona. Prefer aliases instead of copying raw UUIDs when valid: active_soul, active_player, latest_speaker, session_world.\n\
 Current truth comes from the compact state JSON below; Rust validates semantics and applies the ledger.\n\n{}",
         structured_evaluator_current_state_block(
@@ -1982,7 +1983,7 @@ Current truth comes from the compact state JSON below; Rust validates semantics 
     )
 }
 
-pub const PERCEPTION_V2_PROMPT_VERSION: &str = "perception-v2.0";
+pub const PERCEPTION_V2_PROMPT_VERSION: &str = "perception-v2.1";
 
 pub fn build_perception_v2_prompt(soul: &Soul, session_world: Option<&SessionWorld>) -> String {
     build_perception_v2_prompt_with_player_persona(
@@ -2012,6 +2013,7 @@ Distinguish direct observation, a speaker's statement, narrator description, inf
 A statement or belief is not automatically a verified world fact. Preserve who said or perceived it.\n\
 For relationship_evidence only, provide behavior labels and bounded valence/directness/stakes/costliness/repetition; use null relationship_signal for every other kind.\n\
 Use correction only for explicit correction/retcon evidence. Do not silently erase older facts.\n\
+For scene_observation, set predicate to one continuity slot: location, scene, focus, position, room_state, active_object, misunderstanding, open_question, pressure_point, or last_action. Put the current value in object.text, or null when that slot is now empty. Scene claims are current truth, so never anchor them before the current turn.\n\
 durability_hint is advisory only; Rust decides whether anything persists.\n\
 If the exchange has no meaningful perception candidate, return candidates: [] and a specific no_op_reason.\n\
 Do not invent events, motives, thoughts, temporal anchors, participants, or evidence.\n\n{}",

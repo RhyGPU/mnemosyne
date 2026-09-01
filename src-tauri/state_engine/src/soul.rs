@@ -388,6 +388,10 @@ pub struct WorldLog {
     pub resolved_plots: Vec<PlotEntry>,
     #[serde(default)]
     pub stale_plot_decay: f32,
+    /// Who knows what, and who is wrong about it. Durable and world-scoped, not
+    /// scene-scoped: a secret survives a change of room.
+    #[serde(default)]
+    pub knowledge: Vec<KnowledgeEntry>,
 }
 
 impl Default for WorldLog {
@@ -405,6 +409,7 @@ impl Default for WorldLog {
             background_plots: Vec::new(),
             resolved_plots: Vec::new(),
             stale_plot_decay: 0.12,
+            knowledge: Vec::new(),
         }
     }
 }
@@ -434,6 +439,12 @@ pub struct SceneState {
     /// history, so a stale entry is worse than an absent one.
     #[serde(default)]
     pub positions: Vec<String>,
+    /// What each participant is currently wearing, one entry per participant
+    /// ("Aurora: coat off, sweater sleeves pushed up"). Every comparable RP tool
+    /// tracks this because a narrator re-dressing someone it undressed three
+    /// turns ago is the most common continuity break there is.
+    #[serde(default)]
+    pub outfits: Vec<String>,
     /// Door/window/room state that a narrator keeps contradicting across long
     /// sessions ("door closed but unlocked, blinds half-drawn").
     #[serde(default)]
@@ -449,6 +460,76 @@ pub struct SceneState {
     /// The question the scene has raised and not yet answered.
     #[serde(default)]
     pub open_question: String,
+}
+
+/// Epistemic position of one entity toward one proposition.
+///
+/// `Hiding` is deliberately relational rather than a flag: concealment is always
+/// *from someone*, and collapsing that loses the only thing that makes a secret
+/// dramatic. `BelievesFalse` carries the true proposition alongside the false
+/// one so the engine can compute dramatic irony instead of merely labelling it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeStatus {
+    Knows,
+    Suspects,
+    BelievesFalse,
+    #[default]
+    Unaware,
+    Hiding,
+}
+
+impl KnowledgeStatus {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            KnowledgeStatus::Knows => "knows",
+            KnowledgeStatus::Suspects => "suspects",
+            KnowledgeStatus::BelievesFalse => "believes_false",
+            KnowledgeStatus::Unaware => "unaware",
+            KnowledgeStatus::Hiding => "hiding",
+        }
+    }
+
+    /// Whether this position is one the holder could act on as if it were true.
+    /// Used when deciding what a character may reference in narration.
+    pub fn is_actionable_belief(self) -> bool {
+        matches!(
+            self,
+            KnowledgeStatus::Knows | KnowledgeStatus::BelievesFalse | KnowledgeStatus::Hiding
+        )
+    }
+}
+
+/// One entity's position toward one proposition, at one point in the story.
+///
+/// Entries are append-only. A character moving from `Unaware` to `Suspects` to
+/// `Knows` leaves all three rows behind, because that progression *is* the plot:
+/// the turn a reveal landed stays answerable forever.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeEntry {
+    pub knowledge_id: String,
+    pub holder_entity_id: String,
+    pub proposition: String,
+    #[serde(default)]
+    pub status: KnowledgeStatus,
+    /// Whom the proposition is hidden from, or who the holder learned it from.
+    #[serde(default)]
+    pub counterpart_entity_id: Option<String>,
+    /// For `BelievesFalse`, what is actually true.
+    #[serde(default)]
+    pub actual_truth: Option<String>,
+    #[serde(default)]
+    pub established_turn: u64,
+    #[serde(default)]
+    pub evidence_quote: Option<String>,
+    #[serde(default = "default_knowledge_active")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub superseded_by_knowledge_id: Option<String>,
+}
+
+const fn default_knowledge_active() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

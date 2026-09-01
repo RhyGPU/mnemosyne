@@ -6,8 +6,9 @@ use crate::{
         EvaluatorCandidateRejection, EvaluatorConversionContext, EvaluatorConversionReport,
     },
     patch::{
-        EnginePatch, MemoryPatch, ObjectObservationOperationPatch, RelationshipDelta,
-        SceneStatePatch, SoulPatch, WorldEventOperationPatch, WorldPatch, PATCH_PROTOCOL_VERSION,
+        EnginePatch, KnowledgeOperationPatch, MemoryPatch, ObjectObservationOperationPatch,
+        RelationshipDelta, SceneStatePatch, SoulPatch, WorldEventOperationPatch, WorldPatch,
+        PATCH_PROTOCOL_VERSION,
     },
     soul::{MemorySourceType, ObjectState, Soul, TruthStatus},
 };
@@ -31,6 +32,7 @@ pub enum EvaluatorOp {
     RelationshipEvent(RelationshipEventOp),
     UpdateObjectState(UpdateObjectStateOp),
     UpdateSceneState(UpdateSceneStateOp),
+    UpdateKnowledge(UpdateKnowledgeOp),
     AddWorldEvent(AddWorldEventOp),
     NoOp(NoOp),
 }
@@ -120,6 +122,8 @@ pub struct UpdateSceneStateOp {
     #[serde(default)]
     pub positions: Vec<String>,
     #[serde(default)]
+    pub outfits: Vec<String>,
+    #[serde(default)]
     pub room_state: Option<String>,
     #[serde(default)]
     pub current_misunderstanding: Option<String>,
@@ -132,6 +136,23 @@ pub struct UpdateSceneStateOp {
     /// update, and the provider schema marks it required.
     #[serde(default)]
     pub evidence_quote: Option<String>,
+}
+
+/// One character's position toward one proposition. `status` is knows,
+/// suspects, believes_false, unaware, or hiding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateKnowledgeOp {
+    pub holder_entity_id: String,
+    pub proposition: String,
+    pub status: String,
+    /// Whom it is hidden from, or who the holder heard it from.
+    #[serde(default)]
+    pub counterpart_entity_id: Option<String>,
+    /// Required in spirit for believes_false: what is actually true.
+    #[serde(default)]
+    pub actual_truth: Option<String>,
+    pub evidence_quote: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -330,6 +351,7 @@ pub fn compile_evaluator_ops_to_engine_patch(
                         pressure_point: non_empty(&op.pressure_point),
                         continuity_note: non_empty(&op.continuity_note),
                         positions: op.positions.clone(),
+                        outfits: op.outfits.clone(),
                         // Always `Some`, so an omitted or null field lands as an
                         // explicit clear instead of leaving stale scene truth.
                         room_state: Some(op.room_state.clone().unwrap_or_default()),
@@ -341,6 +363,31 @@ pub fn compile_evaluator_ops_to_engine_patch(
                         ..SceneStatePatch::default()
                     });
                     accepted_candidate_ids.push(format!("op:{index}:update_scene_state"));
+                }
+                EvaluatorOp::UpdateKnowledge(op) => {
+                    let mut entities = vec![op.holder_entity_id.clone()];
+                    if let Some(counterpart) = op.counterpart_entity_id.clone() {
+                        entities.push(counterpart);
+                    }
+                    validate_entities(&entities, context, soul)?;
+                    validate_evidence(&op.evidence_quote, &evidence_text)?;
+                    if knowledge_status_label(&op.status).is_none() {
+                        return Err(format!("unknown knowledge status {}", op.status));
+                    }
+                    let world_patch = patch.world_patch.get_or_insert_with(WorldPatch::default);
+                    world_patch
+                        .knowledge_operations
+                        .push(KnowledgeOperationPatch {
+                            operation: "record".into(),
+                            holder_entity_id: non_empty(&op.holder_entity_id),
+                            proposition: non_empty(&op.proposition),
+                            status: non_empty(&op.status),
+                            counterpart_entity_id: op.counterpart_entity_id.clone(),
+                            actual_truth: op.actual_truth.clone(),
+                            evidence_quote: non_empty(&op.evidence_quote),
+                            ..KnowledgeOperationPatch::default()
+                        });
+                    accepted_candidate_ids.push(format!("op:{index}:update_knowledge"));
                 }
                 EvaluatorOp::AddWorldEvent(op) => {
                     validate_evidence(&op.evidence_quote, &evidence_text)?;
@@ -478,6 +525,26 @@ fn resolve_op_entity_aliases(
                 soul,
                 trace,
             )?;
+        }
+        EvaluatorOp::UpdateKnowledge(op) => {
+            resolve_entity_alias_field(
+                &mut op.holder_entity_id,
+                "update_knowledge.holder_entity_id",
+                index,
+                context,
+                soul,
+                trace,
+            )?;
+            if let Some(counterpart) = op.counterpart_entity_id.as_mut() {
+                resolve_entity_alias_field(
+                    counterpart,
+                    "update_knowledge.counterpart_entity_id",
+                    index,
+                    context,
+                    soul,
+                    trace,
+                )?;
+            }
         }
         EvaluatorOp::AddWorldEvent(_) | EvaluatorOp::NoOp(_) => {}
     }
@@ -873,6 +940,17 @@ fn stable_id(prefix: &str, source: &str) -> String {
     format!("{prefix}_{hash:016x}")
 }
 
+fn knowledge_status_label(status: &str) -> Option<&'static str> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "knows" => Some("knows"),
+        "suspects" => Some("suspects"),
+        "believes_false" => Some("believes_false"),
+        "unaware" => Some("unaware"),
+        "hiding" => Some("hiding"),
+        _ => None,
+    }
+}
+
 pub fn evaluator_ops_json_schema() -> serde_json::Value {
     let nullable_string = json!({ "type": ["string", "null"] });
     let string_array = json!({ "type": "array", "items": { "type": "string" } });
@@ -974,7 +1052,7 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
             "current_scene": { "type": "string" }, "focus": { "type": "string" },
             "participants": string_array, "last_user_action": { "type": "string" },
             "pressure_point": { "type": "string" }, "continuity_note": { "type": "string" },
-            "positions": string_array,
+            "positions": string_array, "outfits": string_array,
             "room_state": nullable_string, "current_misunderstanding": nullable_string,
             "active_object": nullable_string, "open_question": nullable_string,
             "evidence_quote": evidence_string
@@ -989,10 +1067,30 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
             // Required so a strict schema forces the model to restate current
             // scene truth every time; `null` is how it says "there is none".
             "positions",
+            "outfits",
             "room_state",
             "current_misunderstanding",
             "active_object",
             "open_question",
+            "evidence_quote",
+        ],
+    );
+    let knowledge_update = op_schema(
+        "update_knowledge",
+        json!({
+            "holder_entity_id": { "type": "string", "minLength": 1 },
+            "proposition": { "type": "string", "minLength": 1 },
+            "status": { "type": "string", "enum": ["knows", "suspects", "believes_false", "unaware", "hiding"] },
+            "counterpart_entity_id": nullable_string,
+            "actual_truth": nullable_string,
+            "evidence_quote": evidence_string
+        }),
+        &[
+            "holder_entity_id",
+            "proposition",
+            "status",
+            "counterpart_entity_id",
+            "actual_truth",
             "evidence_quote",
         ],
     );
@@ -1015,7 +1113,7 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
             "schema_version": { "type": "integer", "enum": [1] },
             "ops": {
                 "type": "array",
-                "items": { "anyOf": [add_memory, relationship_event, object_update, scene_update, world_event, no_op] }
+                "items": { "anyOf": [add_memory, relationship_event, object_update, scene_update, knowledge_update, world_event, no_op] }
             },
             "no_op_reason": nullable_string
         }

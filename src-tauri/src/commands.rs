@@ -19,7 +19,7 @@ use state_engine::{
         compile_perception_pipeline, lower_state_effects_to_engine_patch,
         perception_ir_json_schema, seal_perception_batch, CompilerPipelineReport, EntityCatalog,
         EntityDescriptor, EntityRole, ModelProvenance, PerceptionBatch, PerceptionBatchDraft,
-        SimulationDecision, SimulationSnapshot, SourceEnvelope, SourceIdentity,
+        SceneSlot, SimulationDecision, SimulationSnapshot, SourceEnvelope, SourceIdentity,
         MEMORY_COMPILER_CONTRACT_VERSION, PERCEPTION_IR_SCHEMA_NAME, PERCEPTION_IR_SCHEMA_VERSION,
     },
     consolidation::consolidate_soul,
@@ -48,8 +48,9 @@ use state_engine::{
     memory::{restore_archived_memory, set_memory_pinned},
     patch::{
         is_premature_user_turn_event, is_retcon_or_correction_text,
-        purge_premature_recent_events_from_world, EnginePatch, MemoryApplyAction, MemoryPatch,
-        SceneStatePatch, SoulPatch, WorldPatch, PATCH_PROTOCOL_VERSION,
+        purge_premature_recent_events_from_world, EnginePatch, KnowledgeOperationPatch,
+        MemoryApplyAction, MemoryPatch, SceneStatePatch, SoulPatch, WorldPatch,
+        PATCH_PROTOCOL_VERSION,
     },
     setting::{new_default_setting, SessionWorld, SettingSoul},
     soul::{
@@ -2682,54 +2683,96 @@ fn parse_state_update_body(body: &str) -> Option<(String, String)> {
         .then_some((target, instruction.trim().to_string()))
 }
 
+/// Build the patch for a user-typed `/state update <target> <instruction>`.
+///
+/// The target names a continuity slot, so the user says exactly which piece of
+/// state is wrong instead of leaving the engine to guess from prose. A user
+/// command is a trusted source: unlike an evaluator claim it needs no evidence
+/// quote, because the person typing it *is* the evidence.
+///
+/// `knows`/`suspects`/`believes`/`unaware`/`hiding` targets take
+/// `<holder> : <proposition>` so one command can fix who knows what.
 fn scene_state_command_patch(target: &str, instruction: &str, source_label: &str) -> EnginePatch {
-    let focus = infer_command_focus(instruction);
-    let pressure_point = infer_command_pressure_point(instruction);
+    let instruction = instruction.trim();
+    let note = format!("{source_label}: {instruction}");
+
+    if let Some(status) = knowledge_status_for_command_target(target) {
+        let (holder, proposition) = match instruction.split_once(':') {
+            Some((holder, proposition)) if !holder.trim().is_empty() => {
+                (holder.trim().to_string(), proposition.trim().to_string())
+            }
+            _ => (String::new(), instruction.to_string()),
+        };
+        if !holder.is_empty() && !proposition.is_empty() {
+            return EnginePatch {
+                schema_version: Some(state_engine::patch::PATCH_PROTOCOL_VERSION),
+                world_patch: Some(WorldPatch {
+                    knowledge_operations: vec![KnowledgeOperationPatch {
+                        operation: "record".into(),
+                        holder_entity_id: Some(holder),
+                        proposition: Some(proposition),
+                        status: Some(status.into()),
+                        ..KnowledgeOperationPatch::default()
+                    }],
+                    ..WorldPatch::default()
+                }),
+                ..EnginePatch::default()
+            };
+        }
+    }
+
+    let mut scene = SceneStatePatch {
+        scene_state_id: Some(format!("scene_cmd_{}", uuid_like_id())),
+        continuity_note: Some(note),
+        ..SceneStatePatch::default()
+    };
+    let value = instruction.chars().take(240).collect::<String>();
+    match SceneSlot::from_predicate(target) {
+        Some(SceneSlot::Location) => {
+            return EnginePatch {
+                schema_version: Some(state_engine::patch::PATCH_PROTOCOL_VERSION),
+                world_patch: Some(WorldPatch {
+                    location: Some(value),
+                    scene_state: Some(scene),
+                    ..WorldPatch::default()
+                }),
+                ..EnginePatch::default()
+            };
+        }
+        Some(SceneSlot::CurrentScene) => scene.current_scene = Some(value),
+        Some(SceneSlot::Focus) => scene.focus = Some(value),
+        Some(SceneSlot::Position) => scene.positions = vec![value],
+        Some(SceneSlot::Outfit) => scene.outfits = vec![value],
+        Some(SceneSlot::RoomState) => scene.room_state = Some(value),
+        Some(SceneSlot::ActiveObject) => scene.active_object = Some(value),
+        Some(SceneSlot::Misunderstanding) => scene.current_misunderstanding = Some(value),
+        Some(SceneSlot::OpenQuestion) => scene.open_question = Some(value),
+        Some(SceneSlot::PressurePoint) => scene.pressure_point = Some(value),
+        Some(SceneSlot::LastAction) => scene.last_user_action = Some(value),
+        // An unrecognized target is still a real user correction, so it is kept
+        // as focus rather than dropped — but it is never filed into a named slot
+        // it might not belong to.
+        None => scene.focus = Some(value),
+    }
+
     EnginePatch {
         schema_version: Some(state_engine::patch::PATCH_PROTOCOL_VERSION),
         world_patch: Some(WorldPatch {
-            scene_state: Some(SceneStatePatch {
-                scene_state_id: Some(format!("scene_cmd_{}", uuid_like_id())),
-                focus: Some(focus.unwrap_or_else(|| target.trim().to_string())),
-                pressure_point,
-                continuity_note: Some(format!("{source_label}: {}", instruction.trim())),
-                ..SceneStatePatch::default()
-            }),
+            scene_state: Some(scene),
             ..WorldPatch::default()
         }),
         ..EnginePatch::default()
     }
 }
 
-fn infer_command_focus(instruction: &str) -> Option<String> {
-    let lower = instruction.to_ascii_lowercase();
-    let mut parts = Vec::new();
-    if lower.contains("cautious") && lower.contains("curious") {
-        parts.push("Aurora is cautious but curious".to_string());
-    } else if lower.contains("cautious") {
-        parts.push("Aurora is cautious".to_string());
-    } else if lower.contains("curious") {
-        parts.push("Aurora is curious".to_string());
-    }
-    if lower.contains("not scared") || lower.contains("not afraid") {
-        parts.push("not scared".into());
-    }
-    if parts.is_empty() {
-        let compact = instruction.trim();
-        (!compact.is_empty()).then(|| compact.chars().take(160).collect())
-    } else {
-        Some(format!("{}.", parts.join(", ")))
-    }
-}
-
-fn infer_command_pressure_point(instruction: &str) -> Option<String> {
-    let lower = instruction.to_ascii_lowercase();
-    if lower.contains("door chain") && (lower.contains("engaged") || lower.contains("on")) {
-        Some("The door chain remains engaged.".into())
-    } else if lower.contains("deadbolt") || lower.contains("lock") || lower.contains("chain") {
-        Some(instruction.trim().chars().take(160).collect())
-    } else {
-        None
+fn knowledge_status_for_command_target(target: &str) -> Option<&'static str> {
+    match target.trim().to_ascii_lowercase().as_str() {
+        "knows" | "know" => Some("knows"),
+        "suspects" | "suspect" => Some("suspects"),
+        "believes" | "believes_false" | "wrong" => Some("believes_false"),
+        "unaware" => Some("unaware"),
+        "hiding" | "hides" => Some("hiding"),
+        _ => None,
     }
 }
 

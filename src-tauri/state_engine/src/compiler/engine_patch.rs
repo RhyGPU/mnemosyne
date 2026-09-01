@@ -2,15 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     patch::{
-        EnginePatch, MemoryPatch, ObjectObservationOperationPatch, RelationshipDelta,
-        SceneStatePatch, SoulPatch, WorldEventOperationPatch, WorldPatch, PATCH_PROTOCOL_VERSION,
+        EnginePatch, KnowledgeOperationPatch, MemoryPatch, ObjectObservationOperationPatch,
+        RelationshipDelta, SceneStatePatch, SoulPatch, WorldEventOperationPatch, WorldPatch,
+        PATCH_PROTOCOL_VERSION,
     },
     soul::{MemorySourceType, ObjectState, TruthStatus},
 };
 
 use super::{
     CompilerDiagnostic, CompilerStage, DiagnosticSeverity, EvidenceSource, MemoryFormationKind,
-    RelationshipEvidenceSignal, SourceEnvelope, StateEffect, StateEffectKind,
+    RelationshipEvidenceSignal, SceneSlot, SourceEnvelope, StateEffect, StateEffectKind,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -138,22 +139,99 @@ pub fn lower_state_effects_to_engine_patch(
                     ));
             }
             StateEffectKind::UpdateSceneProjection {
-                scene,
-                focus,
+                slot,
+                value,
                 participant_entity_ids,
-                pressure_point,
+            } => {
+                let world_patch = patch.world_patch.get_or_insert_with(WorldPatch::default);
+                if matches!(slot, SceneSlot::Location) {
+                    if let Some(value) = value.clone() {
+                        world_patch.location = Some(value);
+                    }
+                    continue;
+                }
+                // Merge, never replace: a batch can carry several scene claims
+                // and each owns one slot.
+                let scene_state = world_patch
+                    .scene_state
+                    .get_or_insert_with(SceneStatePatch::default);
+                if scene_state.scene_state_id.is_none() {
+                    scene_state.scene_state_id = Some(effect.provenance.effect_id.clone());
+                }
+                for participant in participant_entity_ids {
+                    if !scene_state.participants.contains(participant) {
+                        scene_state.participants.push(participant.clone());
+                    }
+                }
+                match slot {
+                    // Absent value clears these, because a resolved
+                    // misunderstanding or an answered question must not stand.
+                    SceneSlot::RoomState => {
+                        scene_state.room_state = Some(value.clone().unwrap_or_default());
+                    }
+                    SceneSlot::ActiveObject => {
+                        scene_state.active_object = Some(value.clone().unwrap_or_default());
+                    }
+                    SceneSlot::Misunderstanding => {
+                        scene_state.current_misunderstanding =
+                            Some(value.clone().unwrap_or_default());
+                    }
+                    SceneSlot::OpenQuestion => {
+                        scene_state.open_question = Some(value.clone().unwrap_or_default());
+                    }
+                    // The rest describe a scene that always exists, so an absent
+                    // value is nothing to say rather than an erasure.
+                    SceneSlot::CurrentScene => {
+                        scene_state.current_scene =
+                            value.clone().or(scene_state.current_scene.take());
+                    }
+                    SceneSlot::Focus => {
+                        scene_state.focus = value.clone().or(scene_state.focus.take());
+                    }
+                    SceneSlot::PressurePoint => {
+                        scene_state.pressure_point =
+                            value.clone().or(scene_state.pressure_point.take());
+                    }
+                    SceneSlot::LastAction => {
+                        scene_state.last_user_action =
+                            value.clone().or(scene_state.last_user_action.take());
+                    }
+                    SceneSlot::Position => {
+                        if let Some(value) = value.clone() {
+                            if !scene_state.positions.contains(&value) {
+                                scene_state.positions.push(value);
+                            }
+                        }
+                    }
+                    SceneSlot::Outfit => {
+                        if let Some(value) = value.clone() {
+                            if !scene_state.outfits.contains(&value) {
+                                scene_state.outfits.push(value);
+                            }
+                        }
+                    }
+                    SceneSlot::Location => unreachable!("handled above"),
+                }
+            }
+            StateEffectKind::RecordKnowledge {
+                holder_entity_id,
+                proposition,
+                status,
+                counterpart_entity_id,
             } => {
                 patch
                     .world_patch
                     .get_or_insert_with(WorldPatch::default)
-                    .scene_state = Some(SceneStatePatch {
-                    scene_state_id: Some(effect.provenance.effect_id.clone()),
-                    current_scene: Some(scene.clone()),
-                    focus: Some(focus.clone()),
-                    participants: participant_entity_ids.clone(),
-                    pressure_point: pressure_point.clone(),
-                    ..SceneStatePatch::default()
-                });
+                    .knowledge_operations
+                    .push(KnowledgeOperationPatch {
+                        operation: "record".into(),
+                        holder_entity_id: Some(holder_entity_id.clone()),
+                        proposition: Some(proposition.clone()),
+                        status: Some(status.as_label().into()),
+                        counterpart_entity_id: counterpart_entity_id.clone(),
+                        evidence_quote: Some(effect.provenance.evidence.quote.clone()),
+                        ..KnowledgeOperationPatch::default()
+                    });
             }
             StateEffectKind::RecordCorrection { .. } => {
                 unsupported_effect_ids.push(effect.provenance.effect_id.clone());

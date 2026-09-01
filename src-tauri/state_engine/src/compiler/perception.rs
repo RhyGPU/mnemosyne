@@ -62,6 +62,14 @@ pub enum PerceptionKind {
     Intention,
     BeliefExpression,
     Correction,
+    /// A claim about who knows, suspects, wrongly believes, is unaware of, or is
+    /// hiding something. The `predicate` carries the epistemic status and the
+    /// `object` carries the proposition.
+    KnowledgeClaim,
+    /// A claim about current scene truth: where people are, what the room is
+    /// doing, what is misunderstood, what is unanswered. The `predicate` selects
+    /// which continuity slot the claim addresses.
+    SceneObservation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -364,7 +372,8 @@ pub fn perception_ir_json_schema() -> serde_json::Value {
                 "type": "string",
                 "enum": [
                     "event", "utterance", "object_observation", "affect_cue",
-                    "relationship_evidence", "intention", "belief_expression", "correction"
+                    "relationship_evidence", "intention", "belief_expression", "correction",
+                    "scene_observation", "knowledge_claim"
                 ]
             },
             "subject_ref": { "type": "string", "minLength": 1 },

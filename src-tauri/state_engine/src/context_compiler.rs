@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::patch::is_premature_user_turn_event;
 use crate::relationship_surface::relationship_surface_summary;
 use crate::setting::SessionWorld;
-use crate::soul::{MemoryEntry, MemorySourceType, PlotStatus, Soul, TruthStatus};
+use crate::soul::{KnowledgeStatus, MemoryEntry, MemorySourceType, PlotStatus, Soul, TruthStatus};
 
 const DEFAULT_TOKEN_BUDGET: usize = 2_500;
 const MIN_RECENT_MEMORY_SALIENCE: f32 = 65.0;
@@ -79,6 +79,7 @@ pub struct ContextBudget {
     pub relationship_tokens: usize,
     pub context_priority_tokens: usize,
     pub scene_state_tokens: usize,
+    pub knowledge_tokens: usize,
     pub do_not_replay_tokens: usize,
     pub recent_chat_tokens: usize,
     pub latest_exchange_tokens: usize,
@@ -187,6 +188,7 @@ impl Default for ContextBudget {
             relationship_tokens: 250,
             context_priority_tokens: 150,
             scene_state_tokens: 350,
+            knowledge_tokens: 300,
             do_not_replay_tokens: 180,
             recent_chat_tokens: 500,
             latest_exchange_tokens: 700,
@@ -351,6 +353,7 @@ fn compile_context_with_budget_and_options(
     let mut section_builders = vec![
         build_controlled_entities_section(soul, player_persona, budget),
         build_scene_continuity_section(soul, session_world, budget),
+        build_knowledge_section(soul, session_world, budget),
         build_world_section(soul, session_world, budget, pending_user_text),
         build_profile_section(soul, budget),
         build_memory_section(soul, messages, budget),
@@ -1110,6 +1113,16 @@ fn build_scene_continuity_section(
             lines.push(format!("Positions:\n{}", positions.join("\n")));
         }
     }
+    if !scene.outfits.is_empty() {
+        let outfits = scene
+            .outfits
+            .iter()
+            .filter_map(|outfit| clean(outfit))
+            .collect::<Vec<_>>();
+        if !outfits.is_empty() {
+            lines.push(format!("Wearing:\n{}", outfits.join("\n")));
+        }
+    }
     push(&mut lines, "Room state", &scene.room_state);
     push(&mut lines, "Active object", &scene.active_object);
     push(
@@ -1141,6 +1154,74 @@ fn build_scene_continuity_section(
         "[SCENE CONTINUITY]",
         lines,
         budget.scene_state_tokens.min(budget.max_tokens),
+    )
+}
+
+/// What each character may act on as if it were true.
+///
+/// The narrator writes every character, so it needs both halves of a false
+/// belief: what the character thinks, and what is actually the case. Without the
+/// second half dramatic irony collapses into the narrator simply being wrong.
+fn build_knowledge_section(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    budget: &ContextBudget,
+) -> BuiltSection {
+    let world = if let Some(session_world) = session_world {
+        session_world.world_log()
+    } else {
+        soul.world.clone()
+    };
+
+    let mut lines = Vec::new();
+    for entry in world.knowledge.iter().filter(|entry| entry.is_active) {
+        let Some(holder) = clean(&entry.holder_entity_id) else {
+            continue;
+        };
+        let Some(proposition) = clean(&entry.proposition) else {
+            continue;
+        };
+        let line = match entry.status {
+            KnowledgeStatus::Hiding => {
+                let from = entry
+                    .counterpart_entity_id
+                    .as_deref()
+                    .and_then(clean)
+                    .unwrap_or("everyone");
+                format!("- {holder} hides from {from}: {proposition}")
+            }
+            KnowledgeStatus::BelievesFalse => {
+                let truth = entry
+                    .actual_truth
+                    .as_deref()
+                    .and_then(clean)
+                    .map(|truth| format!(" (actually: {truth})"))
+                    .unwrap_or_default();
+                format!("- {holder} wrongly believes: {proposition}{truth}")
+            }
+            KnowledgeStatus::Knows => format!("- {holder} knows: {proposition}"),
+            KnowledgeStatus::Suspects => format!("- {holder} suspects: {proposition}"),
+            KnowledgeStatus::Unaware => format!("- {holder} does not know: {proposition}"),
+        };
+        lines.push(line);
+    }
+
+    if lines.is_empty() {
+        return BuiltSection {
+            text: String::new(),
+            truncated: false,
+            memory_slot_debug: Vec::new(),
+        };
+    }
+    lines.insert(
+        0,
+        "Do not let a character use knowledge this list denies them.".into(),
+    );
+
+    section_from_lines(
+        "[WHO KNOWS WHAT]",
+        lines,
+        budget.knowledge_tokens.min(budget.max_tokens),
     )
 }
 
@@ -1462,6 +1543,7 @@ fn compact_sections_to_budget(sections: &mut Vec<String>, max_tokens: usize) -> 
         "[CHARACTER SNAPSHOT]",
         "[WORLD SNAPSHOT]",
         "[RELATIONSHIPS]",
+        "[WHO KNOWS WHAT]",
         // The continuity anchor is trimmed only after every durable section has
         // already given up lines, and before nothing except the exchange the
         // narrator is answering.
@@ -2478,6 +2560,7 @@ mod tests {
             relationship_tokens: 80,
             context_priority_tokens: 120,
             scene_state_tokens: 120,
+            knowledge_tokens: 100,
             do_not_replay_tokens: 80,
             recent_chat_tokens: 120,
             latest_exchange_tokens: 120,
@@ -2722,6 +2805,65 @@ mod tests {
             !world.contains("Filler plot thread number 39"),
             "world snapshot should give up lines before the continuity anchor"
         );
+    }
+
+    #[test]
+    fn knowledge_section_gives_the_narrator_both_halves_of_a_false_belief() {
+        let mut soul = new_default_soul("Aurora");
+        soul.world.knowledge = vec![
+            crate::soul::KnowledgeEntry {
+                knowledge_id: "k1".into(),
+                holder_entity_id: "Visitor".into(),
+                proposition: "Aurora called the building manager".into(),
+                status: KnowledgeStatus::BelievesFalse,
+                counterpart_entity_id: None,
+                actual_truth: Some("nobody called anyone".into()),
+                established_turn: 4,
+                evidence_quote: None,
+                is_active: true,
+                superseded_by_knowledge_id: None,
+            },
+            crate::soul::KnowledgeEntry {
+                knowledge_id: "k2".into(),
+                holder_entity_id: "Aurora".into(),
+                proposition: "she kept the spare key".into(),
+                status: KnowledgeStatus::Hiding,
+                counterpart_entity_id: Some("Visitor".into()),
+                actual_truth: None,
+                established_turn: 5,
+                evidence_quote: None,
+                is_active: true,
+                superseded_by_knowledge_id: None,
+            },
+        ];
+
+        let preview = compile_context_for_session(&soul, None, &[]);
+        let knowledge = section_text(&preview.text, "[WHO KNOWS WHAT]");
+
+        assert!(knowledge.contains("Visitor wrongly believes: Aurora called the building manager"));
+        assert!(knowledge.contains("(actually: nobody called anyone)"));
+        assert!(knowledge.contains("Aurora hides from Visitor: she kept the spare key"));
+    }
+
+    #[test]
+    fn retired_knowledge_positions_never_reach_the_narrator() {
+        let mut soul = new_default_soul("Aurora");
+        soul.world.knowledge = vec![crate::soul::KnowledgeEntry {
+            knowledge_id: "k1".into(),
+            holder_entity_id: "Aurora".into(),
+            proposition: "the seal was broken".into(),
+            status: KnowledgeStatus::Unaware,
+            counterpart_entity_id: None,
+            actual_truth: None,
+            established_turn: 1,
+            evidence_quote: None,
+            is_active: false,
+            superseded_by_knowledge_id: Some("k2".into()),
+        }];
+
+        let preview = compile_context_for_session(&soul, None, &[]);
+
+        assert!(!preview.text.contains("[WHO KNOWS WHAT]"));
     }
 
     #[test]

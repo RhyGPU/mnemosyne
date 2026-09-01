@@ -24,7 +24,7 @@ pub use diagnostics::{
 pub use engine_patch::{lower_state_effects_to_engine_patch, EnginePatchLoweringReport};
 pub use lower::{
     DeterministicEffectLowerer, EffectLowerer, EffectProvenance, LoweringReport,
-    MemoryFormationKind, RelationshipEvidenceSignal, StateEffect, StateEffectKind,
+    MemoryFormationKind, RelationshipEvidenceSignal, SceneSlot, StateEffect, StateEffectKind,
 };
 pub use perception::{
     perception_ir_json_schema, seal_perception_batch, BehaviorEvidenceKind, ClaimValue,

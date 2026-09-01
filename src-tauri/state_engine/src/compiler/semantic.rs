@@ -175,6 +175,16 @@ impl SemanticAnalyzer for DeterministicSemanticAnalyzer {
                         Some("temporal.anchor"),
                     );
                 }
+                if perception.kind == PerceptionKind::SceneObservation
+                    && perception.temporal.anchor == TemporalAnchor::BeforeCurrentTurn
+                {
+                    reject(
+                        "stale_scene_claim",
+                        "scene observations carry current truth and cannot be anchored in the past"
+                            .into(),
+                        Some("temporal.anchor"),
+                    );
+                }
                 if perception.kind == PerceptionKind::Correction
                     && !contains_correction_cue(evidence_text)
                 {

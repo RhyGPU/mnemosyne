@@ -435,6 +435,284 @@ fn deterministic_pipeline_binds_validates_lowers_and_simulates_relationship_evid
     assert_eq!(report.simulation.effects.len(), 1);
 }
 
+fn scene_candidate(predicate: &str, value: Option<&str>) -> PerceptionCandidateDraft {
+    PerceptionCandidateDraft {
+        kind: PerceptionKind::SceneObservation,
+        subject_ref: "active_soul".into(),
+        predicate: predicate.into(),
+        object: value.map(|text| ClaimValue::Text { text: text.into() }),
+        actor_ref: None,
+        perceiver_ref: Some("active_soul".into()),
+        target_refs: vec!["active_player".into()],
+        evidence: EvidenceSpan {
+            source: EvidenceSource::AssistantMessage,
+            quote: "the door stays on its chain".into(),
+            start_char: None,
+            end_char: None,
+        },
+        epistemic_mode: EpistemicMode::NarratorDescribed,
+        extraction_confidence: 0.9,
+        temporal: TemporalExpression {
+            anchor: TemporalAnchor::CurrentTurn,
+            expression: None,
+        },
+        durability_hint: DurabilityHint::Turn,
+        relationship_signal: None,
+    }
+}
+
+fn scene_source() -> SourceEnvelope {
+    source("Aurora keeps the door on its chain while the visitor waits, and the door stays on its chain.")
+}
+
+#[test]
+fn scene_perception_lowers_to_the_matching_continuity_slot() {
+    let source = scene_source();
+    let draft = PerceptionBatchDraft {
+        schema_version: PERCEPTION_IR_SCHEMA_VERSION,
+        candidates: vec![scene_candidate(
+            "room_state",
+            Some("Door open on its chain"),
+        )],
+        no_op_reason: None,
+    };
+    let batch = seal_perception_batch(&source, draft, producer()).expect("batch");
+    let report = compile_perception_pipeline(
+        &source,
+        &batch,
+        catalog(),
+        &SimulationSnapshot {
+            state_hash: Some("state:abc123".into()),
+            existing_effect_ids: Vec::new(),
+        },
+    );
+
+    assert_eq!(report.lowering.effects.len(), 1);
+    let StateEffectKind::UpdateSceneProjection { slot, value, .. } =
+        &report.lowering.effects[0].effect
+    else {
+        panic!("scene perception must lower to a scene projection");
+    };
+    assert_eq!(*slot, state_engine::compiler::SceneSlot::RoomState);
+    assert_eq!(value.as_deref(), Some("Door open on its chain"));
+    assert_eq!(report.simulation.decision, SimulationDecision::CommitReady);
+}
+
+#[test]
+fn several_scene_claims_merge_instead_of_overwriting_each_other() {
+    let source = scene_source();
+    let draft = PerceptionBatchDraft {
+        schema_version: PERCEPTION_IR_SCHEMA_VERSION,
+        candidates: vec![
+            scene_candidate("room_state", Some("Door open on its chain")),
+            scene_candidate("open_question", Some("Who sent the visitor?")),
+            scene_candidate("active_object", Some("brass key")),
+        ],
+        no_op_reason: None,
+    };
+    let batch = seal_perception_batch(&source, draft, producer()).expect("batch");
+    let report = compile_perception_pipeline(
+        &source,
+        &batch,
+        catalog(),
+        &SimulationSnapshot {
+            state_hash: Some("state:abc123".into()),
+            existing_effect_ids: Vec::new(),
+        },
+    );
+    let lowered = lower_state_effects_to_engine_patch(&source, &report.lowering.effects);
+    let scene = lowered
+        .patch
+        .world_patch
+        .as_ref()
+        .and_then(|world| world.scene_state.as_ref())
+        .expect("scene state patch");
+
+    assert_eq!(scene.room_state.as_deref(), Some("Door open on its chain"));
+    assert_eq!(
+        scene.open_question.as_deref(),
+        Some("Who sent the visitor?")
+    );
+    assert_eq!(scene.active_object.as_deref(), Some("brass key"));
+    assert!(scene.participants.contains(&"player-1".to_string()));
+}
+
+#[test]
+fn absent_scene_value_clears_resolved_truth() {
+    let source = scene_source();
+    let draft = PerceptionBatchDraft {
+        schema_version: PERCEPTION_IR_SCHEMA_VERSION,
+        candidates: vec![scene_candidate("misunderstanding", None)],
+        no_op_reason: None,
+    };
+    let batch = seal_perception_batch(&source, draft, producer()).expect("batch");
+    let report = compile_perception_pipeline(
+        &source,
+        &batch,
+        catalog(),
+        &SimulationSnapshot {
+            state_hash: Some("state:abc123".into()),
+            existing_effect_ids: Vec::new(),
+        },
+    );
+    let lowered = lower_state_effects_to_engine_patch(&source, &report.lowering.effects);
+    let scene = lowered
+        .patch
+        .world_patch
+        .as_ref()
+        .and_then(|world| world.scene_state.as_ref())
+        .expect("scene state patch");
+
+    assert_eq!(scene.current_misunderstanding.as_deref(), Some(""));
+}
+
+#[test]
+fn hearsay_scene_claim_becomes_memory_not_current_truth() {
+    let source = scene_source();
+    let mut candidate = scene_candidate("room_state", Some("Door wide open"));
+    candidate.epistemic_mode = EpistemicMode::StatedBy;
+    // stated_by requires a bound speaker, which is a pre-existing semantic rule.
+    candidate.actor_ref = Some("active_player".into());
+    let draft = PerceptionBatchDraft {
+        schema_version: PERCEPTION_IR_SCHEMA_VERSION,
+        candidates: vec![candidate],
+        no_op_reason: None,
+    };
+    let batch = seal_perception_batch(&source, draft, producer()).expect("batch");
+    let report = compile_perception_pipeline(
+        &source,
+        &batch,
+        catalog(),
+        &SimulationSnapshot {
+            state_hash: Some("state:abc123".into()),
+            existing_effect_ids: Vec::new(),
+        },
+    );
+
+    assert!(matches!(
+        report.lowering.effects[0].effect,
+        StateEffectKind::FormMemory { .. }
+    ));
+}
+
+#[test]
+fn past_anchored_scene_claim_is_rejected_as_stale() {
+    let source = scene_source();
+    let mut candidate = scene_candidate("room_state", Some("Door was open"));
+    candidate.temporal.anchor = TemporalAnchor::BeforeCurrentTurn;
+    let draft = PerceptionBatchDraft {
+        schema_version: PERCEPTION_IR_SCHEMA_VERSION,
+        candidates: vec![candidate],
+        no_op_reason: None,
+    };
+    let batch = seal_perception_batch(&source, draft, producer()).expect("batch");
+    let report = compile_perception_pipeline(
+        &source,
+        &batch,
+        catalog(),
+        &SimulationSnapshot {
+            state_hash: Some("state:abc123".into()),
+            existing_effect_ids: Vec::new(),
+        },
+    );
+
+    assert!(report
+        .semantic
+        .candidates
+        .iter()
+        .any(|candidate| candidate.disposition
+            != state_engine::compiler::SemanticDisposition::Accepted));
+    assert!(report.lowering.effects.is_empty());
+}
+
+#[test]
+fn unknown_scene_predicate_commits_nothing() {
+    let source = scene_source();
+    let draft = PerceptionBatchDraft {
+        schema_version: PERCEPTION_IR_SCHEMA_VERSION,
+        candidates: vec![scene_candidate("vibes", Some("tense"))],
+        no_op_reason: None,
+    };
+    let batch = seal_perception_batch(&source, draft, producer()).expect("batch");
+    let report = compile_perception_pipeline(
+        &source,
+        &batch,
+        catalog(),
+        &SimulationSnapshot {
+            state_hash: Some("state:abc123".into()),
+            existing_effect_ids: Vec::new(),
+        },
+    );
+
+    assert!(
+        report.lowering.effects.is_empty(),
+        "an unrecognized slot must not be guessed into a real field"
+    );
+}
+
+#[test]
+fn knowledge_claim_lowers_to_a_recorded_epistemic_position() {
+    let source = scene_source();
+    let mut candidate = scene_candidate("hiding", Some("she kept the spare key"));
+    candidate.kind = PerceptionKind::KnowledgeClaim;
+    candidate.subject_ref = "active_soul".into();
+    candidate.target_refs = vec!["active_player".into()];
+    let draft = PerceptionBatchDraft {
+        schema_version: PERCEPTION_IR_SCHEMA_VERSION,
+        candidates: vec![candidate],
+        no_op_reason: None,
+    };
+    let batch = seal_perception_batch(&source, draft, producer()).expect("batch");
+    let report = compile_perception_pipeline(
+        &source,
+        &batch,
+        catalog(),
+        &SimulationSnapshot {
+            state_hash: Some("state:abc123".into()),
+            existing_effect_ids: Vec::new(),
+        },
+    );
+
+    let StateEffectKind::RecordKnowledge {
+        holder_entity_id,
+        proposition,
+        status,
+        counterpart_entity_id,
+    } = &report.lowering.effects[0].effect
+    else {
+        panic!("knowledge perception must lower to a knowledge effect");
+    };
+    assert_eq!(holder_entity_id, "soul-a");
+    assert_eq!(proposition, "she kept the spare key");
+    assert_eq!(*status, state_engine::soul::KnowledgeStatus::Hiding);
+    // Concealment is always from someone; the counterpart is not optional detail.
+    assert_eq!(counterpart_entity_id.as_deref(), Some("player-1"));
+}
+
+#[test]
+fn unknown_epistemic_predicate_commits_nothing() {
+    let source = scene_source();
+    let mut candidate = scene_candidate("vaguely_senses", Some("something is off"));
+    candidate.kind = PerceptionKind::KnowledgeClaim;
+    let draft = PerceptionBatchDraft {
+        schema_version: PERCEPTION_IR_SCHEMA_VERSION,
+        candidates: vec![candidate],
+        no_op_reason: None,
+    };
+    let batch = seal_perception_batch(&source, draft, producer()).expect("batch");
+    let report = compile_perception_pipeline(
+        &source,
+        &batch,
+        catalog(),
+        &SimulationSnapshot {
+            state_hash: Some("state:abc123".into()),
+            existing_effect_ids: Vec::new(),
+        },
+    );
+
+    assert!(report.lowering.effects.is_empty());
+}
+
 #[test]
 fn hearsay_event_forms_testimony_instead_of_world_truth() {
     let source = source("Aurora watches as the visitor returns the brass key exactly as promised.");

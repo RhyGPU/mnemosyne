@@ -63,6 +63,8 @@ pub struct SessionWorld {
     #[serde(default)]
     pub stale_plot_decay: f32,
     #[serde(default)]
+    pub knowledge: Vec<crate::soul::KnowledgeEntry>,
+    #[serde(default)]
     pub scenario: String,
     pub created_at: i64,
     pub last_updated: i64,
@@ -87,6 +89,7 @@ impl SessionWorld {
             background_plots: self.background_plots.clone(),
             resolved_plots: self.resolved_plots.clone(),
             stale_plot_decay: self.stale_plot_decay,
+            knowledge: self.knowledge.clone(),
         }
     }
 
@@ -103,6 +106,7 @@ impl SessionWorld {
         self.background_plots = world.background_plots.clone();
         self.resolved_plots = world.resolved_plots.clone();
         self.stale_plot_decay = world.stale_plot_decay;
+        self.knowledge = world.knowledge.clone();
     }
 }
 
@@ -123,6 +127,7 @@ pub fn session_world_from_setting(setting: &SettingSoul) -> SessionWorld {
         object_states: setting.world.object_states.clone(),
         time_elapsed: setting.world.time_elapsed.clone(),
         scene_state: setting.world.scene_state.clone(),
+        knowledge: setting.world.knowledge.clone(),
         dominant_current_plot: setting.world.dominant_current_plot.clone(),
         background_plots: setting.world.background_plots.clone(),
         resolved_plots: setting.world.resolved_plots.clone(),
@@ -154,6 +159,7 @@ pub fn session_world_from_legacy_world(
         object_states: world.object_states.clone(),
         time_elapsed: world.time_elapsed.clone(),
         scene_state: world.scene_state.clone(),
+        knowledge: world.knowledge.clone(),
         dominant_current_plot: world.dominant_current_plot.clone(),
         background_plots: world.background_plots.clone(),
         resolved_plots: world.resolved_plots.clone(),

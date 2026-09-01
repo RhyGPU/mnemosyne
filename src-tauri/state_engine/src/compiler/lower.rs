@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::soul::KnowledgeStatus;
+
 use super::{
     diagnostics::{CompilerContractError, CompilerDiagnostic},
     perception::{
@@ -89,17 +91,84 @@ pub enum StateEffectKind {
         target_entity_id: String,
         signal: RelationshipEvidenceSignal,
     },
+    /// One slot of current scene truth. Perception arrives as independent
+    /// claims, so a whole-scene effect would let the last claim in a batch
+    /// silently overwrite the rest; slots merge instead.
     UpdateSceneProjection {
-        scene: String,
-        focus: String,
+        slot: SceneSlot,
+        value: Option<String>,
         participant_entity_ids: Vec<String>,
-        pressure_point: Option<String>,
+    },
+    /// One entity's epistemic position toward one proposition.
+    RecordKnowledge {
+        holder_entity_id: String,
+        proposition: String,
+        status: KnowledgeStatus,
+        counterpart_entity_id: Option<String>,
     },
     RecordCorrection {
         subject_entity_id: String,
         predicate: String,
         replacement: Option<String>,
     },
+}
+
+/// Unrecognized epistemic predicates commit nothing, for the same reason an
+/// unrecognized scene slot does: a guessed status would assert a belief nobody
+/// expressed.
+fn knowledge_status_from_predicate(predicate: &str) -> Option<KnowledgeStatus> {
+    match predicate.trim().to_ascii_lowercase().as_str() {
+        "knows" | "learned" | "aware_of" => Some(KnowledgeStatus::Knows),
+        "suspects" | "suspicious_of" => Some(KnowledgeStatus::Suspects),
+        "believes_false" | "wrongly_believes" | "false_belief" => {
+            Some(KnowledgeStatus::BelievesFalse)
+        }
+        "unaware" | "does_not_know" => Some(KnowledgeStatus::Unaware),
+        "hiding" | "hides" | "conceals" => Some(KnowledgeStatus::Hiding),
+        _ => None,
+    }
+}
+
+/// Which piece of current scene truth a `SceneObservation` addresses. Chosen by
+/// the perception `predicate` so one perception kind covers the whole anchor.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SceneSlot {
+    Location,
+    CurrentScene,
+    Focus,
+    Position,
+    Outfit,
+    RoomState,
+    ActiveObject,
+    Misunderstanding,
+    OpenQuestion,
+    PressurePoint,
+    LastAction,
+}
+
+impl SceneSlot {
+    /// Unrecognized predicates return `None` and commit nothing. Guessing a slot
+    /// would file scene truth under the wrong field, which is worse than a
+    /// dropped claim the next turn can restate.
+    pub fn from_predicate(predicate: &str) -> Option<Self> {
+        match predicate.trim().to_ascii_lowercase().as_str() {
+            "location" | "place" | "where" => Some(Self::Location),
+            "scene" | "current_scene" => Some(Self::CurrentScene),
+            "focus" => Some(Self::Focus),
+            "position" | "positions" | "stance" => Some(Self::Position),
+            "outfit" | "outfits" | "clothing" | "clothes" | "wearing" => Some(Self::Outfit),
+            "room_state" | "door" | "door_state" | "room" => Some(Self::RoomState),
+            "active_object" | "object_in_play" => Some(Self::ActiveObject),
+            "misunderstanding" | "current_misunderstanding" | "false_belief" => {
+                Some(Self::Misunderstanding)
+            }
+            "open_question" | "unanswered_question" => Some(Self::OpenQuestion),
+            "pressure_point" | "pressure" => Some(Self::PressurePoint),
+            "last_action" | "last_user_action" => Some(Self::LastAction),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -313,6 +382,50 @@ fn lower_candidate(
             content: summary,
             target_entity_ids: targets,
         }],
+        PerceptionKind::SceneObservation => {
+            // Hearsay and inference describe what someone believes, not what the
+            // room is doing. Only observed or narrated claims may move current
+            // scene truth; the rest become ordinary memories.
+            if matches!(
+                perception.epistemic_mode,
+                EpistemicMode::StatedBy | EpistemicMode::Inferred | EpistemicMode::RememberedBy
+            ) {
+                return vec![StateEffectKind::FormMemory {
+                    owner_soul_id,
+                    memory_kind: memory_kind_for(perception.kind, perception.epistemic_mode),
+                    content: summary,
+                    target_entity_ids: targets,
+                }];
+            }
+            let Some(slot) = SceneSlot::from_predicate(&perception.predicate) else {
+                return Vec::new();
+            };
+            let mut participants = targets;
+            participants.extend(actor);
+            participants.sort();
+            participants.dedup();
+            vec![StateEffectKind::UpdateSceneProjection {
+                slot,
+                value: claim_value_text(perception.object.as_ref(), object_entity.as_deref()),
+                participant_entity_ids: participants,
+            }]
+        }
+        PerceptionKind::KnowledgeClaim => {
+            let Some(status) = knowledge_status_from_predicate(&perception.predicate) else {
+                return Vec::new();
+            };
+            let Some(proposition) =
+                claim_value_text(perception.object.as_ref(), object_entity.as_deref())
+            else {
+                return Vec::new();
+            };
+            vec![StateEffectKind::RecordKnowledge {
+                holder_entity_id: subject,
+                proposition,
+                status,
+                counterpart_entity_id: targets.into_iter().next().or(actor),
+            }]
+        }
         PerceptionKind::Correction => vec![StateEffectKind::RecordCorrection {
             subject_entity_id: subject,
             predicate: perception.predicate.clone(),

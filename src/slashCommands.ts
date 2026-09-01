@@ -17,8 +17,9 @@ export const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   },
   {
     command: "/state",
-    usage: "/state show [target] | /state update <target> <instruction> | /state review",
-    description: "Inspect or manually correct state.",
+    usage: "/state show [target] | /state update <slot> <value> | /state review",
+    description:
+      "Inspect or correct state. Slots: location, scene, focus, position, outfit, room_state, active_object, misunderstanding, open_question, pressure_point, last_action — or knows/suspects/believes/unaware/hiding with \"<who> : <what>\".",
   },
   {
     command: "/persona",
