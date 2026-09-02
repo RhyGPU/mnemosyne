@@ -129,6 +129,9 @@ pub fn start_embedded_repair_model(
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "local-model".to_string());
     let url = format!("http://127.0.0.1:{port}/v1");
+    // Only the `cfg(windows)` block below reassigns this, so every other target
+    // sees an unused `mut`.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut path = binary_path.trim().to_string();
     if path.is_empty() {
         return Err("Provide the path to your llamafile (the single model file).".into());

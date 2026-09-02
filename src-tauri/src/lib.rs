@@ -4,6 +4,12 @@ pub mod commands;
 pub mod db;
 pub mod embedded_model;
 pub mod job_progress;
+
+#[cfg(test)]
+mod evaluator_bakeoff;
+
+#[cfg(test)]
+mod live_harness;
 pub mod mne;
 pub mod pipeline_trace;
 pub mod providers;
