@@ -99,17 +99,48 @@ pub enum RelationshipStage {
     NameKnown,
     /// Enough small talk to place each other: name, where they live, what they do.
     Acquainted,
+    /// Regulars in each other's lives. Relatives get mentioned.
+    Familiar,
+    /// Confidants. History has been told.
+    Close,
+    /// Partners. Everything known, and warm.
+    Intimate,
+    /// Knew each other well and no longer speak. Knowledge stays; warmth does not.
+    Estranged,
+    /// Lifelong. Everything known from before the story starts.
+    Family,
     /// The grid decides; the stage grants nothing on its own.
     Custom,
 }
 
 impl RelationshipStage {
-    pub const ALL: [RelationshipStage; 5] = [
+    pub const ALL: [RelationshipStage; 10] = [
         RelationshipStage::Strangers,
         RelationshipStage::Seen,
         RelationshipStage::NameKnown,
         RelationshipStage::Acquainted,
+        RelationshipStage::Familiar,
+        RelationshipStage::Close,
+        RelationshipStage::Intimate,
+        RelationshipStage::Estranged,
+        RelationshipStage::Family,
         RelationshipStage::Custom,
+    ];
+
+    /// The stages that form a single increasing ladder of knowledge.
+    ///
+    /// `Estranged` and `Family` sit off it deliberately: both know everything,
+    /// but one is cold and the other has known since before the story began, so
+    /// neither is "further along" than the other. `Custom` is off it because it
+    /// grants nothing.
+    pub const KNOWLEDGE_LADDER: [RelationshipStage; 7] = [
+        RelationshipStage::Strangers,
+        RelationshipStage::Seen,
+        RelationshipStage::NameKnown,
+        RelationshipStage::Acquainted,
+        RelationshipStage::Familiar,
+        RelationshipStage::Close,
+        RelationshipStage::Intimate,
     ];
 
     pub fn as_label(self) -> &'static str {
@@ -118,7 +149,29 @@ impl RelationshipStage {
             RelationshipStage::Seen => "seen",
             RelationshipStage::NameKnown => "name_known",
             RelationshipStage::Acquainted => "acquainted",
+            RelationshipStage::Familiar => "familiar",
+            RelationshipStage::Close => "close",
+            RelationshipStage::Intimate => "intimate",
+            RelationshipStage::Estranged => "estranged",
+            RelationshipStage::Family => "family",
             RelationshipStage::Custom => "custom",
+        }
+    }
+
+    /// Short wording for the picker, so the choice reads as a situation rather
+    /// than a score.
+    pub fn description(self) -> &'static str {
+        match self {
+            RelationshipStage::Strangers => "Never met. A phone call or a radio starts here too.",
+            RelationshipStage::Seen => "Have seen each other. No names.",
+            RelationshipStage::NameKnown => "Names exchanged, nothing more.",
+            RelationshipStage::Acquainted => "Small talk done: name, area, work.",
+            RelationshipStage::Familiar => "Regulars. Relatives have come up.",
+            RelationshipStage::Close => "Confidants. History has been told.",
+            RelationshipStage::Intimate => "Partners.",
+            RelationshipStage::Estranged => "Knew each other well. No longer speak.",
+            RelationshipStage::Family => "Known each other their whole lives.",
+            RelationshipStage::Custom => "Set each fact by hand.",
         }
     }
 
@@ -128,21 +181,22 @@ impl RelationshipStage {
             .find(|stage| stage.as_label().eq_ignore_ascii_case(label.trim()))
     }
 
-    /// Which facts each side starts holding. Cumulative: every stage grants what
-    /// the one before it did.
+    /// Which facts each side starts holding.
     pub fn granted_facts(self) -> Vec<CharacterFactKind> {
+        use CharacterFactKind::*;
         match self {
             RelationshipStage::Strangers | RelationshipStage::Custom => Vec::new(),
-            RelationshipStage::Seen => vec![CharacterFactKind::Appearance],
-            RelationshipStage::NameKnown => {
-                vec![CharacterFactKind::Appearance, CharacterFactKind::Name]
+            RelationshipStage::Seen => vec![Appearance],
+            RelationshipStage::NameKnown => vec![Appearance, Name],
+            RelationshipStage::Acquainted => vec![Appearance, Name, Residence, Occupation],
+            RelationshipStage::Familiar => {
+                vec![Appearance, Name, Residence, Occupation, Age, Family]
             }
-            RelationshipStage::Acquainted => vec![
-                CharacterFactKind::Appearance,
-                CharacterFactKind::Name,
-                CharacterFactKind::Residence,
-                CharacterFactKind::Occupation,
-            ],
+            // Everything. What separates these three is warmth, not knowledge.
+            RelationshipStage::Close
+            | RelationshipStage::Intimate
+            | RelationshipStage::Estranged
+            | RelationshipStage::Family => CharacterFactKind::ALL.to_vec(),
         }
     }
 
@@ -214,17 +268,73 @@ pub const SIGHT_LEARNED_LABELS: [&str; 3] = ["appearance", "clothing", "equipmen
 /// people who have never met. Strangers start flat; later stages start with only
 /// the mild familiarity the stage actually implies.
 pub fn starting_relationship(stage: RelationshipStage) -> Relationship {
-    let (curiosity, comfort, respect) = match stage {
-        RelationshipStage::Strangers | RelationshipStage::Custom => (0.0, 0.0, 0.0),
-        RelationshipStage::Seen => (8.0, 0.0, 0.0),
-        RelationshipStage::NameKnown => (12.0, 5.0, 5.0),
-        RelationshipStage::Acquainted => (15.0, 12.0, 10.0),
-    };
-    Relationship {
-        curiosity,
-        comfort,
-        respect,
-        ..Relationship::default()
+    // Knowledge and warmth are separate axes. Estranged knows everything and
+    // likes none of it; family has known forever and is warm. Neither is a point
+    // further along the same line.
+    match stage {
+        RelationshipStage::Strangers | RelationshipStage::Custom => Relationship::default(),
+        RelationshipStage::Seen => Relationship {
+            curiosity: 8.0,
+            ..Relationship::default()
+        },
+        RelationshipStage::NameKnown => Relationship {
+            curiosity: 12.0,
+            comfort: 5.0,
+            respect: 5.0,
+            ..Relationship::default()
+        },
+        RelationshipStage::Acquainted => Relationship {
+            curiosity: 15.0,
+            comfort: 12.0,
+            respect: 10.0,
+            ..Relationship::default()
+        },
+        RelationshipStage::Familiar => Relationship {
+            curiosity: 18.0,
+            comfort: 30.0,
+            respect: 20.0,
+            trust: 25.0,
+            affection: 20.0,
+            ..Relationship::default()
+        },
+        RelationshipStage::Close => Relationship {
+            curiosity: 20.0,
+            comfort: 55.0,
+            respect: 35.0,
+            trust: 55.0,
+            affection: 45.0,
+            ..Relationship::default()
+        },
+        RelationshipStage::Intimate => Relationship {
+            curiosity: 25.0,
+            comfort: 65.0,
+            respect: 40.0,
+            trust: 60.0,
+            affection: 70.0,
+            intimacy: 60.0,
+            passion: 45.0,
+            commitment: 50.0,
+            ..Relationship::default()
+        },
+        RelationshipStage::Estranged => Relationship {
+            // The history is still there; it just went cold.
+            curiosity: 10.0,
+            comfort: 5.0,
+            respect: 15.0,
+            trust: 10.0,
+            affection: 10.0,
+            conflict: 45.0,
+            ..Relationship::default()
+        },
+        RelationshipStage::Family => Relationship {
+            curiosity: 10.0,
+            comfort: 60.0,
+            respect: 30.0,
+            trust: 50.0,
+            affection: 55.0,
+            commitment: 60.0,
+            ..Relationship::default()
+        },
     }
 }
 
@@ -382,14 +492,9 @@ mod tests {
     }
 
     #[test]
-    fn each_stage_grants_what_the_one_before_it_did() {
+    fn each_rung_of_the_ladder_grants_what_the_one_below_it_did() {
         let mut previous: Vec<CharacterFactKind> = Vec::new();
-        for stage in [
-            RelationshipStage::Strangers,
-            RelationshipStage::Seen,
-            RelationshipStage::NameKnown,
-            RelationshipStage::Acquainted,
-        ] {
+        for stage in RelationshipStage::KNOWLEDGE_LADDER {
             let granted = stage.granted_facts();
             for earlier in &previous {
                 assert!(
@@ -400,6 +505,44 @@ mod tests {
                 );
             }
             previous = granted;
+        }
+    }
+
+    #[test]
+    fn knowing_everything_does_not_mean_liking_someone() {
+        // Estranged is the case a single ladder gets wrong: full knowledge, cold
+        // relationship. If warmth were derived from knowledge this would be
+        // indistinguishable from `close`.
+        let estranged = starting_relationship(RelationshipStage::Estranged);
+        let close = starting_relationship(RelationshipStage::Close);
+
+        assert_eq!(
+            RelationshipStage::Estranged.granted_facts().len(),
+            RelationshipStage::Close.granted_facts().len()
+        );
+        assert!(estranged.conflict > close.conflict);
+        assert!(estranged.trust < close.trust);
+        assert!(estranged.comfort < close.comfort);
+    }
+
+    #[test]
+    fn every_stage_that_grants_anything_has_met() {
+        for stage in RelationshipStage::ALL {
+            if !stage.granted_facts().is_empty() {
+                assert!(
+                    stage.has_met(),
+                    "{} hands out facts without anyone having met",
+                    stage.as_label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_stage_is_described_for_the_picker() {
+        for stage in RelationshipStage::ALL {
+            assert!(!stage.description().trim().is_empty());
+            assert_eq!(RelationshipStage::from_label(stage.as_label()), Some(stage));
         }
     }
 
