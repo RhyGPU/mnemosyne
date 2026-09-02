@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     arousal::ArousalSignal,
     hidden_state::HiddenState,
-    memory::create_scored_memory,
+    memory::create_scored_memory_at,
     setting::SessionWorld,
     soul::{
         current_timestamp, KnowledgeEntry, KnowledgeStatus, MemoryEntry, MemorySourceType,
@@ -415,7 +415,19 @@ impl EnginePatch {
     pub fn apply_to_session(
         &self,
         soul: &mut Soul,
+        session_world: Option<&mut SessionWorld>,
+    ) -> Result<PatchReport, PatchError> {
+        self.apply_to_session_at(soul, session_world, current_timestamp())
+    }
+
+    /// Apply with an explicit creation time. Ledger replay passes the turn's
+    /// recorded time so a rebuild produces byte-identical projections no matter
+    /// when it runs; live turns use the wall clock via `apply_to_session`.
+    pub fn apply_to_session_at(
+        &self,
+        soul: &mut Soul,
         mut session_world: Option<&mut SessionWorld>,
+        applied_at: u64,
     ) -> Result<PatchReport, PatchError> {
         self.validate()?;
         if self.is_empty() {
@@ -425,7 +437,7 @@ impl EnginePatch {
         let mut report = PatchReport::default();
         if let Some(soul_patch) = &self.soul_patch {
             report.relationship_updated = soul_patch.apply_relationship(soul);
-            let memory_report = soul_patch.apply_memories(soul);
+            let memory_report = soul_patch.apply_memories(soul, applied_at);
             report.memories_added = memory_report.added;
             report.memory_events = memory_report.events;
         }
@@ -576,7 +588,7 @@ impl SoulPatch {
         changed
     }
 
-    fn apply_memories(&self, soul: &mut Soul) -> MemoryApplyReport {
+    fn apply_memories(&self, soul: &mut Soul, applied_at: u64) -> MemoryApplyReport {
         let mut report = MemoryApplyReport::default();
         // Age existing memories one step before this turn's new ones land, so
         // fresh memories aren't decayed the moment they're created.
@@ -678,7 +690,7 @@ impl SoulPatch {
                 }
             }
             let tag = memory.tag();
-            let mut recent = create_scored_memory(soul, content, tag);
+            let mut recent = create_scored_memory_at(soul, content, tag, applied_at);
             if let Some(memory_id) = memory.cleaned_optional(&memory.memory_id) {
                 recent.id = memory_id;
             }
@@ -2398,6 +2410,7 @@ fn normalize_time_elapsed(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::create_scored_memory;
     use crate::soul::new_default_soul;
 
     #[test]

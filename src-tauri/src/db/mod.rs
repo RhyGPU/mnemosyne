@@ -3366,8 +3366,15 @@ pub fn rebuild_session_state_until(
         for patch_record in patches {
             let patch: EnginePatch = serde_json::from_str(&patch_record.patch_json)
                 .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+            // Replay stamps memories with the turn's recorded time, so two
+            // rebuilds of the same ledger produce identical projections even if
+            // they straddle a clock tick.
             patch
-                .apply_to_session(&mut soul, Some(&mut session_world))
+                .apply_to_session_at(
+                    &mut soul,
+                    Some(&mut session_world),
+                    commit.created_at.max(0) as u64,
+                )
                 .map_err(|err| {
                     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
                         std::io::ErrorKind::Other,

@@ -86,11 +86,27 @@ impl<E: Embedder> MemoryScorer<E> {
 }
 
 pub fn create_scored_memory(soul: &Soul, content: &str, tag: &str) -> MemoryEntry {
+    create_scored_memory_at(soul, content, tag, current_timestamp())
+}
+
+/// Same, with the creation time supplied by the caller.
+///
+/// Ledger replay must be a pure function of the ledger, so rebuilding a session
+/// stamps memories with the turn's recorded time instead of the wall clock. With
+/// `current_timestamp()` here, two rebuilds that straddle a second boundary
+/// produced different `created_at_ms` and the projection stopped being
+/// replay-equivalent.
+pub fn create_scored_memory_at(
+    soul: &Soul,
+    content: &str,
+    tag: &str,
+    created_at: u64,
+) -> MemoryEntry {
     let mut memory = MemoryEntry {
         archived: false,
         is_pinned: false,
         id: format!("mem_{}", Uuid::new_v4()),
-        timestamp: current_timestamp(),
+        timestamp: created_at,
         content: content.trim().to_string(),
         salience: 50.0,
         tag: tag.trim().to_string(),

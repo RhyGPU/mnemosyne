@@ -927,9 +927,25 @@ fn memory_v2_projection_rebuild_is_equivalent_and_drops_inactive_branch_memory()
     )
     .expect("record");
 
+    // Rebuild must be a function of the ledger, not of the wall clock. Backdating
+    // the commit proves the projection takes its time from the recorded turn:
+    // with `current_timestamp()` in the apply path this assertion fails outright,
+    // and the equality check below only failed when two rebuilds happened to
+    // straddle a clock tick.
+    let backdated = 1_600_000_000_i64;
+    conn.execute(
+        "UPDATE turn_commits SET created_at = ?1 WHERE conversation_id = ?2",
+        rusqlite::params![backdated, "memory-v2"],
+    )
+    .expect("backdate commit");
+
     rebuild_session_state(&conn, "memory-v2", &branch.branch_id).expect("first rebuild");
     let first =
         list_memory_v2_projection(&conn, "memory-v2", &branch.branch_id, true).expect("first list");
+    assert_eq!(
+        first[0].created_at_ms, backdated,
+        "rebuilt memory must carry the ledger turn time, not the rebuild time"
+    );
     rebuild_session_state(&conn, "memory-v2", &branch.branch_id).expect("second rebuild");
     let second = list_memory_v2_projection(&conn, "memory-v2", &branch.branch_id, true)
         .expect("second list");
