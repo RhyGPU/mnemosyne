@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::patch::is_premature_user_turn_event;
 use crate::relationship_surface::relationship_surface_summary;
 use crate::setting::SessionWorld;
-use crate::soul::{KnowledgeStatus, MemoryEntry, MemorySourceType, PlotStatus, Soul, TruthStatus};
+use crate::soul::{
+    KnowledgeStatus, MemoryEntry, MemorySourceType, PlotStatus, Soul, SpeechAct, TruthStatus,
+};
 
 const DEFAULT_TOKEN_BUDGET: usize = 2_500;
 const MIN_RECENT_MEMORY_SALIENCE: f32 = 65.0;
@@ -622,9 +624,19 @@ fn build_memory_section(
             });
 
             if selected_for_slot && selected < slot.cap() {
+                // The disclosure note rides in the same bracket as the truth
+                // label. An unheard memory that looks identical to a spoken one
+                // is exactly how another character ends up answering a thought.
+                let disclosure = scored
+                    .memory
+                    .speech_act
+                    .context_note()
+                    .map(|note| format!(" / {note}"))
+                    .unwrap_or_default();
                 lines.push(format!(
-                    "- [{} / salience {:.0}] {}",
+                    "- [{}{} / salience {:.0}] {}",
                     memory_context_label(scored.memory),
+                    disclosure,
                     scored.memory.salience,
                     scored.memory.content.trim()
                 ));
@@ -2808,6 +2820,45 @@ mod tests {
     }
 
     #[test]
+    fn a_thought_is_marked_so_nobody_can_answer_it() {
+        let mut soul = new_default_soul("Aurora");
+        let mut thought = memory(
+            "thought-1",
+            "Aurora decided she did not trust the visitor.",
+            "orientation",
+            90.0,
+            90.0,
+            1,
+        );
+        thought.speech_act = SpeechAct::Thought;
+        soul.memory.recent.push(thought);
+
+        let preview = compile_context_for_session(&soul, None, &[]);
+
+        assert!(preview.text.contains("thought, never said aloud"));
+    }
+
+    #[test]
+    fn an_unclassified_memory_makes_no_disclosure_claim() {
+        // Every legacy memory is Unspecified. Annotating them all would both
+        // assert something false and cost a note on every line.
+        let mut soul = new_default_soul("Aurora");
+        soul.memory.recent.push(memory(
+            "legacy-1",
+            "Aurora found a brass key under the chapel stone.",
+            "orientation",
+            90.0,
+            90.0,
+            1,
+        ));
+
+        let preview = compile_context_for_session(&soul, None, &[]);
+
+        assert!(!preview.text.contains("never said aloud"));
+        assert!(!preview.text.contains("disclosure unknown"));
+    }
+
+    #[test]
     fn knowledge_section_gives_the_narrator_both_halves_of_a_false_belief() {
         let mut soul = new_default_soul("Aurora");
         soul.world.knowledge = vec![
@@ -3345,6 +3396,7 @@ mod tests {
             owner_soul_id: None,
             relevance_tags: Default::default(),
             knowledge_scope: None,
+            speech_act: SpeechAct::Unspecified,
             is_active: true,
             invalidated_by_patch_id: None,
             superseded_by_memory_id: None,

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::soul::{MemoryEntry, MemorySourceType, TruthStatus};
+use crate::soul::{MemoryEntry, MemorySourceType, SpeechAct, TruthStatus};
 
 pub const MEMORY_V2_SCHEMA_VERSION: u32 = 1;
 
@@ -203,6 +203,7 @@ mod tests {
             id: "memory-1".into(),
             timestamp: 1,
             content: "Aurora heard that the gate was locked.".into(),
+            speech_act: SpeechAct::Unspecified,
             salience: 50.0,
             tag: "testimony".into(),
             retrieval_strength: 50.0,

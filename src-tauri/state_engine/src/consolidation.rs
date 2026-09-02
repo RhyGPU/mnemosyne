@@ -126,7 +126,7 @@ fn title_case_tag(tag: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::soul::{new_default_soul, MemorySourceType};
+    use crate::soul::{new_default_soul, MemorySourceType, SpeechAct};
 
     #[test]
     fn consolidation_promotes_discards_and_merges() {
@@ -161,6 +161,7 @@ mod tests {
                 owner_soul_id: None,
                 relevance_tags: Default::default(),
                 knowledge_scope: None,
+                speech_act: SpeechAct::Unspecified,
                 is_active: true,
                 invalidated_by_patch_id: None,
                 superseded_by_memory_id: None,
@@ -196,6 +197,7 @@ mod tests {
             owner_soul_id: None,
             relevance_tags: Default::default(),
             knowledge_scope: None,
+            speech_act: SpeechAct::Unspecified,
             is_active: true,
             invalidated_by_patch_id: None,
             superseded_by_memory_id: None,
@@ -229,6 +231,7 @@ mod tests {
             owner_soul_id: None,
             relevance_tags: Default::default(),
             knowledge_scope: None,
+            speech_act: SpeechAct::Unspecified,
             is_active: true,
             invalidated_by_patch_id: None,
             superseded_by_memory_id: None,

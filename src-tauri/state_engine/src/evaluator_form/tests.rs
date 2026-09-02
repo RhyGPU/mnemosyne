@@ -1,3 +1,4 @@
+use crate::soul::SpeechAct;
 use std::collections::HashMap;
 
 use super::*;
@@ -41,6 +42,7 @@ fn soul_and_world() -> (Soul, SessionWorld) {
         owner_soul_id: Some("aurora_soul".into()),
         relevance_tags: HashMap::new(),
         knowledge_scope: Some("directly_observed".into()),
+        speech_act: SpeechAct::Unspecified,
         is_active: true,
         invalidated_by_patch_id: None,
         superseded_by_memory_id: None,

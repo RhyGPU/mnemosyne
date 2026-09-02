@@ -908,6 +908,7 @@ fn memory_v2_projection_rebuild_is_equivalent_and_drops_inactive_branch_memory()
                 truth_status: Some(TruthStatus::CharacterBelief),
                 owner_soul_id: Some(soul.character_id.clone()),
                 knowledge_scope: Some("heard_about".into()),
+                speech_act: None,
                 ..MemoryPatch::default()
             }],
             ..SoulPatch::default()
@@ -1040,6 +1041,7 @@ fn memory_v2_consolidation_is_evidence_backed_and_idempotent() {
         truth_status: Some(TruthStatus::CharacterBelief),
         owner_soul_id: Some(soul.character_id.clone()),
         knowledge_scope: Some("heard_about".into()),
+        speech_act: None,
         ..MemoryPatch::default()
     })
     .collect();
@@ -1197,6 +1199,7 @@ fn memory_v2_recall_benchmark_reduces_irrelevant_context() {
             truth_status: Some(TruthStatus::CharacterBelief),
             owner_soul_id: Some(soul.character_id.clone()),
             knowledge_scope: Some("heard_about".into()),
+            speech_act: None,
             ..MemoryPatch::default()
         })
         .collect::<Vec<_>>();
@@ -1211,6 +1214,7 @@ fn memory_v2_recall_benchmark_reduces_irrelevant_context() {
             truth_status: Some(TruthStatus::CharacterBelief),
             owner_soul_id: Some(soul.character_id.clone()),
             knowledge_scope: Some("heard_about".into()),
+            speech_act: None,
             ..MemoryPatch::default()
         },
         MemoryPatch {
@@ -1223,6 +1227,7 @@ fn memory_v2_recall_benchmark_reduces_irrelevant_context() {
             truth_status: Some(TruthStatus::CharacterBelief),
             owner_soul_id: Some(soul.character_id.clone()),
             knowledge_scope: Some("heard_about".into()),
+            speech_act: None,
             ..MemoryPatch::default()
         },
     ]);

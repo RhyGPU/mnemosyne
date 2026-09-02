@@ -40,6 +40,11 @@ pub enum EvaluatorOp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AddMemoryOp {
+    /// How the remembered thing entered the world: spoken, thought, action,
+    /// observed, or written. Absent means unclassified, which the engine treats
+    /// as not said aloud.
+    #[serde(default)]
+    pub speech_act: Option<String>,
     pub owner_soul_id: String,
     pub slot: MemorySlotOp,
     pub content: String,
@@ -282,6 +287,7 @@ pub fn compile_evaluator_ops_to_engine_patch(
                         truth_status: Some(op.truth_status.into()),
                         memory_slot: Some(op.slot.as_label().to_string()),
                         owner_soul_id: Some(op.owner_soul_id.clone()),
+                        speech_act: op.speech_act.clone(),
                         architecture_verified: Some(false),
                         ..MemoryPatch::default()
                     });
@@ -993,7 +999,8 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
             "content": { "type": "string", "minLength": 1 },
             "evidence_quote": evidence_string, "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
             "salience": pct,
-            "target_entity_ids": string_array, "truth_status": truth_status
+            "target_entity_ids": string_array, "truth_status": truth_status,
+            "speech_act": { "type": "string", "enum": ["spoken", "thought", "action", "observed", "written"] }
         }),
         &[
             "owner_soul_id",
@@ -1004,6 +1011,9 @@ pub fn evaluator_ops_json_schema() -> serde_json::Value {
             "salience",
             "target_entity_ids",
             "truth_status",
+            // Required so the model must decide, rather than omitting the field
+            // and leaving every memory unclassified.
+            "speech_act",
         ],
     );
     let relationship_event = op_schema(
@@ -1357,6 +1367,7 @@ mod tests {
                 ops: vec![EvaluatorOp::AddMemory(AddMemoryOp {
                     owner_soul_id: "active_soul".into(),
                     slot: MemorySlotOp::CharacterIdentityMemory,
+                    speech_act: None,
                     content: "The evaluator attempted to assert engine truth.".into(),
                     evidence_quote: "assert engine truth".into(),
                     confidence: 1.0,
@@ -1392,6 +1403,7 @@ mod tests {
                 source_message_id: Some(999_999),
                 target_entity_ids: vec!["active_player".into()],
                 truth_status: TruthStatusOp::SceneEvent,
+                speech_act: None,
             })],
             no_op_reason: None,
         };
@@ -1502,6 +1514,7 @@ mod tests {
                 source_message_id: None,
                 target_entity_ids: vec!["preset_male".into()],
                 truth_status: TruthStatusOp::SceneEvent,
+                speech_act: None,
             })],
             no_op_reason: None,
         };
@@ -1663,6 +1676,7 @@ mod tests {
                 source_message_id: None,
                 target_entity_ids: vec!["active_player".into()],
                 truth_status: TruthStatusOp::SceneEvent,
+                speech_act: None,
             })],
             no_op_reason: None,
         };
@@ -1699,6 +1713,7 @@ mod tests {
                     source_message_id: None,
                     target_entity_ids: vec!["active_player".into()],
                     truth_status: TruthStatusOp::SceneEvent,
+                    speech_act: None,
                 }),
                 EvaluatorOp::AddMemory(AddMemoryOp {
                     owner_soul_id: "active_soul".into(),
@@ -1711,6 +1726,7 @@ mod tests {
                     source_message_id: None,
                     target_entity_ids: vec!["active_player".into()],
                     truth_status: TruthStatusOp::SceneEvent,
+                    speech_act: None,
                 }),
             ],
             no_op_reason: None,
@@ -1749,6 +1765,7 @@ mod tests {
                 source_message_id: None,
                 target_entity_ids: vec!["active_player".into()],
                 truth_status: TruthStatusOp::SceneEvent,
+                speech_act: None,
             })],
             no_op_reason: None,
         };

@@ -175,6 +175,72 @@ impl MemorySourceType {
     }
 }
 
+/// How a remembered thing entered the world — said, thought, done, or seen.
+///
+/// This is a different axis from [`TruthStatus`], which records how much the
+/// engine trusts a claim. A thought can be perfectly true and still inaudible.
+/// Without this distinction the narrator receives "Aurora decided she did not
+/// trust him" and has no way to tell whether anyone heard it, so other
+/// characters answer thoughts as though they were spoken.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechAct {
+    /// Said out loud; anyone present heard it.
+    Spoken,
+    /// Interior. Nobody else perceived it, however true it is.
+    Thought,
+    /// A physical act; observable by anyone present.
+    Action,
+    /// Something the owner perceived rather than produced.
+    Observed,
+    /// Written or recorded; perceivable only by whoever read it.
+    Written,
+    /// Legacy or unclassified. Treated as unheard when deciding what other
+    /// characters may react to, because guessing "spoken" is the failure mode
+    /// this type exists to prevent.
+    #[default]
+    Unspecified,
+}
+
+impl SpeechAct {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            SpeechAct::Spoken => "spoken",
+            SpeechAct::Thought => "thought",
+            SpeechAct::Action => "action",
+            SpeechAct::Observed => "observed",
+            SpeechAct::Written => "written",
+            SpeechAct::Unspecified => "unspecified",
+        }
+    }
+
+    /// Whether another character present in the scene could have perceived it.
+    /// `Unspecified` is deliberately false: an unclassified memory must not be
+    /// answered by someone who was never told.
+    pub fn perceivable_by_others(self) -> bool {
+        matches!(self, SpeechAct::Spoken | SpeechAct::Action)
+    }
+
+    /// The phrase shown to the narrator, or `None` to say nothing.
+    ///
+    /// Only an explicit classification produces a note. `Unspecified` stays
+    /// silent on purpose: every legacy memory carries it, and stamping "not said
+    /// aloud" across a whole corpus would assert something false about all of it
+    /// while spending tokens on every line. Engine decisions still treat it as
+    /// unperceived via [`Self::perceivable_by_others`]; the prompt simply does
+    /// not claim what nobody recorded.
+    pub fn context_note(self) -> Option<&'static str> {
+        match self {
+            SpeechAct::Thought => Some("thought, never said aloud"),
+            SpeechAct::Written => Some("written, only whoever read it knows"),
+            SpeechAct::Spoken
+            | SpeechAct::Action
+            | SpeechAct::Observed
+            | SpeechAct::Unspecified => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TruthStatus {
@@ -269,6 +335,8 @@ pub struct MemoryEntry {
     pub relevance_tags: HashMap<String, u8>,
     #[serde(default)]
     pub knowledge_scope: Option<String>,
+    #[serde(default)]
+    pub speech_act: SpeechAct,
     #[serde(default = "default_memory_active")]
     pub is_active: bool,
     #[serde(default)]
@@ -869,6 +937,7 @@ mod tests {
             archived: false,
             is_pinned: false,
             id: "recent".into(),
+            speech_act: SpeechAct::Unspecified,
             timestamp: 1,
             content: "Aurora warmed to the user.".into(),
             salience: 90.0,

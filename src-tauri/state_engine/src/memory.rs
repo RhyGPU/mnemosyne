@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-use crate::soul::{current_timestamp, MemoryEntry, MemorySourceType, Soul, TruthStatus};
+use crate::soul::{current_timestamp, MemoryEntry, MemorySourceType, Soul, SpeechAct, TruthStatus};
 
 pub trait Embedder {
     fn embed(&self, text: &str) -> Vec<f32>;
@@ -130,6 +130,7 @@ pub fn create_scored_memory_at(
         owner_soul_id: None,
         relevance_tags: Default::default(),
         knowledge_scope: None,
+        speech_act: SpeechAct::Unspecified,
         is_active: true,
         invalidated_by_patch_id: None,
         superseded_by_memory_id: None,
@@ -297,6 +298,7 @@ mod tests {
             owner_soul_id: None,
             relevance_tags: Default::default(),
             knowledge_scope: None,
+            speech_act: SpeechAct::Unspecified,
             is_active: true,
             invalidated_by_patch_id: None,
             superseded_by_memory_id: None,
@@ -338,6 +340,7 @@ mod tests {
             owner_soul_id: None,
             relevance_tags: Default::default(),
             knowledge_scope: None,
+            speech_act: SpeechAct::Unspecified,
             is_active: true,
             invalidated_by_patch_id: None,
             superseded_by_memory_id: None,
@@ -372,6 +375,7 @@ mod tests {
             owner_soul_id: None,
             relevance_tags: Default::default(),
             knowledge_scope: None,
+            speech_act: SpeechAct::Unspecified,
             is_active: true,
             invalidated_by_patch_id: None,
             superseded_by_memory_id: None,
@@ -406,6 +410,7 @@ mod tests {
             owner_soul_id: None,
             relevance_tags: Default::default(),
             knowledge_scope: None,
+            speech_act: SpeechAct::Unspecified,
             is_active: true,
             invalidated_by_patch_id: None,
             superseded_by_memory_id: None,

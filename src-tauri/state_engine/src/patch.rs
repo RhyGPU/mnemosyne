@@ -9,7 +9,8 @@ use crate::{
     setting::SessionWorld,
     soul::{
         current_timestamp, KnowledgeEntry, KnowledgeStatus, MemoryEntry, MemorySourceType,
-        ObjectState, Relationship, SceneState, Soul, TruthStatus, WorldEventRecord, WorldLog,
+        ObjectState, Relationship, SceneState, Soul, SpeechAct, TruthStatus, WorldEventRecord,
+        WorldLog,
     },
 };
 
@@ -155,6 +156,7 @@ pub struct MemoryPatch {
     pub owner_soul_id: Option<String>,
     pub relevance_tags: HashMap<String, u8>,
     pub knowledge_scope: Option<String>,
+    pub speech_act: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -733,6 +735,11 @@ impl SoulPatch {
                 .filter(|(key, _)| !key.is_empty())
                 .collect();
             recent.knowledge_scope = memory.cleaned_optional(&memory.knowledge_scope);
+            recent.speech_act = memory
+                .speech_act
+                .as_deref()
+                .and_then(speech_act_from_label)
+                .unwrap_or_default();
             let mut action = MemoryApplyAction::Added;
             if is_generic_emotional_reaction(content, tag) {
                 recent.salience = (recent.salience * 0.55).min(40.0);
@@ -1728,6 +1735,17 @@ fn apply_scene_state_patch(scene_state: &mut SceneState, patch: &SceneStatePatch
         }
     }
     *scene_state != before
+}
+
+fn speech_act_from_label(label: &str) -> Option<SpeechAct> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "spoken" | "said" | "dialogue" => Some(SpeechAct::Spoken),
+        "thought" | "internal" | "inner" => Some(SpeechAct::Thought),
+        "action" | "did" | "physical" => Some(SpeechAct::Action),
+        "observed" | "perceived" | "saw" => Some(SpeechAct::Observed),
+        "written" | "wrote" | "text" => Some(SpeechAct::Written),
+        _ => None,
+    }
 }
 
 fn knowledge_status_from_label(label: &str) -> Option<KnowledgeStatus> {
