@@ -124,6 +124,7 @@ pub fn run() {
             commands::session::get_llm_payload_log,
             commands::session::get_branch_patch_debug,
             commands::session::rebuild_session_from_ledger,
+            commands::session::seed_observable_knowledge,
             commands::session::export_visible_chat_log,
             commands::session::export_llm_payload_history,
             commands::evaluator::list_provider_profiles,

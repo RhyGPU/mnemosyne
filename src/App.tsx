@@ -148,6 +148,7 @@ import {
   runBenchmark,
   prepareBenchmarkSession,
   generateBenchmarkPlayerMessage,
+  seedObservableKnowledge,
   generateTraditionalRpMessage,
   benchmarkTurnSummary,
   finalizeBenchmark,
@@ -2660,6 +2661,19 @@ export function App() {
         setBenchmarkResult(summary);
         setBenchmarkError(null);
         return summary;
+      }
+      case "seed_observable_knowledge": {
+        if (!currentConversationId) {
+          throw new Error("Open a session first.");
+        }
+        const seeded = await seedObservableKnowledge(
+          currentConversationId,
+          effectiveStateUpdaterSettings,
+        );
+        return {
+          seeded_observations: seeded,
+          note: "Everything the pass did not return stays unknown until the story discloses it.",
+        };
       }
       default: {
         const exhaustive: never = commandName;

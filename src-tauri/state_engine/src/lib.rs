@@ -15,4 +15,5 @@ pub mod patch;
 pub mod relationship_surface;
 pub mod schema;
 pub mod setting;
+pub mod sheet_pass;
 pub mod soul;

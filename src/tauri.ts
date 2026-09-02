@@ -206,6 +206,17 @@ export function createDefaultSetting(settingName: string): Promise<SettingSoul> 
   );
 }
 
+/** Split the active character sheet into what a stranger could see, and seed
+ * that as already-known. Everything else on the sheet stays unknown. */
+export function seedObservableKnowledge(
+  conversationId: string,
+  settings: ApiProviderSettings,
+): Promise<number> {
+  return invokeOrPreview("seed_observable_knowledge", { conversationId, settings }, () => {
+    throw new Error("Seeding observable knowledge requires the Tauri runtime.");
+  });
+}
+
 export function listSouls(): Promise<SoulSummary[]> {
   return invokeOrPreview("list_souls", {}, () =>
     previewState.souls.filter((soul) => soul.soul_kind !== "session_clone" && !(soul as any).archived_at).map(summarizeSoul),

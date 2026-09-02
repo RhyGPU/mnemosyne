@@ -2046,3 +2046,84 @@ pub fn export_llm_payload_history(
         },
     })
 }
+
+/// Run the observable-sheet pass for a conversation and seed the resulting
+/// knowledge.
+///
+/// Called once when a session starts rather than every turn: a sheet does not
+/// change, and the split it needs — which lines are visible on sight — is prose
+/// work the engine cannot do alone. Everything the pass does not return stays
+/// unknown, which is the point.
+#[tauri::command]
+pub async fn seed_observable_knowledge(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    settings: ApiProviderSettings,
+) -> Result<usize, String> {
+    let (mut session_world, soul, observers, subject_label, sheet) = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        let conversation =
+            db::get_conversation_summary(&conn, &conversation_id).map_err(|e| e.to_string())?;
+        let soul = db::get_soul(&conn, &conversation.soul_id).map_err(|e| e.to_string())?;
+        let session_world = db::get_conversation_session_world(&conn, &conversation_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
+        let persona =
+            db::get_active_player_persona(&conn, &conversation_id).map_err(|e| e.to_string())?;
+        let sheet = format!(
+            "{}\n{}\n{}",
+            soul.profile.appearance.trim(),
+            soul.profile.description.trim(),
+            soul.profile.scenario.trim()
+        );
+        let observers = vec![persona.persona_id.clone(), soul.character_id.clone()];
+        (
+            session_world,
+            soul.clone(),
+            observers,
+            soul.character_name.clone(),
+            sheet,
+        )
+    };
+
+    if sheet.trim().is_empty() {
+        return Ok(0);
+    }
+
+    let provider = ApiProvider::default();
+    let completion = provider
+        .complete_structured_tool_call_prompt(
+            &settings,
+            state_engine::sheet_pass::observable_sheet_prompt(),
+            &sheet,
+            0.0,
+            Some(Duration::from_secs(90)),
+            state_engine::sheet_pass::SHEET_PASS_SCHEMA_NAME,
+            &state_engine::sheet_pass::observable_sheet_json_schema(),
+        )
+        .await?;
+    let draft: state_engine::sheet_pass::ObservableSheetDraft =
+        serde_json::from_str(&completion.raw_text)
+            .map_err(|err| format!("observable sheet pass returned unusable JSON: {err}"))?;
+
+    let entries = state_engine::sheet_pass::observations_to_knowledge(
+        &draft,
+        &observers,
+        &subject_label,
+        soul.turn_counter,
+    );
+    let added = entries.len();
+    for entry in entries {
+        // Re-running the pass must not pile up duplicates: identity is derived
+        // from observer plus proposition, so a repeat replaces its own row.
+        session_world
+            .knowledge
+            .retain(|existing| existing.knowledge_id != entry.knowledge_id);
+        session_world.knowledge.push(entry);
+    }
+    {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        db::upsert_session_world(&conn, &session_world).map_err(|e| e.to_string())?;
+    }
+    Ok(added)
+}

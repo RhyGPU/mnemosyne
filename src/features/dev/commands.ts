@@ -7,7 +7,8 @@ export type DevCommandName =
   | "repair_accidental_normal_send_variants"
   | "export_visible_chat_log"
   | "export_llm_payload_history"
-  | "run_benchmark";
+  | "run_benchmark"
+  | "seed_observable_knowledge";
 
 export const DEV_COMMAND_OPTIONS: Array<{ name: DevCommandName; label: string; defaultArgs: string }> = [
   {
@@ -48,6 +49,11 @@ export const DEV_COMMAND_OPTIONS: Array<{ name: DevCommandName; label: string; d
   {
     name: "export_llm_payload_history",
     label: "Export Payload History",
+    defaultArgs: "{}",
+  },
+  {
+    name: "seed_observable_knowledge",
+    label: "Seed Observable Knowledge",
     defaultArgs: "{}",
   },
   {

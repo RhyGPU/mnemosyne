@@ -586,7 +586,15 @@ fn build_controlled_entities_section(
             .unwrap_or_else(|| "- name_known_to_character: yes".to_string()),
         format!("- gender_code: {}", player_persona.gender_code),
         format!("- pronouns: {}", player_persona.pronouns),
-        format!("- description: {}", player_persona.description),
+        // Narrator-facing only. Of a character sheet, appearance is the one part
+        // anyone can pick up by looking; background, work, and history all have
+        // to be told. Labelling it here keeps the narrator able to write the
+        // persona while stopping the Soul from reciting their history unprompted.
+        format!(
+            "- description (narrator reference; {} has not been told this): {}",
+            fallback(&soul.character_name, "the character"),
+            player_persona.description
+        ),
         "- controlled_by: user".into(),
         "Operator: the real app user outside RP, appears only through slash commands".into(),
         format!(

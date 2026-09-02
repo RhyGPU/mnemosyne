@@ -13,7 +13,107 @@
 //! it cannot leak it. So an entity whose name has not been given is rendered as
 //! a descriptor instead.
 
+use serde::{Deserialize, Serialize};
+
 use crate::context_compiler::ContextMessage;
+use crate::soul::{KnowledgeEntry, KnowledgeStatus};
+
+/// The standard things one character can know about another.
+///
+/// A fixed vocabulary is what makes a checkbox grid possible at all: free text
+/// cannot be a column. It also gives the engine a baseline to seed, so "not told
+/// yet" is the starting state rather than an absence nobody recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CharacterFactKind {
+    Name,
+    Age,
+    Residence,
+    Occupation,
+    Family,
+    Background,
+    Appearance,
+}
+
+impl CharacterFactKind {
+    pub const ALL: [CharacterFactKind; 7] = [
+        CharacterFactKind::Name,
+        CharacterFactKind::Age,
+        CharacterFactKind::Residence,
+        CharacterFactKind::Occupation,
+        CharacterFactKind::Family,
+        CharacterFactKind::Background,
+        CharacterFactKind::Appearance,
+    ];
+
+    pub fn as_label(self) -> &'static str {
+        match self {
+            CharacterFactKind::Name => "name",
+            CharacterFactKind::Age => "age",
+            CharacterFactKind::Residence => "where they live",
+            CharacterFactKind::Occupation => "occupation",
+            CharacterFactKind::Family => "family",
+            CharacterFactKind::Background => "background",
+            CharacterFactKind::Appearance => "appearance",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_label().eq_ignore_ascii_case(label.trim()))
+    }
+
+    /// Whether anyone sharing a room can pick this up without being told.
+    /// Appearance is the only one you learn by looking.
+    pub fn observable_on_sight(self) -> bool {
+        matches!(self, CharacterFactKind::Appearance)
+    }
+
+    /// The canonical proposition text, so a fact written by seeding, by the
+    /// checkbox grid, and by the evaluator all address the same row.
+    pub fn proposition_about(self, subject: &str) -> String {
+        format!("{}'s {}", subject.trim(), self.as_label())
+    }
+}
+
+/// Baseline knowledge for one observer about one subject.
+///
+/// Seeded as `Unaware` except for what is visible on sight, which is the whole
+/// point: the engine's default has to be "has not been told", or an absent row
+/// silently reads as permission.
+pub fn seed_baseline_knowledge(
+    observer: &str,
+    subject_label: &str,
+    turn: u64,
+) -> Vec<KnowledgeEntry> {
+    CharacterFactKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let proposition = kind.proposition_about(subject_label);
+            KnowledgeEntry {
+                knowledge_id: format!(
+                    "knowledge:{}:{}",
+                    observer.trim().to_ascii_lowercase(),
+                    proposition.to_ascii_lowercase()
+                ),
+                holder_entity_id: observer.trim().to_string(),
+                proposition,
+                status: if kind.observable_on_sight() {
+                    KnowledgeStatus::Knows
+                } else {
+                    KnowledgeStatus::Unaware
+                },
+                counterpart_entity_id: None,
+                actual_truth: None,
+                established_turn: turn,
+                evidence_quote: None,
+                is_active: true,
+                superseded_by_knowledge_id: None,
+            }
+        })
+        .collect()
+}
 
 /// Shortest token worth matching. Two-letter fragments collide with ordinary
 /// words far too often to be evidence that a name was spoken.
@@ -113,6 +213,42 @@ pub fn entity_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_appearance_is_known_without_being_told() {
+        let seeded = seed_baseline_knowledge("aurora", "the visitor", 1);
+
+        assert_eq!(seeded.len(), CharacterFactKind::ALL.len());
+        for entry in &seeded {
+            let expected = if entry.proposition.ends_with("appearance") {
+                KnowledgeStatus::Knows
+            } else {
+                KnowledgeStatus::Unaware
+            };
+            assert_eq!(
+                entry.status, expected,
+                "{} seeded wrong: a sheet is not public except for what you can see",
+                entry.proposition
+            );
+        }
+    }
+
+    #[test]
+    fn a_fact_kind_round_trips_through_its_label() {
+        for kind in CharacterFactKind::ALL {
+            assert_eq!(CharacterFactKind::from_label(kind.as_label()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn seeded_and_hand_edited_rows_address_the_same_knowledge() {
+        // Seeding, the checkbox grid, and the evaluator must all land on one row
+        // per fact, or a correction creates a duplicate instead of a change.
+        let seeded = seed_baseline_knowledge("aurora", "the visitor", 1);
+        let by_hand = CharacterFactKind::Name.proposition_about("the visitor");
+
+        assert!(seeded.iter().any(|entry| entry.proposition == by_hand));
+    }
 
     fn msg(role: &str, content: &str) -> ContextMessage {
         ContextMessage {
