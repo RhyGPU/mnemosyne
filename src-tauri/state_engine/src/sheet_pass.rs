@@ -93,11 +93,13 @@ Exclude anything that has to be told or inferred: name, exact age, job, address,
 Split compound sentences into separate observations. Keep each one short and concrete. Copy the sheet's own wording; invent nothing. If the sheet describes nothing visible, return an empty list."#
 }
 
-/// Turn extracted observations into knowledge every observer already has.
+/// Turn extracted observations into knowledge rows — unknown until seen.
 ///
-/// These are the exception to the default: a sheet is private, but you cannot
-/// un-see someone. Everything else about the character stays `Unaware` until the
-/// story discloses it.
+/// The catalogue of what *is* visible about a character is not the same as what
+/// anyone has actually looked at. A session can open on a phone call, a radio,
+/// or two people in different rooms, so these seed `Unaware` like everything
+/// else; `disclosure::grant_sight_facts` opens them when the story says the
+/// observer has laid eyes on the subject.
 pub fn observations_to_knowledge(
     draft: &ObservableSheetDraft,
     observers: &[String],
@@ -128,7 +130,7 @@ pub fn observations_to_knowledge(
                 ),
                 holder_entity_id: observer.to_string(),
                 proposition: proposition.clone(),
-                status: KnowledgeStatus::Knows,
+                status: KnowledgeStatus::Unaware,
                 counterpart_entity_id: None,
                 actual_truth: None,
                 established_turn: turn,
@@ -163,7 +165,9 @@ mod tests {
     }
 
     #[test]
-    fn observations_become_knowledge_for_everyone_present() {
+    fn observations_are_catalogued_but_not_yet_known() {
+        // What is visible about someone is not what anyone has looked at. The
+        // scene may open on a call, a radio, or two separate rooms.
         let observers = vec!["aurora".to_string(), "player-1".to_string()];
 
         let entries = observations_to_knowledge(&draft(), &observers, "the visitor", 3);
@@ -171,11 +175,24 @@ mod tests {
         assert_eq!(entries.len(), 4);
         assert!(entries
             .iter()
-            .all(|entry| entry.status == KnowledgeStatus::Knows));
+            .all(|entry| entry.status == KnowledgeStatus::Unaware));
         assert!(entries
             .iter()
             .any(|entry| entry.holder_entity_id == "player-1"
                 && entry.proposition.contains("faint scar")));
+    }
+
+    #[test]
+    fn meeting_opens_the_catalogued_observations() {
+        let observers = vec!["aurora".to_string()];
+        let mut entries = observations_to_knowledge(&draft(), &observers, "the visitor", 3);
+
+        let opened = crate::disclosure::grant_sight_facts(&mut entries, "aurora", "the visitor", 4);
+
+        assert_eq!(opened, 2);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.status == KnowledgeStatus::Knows));
     }
 
     #[test]
@@ -189,6 +206,23 @@ mod tests {
         };
 
         assert!(observations_to_knowledge(&empty, &["aurora".into()], "x", 1).is_empty());
+    }
+
+    #[test]
+    fn every_schema_category_is_one_the_meeting_event_can_open() {
+        // A category the sheet pass can emit but `grant_sight_facts` does not
+        // recognise would be catalogued and then never become knowable.
+        for category in [
+            ObservableCategory::Appearance,
+            ObservableCategory::Clothing,
+            ObservableCategory::Equipment,
+        ] {
+            assert!(
+                crate::disclosure::SIGHT_LEARNED_LABELS.contains(&category.as_label()),
+                "{} has no way to ever be learned",
+                category.as_label()
+            );
+        }
     }
 
     #[test]

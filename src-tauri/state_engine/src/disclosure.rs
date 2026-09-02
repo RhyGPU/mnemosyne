@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::context_compiler::ContextMessage;
-use crate::soul::{KnowledgeEntry, KnowledgeStatus};
+use crate::soul::{KnowledgeEntry, KnowledgeStatus, Relationship};
 
 /// The standard things one character can know about another.
 ///
@@ -64,9 +64,13 @@ impl CharacterFactKind {
             .find(|kind| kind.as_label().eq_ignore_ascii_case(label.trim()))
     }
 
-    /// Whether anyone sharing a room can pick this up without being told.
-    /// Appearance is the only one you learn by looking.
-    pub fn observable_on_sight(self) -> bool {
+    /// Whether this is learned by looking rather than by being told.
+    ///
+    /// This is a route, not a default. A session can open with the parties on a
+    /// phone call, on a radio, in separate rooms, in the dark, or masked — so
+    /// "visible" never means "already known". It means this is what opens when
+    /// they actually meet, in one step, without anyone having to say it.
+    pub fn learned_by_sight(self) -> bool {
         matches!(self, CharacterFactKind::Appearance)
     }
 
@@ -77,16 +81,95 @@ impl CharacterFactKind {
     }
 }
 
-/// Baseline knowledge for one observer about one subject.
+/// How far along a relationship starts, expressed as what each side already
+/// knows about the other.
 ///
-/// Seeded as `Unaware` except for what is visible on sight, which is the whole
-/// point: the engine's default has to be "has not been told", or an absent row
-/// silently reads as permission.
+/// Stage and knowledge are the same thing said twice: "strangers" *means* having
+/// none of the other's facts, and "we've met" *means* holding the ones you learn
+/// by looking. Keeping them as one concept stops a session opening as strangers
+/// who somehow know each other's names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipStage {
+    /// Never met. Includes voices on a phone or a radio.
+    Strangers,
+    /// Have laid eyes on each other, nothing said.
+    Seen,
+    /// Names exchanged.
+    NameKnown,
+    /// Enough small talk to place each other: name, where they live, what they do.
+    Acquainted,
+    /// The grid decides; the stage grants nothing on its own.
+    Custom,
+}
+
+impl RelationshipStage {
+    pub const ALL: [RelationshipStage; 5] = [
+        RelationshipStage::Strangers,
+        RelationshipStage::Seen,
+        RelationshipStage::NameKnown,
+        RelationshipStage::Acquainted,
+        RelationshipStage::Custom,
+    ];
+
+    pub fn as_label(self) -> &'static str {
+        match self {
+            RelationshipStage::Strangers => "strangers",
+            RelationshipStage::Seen => "seen",
+            RelationshipStage::NameKnown => "name_known",
+            RelationshipStage::Acquainted => "acquainted",
+            RelationshipStage::Custom => "custom",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|stage| stage.as_label().eq_ignore_ascii_case(label.trim()))
+    }
+
+    /// Which facts each side starts holding. Cumulative: every stage grants what
+    /// the one before it did.
+    pub fn granted_facts(self) -> Vec<CharacterFactKind> {
+        match self {
+            RelationshipStage::Strangers | RelationshipStage::Custom => Vec::new(),
+            RelationshipStage::Seen => vec![CharacterFactKind::Appearance],
+            RelationshipStage::NameKnown => {
+                vec![CharacterFactKind::Appearance, CharacterFactKind::Name]
+            }
+            RelationshipStage::Acquainted => vec![
+                CharacterFactKind::Appearance,
+                CharacterFactKind::Name,
+                CharacterFactKind::Residence,
+                CharacterFactKind::Occupation,
+            ],
+        }
+    }
+
+    /// Whether the sight-learned catalogue opens at this stage — the same
+    /// question [`grant_sight_facts`] answers mid-session, asked up front.
+    pub fn has_met(self) -> bool {
+        !matches!(
+            self,
+            RelationshipStage::Strangers | RelationshipStage::Custom
+        )
+    }
+}
+
+/// Baseline knowledge for one observer about one subject: nothing.
+///
+/// Every fact starts `Unaware`, appearance included. Seeding appearance as known
+/// would assume the two are looking at each other when the session opens, which
+/// is false for a phone call, a radio, separate rooms, darkness, or a mask. The
+/// engine cannot tell those apart, so it must not guess — [`grant_sight_facts`]
+/// opens them when the story says they have met.
 pub fn seed_baseline_knowledge(
     observer: &str,
     subject_label: &str,
     turn: u64,
+    stage: RelationshipStage,
 ) -> Vec<KnowledgeEntry> {
+    let granted = stage.granted_facts();
     CharacterFactKind::ALL
         .into_iter()
         .map(|kind| {
@@ -99,7 +182,7 @@ pub fn seed_baseline_knowledge(
                 ),
                 holder_entity_id: observer.trim().to_string(),
                 proposition,
-                status: if kind.observable_on_sight() {
+                status: if granted.contains(&kind) {
                     KnowledgeStatus::Knows
                 } else {
                     KnowledgeStatus::Unaware
@@ -113,6 +196,77 @@ pub fn seed_baseline_knowledge(
             }
         })
         .collect()
+}
+
+/// Everything about a person that is learned by looking rather than by being
+/// told.
+///
+/// Wider than [`CharacterFactKind`] because the sheet pass splits what is
+/// visible into finer categories than the checkbox grid needs. Both write
+/// propositions of the form "<subject>'s <label>", so one list keeps the grid,
+/// the sheet pass, and the meeting event addressing the same rows.
+pub const SIGHT_LEARNED_LABELS: [&str; 3] = ["appearance", "clothing", "equipment"];
+
+/// Starting numeric relationship for a stage.
+///
+/// The old default opened every relationship with desire, respect, curiosity and
+/// comfort already above zero, which reads as mild fondness — wrong for two
+/// people who have never met. Strangers start flat; later stages start with only
+/// the mild familiarity the stage actually implies.
+pub fn starting_relationship(stage: RelationshipStage) -> Relationship {
+    let (curiosity, comfort, respect) = match stage {
+        RelationshipStage::Strangers | RelationshipStage::Custom => (0.0, 0.0, 0.0),
+        RelationshipStage::Seen => (8.0, 0.0, 0.0),
+        RelationshipStage::NameKnown => (12.0, 5.0, 5.0),
+        RelationshipStage::Acquainted => (15.0, 12.0, 10.0),
+    };
+    Relationship {
+        curiosity,
+        comfort,
+        respect,
+        ..Relationship::default()
+    }
+}
+
+/// Open the sight-learned facts one observer holds about one subject.
+///
+/// The single deliberate "they have now met" event. Facts that must be told are
+/// untouched: meeting someone tells you nothing about their job or their family.
+/// Returns how many rows changed, so a caller can tell a real first meeting from
+/// a repeat.
+pub fn grant_sight_facts(
+    knowledge: &mut [KnowledgeEntry],
+    observer: &str,
+    subject_label: &str,
+    turn: u64,
+) -> usize {
+    let observer = observer.trim();
+    let sight_propositions = SIGHT_LEARNED_LABELS
+        .iter()
+        .map(|label| format!("{}'s {label}", subject_label.trim()).to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    let mut changed = 0usize;
+    for entry in knowledge.iter_mut() {
+        if !entry.is_active
+            || entry.status == KnowledgeStatus::Knows
+            || !entry.holder_entity_id.trim().eq_ignore_ascii_case(observer)
+        {
+            continue;
+        }
+        let proposition = entry.proposition.to_ascii_lowercase();
+        // Matches both the bare fact row and the sheet-pass detail rows, which
+        // are prefixed with the same "<subject>'s appearance" phrase.
+        let is_sight_fact = sight_propositions
+            .iter()
+            .any(|sight| proposition == *sight || proposition.starts_with(&format!("{sight}:")));
+        if is_sight_fact {
+            entry.status = KnowledgeStatus::Knows;
+            entry.established_turn = turn;
+            changed += 1;
+        }
+    }
+    changed
 }
 
 /// Shortest token worth matching. Two-letter fragments collide with ordinary
@@ -215,22 +369,127 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_appearance_is_known_without_being_told() {
-        let seeded = seed_baseline_knowledge("aurora", "the visitor", 1);
+    fn strangers_know_nothing_including_what_is_visible() {
+        // A session can open on a phone call. Granting appearance would assume
+        // the two are looking at each other, which the engine cannot know.
+        let seeded =
+            seed_baseline_knowledge("aurora", "the visitor", 1, RelationshipStage::Strangers);
 
         assert_eq!(seeded.len(), CharacterFactKind::ALL.len());
+        assert!(seeded
+            .iter()
+            .all(|entry| entry.status == KnowledgeStatus::Unaware));
+    }
+
+    #[test]
+    fn each_stage_grants_what_the_one_before_it_did() {
+        let mut previous: Vec<CharacterFactKind> = Vec::new();
+        for stage in [
+            RelationshipStage::Strangers,
+            RelationshipStage::Seen,
+            RelationshipStage::NameKnown,
+            RelationshipStage::Acquainted,
+        ] {
+            let granted = stage.granted_facts();
+            for earlier in &previous {
+                assert!(
+                    granted.contains(earlier),
+                    "{} dropped {:?}, so advancing a relationship would forget something",
+                    stage.as_label(),
+                    earlier
+                );
+            }
+            previous = granted;
+        }
+    }
+
+    #[test]
+    fn having_met_is_the_same_question_the_stage_answers() {
+        assert!(!RelationshipStage::Strangers.has_met());
+        assert!(RelationshipStage::Seen.has_met());
+        // Custom grants nothing on its own; the grid decides.
+        assert!(!RelationshipStage::Custom.has_met());
+        assert!(RelationshipStage::Custom.granted_facts().is_empty());
+    }
+
+    #[test]
+    fn a_name_known_relationship_still_does_not_know_the_family() {
+        let seeded =
+            seed_baseline_knowledge("aurora", "the visitor", 1, RelationshipStage::NameKnown);
+
+        let status = |suffix: &str| {
+            seeded
+                .iter()
+                .find(|entry| entry.proposition.ends_with(suffix))
+                .map(|entry| entry.status)
+        };
+        assert_eq!(status("name"), Some(KnowledgeStatus::Knows));
+        assert_eq!(status("appearance"), Some(KnowledgeStatus::Knows));
+        assert_eq!(status("family"), Some(KnowledgeStatus::Unaware));
+        assert_eq!(status("background"), Some(KnowledgeStatus::Unaware));
+    }
+
+    #[test]
+    fn strangers_start_without_manufactured_fondness() {
+        // The old default opened every relationship with desire and comfort
+        // already positive, which reads as having taken a liking to someone
+        // never met.
+        let flat = starting_relationship(RelationshipStage::Strangers);
+
+        assert_eq!(flat.curiosity, 0.0);
+        assert_eq!(flat.comfort, 0.0);
+        assert_eq!(flat.desire, 0.0);
+        assert!(starting_relationship(RelationshipStage::Acquainted).comfort > flat.comfort);
+    }
+
+    #[test]
+    fn meeting_opens_only_what_is_learned_by_looking() {
+        let mut seeded =
+            seed_baseline_knowledge("aurora", "the visitor", 1, RelationshipStage::Strangers);
+
+        let opened = grant_sight_facts(&mut seeded, "aurora", "the visitor", 5);
+
+        assert_eq!(opened, 1, "appearance is the only sight-learned fact");
         for entry in &seeded {
             let expected = if entry.proposition.ends_with("appearance") {
                 KnowledgeStatus::Knows
             } else {
+                // Meeting someone tells you nothing about their job or family.
                 KnowledgeStatus::Unaware
             };
-            assert_eq!(
-                entry.status, expected,
-                "{} seeded wrong: a sheet is not public except for what you can see",
-                entry.proposition
-            );
+            assert_eq!(entry.status, expected, "{}", entry.proposition);
         }
+    }
+
+    #[test]
+    fn meeting_a_second_time_changes_nothing() {
+        let mut seeded =
+            seed_baseline_knowledge("aurora", "the visitor", 1, RelationshipStage::Strangers);
+        grant_sight_facts(&mut seeded, "aurora", "the visitor", 5);
+
+        assert_eq!(
+            grant_sight_facts(&mut seeded, "aurora", "the visitor", 6),
+            0
+        );
+    }
+
+    #[test]
+    fn one_observer_meeting_does_not_open_anothers_knowledge() {
+        let mut seeded =
+            seed_baseline_knowledge("aurora", "the visitor", 1, RelationshipStage::Strangers);
+        seeded.extend(seed_baseline_knowledge(
+            "bystander",
+            "the visitor",
+            1,
+            RelationshipStage::Strangers,
+        ));
+
+        grant_sight_facts(&mut seeded, "aurora", "the visitor", 5);
+
+        assert!(seeded
+            .iter()
+            .filter(|entry| entry.holder_entity_id == "bystander")
+            .all(|entry| entry.status == KnowledgeStatus::Unaware));
     }
 
     #[test]
@@ -244,7 +503,8 @@ mod tests {
     fn seeded_and_hand_edited_rows_address_the_same_knowledge() {
         // Seeding, the checkbox grid, and the evaluator must all land on one row
         // per fact, or a correction creates a duplicate instead of a change.
-        let seeded = seed_baseline_knowledge("aurora", "the visitor", 1);
+        let seeded =
+            seed_baseline_knowledge("aurora", "the visitor", 1, RelationshipStage::Strangers);
         let by_hand = CharacterFactKind::Name.proposition_about("the visitor");
 
         assert!(seeded.iter().any(|entry| entry.proposition == by_hand));
