@@ -955,6 +955,8 @@ pub(crate) fn send_mock_turn_with_conn(
         correction_instruction.as_deref(),
         Some(snapshot_user_text.as_str()),
         Some(&active_persona_context),
+        // The mock provider has no profile to read a ceiling from.
+        None,
     );
     if let Some(branch) = ledger_branch.as_ref() {
         append_memory_v2_evidence_bundle(
@@ -3150,6 +3152,7 @@ pub async fn send_api_turn(
             correction_instruction.as_deref(),
             Some(snapshot_user_text.as_str()),
             Some(&active_persona_context),
+            narrator_settings.context_max_tokens,
         );
         if let Some(branch) = ledger_branch.as_ref() {
             append_memory_v2_evidence_bundle(
@@ -9142,6 +9145,7 @@ fn append_memory_v2_evidence_bundle(
     preview.estimated_tokens = estimate_tokens(&preview.text);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_context_with_correction(
     soul: &Soul,
     session_world: Option<&SessionWorld>,
@@ -9149,14 +9153,18 @@ fn compile_context_with_correction(
     correction_instruction: Option<&str>,
     pending_user_text: Option<&str>,
     player_persona: Option<&PlayerPersonaContext>,
+    context_max_tokens: Option<usize>,
 ) -> ContextPreview {
-    let mut preview = compile_context_for_session_separate_user_message_with_player_persona_pending(
-        soul,
-        session_world,
-        messages,
-        pending_user_text,
-        player_persona,
-    );
+    let budget = state_engine::context_compiler::budget_with_max_tokens(context_max_tokens);
+    let mut preview =
+        state_engine::context_compiler::compile_context_for_session_separate_user_message_with_player_persona_pending_and_budget(
+            soul,
+            session_world,
+            messages,
+            pending_user_text,
+            player_persona,
+            &budget,
+        );
     let instruction = correction_instruction
         .map(str::trim)
         .filter(|instruction| !instruction.is_empty());

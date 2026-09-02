@@ -644,6 +644,8 @@ export type ApiProviderSettings = {
   system_prompt: string;
   narrator_temperature?: number | null;
   narrator_max_tokens?: number | null;
+  /** Ceiling for the compiled state brief. Caps what the engine sends, not what the model replies. */
+  context_max_tokens?: number | null;
   narrator_top_p?: number | null;
   narrator_frequency_penalty?: number | null;
   narrator_presence_penalty?: number | null;

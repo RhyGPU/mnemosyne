@@ -20,6 +20,7 @@ export function GenerationSettingsPanel({
   onApplyPreset,
   onReset,
   onSetMaxTokens,
+  onSetContextMaxTokens,
   onUpdateSampler,
   providerModeControls,
 }: {
@@ -28,6 +29,7 @@ export function GenerationSettingsPanel({
   onApplyPreset: (preset: GenerationPresetName) => void;
   onReset: () => void;
   onSetMaxTokens: (value: number | null) => void;
+  onSetContextMaxTokens: (value: number | null) => void;
   onUpdateSampler: (key: GenerationSamplerKey, value: number) => void;
   providerModeControls: ReactNode;
 }) {
@@ -136,6 +138,49 @@ export function GenerationSettingsPanel({
                   )
                 }
                 disabled={busy || generationPreferences.maxTokens === null}
+              />
+            </span>
+          </div>
+          <div className="field-row">
+            <span>
+              <strong>State Brief Size</strong>
+              <small>
+                How much compiled state the engine sends each turn. This is not the
+                chat history — it is the memory, scene, and relationship summary.
+                Raise it for large-context models; leave disabled for the default.
+              </small>
+            </span>
+            <span className="generation-limit-row">
+              <label className="toggle-row compact-toggle">
+                <input
+                  type="checkbox"
+                  checked={generationPreferences.contextMaxTokens !== null}
+                  onChange={(event) =>
+                    onSetContextMaxTokens(
+                      event.target.checked ? generationPreferences.contextMaxTokens ?? 6000 : null,
+                    )
+                  }
+                  disabled={busy}
+                />
+                <span>Set size</span>
+              </label>
+              <input
+                className="generation-number-input"
+                type="number"
+                min="1200"
+                max="128000"
+                step="500"
+                aria-label="Maximum compiled state brief tokens"
+                value={generationPreferences.contextMaxTokens ?? ""}
+                placeholder="Engine default"
+                onChange={(event) =>
+                  onSetContextMaxTokens(
+                    event.target.value
+                      ? Math.round(clampNumber(Number(event.target.value), 1200, 128000))
+                      : null,
+                  )
+                }
+                disabled={busy || generationPreferences.contextMaxTokens === null}
               />
             </span>
           </div>

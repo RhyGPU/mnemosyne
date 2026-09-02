@@ -133,6 +133,13 @@ export function loadStoredGenerationPreferences(): GenerationPreferences {
         parsed.maxTokens === null || parsed.maxTokens === undefined
           ? null
           : Math.round(clampNumber(Number(parsed.maxTokens), 64, 32768, 700)),
+      // Floor matches the engine's: below it the brief cannot hold its
+      // constraint sections, and the engine ignores the value rather than
+      // shipping a prompt that looks complete and is not.
+      contextMaxTokens:
+        parsed.contextMaxTokens === null || parsed.contextMaxTokens === undefined
+          ? null
+          : Math.round(clampNumber(Number(parsed.contextMaxTokens), 1200, 128000, 6000)),
     };
   } catch {
     return DEFAULT_GENERATION_PREFERENCES;

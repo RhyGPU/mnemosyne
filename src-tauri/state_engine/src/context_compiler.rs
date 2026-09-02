@@ -241,6 +241,25 @@ pub fn compile_context_for_session(
     compile_context_with_budget_and_world(soul, session_world, messages, &ContextBudget::default())
 }
 
+/// A budget with a caller-chosen ceiling.
+///
+/// Per-section caps are deliberately left alone: they express how much each kind
+/// of content is worth relative to the others, and that ratio does not change
+/// with the window size. Only the overall ceiling — which decides how much of
+/// that gets to survive `compact_sections_to_budget` — is worth exposing.
+///
+/// Values below the built-in floor are ignored rather than honoured: a ceiling
+/// too small to hold the constraint sections produces a prompt that looks fine
+/// and quietly is not.
+pub fn budget_with_max_tokens(max_tokens: Option<usize>) -> ContextBudget {
+    const MIN_USABLE_BUDGET: usize = 1_200;
+    let mut budget = ContextBudget::default();
+    if let Some(requested) = max_tokens.filter(|value| *value >= MIN_USABLE_BUDGET) {
+        budget.max_tokens = requested;
+    }
+    budget
+}
+
 pub fn compile_context_for_session_with_player_persona(
     soul: &Soul,
     session_world: Option<&SessionWorld>,
@@ -252,6 +271,27 @@ pub fn compile_context_for_session_with_player_persona(
         session_world,
         messages,
         &ContextBudget::default(),
+        false,
+        false,
+        None,
+        Some(player_persona),
+    )
+}
+
+/// Same as [`compile_context_for_session_with_player_persona`], with the overall
+/// ceiling supplied by the caller.
+pub fn compile_context_for_session_with_player_persona_and_budget(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    messages: &[ContextMessage],
+    player_persona: &PlayerPersonaContext,
+    budget: &ContextBudget,
+) -> ContextPreview {
+    compile_context_with_budget_and_options(
+        soul,
+        session_world,
+        messages,
+        budget,
         false,
         false,
         None,
@@ -315,6 +355,28 @@ pub fn compile_context_for_session_separate_user_message_with_player_persona_pen
         session_world,
         messages,
         &ContextBudget::default(),
+        true,
+        false,
+        pending_user_text,
+        player_persona,
+    )
+}
+
+/// Same as the pending/persona variant, with a caller-supplied ceiling.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_context_for_session_separate_user_message_with_player_persona_pending_and_budget(
+    soul: &Soul,
+    session_world: Option<&SessionWorld>,
+    messages: &[ContextMessage],
+    pending_user_text: Option<&str>,
+    player_persona: Option<&PlayerPersonaContext>,
+    budget: &ContextBudget,
+) -> ContextPreview {
+    compile_context_with_budget_and_options(
+        soul,
+        session_world,
+        messages,
+        budget,
         true,
         false,
         pending_user_text,

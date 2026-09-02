@@ -5483,6 +5483,9 @@ export function App() {
       onSetMaxTokens={(maxTokens) =>
         setGenerationPreferences((current) => ({ ...current, maxTokens }))
       }
+      onSetContextMaxTokens={(contextMaxTokens) =>
+        setGenerationPreferences((current) => ({ ...current, contextMaxTokens }))
+      }
       onUpdateSampler={updateGenerationSampler}
       providerModeControls={providerModeControls}
     />

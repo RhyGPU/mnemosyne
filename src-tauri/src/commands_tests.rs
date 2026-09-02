@@ -685,6 +685,29 @@ fn token_comparison_is_not_marked_provider_reported_when_estimates_are_mixed_in(
 }
 
 #[test]
+fn a_configured_context_ceiling_is_honoured() {
+    let budget = state_engine::context_compiler::budget_with_max_tokens(Some(9_000));
+
+    assert_eq!(budget.max_tokens, 9_000);
+}
+
+#[test]
+fn a_context_ceiling_too_small_to_be_usable_is_ignored() {
+    // A brief that cannot hold its constraint sections looks fine and quietly
+    // is not, so a bad value falls back rather than shipping a broken prompt.
+    let default_max = state_engine::context_compiler::ContextBudget::default().max_tokens;
+
+    assert_eq!(
+        state_engine::context_compiler::budget_with_max_tokens(Some(50)).max_tokens,
+        default_max
+    );
+    assert_eq!(
+        state_engine::context_compiler::budget_with_max_tokens(None).max_tokens,
+        default_max
+    );
+}
+
+#[test]
 fn player_prompt_keeps_the_persona_when_playing_a_second_character() {
     let played = ("Echo-0".to_string(), "An analysis agent.".to_string());
     let (block, closing) = crate::benchmark::player_prompt_blocks("Visitor (p1)", Some(&played));
@@ -4811,6 +4834,7 @@ fn correction_instruction_is_temporary_context_not_memory() {
         None,
         &messages_to_context(corrected.messages.clone()),
         Some("Continue from the kitchen. Do not replay the phone reveal."),
+        None,
         None,
         None,
     );

@@ -964,6 +964,7 @@ fn provider_profile_to_api_settings(profile: &ProviderProfile) -> ApiProviderSet
         narrator_timeout_ms: profile.narrator_timeout_ms,
         narrator_temperature: None,
         narrator_max_tokens: None,
+        context_max_tokens: None,
         narrator_top_p: None,
         narrator_frequency_penalty: None,
         narrator_presence_penalty: None,

@@ -70,6 +70,7 @@ export function useProviderSettings() {
       ...apiSettings,
       narrator_temperature: generationPreferences.temperature,
       narrator_max_tokens: generationPreferences.maxTokens,
+      context_max_tokens: generationPreferences.contextMaxTokens,
       narrator_top_p: generationPreferences.topP,
       narrator_frequency_penalty: generationPreferences.frequencyPenalty,
       narrator_presence_penalty: generationPreferences.presencePenalty,

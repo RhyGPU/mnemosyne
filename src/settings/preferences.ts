@@ -16,6 +16,8 @@ export type GenerationPreferences = {
   frequencyPenalty: number;
   presencePenalty: number;
   maxTokens: number | null;
+  /** Compiled-context ceiling. null = engine default. */
+  contextMaxTokens: number | null;
 };
 
 export type ReadingPreferences = {
@@ -27,7 +29,7 @@ export type ReadingPreferences = {
 
 export const GENERATION_PRESETS: Record<
   Exclude<GenerationPresetName, "custom">,
-  Omit<GenerationPreferences, "preset" | "maxTokens">
+  Omit<GenerationPreferences, "preset" | "maxTokens" | "contextMaxTokens">
 > = {
   balanced: {
     temperature: 0.85,
@@ -53,6 +55,7 @@ export const DEFAULT_GENERATION_PREFERENCES: GenerationPreferences = {
   preset: "balanced",
   ...GENERATION_PRESETS.balanced,
   maxTokens: null,
+  contextMaxTokens: null,
 };
 
 export const DEFAULT_READING_PREFERENCES: ReadingPreferences = {

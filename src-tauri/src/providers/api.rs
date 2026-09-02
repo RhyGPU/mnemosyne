@@ -327,6 +327,14 @@ pub struct ApiProviderSettings {
     pub system_prompt: String,
     pub narrator_temperature: Option<f32>,
     pub narrator_max_tokens: Option<u32>,
+    /// Ceiling for the compiled state brief, in estimated tokens.
+    ///
+    /// Separate from `narrator_max_tokens`, which caps the model's *reply*. This
+    /// caps what the engine sends. Defaulted when unset or below the usable
+    /// floor, so a bad value cannot quietly produce a prompt missing its
+    /// constraint sections.
+    #[serde(default)]
+    pub context_max_tokens: Option<usize>,
     pub narrator_top_p: Option<f32>,
     pub narrator_frequency_penalty: Option<f32>,
     pub narrator_presence_penalty: Option<f32>,
