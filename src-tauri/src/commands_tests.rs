@@ -597,6 +597,160 @@ fn repair_bench_local() {
 }
 
 #[test]
+fn token_comparison_separates_the_two_engines_and_excludes_the_harness() {
+    let conn = db::init_memory_connection().expect("db");
+    let soul = new_default_soul("Aurora");
+    db::upsert_soul(&conn, &soul).expect("soul");
+    db::ensure_conversation(&conn, "tok", &soul.character_id).expect("conversation");
+
+    let log = |provider: &str, prompt: usize, response: &str, usage: Option<(u64, u64)>| {
+        db::insert_llm_payload_log(
+            &conn,
+            &db::LlmPayloadLog {
+                conversation_id: "tok".into(),
+                provider: provider.into(),
+                mode: "test".into(),
+                context_mode: "test".into(),
+                model: "m".into(),
+                base_url: "b".into(),
+                system_message: String::new(),
+                user_message: String::new(),
+                context_text: String::new(),
+                estimated_total_tokens: prompt,
+                created_at: db::now_ts(),
+                normalized_response: Some(response.into()),
+                pipeline_trace_json: usage.map(|(p, c)| {
+                    format!(r#"{{"token_usage":{{"prompt_tokens":{p},"completion_tokens":{c}}}}}"#)
+                }),
+                ..Default::default()
+            },
+        )
+        .expect("log");
+    };
+
+    log("narrator_brief", 0, "", Some((300, 100)));
+    log("evaluator_structured_v1", 0, "", Some((200, 50)));
+    log("traditional_rp", 0, "", Some((4000, 120)));
+    log("player_simulator", 0, "", Some((150, 40)));
+    // Export traces belong to neither engine.
+    log("mne_export_trace", 9_999, "", None);
+
+    let c = crate::benchmark::collect_benchmark_token_comparison(&conn, "tok");
+
+    assert_eq!(c.narrator_prompt_tokens, 300);
+    assert_eq!(c.evaluator_prompt_tokens, 200);
+    // narrator + evaluator, prompt and completion both.
+    assert_eq!(c.mnemosyne_total_tokens, 300 + 100 + 200 + 50);
+    assert_eq!(c.traditional_total_tokens, 4000 + 120);
+    // The simulated player is harness cost, kept out of both sides.
+    assert_eq!(c.player_simulator_total_tokens, 150 + 40);
+    assert!(
+        c.provider_reported,
+        "every counted row carried real usage, so the run is provider-reported"
+    );
+}
+
+#[test]
+fn token_comparison_is_not_marked_provider_reported_when_estimates_are_mixed_in() {
+    let conn = db::init_memory_connection().expect("db");
+    let soul = new_default_soul("Aurora");
+    db::upsert_soul(&conn, &soul).expect("soul");
+    db::ensure_conversation(&conn, "tok2", &soul.character_id).expect("conversation");
+
+    db::insert_llm_payload_log(
+        &conn,
+        &db::LlmPayloadLog {
+            conversation_id: "tok2".into(),
+            provider: "narrator_brief".into(),
+            mode: "test".into(),
+            context_mode: "test".into(),
+            model: "m".into(),
+            base_url: "b".into(),
+            system_message: String::new(),
+            user_message: String::new(),
+            context_text: String::new(),
+            estimated_total_tokens: 420,
+            created_at: db::now_ts(),
+            normalized_response: Some("hello".into()),
+            pipeline_trace_json: None,
+            ..Default::default()
+        },
+    )
+    .expect("log");
+
+    let c = crate::benchmark::collect_benchmark_token_comparison(&conn, "tok2");
+
+    assert_eq!(c.narrator_prompt_tokens, 420, "falls back to the estimate");
+    assert!(!c.provider_reported);
+}
+
+#[test]
+fn player_prompt_keeps_the_persona_when_playing_a_second_character() {
+    let played = ("Echo-0".to_string(), "An analysis agent.".to_string());
+    let (block, closing) = crate::benchmark::player_prompt_blocks("Visitor (p1)", Some(&played));
+
+    // The persona is still in the room even when the simulator is someone else.
+    assert!(block.contains("Visitor (p1)"));
+    assert!(block.contains("do NOT speak for them"));
+    assert!(block.contains("You are playing this character (Echo-0)"));
+    assert!(block.contains("An analysis agent."));
+    assert_eq!(closing, "Write Echo-0's next message only.");
+}
+
+#[test]
+fn player_prompt_falls_back_to_the_persona_alone() {
+    let (block, closing) = crate::benchmark::player_prompt_blocks("Visitor (p1)", None);
+
+    assert!(block.starts_with("Active player persona:"));
+    assert!(!block.contains("You are playing this character"));
+    assert_eq!(closing, "Write the next user message only.");
+}
+
+#[test]
+fn character_simulator_prompt_still_forbids_writing_the_narrator_side() {
+    let prompt = crate::benchmark::benchmark_character_simulator_prompt();
+
+    assert!(prompt.contains("You are not the narrator."));
+    assert!(prompt.contains("must not write the narrator-controlled character's"));
+    assert!(prompt.contains("must not write backend JSON"));
+}
+
+#[test]
+fn active_character_first_name_is_not_treated_as_contamination() {
+    let mut soul = new_default_soul("Aurora Schwarz");
+    soul.world.recent_events = vec![
+        "Aurora poured a second glass of wine.".into(),
+        "Aurora closed the door behind the visitor.".into(),
+    ];
+
+    assert!(
+        detect_world_character_mismatch(&soul, None).is_none(),
+        "the active soul's own first name must not read as another character"
+    );
+}
+
+#[test]
+fn a_repeated_foreign_name_is_still_reported() {
+    let mut soul = new_default_soul("Aurora Schwarz");
+    soul.world.recent_events = vec![
+        "Marcus knocked twice and left.".into(),
+        "Marcus called again after midnight.".into(),
+    ];
+
+    let warning = detect_world_character_mismatch(&soul, None)
+        .expect("a repeated foreign name is suspicious");
+    assert!(warning.suspicious_names.iter().any(|name| name == "Marcus"));
+}
+
+#[test]
+fn a_single_stray_capitalised_word_is_not_reported() {
+    let mut soul = new_default_soul("Aurora Schwarz");
+    soul.world.recent_events = vec!["They walked past the Cathedral once.".into()];
+
+    assert!(detect_world_character_mismatch(&soul, None).is_none());
+}
+
+#[test]
 fn transient_provider_errors_are_retryable() {
     assert!(is_transient_provider_error(
         "API provider returned an error in a 200 OK body: Provider returned error"
@@ -793,6 +947,7 @@ fn benchmark_summary_fixture() -> BenchmarkSummary {
         payload_history_path: Some("payload.md".into()),
         summary_json_path: Some("summary.json".into()),
         scorecard: BenchmarkScorecard {
+            token_comparison: None,
             visible_chat_messages_created: true,
             normal_pipeline_used: true,
             visible_turns_requested: 2,
@@ -7204,6 +7359,59 @@ fn ui_state_types_include_pending_running_completed_failed_canceled() {
     assert!(statuses.contains(&"completed"));
     assert!(statuses.contains(&"failed"));
     assert!(statuses.contains(&"canceled"));
+}
+
+#[test]
+fn output_contract_strips_a_leading_reasoning_paragraph() {
+    let raw = "The user is playing a male persona who has just knocked on the doorframe.\n\nAurora looks up from the sketchbook, slow, and lets the pencil rest against the page before she answers.";
+
+    let result = apply_output_contract_guard(raw, "*knocks*");
+
+    assert!(!result.text.contains("The user is playing"));
+    assert!(result.text.contains("Aurora looks up from the sketchbook"));
+    // `status_repair_action` is single-valued and later stages overwrite it, so
+    // the durable signal is the warning list.
+    assert!(result
+        .warning
+        .as_deref()
+        .unwrap_or_default()
+        .contains("leading meta-commentary stripped"));
+}
+
+#[test]
+fn output_contract_strips_first_person_planning() {
+    let raw = "Let me parse what's happening here.\n\nRain hammers the overhang while Aurora keeps the chain latched, studying him through the gap.";
+
+    let result = apply_output_contract_guard(raw, "hello");
+
+    assert!(!result.text.contains("Let me parse"));
+    assert!(result.text.contains("Rain hammers the overhang"));
+}
+
+#[test]
+fn output_contract_keeps_narration_that_merely_mentions_a_user() {
+    // "The user" only trips the guard as an opener about the operator, never as
+    // ordinary prose, and never mid-paragraph.
+    let raw = "The userscape of the city glitters below as Aurora leans on the rail.\n\nShe does not look back at him.";
+
+    let result = apply_output_contract_guard(raw, "hi");
+
+    assert!(result.text.contains("The userscape of the city glitters"));
+    assert!(!result
+        .warning
+        .as_deref()
+        .unwrap_or_default()
+        .contains("leading meta-commentary stripped"));
+}
+
+#[test]
+fn output_contract_keeps_a_meta_opener_when_nothing_follows_it() {
+    // Stripping here would empty the reply, which loses the turn outright.
+    let raw = "The user is unclear.";
+
+    let result = apply_output_contract_guard(raw, "???");
+
+    assert!(result.text.contains("The user is unclear"));
 }
 
 #[test]

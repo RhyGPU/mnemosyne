@@ -7109,6 +7109,55 @@ fn guard_narrator_visible_response(
     )
 }
 
+/// Detect a leading block of model reasoning where scene prose should be.
+///
+/// Some models open by restating the user's message or narrating their own
+/// planning ("The user is playing a male persona who...", "Let me parse what's
+/// happening:") before getting to the scene. The prompt forbids it, but a guard
+/// is still needed because the leaked paragraph then becomes the visible reply
+/// and the next turn's context.
+///
+/// Deliberately conservative: only the first paragraph is considered, and only
+/// against openers that cannot begin third-person scene narration. Returns the
+/// offending paragraph's length in bytes when the rest of the response can stand
+/// on its own, so the caller can drop just that paragraph.
+fn leading_meta_commentary(body: &str) -> Option<usize> {
+    let trimmed_start = body.len() - body.trim_start().len();
+    let rest = body.trim_start();
+    let paragraph_end = rest.find("\n\n").unwrap_or(rest.len());
+    let paragraph = &rest[..paragraph_end];
+    let lower = paragraph.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+
+    const META_OPENERS: [&str; 12] = [
+        "the user is ",
+        "the user has ",
+        "the user's message",
+        "the user seems",
+        "let me ",
+        "i need to ",
+        "i should ",
+        "okay, so",
+        "okay, let",
+        "this is a confusing",
+        "this seems to be",
+        "it seems the user",
+    ];
+    if !META_OPENERS.iter().any(|opener| lower.starts_with(opener)) {
+        return None;
+    }
+
+    // Only strip when real narration follows; otherwise the reply would be
+    // emptied and the turn lost entirely.
+    let remainder = rest[paragraph_end..].trim();
+    if remainder.len() < 40 {
+        return None;
+    }
+    Some(trimmed_start + paragraph_end)
+}
+
 #[cfg(test)]
 fn apply_output_contract_guard(content: &str, user_text: &str) -> OutputContractResult {
     apply_output_contract_guard_core(content, user_text, None, "Unknown")
@@ -7167,6 +7216,12 @@ fn apply_output_contract_guard_core(
             warnings.push("prose status extracted");
             repair_action = Some("extracted_from_prose".to_string());
         }
+    }
+
+    if let Some(cut) = leading_meta_commentary(&body) {
+        body = body[cut..].trim_start().to_string();
+        warnings.push("leading meta-commentary stripped");
+        repair_action = Some("stripped_meta_commentary".to_string());
     }
 
     if status_blocks.len() > 1 {
@@ -14070,6 +14125,14 @@ fn detect_world_character_mismatch(
     if active.is_empty() {
         return None;
     }
+    // The active character's own name is not contamination, and neither is any
+    // part of it: a soul called "Aurora Schwarz" is still the same person when
+    // the world log calls her "Aurora". Comparing only against the full display
+    // name flagged every session for multi-word names.
+    let active_name_parts = active
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<std::collections::HashSet<_>>();
     let section_source = if session_world.is_some() {
         "session_world"
     } else {
@@ -14088,7 +14151,11 @@ fn detect_world_character_mismatch(
         let mut event_has_hit = false;
         for name in capitalized_name_candidates(event) {
             let normalized = name.to_ascii_lowercase();
-            if normalized == active || normalized == "user" || normalized == "default" {
+            if normalized == active
+                || active_name_parts.contains(&normalized)
+                || normalized == "user"
+                || normalized == "default"
+            {
                 continue;
             }
             if matches!(
@@ -14119,7 +14186,9 @@ fn detect_world_character_mismatch(
     }
     let mut suspicious_names = counts
         .into_iter()
-        .filter(|(name, count)| *count >= 2 || name.eq_ignore_ascii_case("Aurora"))
+        // Repetition is the only signal here. A single stray capitalised word is
+        // ordinary prose; the same unfamiliar name twice is worth a warning.
+        .filter(|(_, count)| *count >= 2)
         .map(|(name, _)| name)
         .collect::<Vec<_>>();
     suspicious_names.sort();
@@ -14647,7 +14716,7 @@ fn serialize_api_messages(messages: &[ApiMessage]) -> String {
         .join("\n\n")
 }
 
-fn render_visible_chat_log(messages: &[ChatMessage]) -> String {
+pub(crate) fn render_visible_chat_log(messages: &[ChatMessage]) -> String {
     let mut lines = vec!["# Mnemosyne Chat Log".to_string()];
     for message in messages.iter().filter(|message| message.role != "system") {
         let role = match message.role.as_str() {

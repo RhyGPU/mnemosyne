@@ -49,6 +49,7 @@ export type BenchmarkLiveContext = {
   startedAt: number;
   playerProfileId: string;
   playerGoal: string;
+  playerCharacterSoulId: string | null;
   /** Opposing/user side uses the traditional RP engine (full chat, no memory)
    * instead of the player simulator — the comparison-benchmark control. */
   traditionalOpponent: boolean;

@@ -19,8 +19,8 @@ use state_engine::{
 use crate::commands::evaluator::write_diagnostic_json_file;
 
 use contracts::{
-    BenchmarkScorecard, BenchmarkSettings, BenchmarkSummary, BenchmarkTarget, BenchmarkTurnSummary,
-    BenchmarkType,
+    BenchmarkScorecard, BenchmarkSettings, BenchmarkSummary, BenchmarkTarget,
+    BenchmarkTokenComparison, BenchmarkTurnSummary, BenchmarkType,
 };
 
 use crate::{
@@ -186,6 +186,7 @@ pub async fn run_benchmark(
                     &session_soul_id,
                     profile,
                     &settings.player_goal,
+                    settings.player_character_soul_id.as_deref(),
                 )
                 .await
                 {
@@ -593,6 +594,10 @@ fn finalize_benchmark_summary(
         initial_relationship_count,
     );
     summary.scorecard.evaluator_waited_each_turn = settings.wait_for_evaluator_each_turn;
+    summary.scorecard.token_comparison = {
+        let conn = state.conn.lock().map_err(|err| err.to_string())?;
+        Some(collect_benchmark_token_comparison(&conn, &conversation_id))
+    };
     if settings.export_summary_json {
         let path =
             write_diagnostic_json_file(app, &conversation_id, "benchmark-summary", &summary)?;
@@ -790,12 +795,21 @@ pub async fn generate_benchmark_player_message(
     soul_id: String,
     player_profile_id: String,
     player_goal: String,
+    player_character_soul_id: Option<String>,
 ) -> Result<String, String> {
     let profile = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         db::get_provider_profile(&conn, &player_profile_id).map_err(|err| err.to_string())?
     };
-    generate_benchmark_player_turn(&state, &conversation_id, &soul_id, &profile, &player_goal).await
+    generate_benchmark_player_turn(
+        &state,
+        &conversation_id,
+        &soul_id,
+        &profile,
+        &player_goal,
+        player_character_soul_id.as_deref(),
+    )
+    .await
 }
 
 /// Like `generate_benchmark_player_message`, but uses the TRADITIONAL RP engine
@@ -976,8 +990,9 @@ async fn generate_benchmark_player_turn(
     soul_id: &str,
     profile: &ProviderProfile,
     player_goal: &str,
+    player_character_soul_id: Option<&str>,
 ) -> Result<String, String> {
-    let (visible_chat_log, scene_summary, persona_summary) = {
+    let (visible_chat_log, scene_summary, persona_summary, played_character) = {
         let conn = state.conn.lock().map_err(|err| err.to_string())?;
         let messages =
             db::list_messages(&conn, conversation_id, 24).map_err(|err| err.to_string())?;
@@ -1010,6 +1025,9 @@ async fn generate_benchmark_player_turn(
                 )
             })
             .unwrap_or_else(|| "No public scene summary yet.".into());
+        // The operator's persona is part of the scene whether or not the
+        // simulator is playing it, so it is always described. Character mode adds
+        // a second block naming the Soul the simulator speaks as.
         let persona =
             db::get_active_player_persona(&conn, conversation_id).map_err(|err| err.to_string())?;
         let persona_summary = format!(
@@ -1021,18 +1039,51 @@ async fn generate_benchmark_player_turn(
             persona.appearance.as_deref().unwrap_or(""),
             persona.notes.as_deref().unwrap_or("")
         );
+        let played_character = match player_character_soul_id {
+            Some(other_soul_id) if !other_soul_id.trim().is_empty() => {
+                let other = db::get_soul(&conn, other_soul_id).map_err(|err| err.to_string())?;
+                if other.character_id == soul_id {
+                    return Err(
+                        "player character must differ from the narrator-controlled Soul".into(),
+                    );
+                }
+                Some((
+                    other.character_name.clone(),
+                    format!(
+                        "{} ({})\nDescription: {}\nPersonality: {}\nAppearance: {}\nScenario: {}",
+                        other.character_name,
+                        other.character_id,
+                        other.profile.description,
+                        other.profile.personality,
+                        other.profile.appearance,
+                        other.profile.scenario
+                    ),
+                ))
+            }
+            _ => None,
+        };
         let _ = db::get_soul(&conn, soul_id).map_err(|err| err.to_string())?;
-        (visible_chat_log, scene_summary, persona_summary)
+        (
+            visible_chat_log,
+            scene_summary,
+            persona_summary,
+            played_character,
+        )
     };
-    let system_prompt = benchmark_player_simulator_prompt();
+    let system_prompt = if played_character.is_some() {
+        benchmark_character_simulator_prompt()
+    } else {
+        benchmark_player_simulator_prompt()
+    };
+    let (persona_block, closing) =
+        player_prompt_blocks(&persona_summary, played_character.as_ref());
     let user_prompt = format!(
-        "Benchmark goal:\n{}\n\nActive player persona:\n{}\n\nVisible chat:\n{}\n\nPublic scene summary:\n{}\n\nLast narrator response:\n{}\n\nWrite the next user message only.",
+        "Benchmark goal:\n{}\n\n{persona_block}\n\nVisible chat:\n{}\n\nPublic scene summary:\n{}\n\nLast narrator response:\n{}\n\n{closing}",
         if player_goal.trim().is_empty() {
             "Pursue the scene naturally while respecting continuity."
         } else {
             player_goal.trim()
         },
-        persona_summary,
         if visible_chat_log.trim().is_empty() {
             "(no visible chat yet)"
         } else {
@@ -1047,6 +1098,16 @@ async fn generate_benchmark_player_turn(
     );
     let provider = ApiProvider::default();
     let mut settings = provider_profile_to_api_settings(profile);
+    // Fail before the request when the profile carries no credential: the
+    // provider answers "Missing Authentication header" with a 401, which reads
+    // like a key problem at the provider rather than an unset profile here.
+    if settings.api_key.trim().is_empty() && !settings.base_url.contains("127.0.0.1") {
+        return Err(format!(
+            "profile \"{}\" has no API key set; pick a configured profile for this run",
+            profile.name
+        ));
+    }
+
     // Cap each player-line attempt hard. This call runs inside an uninterruptible
     // Tauri command, so a large profile timeout × retries can stall the whole run
     // for many minutes with no way to Stop. The player line is short text — 90s
@@ -1112,6 +1173,9 @@ async fn generate_benchmark_player_turn(
                             finish_reason: completion.finish_reason,
                             provider_request_id: completion.provider_request_id,
                             provider_response_id: completion.provider_response_id,
+                            pipeline_trace_json: token_usage_trace_json(
+                                completion.token_usage.as_ref(),
+                            ),
                             ..Default::default()
                         },
                     );
@@ -1128,8 +1192,22 @@ async fn generate_benchmark_player_turn(
             }
         }
     }
+    log_simulator_failure(
+        state,
+        conversation_id,
+        PLAYER_SIMULATOR_PAYLOAD_PROVIDER,
+        "visible_ai_chat",
+        &settings,
+        profile,
+        system_prompt,
+        &user_prompt,
+        &last_error,
+    );
     Err(format!(
-        "player simulator failed after {attempts} attempt(s): {last_error}"
+        "player simulator failed after {attempts} attempt(s) using profile \"{}\" (model {}, {}): {last_error}",
+        profile.name,
+        settings.model.trim(),
+        settings.base_url.trim()
     ))
 }
 
@@ -1174,6 +1252,51 @@ Pursue the benchmark goal naturally.
 Respect scene continuity and boundaries.
 Do not rush the scene unless the goal requires it.
 Do not summarize. Do not explain. Output only the user message."#
+}
+
+/// Build the persona description and the closing instruction for a player-line
+/// prompt.
+///
+/// In character mode both sides are described: the operator's persona is another
+/// participant in the room, and the played character is who the simulator speaks
+/// as. The persona is never dropped, because the scene still contains them.
+pub(crate) fn player_prompt_blocks(
+    persona_summary: &str,
+    played_character: Option<&(String, String)>,
+) -> (String, String) {
+    match played_character {
+        Some((name, summary)) => (
+            format!(
+                "Other participant, the operator's persona (do NOT speak for them):\n{persona_summary}\n\nYou are playing this character ({name}):\n{summary}"
+            ),
+            format!("Write {name}'s next message only."),
+        ),
+        None => (
+            format!("Active player persona:\n{persona_summary}"),
+            "Write the next user message only.".to_string(),
+        ),
+    }
+}
+
+/// Character mode: the simulator plays a second Soul from the library rather
+/// than the operator's persona. The guard rails are the same as the player
+/// simulator's — it still writes only its own side of the scene — but it is told
+/// it is a character in the story, not the user at the keyboard.
+pub(crate) fn benchmark_character_simulator_prompt() -> &'static str {
+    r#"You are playing ONE character in a Mnemosyne RP benchmark.
+
+You control only the character described below.
+You are not the narrator.
+You must not write the narrator-controlled character's thoughts, dialogue, or actions.
+You must not write backend JSON, tool calls, status blocks, or diagnostics.
+
+Write only what your character says and does next, as a message sent into the RP chat.
+
+Stay in character: use their described personality, voice, and motives.
+React to the latest visible narrator response.
+Pursue the benchmark goal in a way your character would actually pursue it.
+Respect scene continuity and boundaries.
+Do not summarize. Do not explain. Output only your character's message."#
 }
 
 fn traditional_rp_prompt() -> &'static str {
@@ -1256,6 +1379,16 @@ async fn generate_traditional_rp_turn(
     );
     let provider = ApiProvider::default();
     let mut settings = provider_profile_to_api_settings(profile);
+    // Fail before the request when the profile carries no credential: the
+    // provider answers "Missing Authentication header" with a 401, which reads
+    // like a key problem at the provider rather than an unset profile here.
+    if settings.api_key.trim().is_empty() && !settings.base_url.contains("127.0.0.1") {
+        return Err(format!(
+            "profile \"{}\" has no API key set; pick a configured profile for this run",
+            profile.name
+        ));
+    }
+
     const TRADITIONAL_TURN_MAX_TIMEOUT_MS: u64 = 90_000;
     settings.narrator_timeout_ms = Some(
         settings
@@ -1278,7 +1411,45 @@ async fn generate_traditional_rp_turn(
             )
             .await
         {
-            Ok(completion) => return sanitize_player_simulator_message(&completion.raw_text),
+            Ok(completion) => {
+                let sanitized = sanitize_player_simulator_message(&completion.raw_text)?;
+                // The control side was previously invisible: it ran and returned
+                // with no payload row, so its prompt size — the whole point of the
+                // comparison — could not be measured.
+                if let Ok(conn) = state.conn.lock() {
+                    let _ = db::insert_llm_payload_log(
+                        &conn,
+                        &LlmPayloadLog {
+                            conversation_id: conversation_id.to_string(),
+                            provider: TRADITIONAL_RP_PAYLOAD_PROVIDER.into(),
+                            mode: "traditional_rp".into(),
+                            context_mode: "full_transcript".into(),
+                            model: settings.model.trim().to_string(),
+                            base_url: settings.base_url.trim().to_string(),
+                            system_message: system_prompt.to_string(),
+                            user_message: user_prompt.clone(),
+                            context_text: "full_visible_transcript + active_player_persona".into(),
+                            estimated_system_tokens: estimate_tokens(system_prompt),
+                            estimated_user_tokens: estimate_tokens(&user_prompt),
+                            estimated_total_tokens: estimate_tokens(system_prompt)
+                                + estimate_tokens(&user_prompt),
+                            truncated: false,
+                            created_at: db::now_ts(),
+                            request_id: Some(format!("traditional_rp_{}", uuid_like_id())),
+                            raw_provider_response: Some(completion.raw_text),
+                            normalized_response: Some(sanitized.clone()),
+                            finish_reason: completion.finish_reason,
+                            provider_request_id: completion.provider_request_id,
+                            provider_response_id: completion.provider_response_id,
+                            pipeline_trace_json: token_usage_trace_json(
+                                completion.token_usage.as_ref(),
+                            ),
+                            ..Default::default()
+                        },
+                    );
+                }
+                return Ok(sanitized);
+            }
             Err(error) => {
                 last_error = error;
                 if attempts < MAX_ATTEMPTS && is_transient_provider_error(&last_error) {
@@ -1289,9 +1460,91 @@ async fn generate_traditional_rp_turn(
             }
         }
     }
+    log_simulator_failure(
+        state,
+        conversation_id,
+        TRADITIONAL_RP_PAYLOAD_PROVIDER,
+        "traditional_rp",
+        &settings,
+        profile,
+        system_prompt,
+        &user_prompt,
+        &last_error,
+    );
     Err(format!(
-        "traditional RP engine failed after {attempts} attempt(s): {last_error}"
+        "traditional RP engine failed after {attempts} attempt(s) using profile \"{}\" (model {}, {}): {last_error}",
+        profile.name,
+        settings.model.trim(),
+        settings.base_url.trim()
     ))
+}
+
+/// Record a failed simulator call.
+///
+/// Success wrote a payload row but failure wrote nothing, so a run that died on
+/// the first turn left no trace of which profile, model, or endpoint was
+/// actually used — only an error string. The row carries no response, just the
+/// request shape and the provider error.
+#[allow(clippy::too_many_arguments)]
+fn log_simulator_failure(
+    state: &State<'_, AppState>,
+    conversation_id: &str,
+    provider_label: &str,
+    mode: &str,
+    settings: &ApiProviderSettings,
+    profile: &ProviderProfile,
+    system_prompt: &str,
+    user_prompt: &str,
+    error: &str,
+) {
+    let Ok(conn) = state.conn.lock() else {
+        return;
+    };
+    let _ = db::insert_llm_payload_log(
+        &conn,
+        &LlmPayloadLog {
+            conversation_id: conversation_id.to_string(),
+            provider: provider_label.to_string(),
+            mode: mode.to_string(),
+            context_mode: "failed_call".into(),
+            model: settings.model.trim().to_string(),
+            base_url: settings.base_url.trim().to_string(),
+            system_message: system_prompt.to_string(),
+            user_message: user_prompt.to_string(),
+            context_text: format!(
+                "profile={} ({}); api_key_present={}",
+                profile.name,
+                profile.id,
+                !profile.api_key.trim().is_empty()
+            ),
+            estimated_system_tokens: estimate_tokens(system_prompt),
+            estimated_user_tokens: estimate_tokens(user_prompt),
+            estimated_total_tokens: estimate_tokens(system_prompt) + estimate_tokens(user_prompt),
+            truncated: false,
+            created_at: db::now_ts(),
+            provider_error: Some(error.to_string()),
+            ..Default::default()
+        },
+    );
+}
+
+/// Payload-log `provider` value for the control-side engine. Kept as a constant
+/// because the token comparison groups rows by it.
+pub(crate) const TRADITIONAL_RP_PAYLOAD_PROVIDER: &str = "traditional_rp";
+pub(crate) const PLAYER_SIMULATOR_PAYLOAD_PROVIDER: &str = "player_simulator";
+
+/// Store the provider's reported usage on the payload row so the comparison can
+/// prefer real counts over character estimates. Returns `None` when the provider
+/// reported nothing, leaving the estimate as the only source.
+fn token_usage_trace_json(usage: Option<&crate::providers::api::TokenUsage>) -> Option<String> {
+    let usage = usage?;
+    serde_json::to_string(&serde_json::json!({
+        "token_usage": {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+        }
+    }))
+    .ok()
 }
 
 fn sanitize_player_simulator_message(raw: &str) -> Result<String, String> {
@@ -1949,6 +2202,7 @@ fn build_benchmark_summary(
                 || trace_counts.syntactic_repair_count == 0,
             // Recomputed by benchmark_scorecard below; seeded here for the struct.
             strict_tool_evaluator: strict_tool,
+            token_comparison: None,
             evaluator_mode_actual: String::new(),
             local_repair_recovered_state_when_warranted: false,
             local_repair_unavailable: false,
@@ -2211,6 +2465,101 @@ fn duplicate_relationship_context_detected_in_text(text: &str) -> bool {
     false
 }
 
+/// Aggregate one benchmark conversation's payload rows into a side-by-side
+/// token cost.
+///
+/// Both engines are measured the same way: the provider's reported usage when it
+/// gave one, character estimates otherwise. Mixing the two within a run would
+/// make the comparison meaningless, so `provider_reported` is only true when
+/// every counted row carried real usage.
+pub(crate) fn collect_benchmark_token_comparison(
+    conn: &Connection,
+    conversation_id: &str,
+) -> BenchmarkTokenComparison {
+    let logs = match db::list_llm_payload_logs(conn, conversation_id) {
+        Ok(logs) => logs,
+        Err(_) => return BenchmarkTokenComparison::default(),
+    };
+    let mut out = BenchmarkTokenComparison::default();
+    let mut counted = 0usize;
+    let mut reported = 0usize;
+
+    for log in &logs {
+        // Export traces and slash commands are not part of either engine's cost.
+        let bucket = if log.provider.starts_with("narrator") {
+            "narrator"
+        } else if log.provider.starts_with("evaluator") {
+            "evaluator"
+        } else if log.provider == TRADITIONAL_RP_PAYLOAD_PROVIDER {
+            "traditional"
+        } else if log.provider == PLAYER_SIMULATOR_PAYLOAD_PROVIDER {
+            "player"
+        } else {
+            continue;
+        };
+
+        let real = log
+            .pipeline_trace_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| value.get("token_usage").cloned());
+        let (prompt, completion) = match real {
+            Some(usage) => {
+                reported += 1;
+                (
+                    usage
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(log.estimated_total_tokens.max(0) as u64),
+                    usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_else(|| {
+                            estimate_tokens(log.normalized_response.as_deref().unwrap_or("")) as u64
+                        }),
+                )
+            }
+            None => (
+                log.estimated_total_tokens as u64,
+                estimate_tokens(log.normalized_response.as_deref().unwrap_or("")) as u64,
+            ),
+        };
+        counted += 1;
+
+        match bucket {
+            "narrator" => {
+                out.narrator_prompt_tokens += prompt;
+                out.narrator_completion_tokens += completion;
+                out.narrator_calls += 1;
+            }
+            "evaluator" => {
+                out.evaluator_prompt_tokens += prompt;
+                out.evaluator_completion_tokens += completion;
+                out.evaluator_calls += 1;
+            }
+            "traditional" => {
+                out.traditional_prompt_tokens += prompt;
+                out.traditional_completion_tokens += completion;
+                out.traditional_turns += 1;
+            }
+            _ => {
+                out.player_simulator_total_tokens += prompt + completion;
+                out.player_simulator_calls += 1;
+            }
+        }
+    }
+
+    out.mnemosyne_total_tokens = out.narrator_prompt_tokens
+        + out.narrator_completion_tokens
+        + out.evaluator_prompt_tokens
+        + out.evaluator_completion_tokens;
+    out.mnemosyne_turns = out.narrator_calls;
+    out.traditional_total_tokens =
+        out.traditional_prompt_tokens + out.traditional_completion_tokens;
+    out.provider_reported = counted > 0 && reported == counted;
+    out
+}
+
 pub(crate) fn benchmark_scorecard(
     summary: &BenchmarkSummary,
     strict_tool: bool,
@@ -2315,6 +2664,8 @@ pub(crate) fn benchmark_scorecard(
         && repair_invoked
         && summary.scorecard.local_repair_response_count == 0;
     let mut scorecard = BenchmarkScorecard {
+        // Filled in by `finalize_benchmark_summary`, which has the connection.
+        token_comparison: summary.scorecard.token_comparison.clone(),
         visible_chat_messages_created,
         normal_pipeline_used,
         visible_turns_requested: summary.visible_turns_requested,

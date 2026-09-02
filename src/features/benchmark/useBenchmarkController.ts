@@ -24,6 +24,7 @@ export type BenchmarkLiveContext = {
   startedAt: number;
   playerProfileId: string;
   playerGoal: string;
+  playerCharacterSoulId: string | null;
   traditionalOpponent: boolean;
   settings: BenchmarkSettings;
   narratorSettings: ApiProviderSettings;

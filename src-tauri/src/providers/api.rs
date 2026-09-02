@@ -57,7 +57,13 @@ Scene | Focus: [primary active character(s)] | Physical state: [brief] | Atmosph
 ```"#;
 
 const NARRATOR_VISIBLE_ONLY_PROMPT: &str = r#"[OUTPUT]
-Write visible scene narration only. Include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, implementation notes, or command/help text."#;
+Write visible scene narration only. Include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, implementation notes, or command/help text.
+
+[NO META-COMMENTARY]
+Begin with scene prose. Never open by restating, analysing, or planning around the user's message.
+Do not write about "the user", "the persona", "the scene", or "the situation" as things you are interpreting.
+Do not narrate your own reasoning ("Let me...", "I need to...", "This is confusing...", "Okay, so...").
+If the user's message is unclear, write the scene as the character experiencing that ambiguity — do not explain the ambiguity."#;
 
 pub const COMMAND_OOC_PROMPT: &str = r#"# SYSTEM: Mnemosyne Out-of-Roleplay Session Assistant
 

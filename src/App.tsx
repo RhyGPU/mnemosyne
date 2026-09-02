@@ -338,6 +338,7 @@ type AppView = "home" | "library" | "editor" | "chat" | "statemap" | "settings";
 type DisclaimerMode = "launch" | "manual" | null;
 export function App() {
   const [souls, setSouls] = useState<SoulSummary[]>([]);
+  const [benchmarkPlayerCharacterSoulId, setBenchmarkPlayerCharacterSoulId] = useState("");
   const [archivedSouls, setArchivedSouls] = useState<SoulSummary[]>([]);
   const [settings, setSettings] = useState<SettingSummary[]>([]);
   const [archivedSettings, setArchivedSettings] = useState<SettingSummary[]>([]);
@@ -3679,6 +3680,7 @@ export function App() {
         : updaterSettings.structured_evaluator_policy ?? "prefer",
       structured_evaluator_max_retries: updaterSettings.structured_evaluator_max_retries ?? 1,
       player_simulator_profile_id: requiresPlayerProfile ? selectedBenchmarkPlayerProfileId : null,
+      player_character_soul_id: benchmarkPlayerCharacterSoulId || null,
       player_goal: benchmarkPlayerGoal,
       export_payload_history: true,
       export_mne: true,
@@ -3861,6 +3863,7 @@ export function App() {
         startedAt: init.started_at,
         playerProfileId: settingsPayload.player_simulator_profile_id ?? "",
         playerGoal: settingsPayload.player_goal,
+        playerCharacterSoulId: settingsPayload.player_character_soul_id ?? null,
         traditionalOpponent: benchmarkTraditionalOpponent,
         settings: settingsPayload,
         narratorSettings: effectiveNarratorSettings,
@@ -3932,6 +3935,7 @@ export function App() {
         ctx.soulId,
         ctx.playerProfileId,
         ctx.playerGoal,
+        ctx.playerCharacterSoulId,
       );
       ctx.lastPlayerText = playerText;
       if (benchmarkStopRef.current) {
@@ -5030,6 +5034,27 @@ export function App() {
           </select>
         </label>
         <label className="field">
+          <span>Player Character (optional)</span>
+          <select
+            value={benchmarkPlayerCharacterSoulId}
+            onChange={(event) => setBenchmarkPlayerCharacterSoulId(event.target.value)}
+            disabled={benchmarkRunning}
+          >
+            <option value="">User persona only</option>
+            {souls
+              .filter((item) => item.character_id !== soul?.character_id)
+              .map((item) => (
+                <option key={item.character_id} value={item.character_id}>
+                  {item.character_name}
+                </option>
+              ))}
+          </select>
+          <span className="hint">
+            Play a second character against the narrator instead of only the user
+            persona. The persona stays in the scene either way.
+          </span>
+        </label>
+        <label className="field">
           <span>Player Goal</span>
           <textarea
             value={benchmarkPlayerGoal}
@@ -5193,6 +5218,65 @@ export function App() {
               <br />
               <strong>evaluator_calls:</strong> {benchmarkResult.scorecard.visible_turns_completed === 0 ? "skipped_due_to_no_completed_turn" : benchmarkResult.scorecard.evaluator_calls}
               <br />
+              {benchmarkResult.scorecard.token_comparison ? (() => {
+                const t = benchmarkResult.scorecard.token_comparison!;
+                const perTurn = (total: number, turns: number) =>
+                  turns > 0 ? Math.round(total / turns).toLocaleString() : "-";
+                const ratio =
+                  t.mnemosyne_total_tokens > 0 && t.traditional_total_tokens > 0
+                    ? (t.traditional_total_tokens / t.mnemosyne_total_tokens).toFixed(2)
+                    : null;
+                return (
+                  <>
+                    <strong>token cost</strong>{" "}
+                    <span className="muted">
+                      ({t.provider_reported ? "provider-reported" : "estimated"})
+                    </span>
+                    <table className="benchmark-token-table">
+                      <thead>
+                        <tr>
+                          <th>engine</th>
+                          <th>prompt</th>
+                          <th>completion</th>
+                          <th>total</th>
+                          <th>per turn</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr>
+                          <td>Mnemosyne (narrator+evaluator)</td>
+                          <td>{(t.narrator_prompt_tokens + t.evaluator_prompt_tokens).toLocaleString()}</td>
+                          <td>{(t.narrator_completion_tokens + t.evaluator_completion_tokens).toLocaleString()}</td>
+                          <td>{t.mnemosyne_total_tokens.toLocaleString()}</td>
+                          <td>{perTurn(t.mnemosyne_total_tokens, t.mnemosyne_turns)}</td>
+                        </tr>
+                        <tr>
+                          <td>Traditional (full transcript)</td>
+                          <td>{t.traditional_prompt_tokens.toLocaleString()}</td>
+                          <td>{t.traditional_completion_tokens.toLocaleString()}</td>
+                          <td>{t.traditional_total_tokens.toLocaleString()}</td>
+                          <td>{perTurn(t.traditional_total_tokens, t.traditional_turns)}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                    {ratio ? (
+                      <span className="muted">
+                        Traditional costs {ratio}x Mnemosyne over this run.
+                      </span>
+                    ) : (
+                      <span className="muted">
+                        Run the traditional opponent too for a side-by-side ratio.
+                      </span>
+                    )}
+                    <br />
+                    <span className="muted">
+                      Player simulator (harness, excluded):{" "}
+                      {t.player_simulator_total_tokens.toLocaleString()} over {t.player_simulator_calls} call(s)
+                    </span>
+                    <br />
+                  </>
+                );
+              })() : null}
               Payload: {benchmarkResult.payload_history_path ?? "not exported"}
               <br />
               MNE: {benchmarkResult.mne_export_path ?? "not exported"}

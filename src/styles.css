@@ -5521,3 +5521,24 @@ button:disabled {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Benchmark token comparison: the two engines side by side, digits aligned so
+   the difference in prompt cost reads at a glance. */
+.benchmark-token-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5rem 0 0.6rem;
+  font-size: 0.85em;
+}
+.benchmark-token-table th,
+.benchmark-token-table td {
+  text-align: right;
+  padding: 0.25rem 0.5rem;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+  font-variant-numeric: tabular-nums;
+}
+.benchmark-token-table th:first-child,
+.benchmark-token-table td:first-child {
+  text-align: left;
+  font-variant-numeric: normal;
+}

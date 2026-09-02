@@ -35,6 +35,11 @@ pub struct BenchmarkSettings {
     pub structured_evaluator_policy: Option<String>,
     pub structured_evaluator_max_retries: Option<u32>,
     pub player_simulator_profile_id: Option<String>,
+    /// When set, the player simulator speaks as this Soul instead of the user
+    /// persona, so a run exercises character-to-character interaction rather
+    /// than character-to-user.
+    #[serde(default)]
+    pub player_character_soul_id: Option<String>,
     pub player_goal: String,
     #[serde(default = "default_true")]
     pub export_payload_history: bool,
@@ -61,6 +66,34 @@ pub struct BenchmarkObjectIdentityCheck {
     pub label: String,
     pub expected_object_id: String,
     pub found: bool,
+}
+
+/// Prompt/completion tokens per engine for one benchmark run.
+///
+/// The whole product claim is that a compact state brief costs less than
+/// re-injecting the transcript every turn, so the two sides are measured with
+/// the same method and reported side by side. `provider_reported` says whether
+/// the numbers came from the provider's usage block or from character estimates;
+/// a mixed run reports false so the figures are not over-trusted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BenchmarkTokenComparison {
+    pub narrator_prompt_tokens: u64,
+    pub narrator_completion_tokens: u64,
+    pub narrator_calls: usize,
+    pub evaluator_prompt_tokens: u64,
+    pub evaluator_completion_tokens: u64,
+    pub evaluator_calls: usize,
+    /// narrator + evaluator: what a Mnemosyne turn actually costs.
+    pub mnemosyne_total_tokens: u64,
+    pub mnemosyne_turns: usize,
+    pub traditional_prompt_tokens: u64,
+    pub traditional_completion_tokens: u64,
+    pub traditional_total_tokens: u64,
+    pub traditional_turns: usize,
+    /// Harness cost, excluded from both sides: the simulated player's own calls.
+    pub player_simulator_total_tokens: u64,
+    pub player_simulator_calls: usize,
+    pub provider_reported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +151,9 @@ pub struct BenchmarkScorecard {
     /// "evaluator_form_v1" / "evaluator_structured_v1"), derived from per-turn
     /// traces — so a form-mode run can't masquerade as a strict tool-call pass.
     pub evaluator_mode_actual: String,
+    /// Side-by-side token cost. `None` when no payload rows were recorded.
+    #[serde(default)]
+    pub token_comparison: Option<BenchmarkTokenComparison>,
     /// When the primary evaluator failed/produced no state on a turn that
     /// warranted it, local repair must have been invoked AND recovered state.
     pub local_repair_recovered_state_when_warranted: bool,

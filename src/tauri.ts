@@ -1221,12 +1221,32 @@ export type BenchmarkSettings = {
   structured_evaluator_policy?: string | null;
   structured_evaluator_max_retries?: number | null;
   player_simulator_profile_id?: string | null;
+  /** When set, the player simulator speaks as this Soul instead of only the user persona. */
+  player_character_soul_id?: string | null;
   player_goal: string;
   export_payload_history: boolean;
   export_mne: boolean;
   export_summary_json: boolean;
   strict_tool_evaluator: boolean;
   wait_for_evaluator_each_turn: boolean;
+};
+
+export type BenchmarkTokenComparison = {
+  narrator_prompt_tokens: number;
+  narrator_completion_tokens: number;
+  narrator_calls: number;
+  evaluator_prompt_tokens: number;
+  evaluator_completion_tokens: number;
+  evaluator_calls: number;
+  mnemosyne_total_tokens: number;
+  mnemosyne_turns: number;
+  traditional_prompt_tokens: number;
+  traditional_completion_tokens: number;
+  traditional_total_tokens: number;
+  traditional_turns: number;
+  player_simulator_total_tokens: number;
+  player_simulator_calls: number;
+  provider_reported: boolean;
 };
 
 export type BenchmarkScorecard = {
@@ -1277,6 +1297,7 @@ export type BenchmarkScorecard = {
   syntactic_repair_unused_in_strict_mode: boolean;
   strict_tool_evaluator: boolean;
   evaluator_mode_actual: string;
+  token_comparison?: BenchmarkTokenComparison | null;
   local_repair_recovered_state_when_warranted: boolean;
   local_repair_unavailable: boolean;
   memories_increased_over_time: boolean;
@@ -1630,10 +1651,11 @@ export function generateBenchmarkPlayerMessage(
   soulId: string,
   playerProfileId: string,
   playerGoal: string,
+  playerCharacterSoulId?: string | null,
 ): Promise<string> {
   return invokeOrPreview(
     "generate_benchmark_player_message",
-    { conversationId, soulId, playerProfileId, playerGoal },
+    { conversationId, soulId, playerProfileId, playerGoal, playerCharacterSoulId },
     () => {
       throw new Error("Player Simulator requires the Tauri runtime.");
     },
