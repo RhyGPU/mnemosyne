@@ -6034,6 +6034,7 @@ export function App() {
       <StateMapView appDialogNode={appDialogNode} railNav={railNav} railShellClass={railShellClass}>
         <StateMapDashboard
           busy={busy}
+          conversationId={currentConversationId}
           onBackToPlay={() => setView("chat")}
           onRefresh={() => void refreshSessionStateHub()}
           stateMap={sessionStateMap}

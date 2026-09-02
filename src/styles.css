@@ -5542,3 +5542,24 @@ button:disabled {
   text-align: left;
   font-variant-numeric: normal;
 }
+
+/* Who Knows What grid. Statuses are picked per cell, so the columns are narrow
+   and the fact column carries the width. */
+.knowledge-grid { display: flex; flex-direction: column; gap: 0.75rem; }
+.knowledge-grid-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+.knowledge-table { width: 100%; min-width: 34rem; border-collapse: collapse; font-size: 0.88em; }
+.knowledge-table th,
+.knowledge-table td {
+  padding: 0.35rem 0.55rem;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.22));
+  text-align: left;
+  vertical-align: middle;
+}
+.knowledge-table th { font-weight: 600; white-space: nowrap; }
+.knowledge-table td.knowledge-fact { width: 45%; }
+.knowledge-table select { width: 100%; }

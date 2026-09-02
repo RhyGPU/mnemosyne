@@ -206,6 +206,66 @@ export function createDefaultSetting(settingName: string): Promise<SettingSoul> 
   );
 }
 
+export type KnowledgeCell = {
+  holder_entity_id: string;
+  proposition: string;
+  status: "knows" | "suspects" | "believes_false" | "unaware" | "hiding" | string;
+  counterpart_entity_id: string | null;
+  established_turn: number;
+};
+
+export const RELATIONSHIP_STAGES = [
+  { value: "strangers", label: "Strangers", hint: "Never met. A phone call or a radio starts here too." },
+  { value: "seen", label: "Seen each other", hint: "Have seen each other. No names." },
+  { value: "name_known", label: "Names known", hint: "Names exchanged, nothing more." },
+  { value: "acquainted", label: "Acquainted", hint: "Small talk done: name, area, work." },
+  { value: "familiar", label: "Familiar", hint: "Regulars. Relatives have come up." },
+  { value: "close", label: "Close", hint: "Confidants. History has been told." },
+  { value: "intimate", label: "Intimate", hint: "Partners." },
+  { value: "estranged", label: "Estranged", hint: "Knew each other well. No longer speak." },
+  { value: "family", label: "Family", hint: "Known each other their whole lives." },
+  { value: "custom", label: "Custom", hint: "Set each fact by hand." },
+] as const;
+
+export function listCharacterKnowledge(conversationId: string): Promise<KnowledgeCell[]> {
+  return invokeOrPreview("list_character_knowledge", { conversationId }, () => []);
+}
+
+export function applyRelationshipStage(conversationId: string, stage: string): Promise<number> {
+  return invokeOrPreview("apply_relationship_stage", { conversationId, stage }, () => {
+    throw new Error("Applying a relationship stage requires the Tauri runtime.");
+  });
+}
+
+export function setCharacterKnowledge(
+  conversationId: string,
+  holderEntityId: string,
+  proposition: string,
+  status: string,
+): Promise<void> {
+  return invokeOrPreview(
+    "set_character_knowledge",
+    { conversationId, holderEntityId, proposition, status },
+    () => {
+      throw new Error("Editing knowledge requires the Tauri runtime.");
+    },
+  );
+}
+
+export function markCharactersMet(
+  conversationId: string,
+  observerEntityId: string,
+  subjectLabel: string,
+): Promise<number> {
+  return invokeOrPreview(
+    "mark_characters_met",
+    { conversationId, observerEntityId, subjectLabel },
+    () => {
+      throw new Error("Marking a meeting requires the Tauri runtime.");
+    },
+  );
+}
+
 /** Split the active character sheet into what a stranger could see, and seed
  * that as already-known. Everything else on the sheet stays unknown. */
 export function seedObservableKnowledge(

@@ -2127,3 +2127,149 @@ pub async fn seed_observable_knowledge(
     }
     Ok(added)
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KnowledgeCell {
+    pub holder_entity_id: String,
+    pub proposition: String,
+    pub status: String,
+    pub counterpart_entity_id: Option<String>,
+    pub established_turn: u64,
+}
+
+/// The knowledge grid for a session: one row per (observer, fact).
+#[tauri::command]
+pub fn list_character_knowledge(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Vec<KnowledgeCell>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let world = db::get_conversation_session_world(&conn, &conversation_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
+    Ok(world
+        .knowledge
+        .iter()
+        .filter(|entry| entry.is_active)
+        .map(|entry| KnowledgeCell {
+            holder_entity_id: entry.holder_entity_id.clone(),
+            proposition: entry.proposition.clone(),
+            status: entry.status.as_label().to_string(),
+            counterpart_entity_id: entry.counterpart_entity_id.clone(),
+            established_turn: entry.established_turn,
+        })
+        .collect())
+}
+
+/// Seed both sides of a session from a relationship preset.
+///
+/// Runs in both directions, because a relationship is not one-sided: if they
+/// have met, each has seen the other. Replaces any previous seeding for the same
+/// facts rather than layering on top, so switching preset is a correction and
+/// not an accumulation.
+#[tauri::command]
+pub fn apply_relationship_stage(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    stage: String,
+) -> Result<usize, String> {
+    let stage = state_engine::disclosure::RelationshipStage::from_label(&stage)
+        .ok_or_else(|| format!("unknown relationship stage {stage}"))?;
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let conversation =
+        db::get_conversation_summary(&conn, &conversation_id).map_err(|e| e.to_string())?;
+    let soul = db::get_soul(&conn, &conversation.soul_id).map_err(|e| e.to_string())?;
+    let persona =
+        db::get_active_player_persona(&conn, &conversation_id).map_err(|e| e.to_string())?;
+    let mut world = db::get_conversation_session_world(&conn, &conversation_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
+
+    let pairs = [
+        (soul.character_id.clone(), persona.display_name.clone()),
+        (persona.persona_id.clone(), soul.character_name.clone()),
+    ];
+    let mut seeded = 0usize;
+    for (observer, subject) in pairs {
+        let entries = state_engine::disclosure::seed_baseline_knowledge(
+            &observer,
+            &subject,
+            soul.turn_counter,
+            stage,
+        );
+        for entry in entries {
+            world
+                .knowledge
+                .retain(|existing| existing.knowledge_id != entry.knowledge_id);
+            world.knowledge.push(entry);
+            seeded += 1;
+        }
+        if stage.has_met() {
+            state_engine::disclosure::grant_sight_facts(
+                &mut world.knowledge,
+                &observer,
+                &subject,
+                soul.turn_counter,
+            );
+        }
+    }
+    db::upsert_session_world(&conn, &world).map_err(|e| e.to_string())?;
+    Ok(seeded)
+}
+
+/// Flip one cell of the grid.
+#[tauri::command]
+pub fn set_character_knowledge(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    holder_entity_id: String,
+    proposition: String,
+    status: String,
+) -> Result<(), String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let mut world = db::get_conversation_session_world(&conn, &conversation_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
+    // Routed through the patch layer rather than edited in place, so a hand
+    // correction retires the old row the same way an evaluator write does.
+    let world_patch = WorldPatch {
+        knowledge_operations: vec![KnowledgeOperationPatch {
+            operation: "record".into(),
+            holder_entity_id: Some(holder_entity_id),
+            proposition: Some(proposition),
+            status: Some(status),
+            ..KnowledgeOperationPatch::default()
+        }],
+        ..WorldPatch::default()
+    };
+    if !world_patch.apply_to_session_world(&mut world) {
+        return Err("knowledge update was rejected: check the status value".into());
+    }
+    db::upsert_session_world(&conn, &world).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Record that one character has now laid eyes on another.
+#[tauri::command]
+pub fn mark_characters_met(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    observer_entity_id: String,
+    subject_label: String,
+) -> Result<usize, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    let conversation =
+        db::get_conversation_summary(&conn, &conversation_id).map_err(|e| e.to_string())?;
+    let soul = db::get_soul(&conn, &conversation.soul_id).map_err(|e| e.to_string())?;
+    let mut world = db::get_conversation_session_world(&conn, &conversation_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
+    let opened = state_engine::disclosure::grant_sight_facts(
+        &mut world.knowledge,
+        &observer_entity_id,
+        &subject_label,
+        soul.turn_counter,
+    );
+    db::upsert_session_world(&conn, &world).map_err(|e| e.to_string())?;
+    Ok(opened)
+}
