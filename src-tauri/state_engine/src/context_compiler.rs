@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::disclosure;
 use crate::patch::is_premature_user_turn_event;
 use crate::relationship_surface::relationship_surface_summary;
 use crate::setting::SessionWorld;
@@ -10,7 +11,18 @@ use crate::soul::{
     KnowledgeStatus, MemoryEntry, MemorySourceType, PlotStatus, Soul, SpeechAct, TruthStatus,
 };
 
-const DEFAULT_TOKEN_BUDGET: usize = 2_500;
+/// Ceiling for the whole compiled brief.
+///
+/// Raised from 2,500 after measuring a live run: the brief reached 2,435 tokens
+/// by turn four and was about to start dropping sections, while the models it
+/// targets carry 262K-1.3M context windows. The old cap was throwing away the
+/// state map's own output to save room nobody needed.
+///
+/// This is still nothing like replaying the transcript — at fifty turns a raw
+/// log runs well past 30K — so the compactness claim survives comfortably. What
+/// it buys is that the sections carrying hard constraints stop competing with
+/// ordinary prose for space.
+const DEFAULT_TOKEN_BUDGET: usize = 6_000;
 const MIN_RECENT_MEMORY_SALIENCE: f32 = 65.0;
 const ASSISTANT_RECENT_CHAT_CHARS: usize = 350;
 const ASSISTANT_RECENT_CHAT_HEAD_CHARS: usize = 120;
@@ -67,8 +79,23 @@ pub struct ContextPreview {
     pub text: String,
     pub estimated_tokens: usize,
     pub truncated: bool,
+    /// Which sections lost lines, and how many.
+    ///
+    /// `truncated` alone says only that something was dropped, which is not
+    /// enough to act on: sections are trimmed from the end, so the lines most
+    /// likely to vanish are the ones added last — and a constraint the narrator
+    /// never receives fails silently. Naming the section turns "something was
+    /// cut" into a bug report.
+    #[serde(default)]
+    pub truncated_sections: Vec<TruncatedSection>,
     #[serde(default)]
     pub memory_slot_debug: Vec<MemorySlotTrace>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TruncatedSection {
+    pub header: String,
+    pub lines_dropped: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +118,7 @@ pub struct ContextBudget {
 struct BuiltSection {
     text: String,
     truncated: bool,
+    lines_dropped: usize,
     memory_slot_debug: Vec<MemorySlotTrace>,
 }
 
@@ -188,7 +216,10 @@ impl Default for ContextBudget {
             memory_tokens: 650,
             world_tokens: 450,
             relationship_tokens: 250,
-            context_priority_tokens: 150,
+            // Carries the controlled-entity rules and the "not known to" notice.
+            // At 150 the notice was silently dropped, which is worse than not
+            // writing it: the code claims a guard the prompt never received.
+            context_priority_tokens: 260,
             scene_state_tokens: 350,
             knowledge_tokens: 300,
             do_not_replay_tokens: 180,
@@ -353,8 +384,8 @@ fn compile_context_with_budget_and_options(
     };
     let mut truncated = false;
     let mut section_builders = vec![
-        build_controlled_entities_section(soul, player_persona, budget),
-        build_scene_continuity_section(soul, session_world, budget),
+        build_controlled_entities_section(soul, player_persona, budget, messages),
+        build_scene_continuity_section(soul, session_world, budget, messages, player_persona),
         build_knowledge_section(soul, session_world, budget),
         build_world_section(soul, session_world, budget, pending_user_text),
         build_profile_section(soul, budget),
@@ -369,8 +400,17 @@ fn compile_context_with_budget_and_options(
 
     let mut sections = Vec::new();
     let mut memory_slot_debug = Vec::new();
+    let mut truncated_sections = Vec::new();
     for section in section_builders {
         truncated |= section.truncated;
+        if section.lines_dropped > 0 {
+            if let Some(header) = section.text.lines().next() {
+                truncated_sections.push(TruncatedSection {
+                    header: header.trim().to_string(),
+                    lines_dropped: section.lines_dropped,
+                });
+            }
+        }
         memory_slot_debug.extend(section.memory_slot_debug);
         if !section.text.trim().is_empty() {
             sections.push(section.text);
@@ -384,6 +424,7 @@ fn compile_context_with_budget_and_options(
         estimated_tokens: estimate_tokens(&text),
         text,
         truncated,
+        truncated_sections,
         memory_slot_debug,
     }
 }
@@ -437,13 +478,38 @@ fn build_profile_section(soul: &Soul, budget: &ContextBudget) -> BuiltSection {
     )
 }
 
+/// Tell the narrator, in the same block that carries the persona's identity,
+/// that the character has not been given the name.
+///
+/// The narrator legitimately needs the name to write the scene; the character
+/// must not use it. Withholding it here is not an option, so the gap is stated
+/// instead — and stating it is what produces "sorry, what was your name again?"
+/// rather than a character who simply never mentions names.
+fn undisclosed_persona_name_notice(
+    soul: &Soul,
+    player_persona: &PlayerPersonaContext,
+    messages: &[ContextMessage],
+) -> Option<String> {
+    let persona_name = player_persona.display_name.trim();
+    if persona_name.is_empty() || disclosure::appears_in_transcript(messages, persona_name) {
+        return None;
+    }
+    let character_name = fallback(&soul.character_name, "Unnamed Character");
+    Some(format!(
+        "- NOT KNOWN TO {character_name}: the name {persona_name} was never said in the scene. \
+         {character_name} must call them {} and ask if it matters.",
+        disclosure::descriptor_for(&player_persona.gender_code, "the other person")
+    ))
+}
+
 fn build_controlled_entities_section(
     soul: &Soul,
     player_persona: &PlayerPersonaContext,
     budget: &ContextBudget,
+    messages: &[ContextMessage],
 ) -> BuiltSection {
     let character_name = fallback(&soul.character_name, "Unnamed Character");
-    let lines = vec![
+    let mut lines = vec![
         "Narrator-controlled Souls:".into(),
         format!(
             "- {character_name} = engine-controlled character. The user is not {character_name}."
@@ -451,6 +517,11 @@ fn build_controlled_entities_section(
         "User-controlled player persona:".into(),
         format!("- persona_id: {}", player_persona.persona_id),
         format!("- display_name: {}", player_persona.display_name),
+        // Placed high on purpose. This section has a tight token budget and
+        // `section_from_lines` drops from the end, so a warning appended last
+        // silently disappears — and a truncated warning is no warning at all.
+        undisclosed_persona_name_notice(soul, player_persona, messages)
+            .unwrap_or_else(|| "- name_known_to_character: yes".to_string()),
         format!("- gender_code: {}", player_persona.gender_code),
         format!("- pronouns: {}", player_persona.pronouns),
         format!("- description: {}", player_persona.description),
@@ -667,6 +738,7 @@ fn build_memory_section(
     BuiltSection {
         text,
         truncated,
+        lines_dropped: 0,
         memory_slot_debug: debug,
     }
 }
@@ -1067,6 +1139,7 @@ fn build_verified_memory_layer_reply_section(soul: &Soul, budget: &ContextBudget
         return BuiltSection {
             text: String::new(),
             truncated: false,
+            lines_dropped: 0,
             memory_slot_debug: Vec::new(),
         };
     };
@@ -1096,6 +1169,8 @@ fn build_scene_continuity_section(
     soul: &Soul,
     session_world: Option<&SessionWorld>,
     budget: &ContextBudget,
+    messages: &[ContextMessage],
+    player_persona: &PlayerPersonaContext,
 ) -> BuiltSection {
     let world = if let Some(session_world) = session_world {
         session_world.world_log()
@@ -1113,7 +1188,34 @@ fn build_scene_continuity_section(
     let mut lines = Vec::new();
     push(&mut lines, "Scene", &scene.current_scene);
     if !scene.participants.is_empty() {
-        lines.push(format_list("Present", &scene.participants, ""));
+        // An undisclosed name is withheld rather than forbidden: the narrator
+        // cannot leak what the prompt never carried.
+        let present = scene
+            .participants
+            .iter()
+            .filter_map(|participant| clean(participant))
+            .map(|participant| {
+                let is_active_soul = participant.eq_ignore_ascii_case(soul.character_id.trim())
+                    || participant.eq_ignore_ascii_case(soul.character_name.trim());
+                if is_active_soul {
+                    return soul.character_name.trim().to_string();
+                }
+                let is_player = participant.eq_ignore_ascii_case(player_persona.persona_id.trim())
+                    || participant.eq_ignore_ascii_case(player_persona.display_name.trim());
+                let (name, descriptor) = if is_player {
+                    (
+                        player_persona.display_name.as_str(),
+                        disclosure::descriptor_for(&player_persona.gender_code, ""),
+                    )
+                } else {
+                    (participant, "the other person".to_string())
+                };
+                disclosure::entity_display(name, &descriptor, messages, false)
+            })
+            .collect::<Vec<_>>();
+        if !present.is_empty() {
+            lines.push(format!("Present: {}", present.join(", ")));
+        }
     }
     if !scene.positions.is_empty() {
         let positions = scene
@@ -1155,6 +1257,7 @@ fn build_scene_continuity_section(
         return BuiltSection {
             text: String::new(),
             truncated: false,
+            lines_dropped: 0,
             memory_slot_debug: Vec::new(),
         };
     }
@@ -1222,6 +1325,7 @@ fn build_knowledge_section(
         return BuiltSection {
             text: String::new(),
             truncated: false,
+            lines_dropped: 0,
             memory_slot_debug: Vec::new(),
         };
     }
@@ -1459,6 +1563,7 @@ fn build_recent_chat_section(messages: &[ContextMessage], budget: &ContextBudget
         return BuiltSection {
             text: String::new(),
             truncated: false,
+            lines_dropped: 0,
             memory_slot_debug: Vec::new(),
         };
     }
@@ -1515,11 +1620,18 @@ fn build_latest_exchange_section(
 fn section_from_lines(header: &str, lines: Vec<String>, token_cap: usize) -> BuiltSection {
     let mut text = header.to_string();
     let mut truncated = false;
+    let lines = lines
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let offered = lines.len();
+    let mut accepted = 0usize;
 
-    for line in lines.into_iter().filter(|line| !line.trim().is_empty()) {
+    for line in lines.into_iter() {
         let candidate = format!("{text}\n{line}");
         if estimate_tokens(&candidate) <= token_cap {
             text = candidate;
+            accepted += 1;
         } else {
             truncated = true;
             if text == header {
@@ -1538,6 +1650,7 @@ fn section_from_lines(header: &str, lines: Vec<String>, token_cap: usize) -> Bui
     BuiltSection {
         text,
         truncated,
+        lines_dropped: offered.saturating_sub(accepted),
         memory_slot_debug: Vec::new(),
     }
 }
@@ -2817,6 +2930,101 @@ mod tests {
             !world.contains("Filler plot thread number 39"),
             "world snapshot should give up lines before the continuity anchor"
         );
+    }
+
+    #[test]
+    fn truncation_names_the_section_that_lost_lines() {
+        let mut soul = new_default_soul("Aurora");
+        soul.world.active_plots = (0..60)
+            .map(|index| format!("Filler plot thread number {index} padding the world snapshot"))
+            .collect();
+
+        let preview = compile_context_for_session(&soul, None, &[]);
+
+        assert!(preview.truncated);
+        assert!(
+            preview
+                .truncated_sections
+                .iter()
+                .any(|section| section.header.contains("WORLD SNAPSHOT")
+                    && section.lines_dropped > 0),
+            "a bare `truncated` flag cannot be acted on; the section must be named: {:?}",
+            preview.truncated_sections
+        );
+    }
+
+    #[test]
+    fn nothing_is_reported_truncated_when_everything_fits() {
+        let soul = new_default_soul("Aurora");
+
+        let preview = compile_context_for_session(&soul, None, &[]);
+
+        assert!(preview.truncated_sections.is_empty());
+    }
+
+    #[test]
+    fn an_undisclosed_participant_name_never_reaches_the_narrator() {
+        let mut soul = new_default_soul("Aurora Schwarz");
+        soul.world.scene_state = crate::soul::SceneState {
+            current_scene: "Standoff at the door".into(),
+            participants: vec![soul.character_id.clone(), "preset_male".into()],
+            ..crate::soul::SceneState::default()
+        };
+        let messages = [ContextMessage {
+            role: "user".into(),
+            content: "I knock twice and wait.".into(),
+        }];
+        let persona = PlayerPersonaContext {
+            persona_id: "preset_male".into(),
+            display_name: "Rhy".into(),
+            gender_code: "male".into(),
+            ..PlayerPersonaContext::default()
+        };
+
+        let preview =
+            compile_context_for_session_with_player_persona(&soul, None, &messages, &persona);
+        let scene = section_text(&preview.text, "[SCENE CONTINUITY]");
+
+        // The scene the character reasons from carries no name.
+        assert!(scene.contains("the man (name not yet given)"));
+        assert!(!scene.contains("Rhy"));
+        // The narrator still needs the persona's identity, so it stays in the
+        // controlled-entities block — paired with an explicit statement that the
+        // character does not know it. Silence there would leave the model to guess.
+        let controlled = section_text(&preview.text, "[CONTROLLED ENTITIES]");
+        assert!(controlled.contains("NOT KNOWN TO Aurora Schwarz"));
+        assert!(controlled.contains("was never said in the scene"));
+        // The active Soul knows what she is called.
+        assert!(scene.contains("Aurora Schwarz"));
+    }
+
+    #[test]
+    fn a_participant_name_appears_once_it_has_been_said() {
+        let mut soul = new_default_soul("Aurora Schwarz");
+        soul.world.scene_state = crate::soul::SceneState {
+            current_scene: "Standoff at the door".into(),
+            participants: vec![soul.character_id.clone(), "preset_male".into()],
+            ..crate::soul::SceneState::default()
+        };
+        let messages = [ContextMessage {
+            role: "user".into(),
+            content: "\"Rhy,\" I say. \"That's my name.\"".into(),
+        }];
+        let persona = PlayerPersonaContext {
+            persona_id: "preset_male".into(),
+            display_name: "Rhy".into(),
+            gender_code: "male".into(),
+            ..PlayerPersonaContext::default()
+        };
+
+        let preview =
+            compile_context_for_session_with_player_persona(&soul, None, &messages, &persona);
+        let scene = section_text(&preview.text, "[SCENE CONTINUITY]");
+
+        assert!(scene.contains("Rhy"));
+        assert!(!scene.contains("name not yet given"));
+        // Once said, the disclaimer disappears too.
+        assert!(!preview.text.contains("NOT KNOWN TO"));
     }
 
     #[test]

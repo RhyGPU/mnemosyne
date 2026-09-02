@@ -2785,6 +2785,7 @@ fn next_normal_turn_consumes_pending_setup_with_high_priority_block() {
         text: "Base context".into(),
         estimated_tokens: 1,
         truncated: false,
+        truncated_sections: Vec::new(),
         memory_slot_debug: Vec::new(),
     };
     let (preview, user_text) =

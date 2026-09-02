@@ -3234,6 +3234,14 @@ pub async fn send_api_turn(
             "context_mode": context_mode.label(),
             "context_tokens": context_preview.estimated_tokens,
             "context_truncated": context_preview.truncated,
+            // Sections are trimmed from the end, so a guard added last is the
+            // first thing to vanish. Naming what was dropped is the difference
+            // between a diagnosable prompt and a silently weakened one.
+            "context_truncated_sections": context_preview
+                .truncated_sections
+                .iter()
+                .map(|section| format!("{} (-{} lines)", section.header, section.lines_dropped))
+                .collect::<Vec<_>>(),
             "history_messages": context_messages.len()
         })),
     );
