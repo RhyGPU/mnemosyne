@@ -28,6 +28,26 @@ export const DISCLAIMER_STORAGE_KEY = "mnemosyne_disclaimer_accepted_v1";
 export const DISCLAIMER_VERSION = 1;
 export const DEV_LOG_LIMIT = 1000;
 
+/**
+ * How long an evaluator call may run before the app gives up on it.
+ *
+ * This is the only evaluator timeout a person sets; the structured and
+ * diagnostic timeouts stay unset unless a profile names one, so that whatever
+ * is configured here is what actually reaches the provider call. A reasoning
+ * model spends most of its budget before the first visible token — glm-5.3-flash
+ * measured 49-70s per extraction — so the ceiling has to clear that with room,
+ * or a slow-but-correct model reads as a broken one.
+ */
+export const DEFAULT_EVALUATOR_TIMEOUT_MS = 120_000;
+
+/**
+ * How many turns in a row may lose their state before a benchmark gives up.
+ *
+ * One failure is a slow call. Three in a row is an evaluator that is not
+ * working, and every further turn spends money measuring nothing.
+ */
+export const MAX_CONSECUTIVE_EVALUATOR_FAILURES = 3;
+
 export function hasAcceptedDisclaimerVersion() {
   try {
     const raw = localStorage.getItem(DISCLAIMER_STORAGE_KEY);

@@ -13497,6 +13497,11 @@ async fn run_background_evaluator_job(
         "completed"
     };
     let honest_status_str;
+    // A partial success has to say what was partial about it. Without this, a
+    // run where every fallback timed out records `partial_success`, no error,
+    // and an empty patch — a row indistinguishable from a turn where nothing
+    // happened to change, which is how a dead evaluator stayed invisible for a
+    // whole benchmark.
     let error_msg = if enrichment_stale_skipped {
         Some("source turn is no longer on active branch")
     } else if !runtime.form_rejected_rows.is_empty() {
@@ -13507,6 +13512,13 @@ async fn run_background_evaluator_job(
             &runtime.form_rejected_rows,
         );
         Some(honest_status_str.as_str())
+    } else if runtime.partial_success {
+        Some(
+            runtime
+                .partial_success_reason
+                .as_deref()
+                .unwrap_or("the evaluator finished without applying a state patch"),
+        )
     } else {
         None
     };

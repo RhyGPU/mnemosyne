@@ -3403,3 +3403,41 @@ fn test_savepoint_archive_and_restore() {
         .unwrap();
     assert_eq!(restored_a.source_soul_id, Some(soul.character_id.clone()));
 }
+
+#[test]
+fn migration_raises_only_the_evaluator_timeout_nobody_chose() {
+    // The 25s default was written when a front-end constant shadowed it, so no
+    // profile carrying it was ever actually running at 25s. Now that the value
+    // binds, leaving it would cut a reasoning evaluator off mid-thought — but a
+    // number someone typed is theirs, shadowed or not.
+    let conn = init_memory_connection().expect("db");
+    let now = now_ts();
+    for (id, timeout) in [
+        ("untouched-default", 25_000_i64),
+        ("chosen-by-hand", 40_000),
+        ("already-generous", 180_000),
+    ] {
+        conn.execute(
+            "INSERT INTO provider_profiles
+             (id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
+              evaluator_timeout_ms)
+             VALUES (?1, ?1, 'https://example.test/v1', '', 'model', '', ?2, ?2, ?3)",
+            params![id, now, timeout],
+        )
+        .expect("insert profile");
+    }
+
+    run_migrations(&conn).expect("migrations");
+
+    let timeout_for = |id: &str| -> i64 {
+        conn.query_row(
+            "SELECT evaluator_timeout_ms FROM provider_profiles WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .expect("read timeout")
+    };
+    assert_eq!(timeout_for("untouched-default"), 120_000);
+    assert_eq!(timeout_for("chosen-by-hand"), 40_000);
+    assert_eq!(timeout_for("already-generous"), 180_000);
+}

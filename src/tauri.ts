@@ -1081,6 +1081,10 @@ export function getLatestEvaluatorJob(conversationId: string): Promise<Evaluator
   return invokeOrPreview("get_latest_evaluator_job", { conversationId }, () => null);
 }
 
+export function getEvaluatorJob(jobId: string): Promise<EvaluatorJob | null> {
+  return invokeOrPreview("get_evaluator_job", { jobId }, () => null);
+}
+
 export function cancelEvaluatorJob(jobId: string): Promise<void> {
   return invokeOrPreview("cancel_evaluator_job", { jobId }, () => undefined);
 }

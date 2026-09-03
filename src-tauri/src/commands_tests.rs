@@ -7265,6 +7265,26 @@ fn evaluator_timeout_is_configurable() {
     assert_eq!(effective_evaluator_timeout_ms(&settings), Some(4_200));
 }
 
+/// The configured timeout is the one that binds unless a caller deliberately
+/// asks for a different leash. This ordering was a silent no-op for as long as
+/// the front end filled the structured and diagnostic fields with constants on
+/// every call: the diagnostic default won every time, and the number a person
+/// set in Settings never reached a provider. The front end now sends only what
+/// a profile actually stores, so this test is what keeps that true.
+#[test]
+fn an_unset_diagnostic_leash_does_not_shadow_the_configured_timeout() {
+    let mut settings = evaluator_test_settings();
+    settings.evaluator_timeout_ms = Some(120_000);
+    settings.structured_evaluator_timeout_ms = None;
+    settings.diagnostic_evaluator_timeout_ms = None;
+
+    assert_eq!(effective_evaluator_timeout_ms(&settings), Some(120_000));
+
+    // A diagnostic run asks for its own leash, and only then does it win.
+    settings.diagnostic_evaluator_timeout_ms = Some(300_000);
+    assert_eq!(effective_evaluator_timeout_ms(&settings), Some(300_000));
+}
+
 #[test]
 fn evaluator_no_app_timeout_does_not_cancel_at_25s() {
     let mut settings = evaluator_test_settings();

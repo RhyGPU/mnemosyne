@@ -37,6 +37,8 @@ export type BenchmarkLiveContext = {
   perTurn: BenchmarkTurnSummary[];
   narratorFailures: number;
   completedTurns: number;
+  /** Evaluator failures since the last turn whose state actually committed. */
+  consecutiveEvaluatorFailures: number;
   nextTurnIndex: number;
   lastPlayerText: string;
 };

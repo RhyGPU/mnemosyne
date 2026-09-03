@@ -139,6 +139,7 @@ pub fn run() {
             commands::evaluator::restore_provider_profile,
             commands::evaluator::list_archived_provider_profiles,
             commands::evaluator::get_latest_evaluator_job,
+            commands::evaluator::get_evaluator_job,
             commands::evaluator::cancel_evaluator_job,
             commands::evaluator::retry_evaluator_job,
             commands::evaluator::repair_evaluator_ops,

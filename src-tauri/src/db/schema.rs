@@ -639,6 +639,8 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
 
     add_column_if_missing(conn, "provider_profiles", "archived_at", "INTEGER")?;
 
+    raise_shadowed_evaluator_timeouts(conn)?;
+
     add_column_if_missing(
         conn,
         "provider_profiles",
@@ -738,6 +740,34 @@ fn add_column_if_missing(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// The old 25s evaluator ceiling, from when it was never the value that applied.
+///
+/// Three timeout fields fed one call, and the front end filled all three, so the
+/// diagnostic default (60s) shadowed whatever a profile stored. Now that only
+/// `evaluator_timeout_ms` is sent, the stored 25s would suddenly bind — and bind
+/// tighter than the 60s these profiles were in practice running under. A model
+/// that reasons before it answers needs longer than either: glm-5.3-flash was
+/// measured at 49-70s per extraction, so both numbers cut it off mid-thought and
+/// the run read as a provider failure. Only rows still carrying the old default
+/// move; a number someone chose is theirs.
+const SHADOWED_EVALUATOR_TIMEOUT_MS: i64 = 25_000;
+const REPLACEMENT_EVALUATOR_TIMEOUT_MS: i64 = 120_000;
+
+fn raise_shadowed_evaluator_timeouts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "
+        UPDATE provider_profiles
+        SET evaluator_timeout_ms = ?1
+        WHERE evaluator_timeout_ms = ?2
+        ",
+        params![
+            REPLACEMENT_EVALUATOR_TIMEOUT_MS,
+            SHADOWED_EVALUATOR_TIMEOUT_MS
+        ],
+    )?;
+    Ok(())
 }
 
 fn backfill_soul_summary_columns(conn: &Connection) -> rusqlite::Result<()> {

@@ -5,6 +5,7 @@ import type {
   ProviderProfile,
 } from "../../tauri";
 import type { NarrativeMode } from "../../settings/preferences";
+import { DEFAULT_EVALUATOR_TIMEOUT_MS } from "../../app/preferencesStorage";
 import {
   REPAIR_MODEL_AUTO,
   REPAIR_MODEL_EMBEDDED,
@@ -232,7 +233,7 @@ export function StateUpdaterProviderPanel({
           <input
             type="number"
             min="0"
-            value={Math.round((effectiveSettings.evaluator_timeout_ms ?? 25_000) / 1000)}
+            value={Math.round((effectiveSettings.evaluator_timeout_ms ?? DEFAULT_EVALUATOR_TIMEOUT_MS) / 1000)}
             onChange={(event) =>
               onSettingsChange({
                 evaluator_timeout_ms:

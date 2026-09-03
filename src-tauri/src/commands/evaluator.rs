@@ -77,6 +77,21 @@ pub fn get_latest_evaluator_job(
     db::get_latest_evaluator_job(&conn, &conversation_id).map_err(|err| err.to_string())
 }
 
+/// One evaluator job by id.
+///
+/// `get_latest_evaluator_job` answers a different question, and a caller
+/// waiting on a specific job cannot use it: a slow job's successor is already
+/// the latest by the time the slow one finishes, so "latest" reports the wrong
+/// job's status back as this one's verdict.
+#[tauri::command]
+pub fn get_evaluator_job(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<Option<db::EvaluatorJob>, String> {
+    let conn = state.conn.lock().map_err(|err| err.to_string())?;
+    db::get_evaluator_job(&conn, &job_id).map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 pub fn cancel_evaluator_job(state: State<'_, AppState>, job_id: String) -> Result<(), String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;

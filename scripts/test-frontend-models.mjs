@@ -110,6 +110,40 @@ const pendingAssistant = {
     benchmarkRuntime.benchmarkEvaluatorJobCompletedOrSkipped({ status: "failed" }),
     false,
   );
+  // A partial success that applied a patch read the turn; one that applied
+  // nothing is the no-op every fallback path failed into, and counting it as a
+  // finished turn is how a dead evaluator reports a clean benchmark.
+  assert.equal(
+    benchmarkRuntime.benchmarkEvaluatorJobCompletedOrSkipped({
+      status: "partial_success",
+      patch_applied: true,
+    }),
+    true,
+  );
+  assert.equal(
+    benchmarkRuntime.benchmarkEvaluatorJobCompletedOrSkipped({
+      status: "partial_success",
+      patch_applied: false,
+    }),
+    false,
+  );
+  // Skipping a superseded turn is the right outcome, not a lost one, so it
+  // stays a pass even though it commits nothing.
+  assert.equal(
+    benchmarkRuntime.benchmarkEvaluatorJobCompletedOrSkipped({
+      status: "stale_skipped",
+      patch_applied: false,
+    }),
+    true,
+  );
+  // An evaluator that legitimately found nothing to change still completed.
+  assert.equal(
+    benchmarkRuntime.benchmarkEvaluatorJobCompletedOrSkipped({
+      status: "completed",
+      patch_applied: false,
+    }),
+    true,
+  );
 }
 
 {

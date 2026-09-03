@@ -93,6 +93,7 @@ import {
   exportWorldSettingMne,
   exportVisibleChatLog,
   getBranchPatchDebug,
+  getEvaluatorJob,
   getLatestEvaluatorJob,
   getSetting,
   getImageAsset,
@@ -271,7 +272,9 @@ import {
 import {
   CUSTOM_NARRATOR_PROMPT_STORAGE_KEY,
   CHAT_START_MODE_STORAGE_KEY,
+  DEFAULT_EVALUATOR_TIMEOUT_MS,
   DEV_LOG_LIMIT,
+  MAX_CONSECUTIVE_EVALUATOR_FAILURES,
   DISCLAIMER_STORAGE_KEY,
   DISCLAIMER_VERSION,
   EMBEDDED_MODEL_PATH_STORAGE_KEY,
@@ -1429,9 +1432,9 @@ export function App() {
       model: profile.model,
       system_prompt: profile.system_prompt,
       narrator_timeout_ms: profile.narrator_timeout_ms ?? null,
-      evaluator_timeout_ms: profile.evaluator_timeout_ms ?? 25_000,
-      structured_evaluator_timeout_ms: profile.structured_evaluator_timeout_ms ?? 90_000,
-      diagnostic_evaluator_timeout_ms: profile.diagnostic_evaluator_timeout_ms ?? 60_000,
+      evaluator_timeout_ms: profile.evaluator_timeout_ms ?? DEFAULT_EVALUATOR_TIMEOUT_MS,
+      structured_evaluator_timeout_ms: profile.structured_evaluator_timeout_ms ?? null,
+      diagnostic_evaluator_timeout_ms: profile.diagnostic_evaluator_timeout_ms ?? null,
       evaluator_timeout_mode: profile.evaluator_timeout_mode ?? "finite",
       evaluator_mode: profile.evaluator_mode ?? "evaluator_form_v1",
       structured_evaluator_policy: profile.structured_evaluator_policy ?? "prefer",
@@ -1451,9 +1454,9 @@ export function App() {
       model: profile.model,
       system_prompt: profile.system_prompt,
       narrator_timeout_ms: profile.narrator_timeout_ms ?? null,
-      evaluator_timeout_ms: profile.evaluator_timeout_ms ?? 25_000,
-      structured_evaluator_timeout_ms: profile.structured_evaluator_timeout_ms ?? 90_000,
-      diagnostic_evaluator_timeout_ms: profile.diagnostic_evaluator_timeout_ms ?? 60_000,
+      evaluator_timeout_ms: profile.evaluator_timeout_ms ?? DEFAULT_EVALUATOR_TIMEOUT_MS,
+      structured_evaluator_timeout_ms: profile.structured_evaluator_timeout_ms ?? null,
+      diagnostic_evaluator_timeout_ms: profile.diagnostic_evaluator_timeout_ms ?? null,
       evaluator_timeout_mode: profile.evaluator_timeout_mode ?? "finite",
       evaluator_mode: profile.evaluator_mode ?? "evaluator_form_v1",
       structured_evaluator_policy: profile.structured_evaluator_policy ?? "prefer",
@@ -3773,32 +3776,33 @@ export function App() {
   async function waitForBenchmarkEvaluatorJob(conversationId: string): Promise<any> {
     const isTerminal = (status: string) => status !== "pending" && status !== "running";
     // Fast path: nothing in flight.
+    let pending: any;
     try {
-      const job = await getLatestEvaluatorJob(conversationId);
-      if (!job || isTerminal(job.status)) return job;
+      pending = await getLatestEvaluatorJob(conversationId);
+      if (!pending || isTerminal(pending.status)) return pending;
     } catch {
       return undefined;
     }
+    // Wait for THIS job, by id. Re-reading "the latest job" on the way out is
+    // what produced `evaluator_failed: running`: by the time a slow job's
+    // terminal event arrived, the next turn's job already existed, and the
+    // benchmark read the newcomer's `running` as this turn's verdict.
+    const pendingJobId: string = pending.evaluator_job_id;
     return new Promise<any>((resolve) => {
       let done = false;
       let unlisten: (() => void) | undefined;
       let safetyPoll: number | undefined;
-      const finishWithJob = async () => {
+      const finish = (job: any) => {
         if (done) return;
         done = true;
         if (safetyPoll !== undefined) window.clearInterval(safetyPoll);
         unlisten?.();
-        try {
-          const job = await getLatestEvaluatorJob(conversationId);
-          resolve(job);
-        } catch {
-          resolve(undefined);
-        }
+        resolve(job);
       };
-      // Primary signal: the eval job's status-changed event for THIS conversation.
+      // Primary signal: this job's own status-changed event.
       void listenEvaluatorJobStatusChanged((job) => {
-        if (job.conversation_id === conversationId && isTerminal(job.status)) {
-          void finishWithJob();
+        if (job.evaluator_job_id === pendingJobId && isTerminal(job.status)) {
+          finish(job);
         }
       }).then((stop) => {
         unlisten = stop;
@@ -3807,13 +3811,15 @@ export function App() {
       // Safety nets: honor Stop and slow-poll in case an event is dropped.
       safetyPoll = window.setInterval(() => {
         if (benchmarkStopRef.current) {
-          void finishWithJob();
+          finish(pending);
           return;
         }
-        void getLatestEvaluatorJob(conversationId)
+        void getEvaluatorJob(pendingJobId)
           .then((job) => {
-            if (!job || isTerminal(job.status)) {
-              void finishWithJob();
+            if (!job) {
+              finish(undefined);
+            } else if (isTerminal(job.status)) {
+              finish(job);
             }
           })
           .catch(() => undefined);
@@ -3892,6 +3898,7 @@ export function App() {
         perTurn: [],
         narratorFailures: 0,
         completedTurns: 0,
+        consecutiveEvaluatorFailures: 0,
         nextTurnIndex: 0,
         lastPlayerText: "",
       };
@@ -4023,6 +4030,7 @@ export function App() {
       );
       ctx.perTurn.push(summary);
       ctx.completedTurns += 1;
+      ctx.consecutiveEvaluatorFailures = 0;
       ctx.nextTurnIndex = turnIndex + 1;
       phase = "completed";
       setBenchmarkLivePhase("completed");
@@ -4134,27 +4142,49 @@ export function App() {
           ),
         );
       }
-      benchmarkStopRef.current = true;
-      setBenchmarkTurnsRemaining(0);
-      setBenchmarkLivePhase("failed");
+      // The narrator already wrote this turn and it is saved; only the state
+      // extraction fell over. Ending the whole run there throws away the nine
+      // turns still to come over one slow provider call, so a lone evaluator
+      // failure costs the turn and nothing more. A run whose evaluator is
+      // genuinely dead still stops — a benchmark of an engine that never
+      // commits state measures nothing worth paying for.
+      const evaluatorFailureIsRecoverable = stage === "evaluator_failed";
+      if (evaluatorFailureIsRecoverable) {
+        ctx.consecutiveEvaluatorFailures += 1;
+      }
+      const abortRun =
+        !evaluatorFailureIsRecoverable ||
+        ctx.consecutiveEvaluatorFailures >= MAX_CONSECUTIVE_EVALUATOR_FAILURES ||
+        turnIndex + 1 >= ctx.settings.turn_count;
+      if (abortRun) {
+        benchmarkStopRef.current = true;
+        setBenchmarkTurnsRemaining(0);
+        setBenchmarkLivePhase("failed");
+      } else {
+        ctx.nextTurnIndex = turnIndex + 1;
+        setBenchmarkTurnsRemaining((remaining) => remaining - 1);
+      }
+      const detail = abortRun
+        ? message
+        : `${message} (continuing; ${ctx.consecutiveEvaluatorFailures}/${MAX_CONSECUTIVE_EVALUATOR_FAILURES} consecutive evaluator failures)`;
       appendTrackedDevJobHistory(
         liveBenchmarkJobIdRef.current,
         {
           index: turnIndex + 1,
           label: `Cycle ${turnIndex + 1}`,
           status: "failed",
-          detail: message,
+          detail,
           elapsed_ms: null,
         },
         {
-          status: "failed",
+          status: abortRun ? "failed" : "running",
           phase: stage,
           current: ctx.completedTurns,
           succeeded: ctx.completedTurns,
-          failed: 1,
-          estimated_remaining_ms: 0,
-          cancellable: false,
-          detail: message,
+          failed: ctx.perTurn.length - ctx.completedTurns,
+          estimated_remaining_ms: abortRun ? 0 : null,
+          cancellable: !abortRun,
+          detail,
         },
       );
       logDev("warn", "app", "Live benchmark turn failed", {
@@ -4162,6 +4192,8 @@ export function App() {
         turn_index: turnIndex,
         stage,
         error: message,
+        run_aborted: abortRun,
+        consecutive_evaluator_failures: ctx.consecutiveEvaluatorFailures,
       });
     } finally {
       benchmarkTurnInFlightRef.current = false;
@@ -4337,9 +4369,9 @@ export function App() {
       model: apiSettings.model,
       system_prompt: apiSettings.system_prompt,
       narrator_timeout_ms: apiSettings.narrator_timeout_ms ?? null,
-      evaluator_timeout_ms: apiSettings.evaluator_timeout_ms ?? 25_000,
-      structured_evaluator_timeout_ms: apiSettings.structured_evaluator_timeout_ms ?? 90_000,
-      diagnostic_evaluator_timeout_ms: apiSettings.diagnostic_evaluator_timeout_ms ?? 60_000,
+      evaluator_timeout_ms: apiSettings.evaluator_timeout_ms ?? DEFAULT_EVALUATOR_TIMEOUT_MS,
+      structured_evaluator_timeout_ms: apiSettings.structured_evaluator_timeout_ms ?? null,
+      diagnostic_evaluator_timeout_ms: apiSettings.diagnostic_evaluator_timeout_ms ?? null,
       evaluator_timeout_mode: apiSettings.evaluator_timeout_mode ?? "finite",
       evaluator_mode: apiSettings.evaluator_mode ?? "evaluator_form_v1",
       structured_evaluator_policy: apiSettings.structured_evaluator_policy ?? "prefer",
@@ -4397,9 +4429,9 @@ export function App() {
       model: stateUpdaterSettings.model,
       system_prompt: stateUpdaterSettings.system_prompt,
       narrator_timeout_ms: stateUpdaterSettings.narrator_timeout_ms ?? null,
-      evaluator_timeout_ms: stateUpdaterSettings.evaluator_timeout_ms ?? 25_000,
-      structured_evaluator_timeout_ms: stateUpdaterSettings.structured_evaluator_timeout_ms ?? 90_000,
-      diagnostic_evaluator_timeout_ms: stateUpdaterSettings.diagnostic_evaluator_timeout_ms ?? 60_000,
+      evaluator_timeout_ms: stateUpdaterSettings.evaluator_timeout_ms ?? DEFAULT_EVALUATOR_TIMEOUT_MS,
+      structured_evaluator_timeout_ms: stateUpdaterSettings.structured_evaluator_timeout_ms ?? null,
+      diagnostic_evaluator_timeout_ms: stateUpdaterSettings.diagnostic_evaluator_timeout_ms ?? null,
       evaluator_timeout_mode: stateUpdaterSettings.evaluator_timeout_mode ?? "finite",
       evaluator_mode: stateUpdaterSettings.evaluator_mode ?? "evaluator_form_v1",
       structured_evaluator_policy: stateUpdaterSettings.structured_evaluator_policy ?? "prefer",

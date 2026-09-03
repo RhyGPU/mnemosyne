@@ -13,6 +13,22 @@ const COMPLETED_EVALUATOR_STATUSES = new Set([
   "stale_skipped",
 ]);
 
+/**
+ * A job that reached a terminal status but committed nothing.
+ *
+ * `partial_success` covers two different endings: the evaluator read the turn
+ * and some rows were rejected, or every fallback path failed and a no-op was
+ * recorded to keep the pipeline moving. Only the second leaves the state
+ * untouched, and counting it as a completed turn is how ten turns of a dead
+ * evaluator once reported as ten successes. `stale_skipped` is excluded because
+ * skipping a superseded turn is the correct outcome, not a lost one.
+ */
+export function benchmarkEvaluatorJobCommittedNothing(
+  job: Pick<EvaluatorJob, "status" | "patch_applied"> | null | undefined,
+): boolean {
+  return Boolean(job && job.status === "partial_success" && !job.patch_applied);
+}
+
 export function benchmarkLiveUpdaterOverride(
   settings: BenchmarkSettings,
 ): Partial<ApiProviderSettings> {
@@ -48,8 +64,9 @@ export function turnResultEvaluatorCompletedOrSkipped(
 }
 
 export function benchmarkEvaluatorJobCompletedOrSkipped(
-  job: Pick<EvaluatorJob, "status"> | null | undefined,
+  job: Pick<EvaluatorJob, "status" | "patch_applied"> | null | undefined,
 ): boolean {
+  if (benchmarkEvaluatorJobCommittedNothing(job)) return false;
   return Boolean(job && COMPLETED_EVALUATOR_STATUSES.has(job.status));
 }
 
