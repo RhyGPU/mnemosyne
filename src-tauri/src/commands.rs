@@ -128,6 +128,13 @@ const STATE_UPDATER_TARGET_TOKENS: usize = 1_600;
 const STATE_MAP_RECENT_SESSION_LIMIT: usize = 5;
 const DEFAULT_EVALUATOR_TIMEOUT_MS: u64 = 25_000;
 const DEFAULT_STRUCTURED_EVALUATOR_TIMEOUT_MS: u64 = 90_000;
+
+/// How many times the narrator call may be made for one turn.
+///
+/// Bounded at 2 because the only retryable case is a stream that delivered
+/// nothing — see the gate at the call site, which also checks that no chunk
+/// reached the reader before asking again.
+const NARRATOR_MAX_ATTEMPTS: usize = 2;
 const DEFAULT_DIAGNOSTIC_EVALUATOR_TIMEOUT_MS: u64 = 60_000;
 /// Generous ceiling for repair against a LOCAL (loopback) model. CPU inference of
 /// the ~2k-token repair prompt measured ~150s just for prompt eval on an i5; the
@@ -3372,134 +3379,171 @@ pub async fn send_api_turn(
     );
     let narrator_called_timer = Instant::now();
     let narrator_call_started = Instant::now();
-    let provider_completion = match provider
-        .complete_streaming_messages(
-            &narrator_settings,
-            narrator_payload.messages.clone(),
-            |chunk| {
-                stream_chunk_count_for_callback.fetch_add(1, Ordering::Relaxed);
-                stream_byte_count_for_callback
-                    .fetch_add(chunk.as_bytes().len() as u64, Ordering::Relaxed);
-                window
-                    .emit(
-                        "api-chunk",
-                        StreamChunk {
-                            conversation_id: stream_conversation_id.clone(),
-                            chunk: chunk.to_string(),
-                        },
-                    )
-                    .map_err(|err| err.to_string())
-            },
-        )
-        .await
-    {
-        Ok(completion) => {
-            emit_perf_log(
-                &window,
-                &conversation_id,
-                "narrator API call",
-                narrator_call_started.elapsed(),
-            );
-            turn_trace.provider_response_id = completion.provider_response_id.clone();
-            turn_trace.provider_request_id = completion.provider_request_id.clone();
-            emit_dev_log(
-                &window,
-                "success",
-                "stream",
-                "Narrator streaming finished",
-                Some(serde_json::json!({
-                    "conversation_id": conversation_id.as_str(),
-                    "request_id": request_id.as_str(),
-                    "chunks": stream_chunk_count.load(Ordering::Relaxed),
-                    "bytes": stream_byte_count.load(Ordering::Relaxed),
-                    "provider_response_id": completion.provider_response_id.as_deref()
-                })),
-            );
-            emit_dev_log(
-                &window,
-                "success",
-                "narrator",
-                "narrator_provider_finished",
-                Some(serde_json::json!({
-                    "conversation_id": conversation_id.as_str(),
-                    "request_id": request_id.as_str(),
-                    "finish_reason": completion.finish_reason.as_deref(),
-                    "provider_response_id": completion.provider_response_id.as_deref()
-                })),
-            );
-            completion
-        }
-        Err(err) => {
-            pipeline_trace.record_stage_error(
-                "narrator_called",
-                narrator_called_timer.elapsed().as_millis() as u64,
-                PipelineErrorCode::NarratorCallError,
-                err.clone(),
-                Some("Check LLM provider settings or availability".to_string()),
-            );
-            window.emit("pipeline-trace-updated", &pipeline_trace).ok();
-            let _ = state
-                .conn
-                .lock()
-                .map_err(|err| err.to_string())
-                .and_then(|conn| {
-                    let _ = update_llm_payload_pipeline_trace(
-                        &conn,
-                        payload_log_id,
-                        &serde_json::json!({
-                            "pipeline_trace": pipeline_trace,
-                            "narrator_trace": {
-                                "request_id": request_id.as_str(),
-                                "turn_id": turn_trace.turn_id.as_deref(),
-                                "conversation_id": conversation_id.as_str(),
-                                "provider": format!("narrator_{}", context_mode.label()),
-                                "model": narrator_settings.model.trim(),
-                                "fallback_used": false,
-                                "fallback_reason": serde_json::Value::Null,
-                                "narrator_retry_count": 0,
-                                "narrator_retry_succeeded": false,
-                                "narrator_provider_error": err.as_str()
-                            }
-                        }),
+    // A stream that carried nothing can be asked for again. A stream that
+    // carried something cannot: those bytes are already on the reader's screen,
+    // and a second attempt would write the turn over the top of itself. The
+    // chunk counter is what separates the two, so it — not the error text
+    // alone — is what gates the retry.
+    //
+    // Only the empty stream retries, and only immediately. The other transient
+    // classes the benchmark paths retry (429, 5xx) want a backoff, and a silent
+    // multi-second pause in front of a reader waiting on prose is its own
+    // failure; those keep surfacing as they do now.
+    let mut narrator_attempt = 0usize;
+    let mut narrator_retry_count = 0usize;
+    let provider_completion = loop {
+        narrator_attempt += 1;
+        match provider
+            .complete_streaming_messages(
+                &narrator_settings,
+                narrator_payload.messages.clone(),
+                |chunk| {
+                    stream_chunk_count_for_callback.fetch_add(1, Ordering::Relaxed);
+                    stream_byte_count_for_callback
+                        .fetch_add(chunk.as_bytes().len() as u64, Ordering::Relaxed);
+                    window
+                        .emit(
+                            "api-chunk",
+                            StreamChunk {
+                                conversation_id: stream_conversation_id.clone(),
+                                chunk: chunk.to_string(),
+                            },
+                        )
+                        .map_err(|err| err.to_string())
+                },
+            )
+            .await
+        {
+            Ok(completion) => {
+                emit_perf_log(
+                    &window,
+                    &conversation_id,
+                    "narrator API call",
+                    narrator_call_started.elapsed(),
+                );
+                turn_trace.provider_response_id = completion.provider_response_id.clone();
+                turn_trace.provider_request_id = completion.provider_request_id.clone();
+                emit_dev_log(
+                    &window,
+                    "success",
+                    "stream",
+                    "Narrator streaming finished",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "request_id": request_id.as_str(),
+                        "chunks": stream_chunk_count.load(Ordering::Relaxed),
+                        "bytes": stream_byte_count.load(Ordering::Relaxed),
+                        "provider_response_id": completion.provider_response_id.as_deref()
+                    })),
+                );
+                emit_dev_log(
+                    &window,
+                    "success",
+                    "narrator",
+                    "narrator_provider_finished",
+                    Some(serde_json::json!({
+                        "conversation_id": conversation_id.as_str(),
+                        "request_id": request_id.as_str(),
+                        "finish_reason": completion.finish_reason.as_deref(),
+                        "provider_response_id": completion.provider_response_id.as_deref()
+                    })),
+                );
+                break completion;
+            }
+            Err(err) => {
+                let stream_reached_the_reader = stream_chunk_count.load(Ordering::Relaxed) > 0;
+                if narrator_attempt < NARRATOR_MAX_ATTEMPTS
+                    && !stream_reached_the_reader
+                    && err
+                        .to_ascii_lowercase()
+                        .contains("api stream did not include assistant content")
+                {
+                    narrator_retry_count += 1;
+                    emit_dev_log(
+                        &window,
+                        "warn",
+                        "narrator",
+                        "narrator_empty_stream_retrying",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "request_id": request_id.as_str(),
+                            "attempt": narrator_attempt,
+                            "error": err.as_str()
+                        })),
                     );
-                    db::update_llm_payload_log_response(
-                        &conn,
-                        payload_log_id,
-                        &db::LlmPayloadResponseUpdate {
-                            provider_error: Some(err.clone()),
-                            ..Default::default()
-                        },
-                    )
+                    continue;
+                }
+                pipeline_trace.record_stage_error(
+                    "narrator_called",
+                    narrator_called_timer.elapsed().as_millis() as u64,
+                    PipelineErrorCode::NarratorCallError,
+                    err.clone(),
+                    Some("Check LLM provider settings or availability".to_string()),
+                );
+                window.emit("pipeline-trace-updated", &pipeline_trace).ok();
+                let _ = state
+                    .conn
+                    .lock()
                     .map_err(|err| err.to_string())
-                });
-            emit_dev_log(
-                &window,
-                "error",
-                "narrator",
-                "narrator_provider_failed",
-                Some(serde_json::json!({
-                    "conversation_id": conversation_id.as_str(),
-                    "request_id": request_id.as_str(),
-                    "error": err.clone()
-                })),
-            );
-            if err
-                .to_ascii_lowercase()
-                .contains("did not include assistant content")
-            {
+                    .and_then(|conn| {
+                        let _ = update_llm_payload_pipeline_trace(
+                            &conn,
+                            payload_log_id,
+                            &serde_json::json!({
+                                "pipeline_trace": pipeline_trace,
+                                "narrator_trace": {
+                                    "request_id": request_id.as_str(),
+                                    "turn_id": turn_trace.turn_id.as_deref(),
+                                    "conversation_id": conversation_id.as_str(),
+                                    "provider": format!("narrator_{}", context_mode.label()),
+                                    "model": narrator_settings.model.trim(),
+                                    "fallback_used": false,
+                                    "fallback_reason": serde_json::Value::Null,
+                                    "narrator_retry_count": narrator_retry_count,
+                                    "narrator_retry_succeeded": false,
+                                    "narrator_provider_error": err.as_str()
+                                }
+                            }),
+                        );
+                        db::update_llm_payload_log_response(
+                            &conn,
+                            payload_log_id,
+                            &db::LlmPayloadResponseUpdate {
+                                provider_error: Some(err.clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .map_err(|err| err.to_string())
+                    });
                 emit_dev_log(
                     &window,
                     "error",
                     "narrator",
-                    "narrator_empty_stream",
+                    "narrator_provider_failed",
                     Some(serde_json::json!({
                         "conversation_id": conversation_id.as_str(),
                         "request_id": request_id.as_str(),
                         "error": err.clone()
                     })),
                 );
+                if err
+                    .to_ascii_lowercase()
+                    .contains("did not include assistant content")
+                {
+                    emit_dev_log(
+                        &window,
+                        "error",
+                        "narrator",
+                        "narrator_empty_stream",
+                        Some(serde_json::json!({
+                            "conversation_id": conversation_id.as_str(),
+                            "request_id": request_id.as_str(),
+                            "error": err.clone()
+                        })),
+                    );
+                }
+                return Err(err);
             }
-            return Err(err);
         }
     };
     let mut active_provider_completion = provider_completion;
@@ -4426,8 +4470,12 @@ pub async fn send_api_turn(
             "response_integrity_ok": integrity_ok,
             "fallback_used": false,
             "fallback_reason": serde_json::Value::Null,
-            "narrator_retry_count": 0,
-            "narrator_retry_succeeded": serde_json::Value::Null,
+            "narrator_retry_count": narrator_retry_count,
+            "narrator_retry_succeeded": if narrator_retry_count > 0 {
+                serde_json::Value::Bool(true)
+            } else {
+                serde_json::Value::Null
+            },
             "narrator_provider_error": serde_json::Value::Null,
             "anti_replay_triggered": debug_replay_detected,
             "anti_replay_retry_count": anti_replay_retry_count,

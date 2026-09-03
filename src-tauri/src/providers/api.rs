@@ -19,6 +19,7 @@ Engine-controlled characters: may speak, act, react, misunderstand, interrupt, r
 
 [USER ACTION BOUNDARY]
 User-controlled characters own their decisions, thoughts, dialogue, intentions, and major voluntary actions.
+What the user writes about their own character outranks anything you have written about them. Your own earlier prose is not evidence about them: a name, title, role, history, or motive you gave them is a guess until they use it themselves. If their message declines or contradicts one, drop it and do not use it again — do not defend it, restate it, or read the correction as evasion.
 If the user says "I", resolve "I" to the active player persona, not to Aurora Schwarz.
 Aurora Schwarz is narrator-controlled. The user is not Aurora Schwarz.
 Do not use second-person "you" to describe Aurora. Use third-person narration by default.
@@ -201,6 +202,7 @@ When asked about backend tests, logs, imports, exports, memory hygiene, world ro
 
 const USER_ACTION_AND_CONFLICT_PROMPT: &str = r#"[USER ACTION BOUNDARY]
 User-controlled characters own their decisions, thoughts, dialogue, intentions, and major voluntary actions.
+What the user writes about their own character outranks anything you have written about them. Your own earlier prose is not evidence about them: a name, title, role, history, or motive you gave them is a guess until they use it themselves. If their message declines or contradicts one, drop it and do not use it again — do not defend it, restate it, or read the correction as evasion.
 The narrator may describe user-provided actions in concrete physical detail, including immediate follow-through, contact, momentum, posture, physical consequences, and observable effects.
 The narrator may describe unavoidable physical consequences caused by engine-controlled characters or the environment, such as being shoved off-balance, forced to brace, blocked, grabbed, pulled, interrupted, or pressured.
 Do not invent new user decisions, hidden motives, emotional reactions, dialogue, or major strategic choices.
@@ -3294,6 +3296,11 @@ mod tests {
         assert!(prompt.contains("[CHARACTER CONTROL]"));
         assert!(prompt.contains("[USER ACTION BOUNDARY]"));
         assert!(prompt.contains("decisions, thoughts, dialogue, intentions"));
+        // A live run had the narrator call the player "Analyst", the player say
+        // in scene "I didn't give you one", and the narrator go on using it.
+        // Its own output is the weaker of the two sources about him.
+        assert!(prompt.contains("outranks anything you have written about them"));
+        assert!(prompt.contains("is a guess until they use it themselves"));
         assert!(prompt.contains("[ACTION AND TURN CONTROL]"));
         assert!(prompt.contains("Engine-controlled characters may act proactively"));
         assert!(prompt.contains("stop on the attempt, demand, or pressure point"));
