@@ -1229,6 +1229,14 @@ pub(crate) fn is_transient_provider_error(error: &str) -> bool {
         || lower.contains("api request failed:")
         // Mid-stream drop on the streaming transport.
         || lower.contains("api stream failed")
+        // An SSE connection that delivered zero content deltas. The non-stream
+        // twin of this message ("API *response* did not include assistant
+        // content") stays a shape problem worth surfacing — a body that parsed
+        // and held nothing says something about the request. A stream that
+        // carried nothing says only that the connection carried nothing, and a
+        // loaded free endpoint does that to a prompt shape that worked on the
+        // previous turn.
+        || lower.contains("api stream did not include assistant content")
         || lower.contains(" 429")
         || lower.contains(" 500")
         || lower.contains(" 502")

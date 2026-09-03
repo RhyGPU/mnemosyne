@@ -833,10 +833,18 @@ fn transient_provider_errors_are_retryable() {
     assert!(is_transient_provider_error(
         "API stream failed: body truncated"
     ));
+    // A stream that carried no content deltas. Observed from a loaded free
+    // endpoint on the turn after the identical prompt shape succeeded, so it
+    // says nothing about the request — and it ended a ten-turn run.
+    assert!(is_transient_provider_error(
+        "API stream did not include assistant content"
+    ));
     // Shape problems are NOT transient — they must surface for diagnosis.
     assert!(!is_transient_provider_error(
         "API response parse failed: no assistant content found; raw body: {…}"
     ));
+    // Its non-stream twin stays a shape problem: a body that parsed and held
+    // no content is evidence about the request, not about the connection.
     assert!(!is_transient_provider_error(
         "API response did not include assistant content"
     ));

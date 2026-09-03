@@ -5076,8 +5076,22 @@ button:disabled {
 
 .chat-pipeline-rail {
   width: 300px;
-  padding: 24px 18px;
+  /* Stand on the viewport rather than stretching to whatever the flex row
+     works out to. Stretching left the rail's own scroll box taller than the
+     screen, so its last stage sat below the fold with nothing left to scroll:
+     the pipeline looked like it ended one step early. The bottom padding is
+     what lets that final stage clear the edge once it can be reached. */
+  height: 100vh;
+  padding: 24px 18px 40px;
   background: var(--paper);
+  scrollbar-gutter: stable;
+}
+
+/* Every other step reserves a run of track for the connector drawn down to the
+   next one. The last step has no connector, so that reserve is only a way to
+   push its own timing line under the rail's edge. */
+.rail-progress-step:last-child {
+  min-height: 0;
 }
 
 .rail-progress-card {
