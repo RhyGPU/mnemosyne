@@ -62,6 +62,7 @@ Write visible scene narration only. Include the visible status block. Do not wri
 
 [WHAT A CHARACTER MAY KNOW]
 Memory lines carry a disclosure note in their bracket. A line marked "thought, never said aloud" was never heard by anyone else: no other character may answer it, reference it, or act as if it were said. The same holds for "written" unless that character read it. A line with no disclosure note is unclassified: do not assume it was spoken.
+This governs the turn you are answering, not only remembered lines. If the user's message has their character write, read, or look at something without saying it aloud or holding it out, the content is theirs alone: do not quote it, paraphrase it, or let the light catch the ink. A closed page is closed. Write the other character asking to be shown instead.
 A character knows only what they perceived, were told, or already knew. If the context does not say they learned something, they do not know it. Do not have a character use a name, fact, or motive that was never given to them in the scene. When they lack information, write them noticing the gap — asking, guessing, or misreading — never quietly having the answer.
 
 [NO META-COMMENTARY]
@@ -1993,6 +1994,7 @@ Use only fields defined for each op. Never put confidence on update_scene_state;
 update_scene_state is current truth, not history: restate its continuity fields each turn, and send null once one is resolved or leaves play.\n\
 Use update_knowledge when the exchange changes who knows, suspects, wrongly believes, is unaware of, or is hiding something; give actual_truth for believes_false and counterpart_entity_id for hiding.\n\
 knows means the holder was told it, saw it, or lived it. A character naming, titling, or characterising someone else does not make it so: that is the speaker suspects, and stays suspects until the other party confirms it. Never record a fact about someone as knows on the strength of the holder's own words alone.\n\
+Content a character writes, reads to themselves, or studies without showing reaches nobody else. Record every other holder as unaware of it, however the narration behaves, unless the exchange shows it read aloud, handed over, or plainly in view.\n\
 Resolve user-controlled \"I\" to the active player persona. Prefer aliases instead of copying raw UUIDs when valid: active_soul, active_player, latest_speaker, session_world.\n\
 Current truth comes from the compact state JSON below; Rust validates semantics and applies the ledger.\n\n{}",
         structured_evaluator_current_state_block(
@@ -3270,6 +3272,12 @@ mod tests {
         let prompt = build_structured_evaluator_prompt(&soul, None);
 
         assert!(prompt.contains("knows means the holder was told it, saw it, or lived it"));
+        // A live run had him write a line, close the book, keep his hand on the
+        // cover, and pointedly not say it — and the ledger recorded her as
+        // knowing it. The memory was even tagged `written`; nothing carried
+        // that across to the knowledge row.
+        assert!(prompt.contains("reaches nobody else"));
+        assert!(prompt.contains("Record every other holder as unaware"));
         assert!(prompt.contains("that is the speaker suspects"));
         assert!(prompt.contains("on the strength of the holder's own words alone"));
     }
@@ -3387,6 +3395,12 @@ mod tests {
 
         assert!(prompt.contains("[OUTPUT]"));
         assert_scene_only_visible_prompt(&prompt);
+        // A live run had him write a line, close the book, keep his hand on the
+        // cover, and pointedly not say it — and the next paragraph opened with
+        // "the neon catches the fresh ink" and quoted it. The disclosure rule
+        // covered remembered lines only; the turn in hand was unguarded.
+        assert!(prompt.contains("A closed page is closed"));
+        assert!(prompt.contains("do not quote it, paraphrase it, or let the light catch the ink"));
         assert!(!prompt.contains("After each response, output a hidden state block"));
         assert!(!prompt.contains("[HIDDEN STATE]{"));
     }
