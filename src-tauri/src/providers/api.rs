@@ -1990,6 +1990,7 @@ Do not return empty ops for entering/leaving a location, object movement/conditi
 Use only fields defined for each op. Never put confidence on update_scene_state; confidence is allowed only on add_memory.\n\
 update_scene_state is current truth, not history: restate its continuity fields each turn, and send null once one is resolved or leaves play.\n\
 Use update_knowledge when the exchange changes who knows, suspects, wrongly believes, is unaware of, or is hiding something; give actual_truth for believes_false and counterpart_entity_id for hiding.\n\
+knows means the holder was told it, saw it, or lived it. A character naming, titling, or characterising someone else does not make it so: that is the speaker suspects, and stays suspects until the other party confirms it. Never record a fact about someone as knows on the strength of the holder's own words alone.\n\
 Resolve user-controlled \"I\" to the active player persona. Prefer aliases instead of copying raw UUIDs when valid: active_soul, active_player, latest_speaker, session_world.\n\
 Current truth comes from the compact state JSON below; Rust validates semantics and applies the ledger.\n\n{}",
         structured_evaluator_current_state_block(
@@ -3253,6 +3254,22 @@ mod tests {
             chat_completions_url("https://openrouter.ai/api/v1/chat/completions"),
             "https://openrouter.ai/api/v1/chat/completions"
         );
+    }
+
+    /// A live run recorded "The male persona is an analyst" as something Aurora
+    /// *knows*, on the strength of Aurora having called him one. He never said
+    /// it; the player character stopped and told her so in the scene ("You used
+    /// a title. I didn't give you one."), and the engine wrote it down as
+    /// knowledge anyway. Saying a thing about someone is not learning it.
+    #[test]
+    fn the_structured_evaluator_is_told_that_asserting_is_not_knowing() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+
+        let prompt = build_structured_evaluator_prompt(&soul, None);
+
+        assert!(prompt.contains("knows means the holder was told it, saw it, or lived it"));
+        assert!(prompt.contains("that is the speaker suspects"));
+        assert!(prompt.contains("on the strength of the holder's own words alone"));
     }
 
     #[test]

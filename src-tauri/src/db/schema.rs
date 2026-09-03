@@ -742,31 +742,32 @@ fn add_column_if_missing(
     Ok(false)
 }
 
-/// The old 25s evaluator ceiling, from when it was never the value that applied.
+/// Evaluator ceilings this project set for people, rather than ones they chose.
 ///
-/// Three timeout fields fed one call, and the front end filled all three, so the
-/// diagnostic default (60s) shadowed whatever a profile stored. Now that only
-/// `evaluator_timeout_ms` is sent, the stored 25s would suddenly bind — and bind
-/// tighter than the 60s these profiles were in practice running under. A model
-/// that reasons before it answers needs longer than either: glm-5.3-flash was
-/// measured at 49-70s per extraction, so both numbers cut it off mid-thought and
-/// the run read as a provider failure. Only rows still carrying the old default
-/// move; a number someone chose is theirs.
-const SHADOWED_EVALUATOR_TIMEOUT_MS: i64 = 25_000;
-const REPLACEMENT_EVALUATOR_TIMEOUT_MS: i64 = 120_000;
+/// 25s came from when the field was never the value that applied: three timeout
+/// fields fed one call and the front end filled all three, so the diagnostic
+/// default shadowed whatever a profile stored. 120s came from the migration that
+/// fixed that, sized against extractions measured at 49-70s.
+///
+/// Both are now too tight. A reasoning evaluator's cost grows with the
+/// transcript it is reading, and the same model on the same session walked
+/// 49s -> 69s -> 86s -> 103s -> 106s across five turns before crossing 120s and
+/// losing a turn's state to a timeout. The ceiling has to sit above where that
+/// curve is going, not where it started. A number someone typed is still theirs.
+const PROJECT_SET_EVALUATOR_TIMEOUTS_MS: [i64; 2] = [25_000, 120_000];
+const REPLACEMENT_EVALUATOR_TIMEOUT_MS: i64 = 180_000;
 
 fn raise_shadowed_evaluator_timeouts(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute(
-        "
-        UPDATE provider_profiles
-        SET evaluator_timeout_ms = ?1
-        WHERE evaluator_timeout_ms = ?2
-        ",
-        params![
-            REPLACEMENT_EVALUATOR_TIMEOUT_MS,
-            SHADOWED_EVALUATOR_TIMEOUT_MS
-        ],
-    )?;
+    for superseded in PROJECT_SET_EVALUATOR_TIMEOUTS_MS {
+        conn.execute(
+            "
+            UPDATE provider_profiles
+            SET evaluator_timeout_ms = ?1
+            WHERE evaluator_timeout_ms = ?2
+            ",
+            params![REPLACEMENT_EVALUATOR_TIMEOUT_MS, superseded],
+        )?;
+    }
     Ok(())
 }
 

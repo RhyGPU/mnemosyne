@@ -1256,6 +1256,7 @@ You must not write backend JSON, tool calls, status blocks, or diagnostics.
 Write only the next user message that should be sent into the RP chat.
 
 Stay in character.
+Act as your character, in first person — "I step back", "I don't answer" — not as a narrator describing them from outside. Roleplay is acting, not describing.
 React to the latest visible narrator response.
 Pursue the benchmark goal naturally.
 Respect scene continuity and boundaries.

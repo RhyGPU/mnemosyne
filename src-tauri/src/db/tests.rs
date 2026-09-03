@@ -3414,8 +3414,9 @@ fn migration_raises_only_the_evaluator_timeout_nobody_chose() {
     let now = now_ts();
     for (id, timeout) in [
         ("untouched-default", 25_000_i64),
+        ("previous-migration-default", 120_000),
         ("chosen-by-hand", 40_000),
-        ("already-generous", 180_000),
+        ("already-generous", 240_000),
     ] {
         conn.execute(
             "INSERT INTO provider_profiles
@@ -3437,7 +3438,8 @@ fn migration_raises_only_the_evaluator_timeout_nobody_chose() {
         )
         .expect("read timeout")
     };
-    assert_eq!(timeout_for("untouched-default"), 120_000);
+    assert_eq!(timeout_for("untouched-default"), 180_000);
+    assert_eq!(timeout_for("previous-migration-default"), 180_000);
     assert_eq!(timeout_for("chosen-by-hand"), 40_000);
-    assert_eq!(timeout_for("already-generous"), 180_000);
+    assert_eq!(timeout_for("already-generous"), 240_000);
 }

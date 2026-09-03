@@ -1114,6 +1114,12 @@ fn player_simulator_prompt_keeps_control_on_user_side() {
     assert!(prompt.contains("Write only the next user message"));
     assert!(prompt.contains("You are not the narrator"));
     assert!(prompt.contains("backend JSON"));
+    // The narrator writes its character in third person, and with nothing said
+    // here the simulator drifted into doing the same for its own — one live run
+    // produced "He doesn't flinch. His hand moves" and "I don't correct it" for
+    // the same character, minutes apart.
+    assert!(prompt.contains("in first person"));
+    assert!(prompt.contains("acting, not describing"));
 }
 
 #[test]

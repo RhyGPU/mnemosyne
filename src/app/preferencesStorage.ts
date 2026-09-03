@@ -34,11 +34,12 @@ export const DEV_LOG_LIMIT = 1000;
  * This is the only evaluator timeout a person sets; the structured and
  * diagnostic timeouts stay unset unless a profile names one, so that whatever
  * is configured here is what actually reaches the provider call. A reasoning
- * model spends most of its budget before the first visible token — glm-5.3-flash
- * measured 49-70s per extraction — so the ceiling has to clear that with room,
- * or a slow-but-correct model reads as a broken one.
+ * model spends most of its budget before the first visible token, and that cost
+ * grows with the transcript it is reading: glm-5.3-flash walked 49s to 106s over
+ * five turns of one session. The ceiling has to sit above where that curve is
+ * going, or a slow-but-correct model reads as a broken one.
  */
-export const DEFAULT_EVALUATOR_TIMEOUT_MS = 120_000;
+export const DEFAULT_EVALUATOR_TIMEOUT_MS = 180_000;
 
 /**
  * How many turns in a row may lose their state before a benchmark gives up.
