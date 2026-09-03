@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
 import { Play, RefreshCcw } from "lucide-react";
 import type { SessionStateMap } from "../../tauri";
-import { KnowledgeGrid } from "./KnowledgeGrid";
 import {
   buildStateMapPresentation,
   humanizeStateMapText,
@@ -29,13 +28,11 @@ export function StateMapView({
 
 export function StateMapDashboard({
   busy,
-  conversationId,
   onBackToPlay,
   onRefresh,
   stateMap,
 }: {
   busy: boolean;
-  conversationId: string | null;
   onBackToPlay: () => void;
   onRefresh: () => void;
   stateMap: SessionStateMap | null;
@@ -260,21 +257,6 @@ export function StateMapDashboard({
                   </aside>
                 </div>
               )}
-            </section>
-
-            <section className="statemap-panel statemap-knowledge-panel">
-              <h2 className="statemap-panel-title">
-                <span className="statemap-dot warm" /> Who Knows What{" "}
-                <span className="statemap-count">
-                  what has and has not been disclosed
-                </span>
-              </h2>
-              <p className="statemap-note">
-                The engine reads most of this from the transcript. Correct it here for
-                anything it cannot see: a previous session, or something that happened
-                off-screen.
-              </p>
-              <KnowledgeGrid conversationId={conversationId} busy={busy} />
             </section>
 
             <section className="statemap-panel statemap-memory-panel">

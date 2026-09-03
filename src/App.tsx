@@ -224,6 +224,7 @@ import { DevModeShell } from "./components/views/DevModeShell";
 import { HomeDashboard, HomeView } from "./components/views/HomeView";
 import { LibraryView } from "./components/views/LibraryView";
 import { SettingsPageView } from "./components/views/SettingsPageView";
+import { KnowledgeGrid } from "./components/views/KnowledgeGrid";
 import { StateMapDashboard, StateMapView } from "./components/views/StateMapView";
 import { getFocusableElements, useModalBehavior } from "./components/a11y";
 import {
@@ -340,6 +341,7 @@ type DisclaimerMode = "launch" | "manual" | null;
 export function App() {
   const [souls, setSouls] = useState<SoulSummary[]>([]);
   const [benchmarkPlayerCharacterSoulId, setBenchmarkPlayerCharacterSoulId] = useState("");
+  const [knowledgeEditorOpen, setKnowledgeEditorOpen] = useState(false);
   const [archivedSouls, setArchivedSouls] = useState<SoulSummary[]>([]);
   const [settings, setSettings] = useState<SettingSummary[]>([]);
   const [archivedSettings, setArchivedSettings] = useState<SettingSummary[]>([]);
@@ -6034,7 +6036,6 @@ export function App() {
       <StateMapView appDialogNode={appDialogNode} railNav={railNav} railShellClass={railShellClass}>
         <StateMapDashboard
           busy={busy}
-          conversationId={currentConversationId}
           onBackToPlay={() => setView("chat")}
           onRefresh={() => void refreshSessionStateHub()}
           stateMap={sessionStateMap}
@@ -6715,6 +6716,37 @@ export function App() {
                     </div>
                   ) : null}
                 </section>
+              </div>
+            ) : null}
+          </section>
+
+          <section
+            className={`creator-section workspace-card collapsible-section ${
+              knowledgeEditorOpen ? "open" : ""
+            }`}
+          >
+            <button
+              className="section-toggle studio-toggle"
+              type="button"
+              onClick={() => setKnowledgeEditorOpen((open) => !open)}
+              aria-expanded={knowledgeEditorOpen}
+            >
+              <span>
+                <span className="eyebrow">Relationship</span>
+                <strong>What they know about each other</strong>
+              </span>
+              <ChevronDown size={18} aria-hidden="true" />
+            </button>
+
+            {knowledgeEditorOpen ? (
+              <div className="section-body">
+                <p className="hint">
+                  Where the story starts. Once it is running the engine works most of this
+                  out from the transcript — a name counts as known once it has been said —
+                  so this is for what it cannot see: a previous session, or something that
+                  happened off-screen.
+                </p>
+                <KnowledgeGrid conversationId={currentConversationId} busy={busy} />
               </div>
             ) : null}
           </section>
