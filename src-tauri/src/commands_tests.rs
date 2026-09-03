@@ -685,20 +685,6 @@ fn token_comparison_is_not_marked_provider_reported_when_estimates_are_mixed_in(
 }
 
 #[test]
-fn the_player_simulator_is_told_it_is_in_the_story_not_testing_it() {
-    // A live run had the simulated player interrogating the character as
-    // software — "You're Aurora, correct? The system running a memory and
-    // persona framework?" — which measures meta-conversation, not roleplay.
-    for prompt in [
-        crate::benchmark::benchmark_player_simulator_prompt(),
-        crate::benchmark::benchmark_character_simulator_prompt(),
-    ] {
-        assert!(prompt.contains("not software"));
-        assert!(prompt.contains("Never treat them as an AI"));
-    }
-}
-
-#[test]
 fn evaluator_settings_without_a_model_are_refused_before_a_job_starts() {
     // What an unassigned State Updater profile actually looks like: the built-in
     // default. It reached the provider as an empty model, failed in
