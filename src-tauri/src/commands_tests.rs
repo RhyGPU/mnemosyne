@@ -685,6 +685,62 @@ fn token_comparison_is_not_marked_provider_reported_when_estimates_are_mixed_in(
 }
 
 #[test]
+fn the_player_simulator_is_told_it_is_in_the_story_not_testing_it() {
+    // A live run had the simulated player interrogating the character as
+    // software — "You're Aurora, correct? The system running a memory and
+    // persona framework?" — which measures meta-conversation, not roleplay.
+    for prompt in [
+        crate::benchmark::benchmark_player_simulator_prompt(),
+        crate::benchmark::benchmark_character_simulator_prompt(),
+    ] {
+        assert!(prompt.contains("not software"));
+        assert!(prompt.contains("Never treat them as an AI"));
+    }
+}
+
+#[test]
+fn evaluator_settings_without_a_model_are_refused_before_a_job_starts() {
+    // What an unassigned State Updater profile actually looks like: the built-in
+    // default. It reached the provider as an empty model, failed in
+    // milliseconds, and was recorded as partial_success with no error.
+    let unassigned = ApiProviderSettings {
+        base_url: "https://api.openai.com/v1".into(),
+        model: String::new(),
+        api_key: "sk-test".into(),
+        ..ApiProviderSettings::default()
+    };
+
+    assert_eq!(
+        unusable_evaluator_settings(&unassigned),
+        Some("no evaluator model is set")
+    );
+}
+
+#[test]
+fn a_configured_evaluator_profile_is_accepted() {
+    let configured = ApiProviderSettings {
+        base_url: "https://openrouter.ai/api/v1".into(),
+        model: "z-ai/glm-5.3-flash".into(),
+        api_key: "sk-or-v1-test".into(),
+        ..ApiProviderSettings::default()
+    };
+
+    assert_eq!(unusable_evaluator_settings(&configured), None);
+}
+
+#[test]
+fn a_local_endpoint_needs_no_key() {
+    let local = ApiProviderSettings {
+        base_url: "http://127.0.0.1:8080/v1".into(),
+        model: "local-model".into(),
+        api_key: String::new(),
+        ..ApiProviderSettings::default()
+    };
+
+    assert_eq!(unusable_evaluator_settings(&local), None);
+}
+
+#[test]
 fn a_configured_context_ceiling_is_honoured() {
     let budget = state_engine::context_compiler::budget_with_max_tokens(Some(9_000));
 

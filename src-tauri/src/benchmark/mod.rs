@@ -1252,7 +1252,11 @@ React to the latest visible narrator response.
 Pursue the benchmark goal naturally.
 Respect scene continuity and boundaries.
 Do not rush the scene unless the goal requires it.
-Do not summarize. Do not explain. Output only the user message."#
+Do not summarize. Do not explain. Output only the user message.
+
+[YOU ARE IN THE STORY, NOT TESTING IT]
+The other character is a person in the scene, not software. Never treat them as an AI, a system, a model, an architecture, or a memory framework. Never audit, probe, benchmark, or run diagnostics on them, and never speak as an engineer describing what you are doing.
+Write what a person in this scene would actually say and do. If your goal sounds like a test, pursue it the way a character would: by asking, doing, or provoking something inside the fiction."#
 }
 
 /// Build the persona description and the closing instruction for a player-line
@@ -1297,7 +1301,10 @@ Stay in character: use their described personality, voice, and motives.
 React to the latest visible narrator response.
 Pursue the benchmark goal in a way your character would actually pursue it.
 Respect scene continuity and boundaries.
-Do not summarize. Do not explain. Output only your character's message."#
+Do not summarize. Do not explain. Output only your character's message.
+
+[YOU ARE IN THE STORY, NOT TESTING IT]
+The other character is a person in the scene, not software. Never treat them as an AI, a system, a model, or an architecture, and never speak as an engineer describing what you are doing."#
 }
 
 fn traditional_rp_prompt() -> &'static str {

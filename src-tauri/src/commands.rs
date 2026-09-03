@@ -4853,7 +4853,58 @@ pub async fn send_api_turn(
     }
 
     let job_start = Instant::now();
-    if evaluator_background_enabled(&state_updater_settings) {
+    // A background job whose settings cannot produce a request finishes in
+    // milliseconds having called nothing, and used to report `partial_success`
+    // with no error and no patch — so a whole run could look like it evaluated
+    // every turn while storing nothing. Refuse up front and say why.
+    // An unassigned State Updater profile arrives as the built-in default: no
+    // model, and OpenAI's base URL. Rather than skip evaluation for the whole
+    // session, borrow the narrator's profile — it is configured by definition,
+    // since the turn just used it. Announced, not silent: a run that quietly
+    // evaluated with different settings than the operator chose is its own bug.
+    let state_updater_settings = match unusable_evaluator_settings(&state_updater_settings) {
+        Some(reason) if unusable_evaluator_settings(&narrator_settings).is_none() => {
+            emit_dev_log(
+                &window,
+                "warn",
+                "evaluator",
+                "evaluator_settings_fell_back_to_narrator",
+                Some(serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "reason": reason,
+                    "using_model": narrator_settings.model.trim(),
+                    "hint": "Assign a State Updater profile in Settings > AI to choose the model yourself.",
+                })),
+            );
+            ApiProviderSettings {
+                evaluator_background_enabled: state_updater_settings.evaluator_background_enabled,
+                evaluator_mode: state_updater_settings.evaluator_mode.clone(),
+                structured_evaluator_transport: state_updater_settings
+                    .structured_evaluator_transport
+                    .clone(),
+                structured_evaluator_policy: state_updater_settings
+                    .structured_evaluator_policy
+                    .clone(),
+                ..narrator_settings.clone()
+            }
+        }
+        _ => state_updater_settings,
+    };
+
+    if let Some(reason) = unusable_evaluator_settings(&state_updater_settings) {
+        emit_dev_log(
+            &window,
+            "error",
+            "evaluator",
+            "evaluator_settings_unusable",
+            Some(serde_json::json!({
+                "conversation_id": conversation_id,
+                "reason": reason,
+                "base_url": state_updater_settings.base_url.trim(),
+                "hint": "Assign a State Updater provider profile in Settings > AI.",
+            })),
+        );
+    } else if evaluator_background_enabled(&state_updater_settings) {
         let entity_updater_context =
             build_entity_updater_context(&pre_baseline_soul, &entity_context);
         let memory_debug_nonce = format!("memory-debug-{}", uuid_like_id());
@@ -10892,6 +10943,25 @@ pub(crate) fn effective_evaluator_timeout_ms(settings: &ApiProviderSettings) -> 
                 .unwrap_or(DEFAULT_STRUCTURED_EVALUATOR_TIMEOUT_MS),
         )
     }
+}
+
+/// Why these settings could never reach a provider, if so.
+///
+/// Checked before a job is created rather than inside the call, because the
+/// failure is a configuration gap and the error should name it: an empty model
+/// with the built-in default base URL means no updater profile was ever
+/// assigned, which reads nothing like the transport error the call would raise.
+fn unusable_evaluator_settings(settings: &ApiProviderSettings) -> Option<&'static str> {
+    if settings.model.trim().is_empty() {
+        return Some("no evaluator model is set");
+    }
+    if settings.base_url.trim().is_empty() {
+        return Some("no evaluator base URL is set");
+    }
+    if settings.api_key.trim().is_empty() && !settings.base_url.contains("127.0.0.1") {
+        return Some("the evaluator profile has no API key");
+    }
+    None
 }
 
 fn evaluator_background_enabled(settings: &ApiProviderSettings) -> bool {
