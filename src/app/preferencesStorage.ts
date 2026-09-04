@@ -49,6 +49,15 @@ export const DEFAULT_EVALUATOR_TIMEOUT_MS = 180_000;
  */
 export const MAX_CONSECUTIVE_EVALUATOR_FAILURES = 3;
 
+/**
+ * The extraction pipeline a session uses unless a profile names another.
+ *
+ * The perception compiler is the post-overhaul path: the evaluator describes
+ * what was perceived and Rust decides what persists, rather than the model
+ * proposing state changes directly.
+ */
+export const DEFAULT_EVALUATOR_MODE = "evaluator_perception_v2";
+
 export function hasAcceptedDisclaimerVersion() {
   try {
     const raw = localStorage.getItem(DISCLAIMER_STORAGE_KEY);

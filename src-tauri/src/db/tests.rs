@@ -3443,3 +3443,40 @@ fn migration_raises_only_the_evaluator_timeout_nobody_chose() {
     assert_eq!(timeout_for("chosen-by-hand"), 40_000);
     assert_eq!(timeout_for("already-generous"), 240_000);
 }
+
+#[test]
+fn migration_moves_only_shipped_evaluator_modes_to_the_compiler() {
+    // The perception compiler is the path under test after the overhaul, but a
+    // mode someone chose by hand is theirs — only the values this project set
+    // as a default move.
+    let conn = init_memory_connection().expect("db");
+    let now = now_ts();
+    for (id, mode) in [
+        ("shipped-form", "evaluator_form_v1"),
+        ("shipped-structured", "evaluator_structured_v1"),
+        ("chosen-by-hand", "form_v1_compact"),
+    ] {
+        conn.execute(
+            "INSERT INTO provider_profiles
+             (id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
+              evaluator_mode)
+             VALUES (?1, ?1, 'https://example.test/v1', '', 'model', '', ?2, ?2, ?3)",
+            params![id, now, mode],
+        )
+        .expect("insert profile");
+    }
+
+    run_migrations(&conn).expect("migrations");
+
+    let mode_for = |id: &str| -> String {
+        conn.query_row(
+            "SELECT evaluator_mode FROM provider_profiles WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .expect("read mode")
+    };
+    assert_eq!(mode_for("shipped-form"), "evaluator_perception_v2");
+    assert_eq!(mode_for("shipped-structured"), "evaluator_perception_v2");
+    assert_eq!(mode_for("chosen-by-hand"), "form_v1_compact");
+}

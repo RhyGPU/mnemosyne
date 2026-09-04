@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 
 import type { ApiProviderSettings } from "../../tauri";
 import {
+  DEFAULT_EVALUATOR_MODE,
   DEFAULT_EVALUATOR_TIMEOUT_MS,
   EVALUATOR_EXECUTION_MODE_STORAGE_KEY,
   NARRATOR_PROVIDER_PROFILE_STORAGE_KEY,
@@ -29,7 +30,7 @@ function defaultProviderSettings(systemPrompt = ""): ApiProviderSettings {
     structured_evaluator_timeout_ms: null,
     diagnostic_evaluator_timeout_ms: null,
     evaluator_timeout_mode: "finite",
-    evaluator_mode: "evaluator_form_v1",
+    evaluator_mode: DEFAULT_EVALUATOR_MODE,
     structured_evaluator_policy: "prefer",
     structured_evaluator_max_retries: 1,
     wait_for_evaluator_before_next_turn: true,

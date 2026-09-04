@@ -2037,6 +2037,7 @@ A statement or belief is not automatically a verified world fact. Preserve who s
 For relationship_evidence only, provide behavior labels and bounded valence/directness/stakes/costliness/repetition; use null relationship_signal for every other kind.\n\
 Use correction only for explicit correction/retcon evidence. Do not silently erase older facts.\n\
 For scene_observation, set predicate to one continuity slot: location, scene, focus, position, room_state, active_object, misunderstanding, open_question, pressure_point, or last_action. Put the current value in object.text, or null when that slot is now empty. Scene claims are current truth, so never anchor them before the current turn.\n\
+For knowledge_claim, set subject to the holder, predicate to one of knows, suspects, believes_false, unaware, or hiding, and object.text to the proposition. knows means the holder was told it, saw it, or lived it. A character naming, titling, or characterising someone else does not make it so: that is suspects, and stays suspects until the other party confirms it. Never claim knows about someone on the strength of the holder's own words alone. Content a character writes, reads to themselves, or studies without showing reaches nobody else: every other holder is unaware of it, however the narration behaves, unless the exchange shows it read aloud, handed over, or plainly in view.\n\
 durability_hint is advisory only; Rust decides whether anything persists.\n\
 If the exchange has no meaningful perception candidate, return candidates: [] and a specific no_op_reason.\n\
 Do not invent events, motives, thoughts, temporal anchors, participants, or evidence.\n\n{}",
@@ -3280,6 +3281,21 @@ mod tests {
         assert!(prompt.contains("Record every other holder as unaware"));
         assert!(prompt.contains("that is the speaker suspects"));
         assert!(prompt.contains("on the strength of the holder's own words alone"));
+    }
+
+    /// The perception schema has carried `knowledge_claim` since the overhaul,
+    /// but the prompt never asked for one, so the who-knows-what layer was
+    /// unreachable on the compiler path while V1 was quietly carrying it.
+    #[test]
+    fn the_perception_prompt_asks_for_knowledge_and_keeps_the_disclosure_rules() {
+        let soul = state_engine::soul::new_default_soul("Aurora");
+
+        let prompt = build_perception_v2_prompt(&soul, None);
+
+        assert!(prompt.contains("For knowledge_claim, set subject to the holder"));
+        assert!(prompt.contains("knows means the holder was told it, saw it, or lived it"));
+        assert!(prompt.contains("that is suspects, and stays suspects"));
+        assert!(prompt.contains("reaches nobody else"));
     }
 
     #[test]

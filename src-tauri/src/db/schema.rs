@@ -640,6 +640,7 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "provider_profiles", "archived_at", "INTEGER")?;
 
     raise_shadowed_evaluator_timeouts(conn)?;
+    adopt_perception_compiler_for_untouched_profiles(conn)?;
 
     add_column_if_missing(
         conn,
@@ -756,6 +757,29 @@ fn add_column_if_missing(
 /// curve is going, not where it started. A number someone typed is still theirs.
 const PROJECT_SET_EVALUATOR_TIMEOUTS_MS: [i64; 2] = [25_000, 120_000];
 const REPLACEMENT_EVALUATOR_TIMEOUT_MS: i64 = 180_000;
+
+/// Evaluator modes the project shipped as a default, rather than ones a person
+/// picked. Both predate the perception compiler being the path under test.
+///
+/// The compiler is the post-overhaul route: the model reports what it perceived
+/// and Rust decides what persists, instead of the model proposing state changes
+/// directly. Profiles still carrying an older shipped default move to it; a mode
+/// someone selected stays selected.
+const PROJECT_SET_EVALUATOR_MODES: [&str; 2] = ["evaluator_form_v1", "evaluator_structured_v1"];
+
+fn adopt_perception_compiler_for_untouched_profiles(conn: &Connection) -> rusqlite::Result<()> {
+    for superseded in PROJECT_SET_EVALUATOR_MODES {
+        conn.execute(
+            "
+            UPDATE provider_profiles
+            SET evaluator_mode = 'evaluator_perception_v2'
+            WHERE evaluator_mode = ?1
+            ",
+            params![superseded],
+        )?;
+    }
+    Ok(())
+}
 
 fn raise_shadowed_evaluator_timeouts(conn: &Connection) -> rusqlite::Result<()> {
     for superseded in PROJECT_SET_EVALUATOR_TIMEOUTS_MS {
