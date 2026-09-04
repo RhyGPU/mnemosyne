@@ -6350,16 +6350,22 @@ fn evaluator_gate_parses_per_line_and_cjk_dialogue() {
     assert!(status_gate_signature("```status\nAtmosphere: Calm\n```").is_none());
 }
 
+/// Unset falls to fast, and so does anything unrecognised.
+///
+/// `balanced` evaluates every turn, which no evaluator that reasons before it
+/// answers can keep up with: 150-190s against turns arriving every 100s, and
+/// the gap only widens. Skipping a turn where nothing moved queues it for the
+/// next run; running every turn and falling behind loses the present.
 #[test]
-fn evaluator_execution_mode_defaults_to_balanced() {
+fn evaluator_execution_mode_defaults_to_fast() {
     let mut settings = ApiProviderSettings::default();
-    assert_eq!(evaluator_execution_mode(&settings), "balanced");
-    settings.evaluator_execution_mode = Some("fast".into());
     assert_eq!(evaluator_execution_mode(&settings), "fast");
+    settings.evaluator_execution_mode = Some("balanced".into());
+    assert_eq!(evaluator_execution_mode(&settings), "balanced");
     settings.evaluator_execution_mode = Some("long_context".into());
     assert_eq!(evaluator_execution_mode(&settings), "long_context");
     settings.evaluator_execution_mode = Some("warp_speed".into());
-    assert_eq!(evaluator_execution_mode(&settings), "balanced");
+    assert_eq!(evaluator_execution_mode(&settings), "fast");
 }
 
 #[test]

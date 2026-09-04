@@ -76,6 +76,22 @@ export const DEFAULT_EVALUATOR_BACKGROUND_ENABLED = true;
 export const DEFAULT_WAIT_FOR_EVALUATOR_BEFORE_NEXT_TURN = false;
 export const DEFAULT_ALLOW_SEND_WITH_STALE_STATE = true;
 
+/**
+ * How often the evaluator runs.
+ *
+ * `balanced` evaluates every turn. That was the default while nobody had timed
+ * it: an extraction that reasons before it answers takes 150-190s on the models
+ * that extract properly at all, while turns arrive every 100s or so, and the
+ * gap only grows. State ends up several turns behind what is on screen.
+ *
+ * `fast` skips turns where nothing moved — no change of focus, no change of
+ * physical state, no correction, and a user line that reads as dialogue. Those
+ * exchanges are queued and folded into the next run rather than dropped, so the
+ * trade is fewer, later updates, not lost ones. A faster evaluator can go back
+ * to `balanced`.
+ */
+export const DEFAULT_EVALUATOR_EXECUTION_MODE = "fast";
+
 export function hasAcceptedDisclaimerVersion() {
   try {
     const raw = localStorage.getItem(DISCLAIMER_STORAGE_KEY);

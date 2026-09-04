@@ -7662,11 +7662,16 @@ const EVALUATOR_EXECUTION_MODE_FAST: &str = "fast";
 const EVALUATOR_EXECUTION_MODE_BALANCED: &str = "balanced";
 const EVALUATOR_EXECUTION_MODE_LONG_CONTEXT: &str = "long_context";
 
+/// Unset means fast, matching the front end's default.
+///
+/// Two defaults that disagree is how the evaluator timeout spent months being
+/// a number nobody's setting could reach, so this fallback tracks the one a
+/// person actually sees.
 fn evaluator_execution_mode(settings: &ApiProviderSettings) -> &'static str {
     match settings.evaluator_execution_mode.as_deref() {
-        Some(EVALUATOR_EXECUTION_MODE_FAST) => EVALUATOR_EXECUTION_MODE_FAST,
+        Some(EVALUATOR_EXECUTION_MODE_BALANCED) => EVALUATOR_EXECUTION_MODE_BALANCED,
         Some(EVALUATOR_EXECUTION_MODE_LONG_CONTEXT) => EVALUATOR_EXECUTION_MODE_LONG_CONTEXT,
-        _ => EVALUATOR_EXECUTION_MODE_BALANCED,
+        _ => EVALUATOR_EXECUTION_MODE_FAST,
     }
 }
 

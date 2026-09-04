@@ -4,6 +4,7 @@ import type { ApiProviderSettings } from "../../tauri";
 import {
   DEFAULT_ALLOW_SEND_WITH_STALE_STATE,
   DEFAULT_EVALUATOR_BACKGROUND_ENABLED,
+  DEFAULT_EVALUATOR_EXECUTION_MODE,
   DEFAULT_EVALUATOR_MODE,
   DEFAULT_WAIT_FOR_EVALUATOR_BEFORE_NEXT_TURN,
   DEFAULT_EVALUATOR_TIMEOUT_MS,
@@ -83,7 +84,7 @@ export function useProviderSettings() {
     [apiSettings, generationPreferences],
   );
   const [evaluatorExecutionMode, setEvaluatorExecutionMode] = useState(
-    () => localStorage.getItem(EVALUATOR_EXECUTION_MODE_STORAGE_KEY) ?? "balanced",
+    () => localStorage.getItem(EVALUATOR_EXECUTION_MODE_STORAGE_KEY) ?? DEFAULT_EVALUATOR_EXECUTION_MODE,
   );
   const [structuredEvaluatorTransport, setStructuredEvaluatorTransport] = useState(
     () => localStorage.getItem(STRUCTURED_EVALUATOR_TRANSPORT_STORAGE_KEY) ?? "auto",
