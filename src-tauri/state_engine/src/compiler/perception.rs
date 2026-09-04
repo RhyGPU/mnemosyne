@@ -1,3 +1,4 @@
+use crate::soul::SpeechAct;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -44,6 +45,19 @@ pub struct PerceptionCandidateDraft {
     pub target_refs: Vec<String>,
     pub evidence: EvidenceSpan,
     pub epistemic_mode: EpistemicMode,
+    /// How the thing reached the room, as distinct from how the evaluator came
+    /// to know it. `epistemic_mode` answers the second and cannot answer the
+    /// first: a line "stated by" someone is spoken, but narrator-described
+    /// covers an action, a glance, and a page nobody was shown alike. Deriving
+    /// one axis from the other is the conflation `SpeechAct` exists to prevent,
+    /// so the model is asked outright.
+    ///
+    /// Required in the JSON schema, so an enforcing provider will not let it be
+    /// skipped, but defaulted here: when enforcement degrades to json_object or
+    /// prose, losing an entire batch over one absent field is worse than one
+    /// memory landing unclassified.
+    #[serde(default)]
+    pub speech_act: SpeechAct,
     pub extraction_confidence: f32,
     pub temporal: TemporalExpression,
     pub durability_hint: DurabilityHint,
@@ -364,7 +378,7 @@ pub fn perception_ir_json_schema() -> serde_json::Value {
         "additionalProperties": false,
         "required": [
             "kind", "subject_ref", "predicate", "object", "actor_ref",
-            "perceiver_ref", "target_refs", "evidence", "epistemic_mode",
+            "perceiver_ref", "target_refs", "evidence", "epistemic_mode", "speech_act",
             "extraction_confidence", "temporal", "durability_hint", "relationship_signal"
         ],
         "properties": {
@@ -395,6 +409,10 @@ pub fn perception_ir_json_schema() -> serde_json::Value {
                     "start_char": nullable_u32,
                     "end_char": nullable_u32
                 }
+            },
+            "speech_act": {
+                "type": "string",
+                "enum": ["spoken", "thought", "action", "observed", "written", "unspecified"]
             },
             "epistemic_mode": {
                 "type": "string",

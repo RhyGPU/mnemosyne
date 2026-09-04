@@ -9,6 +9,7 @@ use state_engine::compiler::{
     StateEffectKind, TemporalAnchor, TemporalExpression, MEMORY_COMPILER_CONTRACT_VERSION,
     PERCEPTION_IR_SCHEMA_VERSION, SOURCE_ENVELOPE_SCHEMA_VERSION,
 };
+use state_engine::soul::SpeechAct;
 
 fn identity() -> SourceIdentity {
     SourceIdentity {
@@ -36,6 +37,7 @@ fn source(assistant_text: &str) -> SourceEnvelope {
 
 fn candidate() -> PerceptionCandidateDraft {
     PerceptionCandidateDraft {
+        speech_act: SpeechAct::Spoken,
         kind: PerceptionKind::RelationshipEvidence,
         subject_ref: "active_player".into(),
         predicate: "returned_as_promised".into(),
@@ -290,6 +292,7 @@ fn effects_and_transactions_inherit_engine_owned_provenance() {
     let effect = StateEffect {
         provenance: first,
         effect: StateEffectKind::FormMemory {
+            speech_act: SpeechAct::Spoken,
             owner_soul_id: "soul-a".into(),
             memory_kind: MemoryFormationKind::Episode,
             content: "The visitor returned the brass key as promised.".into(),
@@ -326,6 +329,7 @@ fn transaction_rejects_cross_source_effect_injection() {
         effects: vec![StateEffect {
             provenance,
             effect: StateEffectKind::RecordIntention {
+                speech_act: SpeechAct::Thought,
                 owner_entity_id: "active_player".into(),
                 content: "Keep the key.".into(),
                 target_entity_ids: Vec::new(),
@@ -437,6 +441,7 @@ fn deterministic_pipeline_binds_validates_lowers_and_simulates_relationship_evid
 
 fn scene_candidate(predicate: &str, value: Option<&str>) -> PerceptionCandidateDraft {
     PerceptionCandidateDraft {
+        speech_act: SpeechAct::Spoken,
         kind: PerceptionKind::SceneObservation,
         subject_ref: "active_soul".into(),
         predicate: predicate.into(),
@@ -744,6 +749,7 @@ fn hearsay_event_forms_testimony_instead_of_world_truth() {
     assert!(matches!(
         report.lowering.effects[0].effect,
         StateEffectKind::FormMemory {
+            speech_act: SpeechAct::Spoken,
             memory_kind: MemoryFormationKind::Testimony,
             ..
         }
@@ -965,4 +971,48 @@ fn metamorphic_actor_perceiver_negation_and_paraphrase_change_only_owned_semanti
     negated.predicate = "did_not_return".into();
     assert_eq!(compile(positive.clone()), compile(paraphrase));
     assert_ne!(compile(positive), compile(negated));
+}
+
+/// The perception schema must demand a speech act, because the pipeline has no
+/// honest way to recover one afterwards.
+///
+/// `epistemic_mode` answers how the evaluator knows a thing; `speech_act`
+/// answers whether the room heard it. Deriving the second from the first is the
+/// conflation the type exists to prevent — "narrator described" covers an
+/// action, a glance, and a page nobody was shown alike. When the compiler
+/// became the default without this field, 25 of 30 memories in the first live
+/// session came back `unspecified`, and an unspecified line carries no
+/// disclosure note into the narrator prompt at all.
+#[test]
+fn the_perception_schema_requires_a_speech_act() {
+    let schema = state_engine::compiler::perception::perception_ir_json_schema();
+    let candidate = &schema["properties"]["candidates"]["items"];
+
+    let required: Vec<&str> = candidate["required"]
+        .as_array()
+        .expect("required list")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(
+        required.contains(&"speech_act"),
+        "a model that may omit the act will omit it"
+    );
+
+    let acts = candidate["properties"]["speech_act"]["enum"]
+        .as_array()
+        .expect("speech_act enum");
+    for act in [
+        "spoken",
+        "thought",
+        "action",
+        "observed",
+        "written",
+        "unspecified",
+    ] {
+        assert!(
+            acts.iter().any(|value| value.as_str() == Some(act)),
+            "{act} has no way to be reported"
+        );
+    }
 }

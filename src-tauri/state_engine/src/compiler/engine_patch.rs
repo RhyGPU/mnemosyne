@@ -1,3 +1,4 @@
+use crate::soul::SpeechAct;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -90,6 +91,7 @@ pub fn lower_state_effects_to_engine_patch(
                 memory_kind,
                 content,
                 target_entity_ids,
+                speech_act,
             } => {
                 patch
                     .soul_patch
@@ -102,12 +104,14 @@ pub fn lower_state_effects_to_engine_patch(
                         *memory_kind,
                         content,
                         target_entity_ids,
+                        *speech_act,
                     ));
             }
             StateEffectKind::RecordIntention {
                 owner_entity_id,
                 content,
                 target_entity_ids,
+                speech_act,
             } => {
                 patch
                     .soul_patch
@@ -120,6 +124,7 @@ pub fn lower_state_effects_to_engine_patch(
                         MemoryFormationKind::Intention,
                         content,
                         target_entity_ids,
+                        *speech_act,
                     ));
             }
             StateEffectKind::ApplyRelationshipEvidence {
@@ -259,6 +264,7 @@ fn memory_patch(
     memory_kind: MemoryFormationKind,
     content: &str,
     target_entity_ids: &[String],
+    speech_act: SpeechAct,
 ) -> MemoryPatch {
     let (tag, truth_status) = match memory_kind {
         MemoryFormationKind::Episode => ("episode", TruthStatus::SceneEvent),
@@ -287,6 +293,7 @@ fn memory_patch(
         salience: Some(60.0),
         retrieval_strength: Some(60.0),
         truth_status: Some(truth_status),
+        speech_act: Some(speech_act.as_label().into()),
         memory_slot: Some(tag.into()),
         owner_soul_id: Some(owner_soul_id.into()),
         architecture_verified: Some(false),

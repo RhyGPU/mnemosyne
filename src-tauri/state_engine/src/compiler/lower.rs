@@ -1,3 +1,4 @@
+use crate::soul::SpeechAct;
 use serde::{Deserialize, Serialize};
 
 use crate::soul::KnowledgeStatus;
@@ -80,9 +81,14 @@ pub enum StateEffectKind {
         memory_kind: MemoryFormationKind,
         content: String,
         target_entity_ids: Vec<String>,
+        /// Carried from the perception rather than inferred here: whether the
+        /// room heard this is the difference between a memory another character
+        /// may answer and one they may not.
+        speech_act: SpeechAct,
     },
     RecordIntention {
         owner_entity_id: String,
+        speech_act: SpeechAct,
         content: String,
         target_entity_ids: Vec<String>,
     },
@@ -303,6 +309,7 @@ fn lower_candidate(
             ) {
                 vec![StateEffectKind::FormMemory {
                     owner_soul_id,
+                    speech_act: perception.speech_act,
                     memory_kind: memory_kind_for(perception.kind, perception.epistemic_mode),
                     content: summary,
                     target_entity_ids: targets,
@@ -323,6 +330,7 @@ fn lower_candidate(
         PerceptionKind::Utterance
         | PerceptionKind::AffectCue
         | PerceptionKind::BeliefExpression => vec![StateEffectKind::FormMemory {
+            speech_act: perception.speech_act,
             owner_soul_id,
             memory_kind: memory_kind_for(perception.kind, perception.epistemic_mode),
             content: summary,
@@ -335,6 +343,7 @@ fn lower_candidate(
             ) {
                 vec![StateEffectKind::FormMemory {
                     owner_soul_id,
+                    speech_act: perception.speech_act,
                     memory_kind: memory_kind_for(perception.kind, perception.epistemic_mode),
                     content: summary,
                     target_entity_ids: targets,
@@ -378,6 +387,7 @@ fn lower_candidate(
             })
             .unwrap_or_default(),
         PerceptionKind::Intention => vec![StateEffectKind::RecordIntention {
+            speech_act: perception.speech_act,
             owner_entity_id: actor.unwrap_or(subject),
             content: summary,
             target_entity_ids: targets,
@@ -392,6 +402,7 @@ fn lower_candidate(
             ) {
                 return vec![StateEffectKind::FormMemory {
                     owner_soul_id,
+                    speech_act: perception.speech_act,
                     memory_kind: memory_kind_for(perception.kind, perception.epistemic_mode),
                     content: summary,
                     target_entity_ids: targets,

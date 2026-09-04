@@ -4,6 +4,7 @@ use state_engine::compiler::{
     DurabilityHint, EpistemicMode, EvidenceSource, EvidenceSpan, PerceptionBatchDraft,
     PerceptionCandidateDraft, PerceptionKind, TemporalAnchor, TemporalExpression,
 };
+use state_engine::soul::SpeechAct;
 
 fn perception_v2_test_source() -> SourceEnvelope {
     SourceEnvelope::new(
@@ -43,6 +44,7 @@ fn perception_v2_shadow_runtime_strictly_parses_and_seals() {
                 "start_char": null,
                 "end_char": null
             },
+            "speech_act": "spoken",
             "epistemic_mode": "directly_observed",
             "extraction_confidence": 0.95,
             "temporal": {"anchor":"current_turn","expression":null},
@@ -99,6 +101,7 @@ fn perception_v2_shadow_runtime_rejects_effect_or_truth_injection() {
                     "perceiver_ref":"active_soul",
                     "target_refs":[],
                     "evidence":{{"source":"user_message","quote":"return the key","start_char":null,"end_char":null}},
+                    "speech_act": "spoken",
                     "epistemic_mode":"stated_by",
                     "extraction_confidence":0.8,
                     "temporal":{{"anchor":"current_turn","expression":null}},
@@ -169,6 +172,7 @@ fn perception_v2_production_runtime_only_returns_compiler_validated_patch() {
                 "start_char": null,
                 "end_char": null
             },
+            "speech_act": "spoken",
             "epistemic_mode": "directly_observed",
             "extraction_confidence": 0.95,
             "temporal": {"anchor":"current_turn","expression":null},
@@ -270,6 +274,7 @@ fn perception_v2_repair_extracts_only_rejected_candidates() {
         schema_version: state_engine::compiler::PERCEPTION_IR_SCHEMA_VERSION,
         candidates: vec![
             PerceptionCandidateDraft {
+                speech_act: SpeechAct::Spoken,
                 kind: PerceptionKind::Event,
                 subject_ref: "active_player".into(),
                 predicate: "returned".into(),
@@ -293,6 +298,7 @@ fn perception_v2_repair_extracts_only_rejected_candidates() {
                 relationship_signal: None,
             },
             PerceptionCandidateDraft {
+                speech_act: SpeechAct::Spoken,
                 kind: PerceptionKind::BeliefExpression,
                 subject_ref: "active_soul".into(),
                 predicate: "suspects".into(),

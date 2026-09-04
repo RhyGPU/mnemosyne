@@ -2033,6 +2033,7 @@ Use exact continuous evidence.quote substrings from the selected source message.
 Set evidence.source to user_message or assistant_message. Use null offsets unless exact character offsets are certain.\n\
 Resolve user-controlled \"I\" to active_player and the active character to active_soul. Use aliases rather than inventing IDs.\n\
 Distinguish direct observation, a speaker's statement, narrator description, inference, and remembered material with epistemic_mode.\n\
+Set speech_act to how it reached the room, which is a different question from how you know it: spoken, thought, action, observed, written, or unspecified. A thought nobody voiced and a page nobody was shown are not spoken, whatever the prose implies around them. Use unspecified only when the exchange genuinely does not say.\n\
 A statement or belief is not automatically a verified world fact. Preserve who said or perceived it.\n\
 For relationship_evidence only, provide behavior labels and bounded valence/directness/stakes/costliness/repetition; use null relationship_signal for every other kind.\n\
 Use correction only for explicit correction/retcon evidence. Do not silently erase older facts.\n\
@@ -3293,6 +3294,11 @@ mod tests {
         let prompt = build_perception_v2_prompt(&soul, None);
 
         assert!(prompt.contains("For knowledge_claim, set subject to the holder"));
+        // Switching the default to the compiler silently turned this axis off:
+        // 25 of 30 memories from the first live V2 session came back
+        // `unspecified`, and `unspecified` gets no disclosure note at all.
+        assert!(prompt.contains("Set speech_act to how it reached the room"));
+        assert!(prompt.contains("a page nobody was shown are not spoken"));
         assert!(prompt.contains("knows means the holder was told it, saw it, or lived it"));
         assert!(prompt.contains("that is suspects, and stays suspects"));
         assert!(prompt.contains("reaches nobody else"));
