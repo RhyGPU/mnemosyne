@@ -641,6 +641,7 @@ pub fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
 
     raise_shadowed_evaluator_timeouts(conn)?;
     adopt_perception_compiler_for_untouched_profiles(conn)?;
+    unblock_reading_for_untouched_profiles(conn)?;
 
     add_column_if_missing(
         conn,
@@ -778,6 +779,30 @@ fn adopt_perception_compiler_for_untouched_profiles(conn: &Connection) -> rusqli
             params![superseded],
         )?;
     }
+    Ok(())
+}
+
+/// Move profiles off the blocking evaluator triple this project shipped.
+///
+/// Inline extraction (background off) makes a reader wait out the whole
+/// evaluator before seeing prose; moving it to the background but leaving the
+/// next-turn gate closed just moves the wait; and opening the gate without
+/// allowing a stale send fails the turn outright. So the three only mean
+/// anything together, and only a profile still carrying all three as shipped is
+/// one nobody has touched.
+fn unblock_reading_for_untouched_profiles(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "
+        UPDATE provider_profiles
+        SET evaluator_background_enabled = 1,
+            wait_for_evaluator_before_next_turn = 0,
+            allow_send_with_stale_state = 1
+        WHERE evaluator_background_enabled = 0
+          AND wait_for_evaluator_before_next_turn = 1
+          AND allow_send_with_stale_state = 0
+        ",
+        [],
+    )?;
     Ok(())
 }
 

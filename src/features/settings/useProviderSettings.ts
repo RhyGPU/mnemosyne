@@ -2,7 +2,10 @@ import { useMemo, useState } from "react";
 
 import type { ApiProviderSettings } from "../../tauri";
 import {
+  DEFAULT_ALLOW_SEND_WITH_STALE_STATE,
+  DEFAULT_EVALUATOR_BACKGROUND_ENABLED,
   DEFAULT_EVALUATOR_MODE,
+  DEFAULT_WAIT_FOR_EVALUATOR_BEFORE_NEXT_TURN,
   DEFAULT_EVALUATOR_TIMEOUT_MS,
   EVALUATOR_EXECUTION_MODE_STORAGE_KEY,
   NARRATOR_PROVIDER_PROFILE_STORAGE_KEY,
@@ -33,9 +36,9 @@ function defaultProviderSettings(systemPrompt = ""): ApiProviderSettings {
     evaluator_mode: DEFAULT_EVALUATOR_MODE,
     structured_evaluator_policy: "prefer",
     structured_evaluator_max_retries: 1,
-    wait_for_evaluator_before_next_turn: true,
-    allow_send_with_stale_state: false,
-    evaluator_background_enabled: false,
+    wait_for_evaluator_before_next_turn: DEFAULT_WAIT_FOR_EVALUATOR_BEFORE_NEXT_TURN,
+    allow_send_with_stale_state: DEFAULT_ALLOW_SEND_WITH_STALE_STATE,
+    evaluator_background_enabled: DEFAULT_EVALUATOR_BACKGROUND_ENABLED,
     anti_replay_forced_retry_enabled: false,
   };
 }

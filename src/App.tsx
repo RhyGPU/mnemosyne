@@ -272,7 +272,10 @@ import {
 import {
   CUSTOM_NARRATOR_PROMPT_STORAGE_KEY,
   CHAT_START_MODE_STORAGE_KEY,
+  DEFAULT_ALLOW_SEND_WITH_STALE_STATE,
+  DEFAULT_EVALUATOR_BACKGROUND_ENABLED,
   DEFAULT_EVALUATOR_MODE,
+  DEFAULT_WAIT_FOR_EVALUATOR_BEFORE_NEXT_TURN,
   DEFAULT_EVALUATOR_TIMEOUT_MS,
   DEV_LOG_LIMIT,
   MAX_CONSECUTIVE_EVALUATOR_FAILURES,
@@ -1440,9 +1443,12 @@ export function App() {
       evaluator_mode: profile.evaluator_mode ?? DEFAULT_EVALUATOR_MODE,
       structured_evaluator_policy: profile.structured_evaluator_policy ?? "prefer",
       structured_evaluator_max_retries: profile.structured_evaluator_max_retries ?? 1,
-      wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn ?? true,
-      allow_send_with_stale_state: profile.allow_send_with_stale_state ?? false,
-      evaluator_background_enabled: profile.evaluator_background_enabled ?? false,
+      wait_for_evaluator_before_next_turn:
+        profile.wait_for_evaluator_before_next_turn ?? DEFAULT_WAIT_FOR_EVALUATOR_BEFORE_NEXT_TURN,
+      allow_send_with_stale_state:
+        profile.allow_send_with_stale_state ?? DEFAULT_ALLOW_SEND_WITH_STALE_STATE,
+      evaluator_background_enabled:
+        profile.evaluator_background_enabled ?? DEFAULT_EVALUATOR_BACKGROUND_ENABLED,
       anti_replay_forced_retry_enabled: profile.anti_replay_forced_retry_enabled ?? false,
     });
   }
@@ -1462,9 +1468,12 @@ export function App() {
       evaluator_mode: profile.evaluator_mode ?? DEFAULT_EVALUATOR_MODE,
       structured_evaluator_policy: profile.structured_evaluator_policy ?? "prefer",
       structured_evaluator_max_retries: profile.structured_evaluator_max_retries ?? 1,
-      wait_for_evaluator_before_next_turn: profile.wait_for_evaluator_before_next_turn ?? true,
-      allow_send_with_stale_state: profile.allow_send_with_stale_state ?? false,
-      evaluator_background_enabled: profile.evaluator_background_enabled ?? false,
+      wait_for_evaluator_before_next_turn:
+        profile.wait_for_evaluator_before_next_turn ?? DEFAULT_WAIT_FOR_EVALUATOR_BEFORE_NEXT_TURN,
+      allow_send_with_stale_state:
+        profile.allow_send_with_stale_state ?? DEFAULT_ALLOW_SEND_WITH_STALE_STATE,
+      evaluator_background_enabled:
+        profile.evaluator_background_enabled ?? DEFAULT_EVALUATOR_BACKGROUND_ENABLED,
       anti_replay_forced_retry_enabled: profile.anti_replay_forced_retry_enabled ?? false,
     });
   }
@@ -4377,9 +4386,12 @@ export function App() {
       evaluator_mode: apiSettings.evaluator_mode ?? DEFAULT_EVALUATOR_MODE,
       structured_evaluator_policy: apiSettings.structured_evaluator_policy ?? "prefer",
       structured_evaluator_max_retries: apiSettings.structured_evaluator_max_retries ?? 1,
-      wait_for_evaluator_before_next_turn: apiSettings.wait_for_evaluator_before_next_turn ?? true,
-      allow_send_with_stale_state: apiSettings.allow_send_with_stale_state ?? false,
-      evaluator_background_enabled: apiSettings.evaluator_background_enabled ?? false,
+      wait_for_evaluator_before_next_turn:
+        apiSettings.wait_for_evaluator_before_next_turn ?? DEFAULT_WAIT_FOR_EVALUATOR_BEFORE_NEXT_TURN,
+      allow_send_with_stale_state:
+        apiSettings.allow_send_with_stale_state ?? DEFAULT_ALLOW_SEND_WITH_STALE_STATE,
+      evaluator_background_enabled:
+        apiSettings.evaluator_background_enabled ?? DEFAULT_EVALUATOR_BACKGROUND_ENABLED,
       anti_replay_forced_retry_enabled: apiSettings.anti_replay_forced_retry_enabled ?? false,
       created_at: existing?.created_at ?? 0,
       updated_at: 0,
@@ -4437,9 +4449,12 @@ export function App() {
       evaluator_mode: stateUpdaterSettings.evaluator_mode ?? DEFAULT_EVALUATOR_MODE,
       structured_evaluator_policy: stateUpdaterSettings.structured_evaluator_policy ?? "prefer",
       structured_evaluator_max_retries: stateUpdaterSettings.structured_evaluator_max_retries ?? 1,
-      wait_for_evaluator_before_next_turn: stateUpdaterSettings.wait_for_evaluator_before_next_turn ?? true,
-      allow_send_with_stale_state: stateUpdaterSettings.allow_send_with_stale_state ?? false,
-      evaluator_background_enabled: stateUpdaterSettings.evaluator_background_enabled ?? false,
+      wait_for_evaluator_before_next_turn:
+        stateUpdaterSettings.wait_for_evaluator_before_next_turn ?? DEFAULT_WAIT_FOR_EVALUATOR_BEFORE_NEXT_TURN,
+      allow_send_with_stale_state:
+        stateUpdaterSettings.allow_send_with_stale_state ?? DEFAULT_ALLOW_SEND_WITH_STALE_STATE,
+      evaluator_background_enabled:
+        stateUpdaterSettings.evaluator_background_enabled ?? DEFAULT_EVALUATOR_BACKGROUND_ENABLED,
       anti_replay_forced_retry_enabled: stateUpdaterSettings.anti_replay_forced_retry_enabled ?? false,
       created_at: existing?.created_at ?? 0,
       updated_at: 0,

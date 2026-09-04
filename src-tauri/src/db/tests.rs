@@ -3480,3 +3480,43 @@ fn migration_moves_only_shipped_evaluator_modes_to_the_compiler() {
     assert_eq!(mode_for("shipped-structured"), "evaluator_perception_v2");
     assert_eq!(mode_for("chosen-by-hand"), "form_v1_compact");
 }
+
+#[test]
+fn migration_unblocks_reading_only_where_all_three_are_as_shipped() {
+    // The evaluator gate is three fields that only mean anything together, so a
+    // profile counts as untouched only if it still carries the whole shipped
+    // set. Change any one of them and the row is someone's choice.
+    let conn = init_memory_connection().expect("db");
+    let now = now_ts();
+    for (id, background, wait, stale) in [
+        ("as-shipped", 0, 1, 0),
+        ("already-background", 1, 1, 0),
+        ("gate-opened-by-hand", 0, 0, 1),
+    ] {
+        conn.execute(
+            "INSERT INTO provider_profiles
+             (id, name, base_url, api_key, model, system_prompt, created_at, updated_at,
+              evaluator_background_enabled, wait_for_evaluator_before_next_turn,
+              allow_send_with_stale_state)
+             VALUES (?1, ?1, 'https://example.test/v1', '', 'model', '', ?2, ?2, ?3, ?4, ?5)",
+            params![id, now, background, wait, stale],
+        )
+        .expect("insert profile");
+    }
+
+    run_migrations(&conn).expect("migrations");
+
+    let gate_for = |id: &str| -> (i64, i64, i64) {
+        conn.query_row(
+            "SELECT evaluator_background_enabled, wait_for_evaluator_before_next_turn,
+                    allow_send_with_stale_state
+             FROM provider_profiles WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read gate")
+    };
+    assert_eq!(gate_for("as-shipped"), (1, 0, 1));
+    assert_eq!(gate_for("already-background"), (1, 1, 0));
+    assert_eq!(gate_for("gate-opened-by-hand"), (0, 0, 1));
+}

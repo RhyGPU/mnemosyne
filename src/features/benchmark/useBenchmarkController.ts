@@ -62,7 +62,7 @@ export function useBenchmarkController() {
   const [benchmarkStrictToolEvaluator, setBenchmarkStrictToolEvaluator] = useState(false);
   const [benchmarkTransport, setBenchmarkTransport] =
     useState<ApiProviderSettings["structured_evaluator_transport"]>("tool_call");
-  const [benchmarkWaitForEvaluator, setBenchmarkWaitForEvaluator] = useState(true);
+  const [benchmarkWaitForEvaluator, setBenchmarkWaitForEvaluator] = useState(false);
   // On by default: without the opposing arm the token comparison has one
   // column, and a run that measures only itself cannot say whether the
   // compiled context is cheaper than the transcript it replaces.

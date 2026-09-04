@@ -58,6 +58,24 @@ export const MAX_CONSECUTIVE_EVALUATOR_FAILURES = 3;
  */
 export const DEFAULT_EVALUATOR_MODE = "evaluator_perception_v2";
 
+/**
+ * Whether a turn waits for the previous turn's state to commit.
+ *
+ * These three move together or not at all. With the evaluator inline, a reader
+ * waits out the whole extraction before seeing prose; with it in the background
+ * but the gate still closed, they wait for it before the next turn instead; and
+ * opening the gate without allowing a stale send just fails the turn outright
+ * ("State update in progress and stale send is not allowed").
+ *
+ * So the default is the non-blocking triple: extract behind the scene, let the
+ * next turn go, and narrate from state that may be a turn behind. Waiting is
+ * what a benchmark wants, because it needs to attribute state to a turn. It is
+ * not what reading wants.
+ */
+export const DEFAULT_EVALUATOR_BACKGROUND_ENABLED = true;
+export const DEFAULT_WAIT_FOR_EVALUATOR_BEFORE_NEXT_TURN = false;
+export const DEFAULT_ALLOW_SEND_WITH_STALE_STATE = true;
+
 export function hasAcceptedDisclaimerVersion() {
   try {
     const raw = localStorage.getItem(DISCLAIMER_STORAGE_KEY);
