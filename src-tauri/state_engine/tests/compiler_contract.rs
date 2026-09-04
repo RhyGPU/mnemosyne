@@ -1016,3 +1016,42 @@ fn the_perception_schema_requires_a_speech_act() {
         );
     }
 }
+
+/// The compiler must not score its own memories.
+///
+/// `apply_memories` scores a new memory from its content and tag, then lets an
+/// explicit score in the patch overwrite that result. So a compiler that fills
+/// the field is not adding information, it is discarding the engine's — and a
+/// flat value below the core threshold (85) means nothing it ever produces can
+/// be promoted. The first live session ran entirely at 60.
+#[test]
+fn the_compiler_leaves_memory_scoring_to_the_engine() {
+    let source = source("Aurora says the brass key was never hers to keep.");
+    let mut utterance = candidate();
+    utterance.kind = PerceptionKind::Utterance;
+    utterance.relationship_signal = None;
+    utterance.evidence.quote = "the brass key was never hers to keep".into();
+    let mut batch = draft();
+    batch.candidates = vec![utterance];
+    let batch = seal_perception_batch(&source, batch, producer()).expect("batch");
+    let report = compile_perception_pipeline(
+        &source,
+        &batch,
+        catalog(),
+        &SimulationSnapshot {
+            state_hash: Some("state:abc123".into()),
+            existing_effect_ids: Vec::new(),
+        },
+    );
+    let patch = lower_state_effects_to_engine_patch(&source, &report.lowering.effects);
+
+    let memories = patch.patch.soul_patch.expect("soul patch").new_memories;
+    assert!(!memories.is_empty(), "an utterance should form a memory");
+    for memory in memories {
+        assert!(
+            memory.salience.is_none(),
+            "a pinned salience overwrites the engine's own scoring"
+        );
+        assert!(memory.retrieval_strength.is_none());
+    }
+}

@@ -290,8 +290,13 @@ fn memory_patch(
         perceived_by_entity_id: Some(owner_soul_id.into()),
         target_entity_ids: target_entity_ids.to_vec(),
         confidence: Some(0.8),
-        salience: Some(60.0),
-        retrieval_strength: Some(60.0),
+        // Deliberately unset. `apply_memories` runs the scorer over the content
+        // and tag, then lets an explicit score from the patch overwrite the
+        // result — so pinning every memory at a flat 60 both discarded the
+        // scoring and put core promotion (85) permanently out of reach. Nothing
+        // the compiler produced could ever become a core memory. Leaving these
+        // to the engine is also what this pipeline claims to do: the model
+        // reports what it perceived and Rust decides what it is worth.
         truth_status: Some(truth_status),
         speech_act: Some(speech_act.as_label().into()),
         memory_slot: Some(tag.into()),

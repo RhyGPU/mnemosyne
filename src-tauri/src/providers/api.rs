@@ -2037,7 +2037,8 @@ Set speech_act to how it reached the room, which is a different question from ho
 A statement or belief is not automatically a verified world fact. Preserve who said or perceived it.\n\
 For relationship_evidence only, provide behavior labels and bounded valence/directness/stakes/costliness/repetition; use null relationship_signal for every other kind.\n\
 Use correction only for explicit correction/retcon evidence. Do not silently erase older facts.\n\
-For scene_observation, set predicate to one continuity slot: location, scene, focus, position, room_state, active_object, misunderstanding, open_question, pressure_point, or last_action. Put the current value in object.text, or null when that slot is now empty. Scene claims are current truth, so never anchor them before the current turn.\n\
+Use object_observation whenever something is picked up, put down, opened, closed, worn, removed, moved, or changes condition, and name each object the same way every turn so it stays the same object. Do not return an empty batch for entering or leaving a location, an object moving or changing condition, a relationship-significant action, or an explicit scene change.\n\
+For scene_observation, set predicate to one continuity slot: location, scene, focus, position, outfit, room_state, active_object, misunderstanding, open_question, pressure_point, or last_action. Put the current value in object.text, or null when that slot is now empty. Scene claims are current truth rather than history: restate every slot still in play on every turn, and send null once one is resolved or leaves the scene. A slot you do not restate is a slot that stops being true. Never anchor a scene claim before the current turn.\n\
 For knowledge_claim, set subject to the holder, predicate to one of knows, suspects, believes_false, unaware, or hiding, and object.text to the proposition. knows means the holder was told it, saw it, or lived it. A character naming, titling, or characterising someone else does not make it so: that is suspects, and stays suspects until the other party confirms it. Never claim knows about someone on the strength of the holder's own words alone. Content a character writes, reads to themselves, or studies without showing reaches nobody else: every other holder is unaware of it, however the narration behaves, unless the exchange shows it read aloud, handed over, or plainly in view.\n\
 durability_hint is advisory only; Rust decides whether anything persists.\n\
 If the exchange has no meaningful perception candidate, return candidates: [] and a specific no_op_reason.\n\
@@ -3298,6 +3299,13 @@ mod tests {
         // 25 of 30 memories from the first live V2 session came back
         // `unspecified`, and `unspecified` gets no disclosure note at all.
         assert!(prompt.contains("Set speech_act to how it reached the room"));
+        // The first live V2 session came back with outfits and active_object
+        // empty and one object where V1 had seven. The slot vocabulary was
+        // missing outfit outright, nothing asked for a restatement, so a slot
+        // emitted once was never refreshed, and objects went unmentioned.
+        assert!(prompt.contains("position, outfit, room_state"));
+        assert!(prompt.contains("restate every slot still in play on every turn"));
+        assert!(prompt.contains("Use object_observation whenever something is picked up"));
         assert!(prompt.contains("a page nobody was shown are not spoken"));
         assert!(prompt.contains("knows means the holder was told it, saw it, or lived it"));
         assert!(prompt.contains("that is suspects, and stays suspects"));
