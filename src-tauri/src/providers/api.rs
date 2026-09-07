@@ -55,7 +55,8 @@ Concrete time only comes from user input or World Log. Avoid invented minutes/ho
 When writing scene narration, end with a code block:
 ```status
 Scene | Focus: [primary active character(s)] | Physical state: [brief] | Atmosphere: [1-line environmental impression]
-```"#;
+```
+Fill every field with what is concretely true right now — where each person is, what they are holding, how they are dressed if it has changed. Never write "Not specified", "unchanged", or "same as before": restate it. The engine reads Focus and Physical state to tell a turn where something moved from a turn where nothing did, so a field that says nothing makes that judgement for it, wrongly."#;
 
 const NARRATOR_VISIBLE_ONLY_PROMPT: &str = r#"[OUTPUT]
 Write visible scene narration only. Include the visible status block. Do not write hidden state, EnginePatch JSON, markdown JSON, implementation notes, or command/help text.
@@ -3430,6 +3431,10 @@ mod tests {
         // "the neon catches the fresh ink" and quoted it. The disclosure rule
         // covered remembered lines only; the turn in hand was unguarded.
         assert!(prompt.contains("A closed page is closed"));
+        // A status block that degraded to "Physical state: Not specified" while
+        // the engine held two detailed position lines — and the fast-mode gate
+        // reads exactly those two fields to decide whether a turn moved.
+        assert!(prompt.contains("Never write \"Not specified\""));
         assert!(prompt.contains("do not quote it, paraphrase it, or let the light catch the ink"));
         assert!(!prompt.contains("After each response, output a hidden state block"));
         assert!(!prompt.contains("[HIDDEN STATE]{"));

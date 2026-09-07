@@ -448,7 +448,7 @@ fn compile_context_with_budget_and_options(
     let mut section_builders = vec![
         build_controlled_entities_section(soul, player_persona, budget, messages),
         build_scene_continuity_section(soul, session_world, budget, messages, player_persona),
-        build_knowledge_section(soul, session_world, budget),
+        build_knowledge_section(soul, session_world, budget, player_persona),
         build_world_section(soul, session_world, budget, pending_user_text),
         build_profile_section(soul, budget),
         build_memory_section(soul, messages, budget),
@@ -1351,7 +1351,24 @@ fn build_knowledge_section(
     soul: &Soul,
     session_world: Option<&SessionWorld>,
     budget: &ContextBudget,
+    player_persona: &PlayerPersonaContext,
 ) -> BuiltSection {
+    // Knowledge rows are keyed by entity id, and the narrator has no way to
+    // read one. This block was printing raw UUIDs where every other section
+    // prints a name, so the one list that says who may not know a thing named
+    // nobody the narrator could recognise.
+    let name_for = |entity_id: &str| -> String {
+        let entity_id = entity_id.trim();
+        if entity_id.eq_ignore_ascii_case(soul.character_id.trim())
+            || entity_id.eq_ignore_ascii_case(soul.character_name.trim())
+        {
+            soul.character_name.trim().to_string()
+        } else if entity_id.eq_ignore_ascii_case(player_persona.persona_id.trim()) {
+            player_persona.display_name.trim().to_string()
+        } else {
+            entity_id.to_string()
+        }
+    };
     let world = if let Some(session_world) = session_world {
         session_world.world_log()
     } else {
@@ -1363,6 +1380,7 @@ fn build_knowledge_section(
         let Some(holder) = clean(&entry.holder_entity_id) else {
             continue;
         };
+        let holder = name_for(holder);
         let Some(proposition) = clean(&entry.proposition) else {
             continue;
         };
@@ -1372,7 +1390,8 @@ fn build_knowledge_section(
                     .counterpart_entity_id
                     .as_deref()
                     .and_then(clean)
-                    .unwrap_or("everyone");
+                    .map(name_for)
+                    .unwrap_or_else(|| "everyone".to_string());
                 format!("- {holder} hides from {from}: {proposition}")
             }
             KnowledgeStatus::BelievesFalse => {
@@ -3724,5 +3743,39 @@ mod tests {
         let rest = &text[start..];
         let end = rest.find("\n\n[").unwrap_or(rest.len());
         &rest[..end]
+    }
+}
+
+#[cfg(test)]
+mod knowledge_naming_tests {
+    use super::*;
+    use crate::soul::new_default_soul;
+
+    /// The one section that says who may not know a thing has to name someone
+    /// the narrator can recognise. It was printing raw entity ids while every
+    /// other section printed names, so `[WHO KNOWS WHAT]` read as a list of
+    /// UUIDs and denied knowledge to nobody in particular.
+    #[test]
+    fn knowledge_lines_use_names_rather_than_entity_ids() {
+        let mut soul = new_default_soul("Aurora Schwarz");
+        let mut world = crate::setting::session_world_from_setting(
+            &crate::setting::new_default_setting("Berlin flat"),
+        );
+        world.knowledge = crate::disclosure::seed_baseline_knowledge(
+            &soul.character_id,
+            "the visitor",
+            0,
+            crate::disclosure::RelationshipStage::Strangers,
+        );
+        soul.turn_counter = 3;
+
+        let preview = compile_context_for_session(&soul, Some(&world), &[]);
+
+        assert!(
+            preview.text.contains("Aurora Schwarz does not know:"),
+            "expected a name, got:\n{}",
+            preview.text
+        );
+        assert!(!preview.text.contains(&soul.character_id));
     }
 }
