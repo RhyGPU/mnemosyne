@@ -40,6 +40,30 @@ pub fn create_session_soul_from_savepoint(
     db::upsert_soul(&conn, &session).map_err(|err| err.to_string())?;
     let conversation_id =
         conversation_id_for_session(Some(&session_world.world_id), &session.character_id);
+    // Open the session on the default-deny rung rather than on an empty
+    // knowledge table. Empty is not the same as "has not been told": with no
+    // rows at all there is nothing for the compiler to contradict, and the
+    // narrator's first guess about who knows what becomes the record. Someone
+    // starting further along changes it in the grid.
+    let mut session_world = session_world;
+    {
+        let persona = db::get_active_player_persona(&conn, &conversation_id).unwrap_or_else(|_| {
+            db::built_in_player_personas()
+                .into_iter()
+                .next()
+                .expect("built-in player persona exists")
+        });
+        seed_relationship_stage_into_world(
+            &mut session_world,
+            &session.character_id,
+            &session.character_name,
+            &persona.persona_id,
+            &persona.display_name,
+            session.turn_counter,
+            state_engine::disclosure::RelationshipStage::Strangers,
+        );
+        db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
+    }
     let default_title = format!("{} Session", source.character_name.trim());
     let title = title
         .as_deref()
@@ -2185,18 +2209,43 @@ pub fn apply_relationship_stage(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
 
+    let seeded = seed_relationship_stage_into_world(
+        &mut world,
+        &soul.character_id,
+        &soul.character_name,
+        &persona.persona_id,
+        &persona.display_name,
+        soul.turn_counter,
+        stage,
+    );
+    db::upsert_session_world(&conn, &world).map_err(|e| e.to_string())?;
+    Ok(seeded)
+}
+
+/// Lay the default-deny ladder over one session's world, both directions.
+///
+/// Shared with session creation, because a session that starts with no
+/// knowledge rows at all is not starting from "they have not been told" — it is
+/// starting from nothing, and the evaluator fills nothing with whatever the
+/// prose implies. The rung decides what is already known; everything else seeds
+/// unaware, and only meeting opens what a look would give you.
+pub(crate) fn seed_relationship_stage_into_world(
+    world: &mut state_engine::setting::SessionWorld,
+    soul_id: &str,
+    soul_name: &str,
+    persona_id: &str,
+    persona_name: &str,
+    turn: u64,
+    stage: state_engine::disclosure::RelationshipStage,
+) -> usize {
     let pairs = [
-        (soul.character_id.clone(), persona.display_name.clone()),
-        (persona.persona_id.clone(), soul.character_name.clone()),
+        (soul_id.to_string(), persona_name.to_string()),
+        (persona_id.to_string(), soul_name.to_string()),
     ];
     let mut seeded = 0usize;
     for (observer, subject) in pairs {
-        let entries = state_engine::disclosure::seed_baseline_knowledge(
-            &observer,
-            &subject,
-            soul.turn_counter,
-            stage,
-        );
+        let entries =
+            state_engine::disclosure::seed_baseline_knowledge(&observer, &subject, turn, stage);
         for entry in entries {
             world
                 .knowledge
@@ -2209,12 +2258,11 @@ pub fn apply_relationship_stage(
                 &mut world.knowledge,
                 &observer,
                 &subject,
-                soul.turn_counter,
+                turn,
             );
         }
     }
-    db::upsert_session_world(&conn, &world).map_err(|e| e.to_string())?;
-    Ok(seeded)
+    seeded
 }
 
 /// Flip one cell of the grid.

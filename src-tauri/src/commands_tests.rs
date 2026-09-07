@@ -9769,3 +9769,46 @@ fn write_test_mne_bytes(entries: HashMap<String, Vec<u8>>) -> Vec<u8> {
     write_stored_zip(&path, &files).unwrap();
     fs::read(&path).unwrap()
 }
+
+/// A new session opens on the default-deny rung, not on an empty table.
+///
+/// Empty is not the same as "has not been told". With no knowledge rows at all
+/// there is nothing for the compiler to contradict, so whatever the narrator
+/// first assumes about who knows what becomes the record — which is how a name
+/// nobody gave got used, and how a title nobody claimed became something Aurora
+/// "knew". The ladder has to be laid before the first turn, in both directions.
+#[test]
+fn a_new_session_starts_with_nobody_knowing_anything() {
+    let setting = state_engine::setting::new_default_setting("Berlin flat");
+    let mut world = state_engine::setting::session_world_from_setting(&setting);
+
+    let seeded = crate::commands::session::seed_relationship_stage_into_world(
+        &mut world,
+        "soul-aurora",
+        "Aurora",
+        "preset_male",
+        "the visitor",
+        0,
+        state_engine::disclosure::RelationshipStage::Strangers,
+    );
+
+    assert!(
+        seeded > 0,
+        "strangers still need rows saying they do not know"
+    );
+    assert!(
+        world
+            .knowledge
+            .iter()
+            .all(|entry| entry.status == state_engine::soul::KnowledgeStatus::Unaware),
+        "nothing is known between strangers, including what a look would give"
+    );
+    assert!(world
+        .knowledge
+        .iter()
+        .any(|entry| entry.holder_entity_id == "soul-aurora"));
+    assert!(world
+        .knowledge
+        .iter()
+        .any(|entry| entry.holder_entity_id == "preset_male"));
+}

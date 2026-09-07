@@ -18,6 +18,12 @@ export function evaluatorJobStatusText(job: EvaluatorJob) {
     return job.patch_applied ? "Memory/state update completed" : "Memory/state update completed with no patch";
   }
   if (job.status === "partial_success") {
+    // A partial success that committed nothing is not a partial anything. This
+    // read "State updated partially" while the turn's state was lost outright,
+    // which is only discovered much later, as the character not remembering.
+    if (!job.patch_applied) {
+      return "This turn's state was not saved";
+    }
     if (job.error_message?.includes("some enrichment rows rejected")) {
       return "State updated; some enrichment rows rejected";
     }
@@ -49,6 +55,17 @@ export function evaluatorJobBannerTitle(job: EvaluatorJob) {
   if (job.status === "timed_out") return "State update timed out";
   if (job.status === "failed") return "State update failed";
   return job.status;
+}
+
+/**
+ * Did this job leave the turn without state?
+ *
+ * `partial_success` covers two endings: rows were read and some rejected, or
+ * every path failed and a no-op was recorded to keep the pipeline moving. Only
+ * the second loses the turn, and only `patch_applied` tells them apart.
+ */
+export function evaluatorJobLostTheTurn(job: Pick<EvaluatorJob, "status" | "patch_applied">) {
+  return job.status === "partial_success" && !job.patch_applied;
 }
 
 export function evaluatorJobRefreshesState(job: EvaluatorJob) {

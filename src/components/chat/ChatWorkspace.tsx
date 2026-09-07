@@ -348,11 +348,17 @@ export function EvaluatorStatusBanner({
   title: string;
 }) {
   if (!job) return null;
+  // A no-op partial success lost the turn as surely as a failure did, so it
+  // gets the same offer to run again.
+  const lostTheTurn = job.status === "partial_success" && !job.patch_applied;
   const canRetry =
-    job.status === "failed" || job.status === "canceled" || job.status === "timed_out";
+    job.status === "failed" ||
+    job.status === "canceled" ||
+    job.status === "timed_out" ||
+    lostTheTurn;
 
   return (
-    <section className={`evaluator-job-banner ${job.status}`}>
+    <section className={`evaluator-job-banner ${lostTheTurn ? "failed" : job.status}`}>
       <button
         type="button"
         className="evaluator-job-banner-close"

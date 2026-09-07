@@ -21,6 +21,7 @@ const benchmarkRuntime = await importTypeScriptModule(
   "src/features/benchmark/model/benchmarkRuntime.ts",
 );
 const devCommands = await importTypeScriptModule("src/features/dev/commands.ts");
+const evaluatorJob = await importTypeScriptModule("src/features/chat/model/evaluatorJob.ts");
 const assistantDisplay = await importTypeScriptModule(
   "src/features/chat/model/assistantDisplay.ts",
 );
@@ -143,6 +144,28 @@ const pendingAssistant = {
       patch_applied: false,
     }),
     true,
+  );
+}
+
+{
+  // A partial success that committed nothing lost the turn. It used to read
+  // "State updated partially", which is only discovered later as the character
+  // not remembering.
+  assert.equal(
+    evaluatorJob.evaluatorJobLostTheTurn({ status: "partial_success", patch_applied: false }),
+    true,
+  );
+  assert.equal(
+    evaluatorJob.evaluatorJobLostTheTurn({ status: "partial_success", patch_applied: true }),
+    false,
+  );
+  assert.equal(
+    evaluatorJob.evaluatorJobLostTheTurn({ status: "completed", patch_applied: false }),
+    false,
+  );
+  assert.equal(
+    evaluatorJob.evaluatorJobStatusText({ status: "partial_success", patch_applied: false }),
+    "This turn's state was not saved",
   );
 }
 
