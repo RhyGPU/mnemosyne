@@ -3520,3 +3520,54 @@ fn migration_unblocks_reading_only_where_all_three_are_as_shipped() {
     assert_eq!(gate_for("already-background"), (1, 1, 0));
     assert_eq!(gate_for("gate-opened-by-hand"), (0, 0, 1));
 }
+
+/// Recall has to key off what the sentence is about.
+///
+/// The terms are OR-ed and ranked by bm25, so stop words drag the whole corpus
+/// into the top six the bundle keeps, and taking the first twelve tokens of a
+/// message searched whatever it happened to open with — "I open the door and" —
+/// while dropping the nouns further in that actually name the thing.
+#[test]
+fn recall_searches_the_words_that_carry_the_question() {
+    let conn = init_memory_connection().expect("db");
+    let conversation_id = "conversation-recall";
+    let soul = new_default_soul("Aurora");
+    upsert_soul(&conn, &soul).expect("soul");
+    ensure_conversation(&conn, conversation_id, &soul.character_id).expect("conversation");
+    let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+    let branch = create_session_branch(&conn, conversation_id, &soul, &world).expect("branch");
+    let branch_id = branch.branch_id.as_str();
+
+    let mut with_memory = soul.clone();
+    with_memory.memory.recent = vec![
+        state_engine::memory::create_scored_memory(
+            &soul,
+            "He hung the wet coat on the chair by the door",
+            "orientation",
+        ),
+        state_engine::memory::create_scored_memory(
+            &soul,
+            "She poured a second glass of red wine",
+            "bonding",
+        ),
+    ];
+    rebuild_memory_v2_projection(&conn, conversation_id, branch_id, &with_memory).expect("project");
+
+    // The informative word sits late in a long, ordinary sentence.
+    let hits = recall_memory_v2(
+        &conn,
+        conversation_id,
+        branch_id,
+        "I walk back in and look around for a moment before I ask about that coat",
+        6,
+    )
+    .expect("recall");
+
+    assert!(
+        hits.iter().any(|hit| hit.memory.content.contains("coat")),
+        "expected the coat memory, got {:?}",
+        hits.iter()
+            .map(|hit| &hit.memory.content)
+            .collect::<Vec<_>>()
+    );
+}

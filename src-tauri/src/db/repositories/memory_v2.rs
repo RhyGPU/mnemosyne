@@ -827,13 +827,39 @@ fn refresh_memory_v2_search_projection(
     transaction.commit()
 }
 
+/// Words that match nearly every memory and so rank none of them.
+///
+/// The terms are OR-ed and scored by bm25, so a stop word does not merely fail
+/// to help: it drags in the whole corpus and pushes the informative hits out of
+/// the top six the bundle keeps.
+const RECALL_STOP_WORDS: &[&str] = &[
+    "the", "and", "but", "for", "you", "your", "yours", "she", "her", "hers", "him", "his", "they",
+    "them", "their", "that", "this", "these", "those", "with", "from", "into", "onto", "was",
+    "were", "are", "not", "have", "has", "had", "would", "could", "should", "will", "just", "then",
+    "than", "when", "what", "who", "why", "how", "there", "here", "been", "being", "does", "did",
+    "doesn", "don", "its", "our", "out", "off", "over", "back", "still", "like", "about",
+];
+
 fn fts_match_query(query: &str) -> String {
-    query
+    let mut tokens = query
         .split(|character: char| !character.is_alphanumeric())
         .map(str::trim)
-        .filter(|token| token.chars().count() >= 2)
-        .take(12)
-        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .filter(|token| token.chars().count() >= 3)
+        .map(str::to_ascii_lowercase)
+        .filter(|token| !RECALL_STOP_WORDS.contains(&token.as_str()))
+        .collect::<Vec<_>>();
+    tokens.dedup();
+    // Longest first, then truncate. Taking the first twelve words of a message
+    // searched whatever the sentence happened to open with — usually the least
+    // informative part of it — and dropped the nouns that carry the recall.
+    tokens.sort_by(|left, right| right.chars().count().cmp(&left.chars().count()));
+    tokens.truncate(12);
+    tokens
+        .into_iter()
+        // Prefix matching, so a memory holding "walking" answers a turn that
+        // says "walked". It does not reach across a rewording, which needs real
+        // embeddings; it does reach across an inflection, which is most of it.
+        .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ")
 }
