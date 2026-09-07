@@ -67,6 +67,16 @@ pub fn rebuild_memory_v2_projection(
     let generation = previous_generation.saturating_add(1);
     let rebuilt_at = now_ts();
     let transaction = conn.unchecked_transaction()?;
+    // Last rebuild's derived rows go stale; the one before that is dead weight.
+    // Consolidation reruns on every projection pass, so without this the table
+    // keeps one superseded summary per rebuild forever — the shipping database
+    // was carrying 226 of them against 412 live rows.
+    transaction.execute(
+        "DELETE FROM memory_v2_entries
+         WHERE conversation_id = ?1 AND branch_id = ?2
+           AND layer = 'derived' AND validity = 'stale'",
+        params![conversation_id, branch_id],
+    )?;
     transaction.execute(
         "UPDATE memory_v2_entries
          SET validity = 'stale'
@@ -189,8 +199,8 @@ pub fn recall_memory_v2_filtered_with_semantic(
          WHERE memory_v2_fts MATCH ?1
            AND e.conversation_id = ?2
            AND e.branch_id = ?3
-           AND e.validity = 'valid'
-         ORDER BY rank, e.confidence DESC, e.memory_id
+           AND e.validity IN ('valid', 'faded')
+         ORDER BY e.validity = 'faded', rank, e.confidence DESC, e.memory_id
          LIMIT ?4",
     )?;
     let rows = statement.query_map(
@@ -700,6 +710,7 @@ fn validity_label(validity: MemoryValidity) -> &'static str {
         MemoryValidity::Valid => "valid",
         MemoryValidity::Stale => "stale",
         MemoryValidity::Superseded => "superseded",
+        MemoryValidity::Faded => "faded",
         MemoryValidity::Invalidated => "invalidated",
     }
 }
@@ -776,7 +787,8 @@ fn refresh_memory_v2_search_projection(
             (memory_id, conversation_id, branch_id, content, source_quote)
          SELECT memory_id, conversation_id, branch_id, content, COALESCE(source_quote, '')
          FROM memory_v2_entries
-         WHERE conversation_id = ?1 AND branch_id = ?2 AND validity = 'valid'",
+         WHERE conversation_id = ?1 AND branch_id = ?2
+           AND validity IN ('valid', 'faded')",
         params![conversation_id, branch_id],
     )?;
     transaction.execute(
@@ -919,7 +931,7 @@ fn get_memory_v2_record(
                 schema_version, compiler_version, created_at_ms
          FROM memory_v2_entries
          WHERE conversation_id = ?1 AND branch_id = ?2
-           AND memory_id = ?3 AND validity = 'valid'",
+           AND memory_id = ?3 AND validity IN ('valid', 'faded')",
         params![conversation_id, branch_id, memory_id],
         record_from_row,
     )

@@ -9182,6 +9182,7 @@ fn append_memory_v2_evidence_bundle(
     let mut lines = vec![
         "[MEMORY EVIDENCE BUNDLE]".to_string(),
         "Use these as scoped recollections, not unconditional world truth. Derived memories are interpretations and each item includes why it was selected.".to_string(),
+        "valid=faded marks something that dropped out of active recall: still true, just not on the character's mind until this surfaced it. Let them reach for it the way a person reaches for an old detail, rather than reciting it.".to_string(),
     ];
     for hit in hits {
         let direct_evidence = hit

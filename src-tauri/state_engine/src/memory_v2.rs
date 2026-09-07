@@ -37,6 +37,14 @@ pub enum MemoryValidity {
     Valid,
     Stale,
     Superseded,
+    /// Aged out of the active pool, and still true.
+    ///
+    /// Distinct from `Invalidated`, which the two used to share. A memory that
+    /// faded is not a memory that was wrong: it is exactly the old material
+    /// recall exists to reach, and folding it in with retconned rows is what
+    /// made "what happened forty turns ago" unreachable — out of the recent
+    /// pool on one side, filtered out of search on the other.
+    Faded,
     Invalidated,
 }
 
@@ -159,10 +167,12 @@ pub fn project_legacy_memory(
     source_turn_id: Option<String>,
     compiler_version: u32,
 ) -> MemoryV2Entry {
-    let validity = if !memory.is_active || memory.is_retconned {
+    let validity = if memory.is_retconned {
         MemoryValidity::Invalidated
     } else if memory.superseded_by_memory_id.is_some() {
         MemoryValidity::Superseded
+    } else if memory.archived || !memory.is_active {
+        MemoryValidity::Faded
     } else {
         MemoryValidity::Valid
     };
@@ -260,5 +270,58 @@ mod tests {
         projected.derived_kind = Some(DerivedMemoryKind::Belief);
         projected.source_memory_ids = vec!["memory-1".into()];
         assert!(projected.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod faded_recall_tests {
+    use super::*;
+    use crate::memory::create_scored_memory;
+    use crate::soul::new_default_soul;
+
+    fn projected(mutate: impl FnOnce(&mut crate::soul::MemoryEntry)) -> MemoryValidity {
+        let soul = new_default_soul("Aurora");
+        let mut memory =
+            create_scored_memory(&soul, "He left the coat on the chair", "orientation");
+        mutate(&mut memory);
+        project_legacy_memory(&memory, "conversation-1", "branch-1", None, None, 1).validity
+    }
+
+    /// Fading and being wrong are different things, and search has to be able to
+    /// tell them apart. While both mapped to `Invalidated`, a memory that aged
+    /// out of the active pool was gone twice over: past the recent window on one
+    /// side, filtered out of the index on the other.
+    #[test]
+    fn a_faded_memory_is_not_an_invalidated_one() {
+        assert_eq!(projected(|_| {}), MemoryValidity::Valid);
+        assert_eq!(
+            projected(|memory| {
+                memory.archived = true;
+                memory.is_active = false;
+            }),
+            MemoryValidity::Faded
+        );
+        assert_eq!(
+            projected(|memory| memory.is_retconned = true),
+            MemoryValidity::Invalidated
+        );
+        assert_eq!(
+            projected(|memory| memory.superseded_by_memory_id = Some("mem_other".into())),
+            MemoryValidity::Superseded
+        );
+    }
+
+    /// A retconned memory that also happens to be archived stays invalidated:
+    /// being wrong outranks having faded.
+    #[test]
+    fn retcon_outranks_fading() {
+        assert_eq!(
+            projected(|memory| {
+                memory.archived = true;
+                memory.is_active = false;
+                memory.is_retconned = true;
+            }),
+            MemoryValidity::Invalidated
+        );
     }
 }
