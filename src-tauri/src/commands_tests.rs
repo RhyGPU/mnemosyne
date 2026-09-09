@@ -9812,3 +9812,52 @@ fn a_new_session_starts_with_nobody_knowing_anything() {
         .iter()
         .any(|entry| entry.holder_entity_id == "preset_male"));
 }
+
+/// Switching who is playing has to seed the incoming persona.
+///
+/// The rows are keyed by entity id, so a session seeded for one persona leaves
+/// the next one with nothing recorded in either direction — the same empty
+/// table a new session used to open on, where nothing contradicts the narrator
+/// and its first assumption becomes the record. The outgoing persona's rows
+/// stay: they are still true if the player switches back.
+#[test]
+fn switching_persona_seeds_the_incoming_one_and_keeps_the_outgoing() {
+    let setting = state_engine::setting::new_default_setting("Berlin flat");
+    let mut world = state_engine::setting::session_world_from_setting(&setting);
+
+    crate::commands::session::seed_relationship_stage_into_world(
+        &mut world,
+        "soul-aurora",
+        "Aurora",
+        "preset_male",
+        "Male Persona",
+        0,
+        state_engine::disclosure::RelationshipStage::Strangers,
+    );
+    let after_first = world.knowledge.len();
+
+    crate::commands::session::seed_relationship_stage_into_world(
+        &mut world,
+        "soul-aurora",
+        "Aurora",
+        "preset_female",
+        "Female Persona",
+        4,
+        state_engine::disclosure::RelationshipStage::Strangers,
+    );
+
+    assert!(world.knowledge.len() > after_first, "the newcomer got rows");
+    for persona in ["preset_male", "preset_female"] {
+        assert!(
+            world
+                .knowledge
+                .iter()
+                .any(|entry| entry.holder_entity_id == persona),
+            "{persona} should still have rows"
+        );
+    }
+    assert!(world
+        .knowledge
+        .iter()
+        .all(|entry| entry.status == state_engine::soul::KnowledgeStatus::Unaware));
+}

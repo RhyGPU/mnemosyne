@@ -40,30 +40,6 @@ pub fn create_session_soul_from_savepoint(
     db::upsert_soul(&conn, &session).map_err(|err| err.to_string())?;
     let conversation_id =
         conversation_id_for_session(Some(&session_world.world_id), &session.character_id);
-    // Open the session on the default-deny rung rather than on an empty
-    // knowledge table. Empty is not the same as "has not been told": with no
-    // rows at all there is nothing for the compiler to contradict, and the
-    // narrator's first guess about who knows what becomes the record. Someone
-    // starting further along changes it in the grid.
-    let mut session_world = session_world;
-    {
-        let persona = db::get_active_player_persona(&conn, &conversation_id).unwrap_or_else(|_| {
-            db::built_in_player_personas()
-                .into_iter()
-                .next()
-                .expect("built-in player persona exists")
-        });
-        seed_relationship_stage_into_world(
-            &mut session_world,
-            &session.character_id,
-            &session.character_name,
-            &persona.persona_id,
-            &persona.display_name,
-            session.turn_counter,
-            state_engine::disclosure::RelationshipStage::Strangers,
-        );
-        db::upsert_session_world(&conn, &session_world).map_err(|err| err.to_string())?;
-    }
     let default_title = format!("{} Session", source.character_name.trim());
     let title = title
         .as_deref()
@@ -79,6 +55,15 @@ pub fn create_session_soul_from_savepoint(
         Some(title),
     )
     .map_err(|err| err.to_string())?;
+    // Open the session on the default-deny rung rather than on an empty
+    // knowledge table. Empty is not the same as "has not been told": with no
+    // rows at all there is nothing for the compiler to contradict, and the
+    // narrator's first guess about who knows what becomes the record. Runs
+    // after the conversation row exists, so the persona it seeds against is the
+    // one the session will actually open with.
+    let mut session_world = session_world;
+    seed_active_pair_if_unseeded(&conn, &conversation_id, &session, &mut session_world)
+        .map_err(|err| err.to_string())?;
     db::create_session_branch(&conn, &conversation_id, &session, &session_world)
         .map_err(|err| err.to_string())?;
     let opening = session.profile.opening_narrator_message.trim();
@@ -576,8 +561,16 @@ pub fn set_active_player_persona(
     persona_id: String,
 ) -> Result<PlayerPersona, String> {
     let conn = state.conn.lock().map_err(|err| err.to_string())?;
-    db::set_active_player_persona(&conn, &conversation_id, &persona_id)
-        .map_err(|err| err.to_string())
+    let persona = db::set_active_player_persona(&conn, &conversation_id, &persona_id)
+        .map_err(|err| err.to_string())?;
+    if let Ok(Some(mut world)) = db::get_conversation_session_world(&conn, &conversation_id) {
+        if let Ok(conversation) = db::get_conversation_summary(&conn, &conversation_id) {
+            if let Ok(soul) = db::get_soul(&conn, &conversation.soul_id) {
+                let _ = seed_active_pair_if_unseeded(&conn, &conversation_id, &soul, &mut world);
+            }
+        }
+    }
+    Ok(persona)
 }
 
 #[tauri::command]
@@ -2219,6 +2212,41 @@ pub fn apply_relationship_stage(
         stage,
     );
     db::upsert_session_world(&conn, &world).map_err(|e| e.to_string())?;
+    Ok(seeded)
+}
+
+/// Seed the ladder for whoever is playing, if they have no rows yet.
+///
+/// Called at session creation and again whenever the active persona changes.
+/// Switching persona used to leave the incoming one with nothing recorded about
+/// them in either direction, which is the same empty table a new session used
+/// to open on: nothing contradicts the narrator, so its first assumption about
+/// who knows what becomes the record. Existing rows are left alone — including
+/// the outgoing persona's, which are still true if they are switched back to.
+pub(crate) fn seed_active_pair_if_unseeded(
+    conn: &Connection,
+    conversation_id: &str,
+    soul: &Soul,
+    world: &mut state_engine::setting::SessionWorld,
+) -> rusqlite::Result<usize> {
+    let persona = db::get_active_player_persona(conn, conversation_id)?;
+    let already_seeded = world
+        .knowledge
+        .iter()
+        .any(|entry| entry.holder_entity_id == persona.persona_id);
+    if already_seeded {
+        return Ok(0);
+    }
+    let seeded = seed_relationship_stage_into_world(
+        world,
+        &soul.character_id,
+        &soul.character_name,
+        &persona.persona_id,
+        &persona.display_name,
+        soul.turn_counter,
+        state_engine::disclosure::RelationshipStage::Strangers,
+    );
+    db::upsert_session_world(conn, world)?;
     Ok(seeded)
 }
 
