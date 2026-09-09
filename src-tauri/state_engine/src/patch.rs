@@ -2004,8 +2004,12 @@ fn apply_recent_event_record_with_guard(
 }
 
 fn apply_retcon_correction_note(world: &mut WorldLog, note: &str) -> bool {
-    let mut changed = remove_contradictory_phone_events(world);
-    let correction = if note.to_ascii_lowercase().contains("phone") {
+    let about_a_phone = note.to_ascii_lowercase().contains("phone");
+    // Only sweep phone events when the correction was about one. This ran for
+    // every retcon, so correcting anything at all deleted a legitimate phone
+    // event standing elsewhere in the scene.
+    let mut changed = about_a_phone && remove_contradictory_phone_events(world);
+    let correction = if about_a_phone {
         "Retcon: phone did not buzz because notifications were off / no vibration / screen wake disabled."
     } else {
         "Retcon: previous contradictory scene event was invalidated and should not be used as objective world state."

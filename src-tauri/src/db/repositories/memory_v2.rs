@@ -221,7 +221,13 @@ pub fn recall_memory_v2_filtered_with_semantic(
         .into_iter()
         .filter(|(memory, _)| memory_matches_recall_filter(memory, filter))
         .map(|(memory, rank)| {
-            let lexical_score = (1.0 / (1.0 + rank.abs() as f32)).clamp(0.0, 1.0);
+            // FTS5 bm25 returns a negative score where more negative is a
+            // better match. Taking the absolute value and inverting it made a
+            // weak hit outscore a strong one, and the sort below then threw
+            // away the ordering SQL had already got right — recall returned the
+            // least relevant of its own candidates.
+            let goodness = (-rank).max(0.0) as f32;
+            let lexical_score = (goodness / (1.0 + goodness)).clamp(0.0, 1.0);
             let semantic_score = semantic
                 .score(query, &memory)
                 .unwrap_or(0.0)

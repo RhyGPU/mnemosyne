@@ -2202,8 +2202,7 @@ pub fn apply_relationship_stage(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No SessionWorld linked to this conversation".to_string())?;
 
-    let seeded = seed_relationship_stage_into_world(
-        &mut world,
+    let entries = collect_relationship_stage_entries(
         &soul.character_id,
         &soul.character_name,
         &persona.persona_id,
@@ -2211,8 +2210,76 @@ pub fn apply_relationship_stage(
         soul.turn_counter,
         stage,
     );
-    db::upsert_session_world(&conn, &world).map_err(|e| e.to_string())?;
+    let seeded = entries.len();
+    commit_world_patch(
+        &conn,
+        &conversation_id,
+        &mut world,
+        knowledge_patch_from_entries(entries),
+    )?;
     Ok(seeded)
+}
+
+/// Put a hand-made world change into the ledger, not just the cache.
+///
+/// Every one of these wrote the corrected world straight to `session_worlds`
+/// and stopped. The ledger is the record replay rebuilds from, so a correction
+/// that never reached it survived exactly until the next rebuild — startup
+/// recovery, a branch switch, a regenerate — and then reverted, silently, to
+/// whatever the evaluator had decided. Correcting a wrong fact and having it
+/// stay corrected is the thing this project is for.
+///
+/// Attaches to the latest assistant message, which is where in the story the
+/// correction takes effect. Before any assistant message exists there is
+/// nothing to replay past, and the branch baseline carries it.
+pub(crate) fn commit_world_patch(
+    conn: &Connection,
+    conversation_id: &str,
+    world: &mut state_engine::setting::SessionWorld,
+    world_patch: WorldPatch,
+) -> Result<(), String> {
+    if !world_patch.clone().apply_to_session_world(world) {
+        return Err("world update was rejected: check the values".into());
+    }
+    let conversation =
+        db::get_conversation_summary(conn, conversation_id).map_err(|err| err.to_string())?;
+    let soul = db::get_soul(conn, &conversation.soul_id).map_err(|err| err.to_string())?;
+
+    let latest_assistant = db::list_messages(conn, conversation_id, 200)
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| message.id)
+        .next_back();
+    let Some(assistant_message_id) = latest_assistant else {
+        db::upsert_session_world(conn, world).map_err(|err| err.to_string())?;
+        return Ok(());
+    };
+
+    let branch = match db::get_active_session_branch(conn, conversation_id) {
+        Ok(branch) => branch,
+        Err(_) => db::create_session_branch(conn, conversation_id, &soul, world)
+            .map_err(|err| err.to_string())?,
+    };
+    let patch = EnginePatch {
+        world_patch: Some(world_patch),
+        ..EnginePatch::default()
+    };
+    db::record_turn_commit_with_patch(
+        conn,
+        conversation_id,
+        &branch.branch_id,
+        None,
+        None,
+        assistant_message_id,
+        None,
+        &patch,
+        false,
+    )
+    .map_err(|err| err.to_string())?;
+    db::rebuild_session_state(conn, conversation_id, &branch.branch_id)
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 /// Seed the ladder for whoever is playing, if they have no rows yet.
@@ -2248,6 +2315,51 @@ pub(crate) fn seed_active_pair_if_unseeded(
     );
     db::upsert_session_world(conn, world)?;
     Ok(seeded)
+}
+
+/// The rows a stage lays down, without writing them anywhere.
+pub(crate) fn collect_relationship_stage_entries(
+    soul_id: &str,
+    soul_name: &str,
+    persona_id: &str,
+    persona_name: &str,
+    turn: u64,
+    stage: state_engine::disclosure::RelationshipStage,
+) -> Vec<state_engine::soul::KnowledgeEntry> {
+    let mut entries = Vec::new();
+    for (observer, subject) in [
+        (soul_id.to_string(), persona_name.to_string()),
+        (persona_id.to_string(), soul_name.to_string()),
+    ] {
+        let mut seeded =
+            state_engine::disclosure::seed_baseline_knowledge(&observer, &subject, turn, stage);
+        if stage.has_met() {
+            state_engine::disclosure::grant_sight_facts(&mut seeded, &observer, &subject, turn);
+        }
+        entries.extend(seeded);
+    }
+    entries
+}
+
+/// Turn seeded rows into one patch the ledger can replay.
+pub(crate) fn knowledge_patch_from_entries(
+    entries: Vec<state_engine::soul::KnowledgeEntry>,
+) -> WorldPatch {
+    WorldPatch {
+        knowledge_operations: entries
+            .into_iter()
+            .map(|entry| KnowledgeOperationPatch {
+                operation: "record".into(),
+                holder_entity_id: Some(entry.holder_entity_id),
+                proposition: Some(entry.proposition),
+                status: Some(entry.status.as_label().into()),
+                counterpart_entity_id: entry.counterpart_entity_id,
+                actual_truth: entry.actual_truth,
+                ..KnowledgeOperationPatch::default()
+            })
+            .collect(),
+        ..WorldPatch::default()
+    }
 }
 
 /// Lay the default-deny ladder over one session's world, both directions.
@@ -2318,11 +2430,7 @@ pub fn set_character_knowledge(
         }],
         ..WorldPatch::default()
     };
-    if !world_patch.apply_to_session_world(&mut world) {
-        return Err("knowledge update was rejected: check the status value".into());
-    }
-    db::upsert_session_world(&conn, &world).map_err(|e| e.to_string())?;
-    Ok(())
+    commit_world_patch(&conn, &conversation_id, &mut world, world_patch)
 }
 
 /// Record that one character has now laid eyes on another.

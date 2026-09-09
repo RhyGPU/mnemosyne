@@ -3571,3 +3571,109 @@ fn recall_searches_the_words_that_carry_the_question() {
             .collect::<Vec<_>>()
     );
 }
+
+/// Recall must not rank its own candidates backwards.
+///
+/// FTS5 bm25 scores are negative and more negative is better. The conversion
+/// took an absolute value and inverted it, so a weak hit outscored a strong one
+/// — and because the results are re-sorted by that score before truncation, the
+/// ordering SQL had already got right was discarded. What came back was the
+/// least relevant of the candidate set.
+#[test]
+fn recall_ranks_the_stronger_match_first() {
+    let conn = init_memory_connection().expect("db");
+    let conversation_id = "conversation-rank";
+    let soul = new_default_soul("Aurora");
+    upsert_soul(&conn, &soul).expect("soul");
+    ensure_conversation(&conn, conversation_id, &soul.character_id).expect("conversation");
+    let world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+    let branch = create_session_branch(&conn, conversation_id, &soul, &world).expect("branch");
+
+    let mut with_memory = soul.clone();
+    with_memory.memory.recent = vec![
+        state_engine::memory::create_scored_memory(
+            &soul,
+            "cobalt cobalt cobalt cobalt cobalt",
+            "orientation",
+        ),
+        state_engine::memory::create_scored_memory(
+            &soul,
+            "cobalt amber willow copper silver bronze marble cedar stone",
+            "orientation",
+        ),
+    ];
+    rebuild_memory_v2_projection(&conn, conversation_id, &branch.branch_id, &with_memory)
+        .expect("project");
+
+    let hits =
+        recall_memory_v2(&conn, conversation_id, &branch.branch_id, "cobalt", 2).expect("recall");
+
+    assert_eq!(hits.len(), 2);
+    assert!(
+        hits[0].memory.content.starts_with("cobalt cobalt"),
+        "the denser match should come first, got {:?}",
+        hits.iter()
+            .map(|hit| &hit.memory.content)
+            .collect::<Vec<_>>()
+    );
+    assert!(hits[0].lexical_score > hits[1].lexical_score);
+}
+
+/// A hand correction has to outlive a rebuild.
+///
+/// The knowledge editor wrote the corrected world straight to `session_worlds`
+/// and stopped. The ledger is what replay rebuilds from, so the correction
+/// survived exactly until the next rebuild — startup recovery, a branch switch,
+/// a regenerate — and then reverted, without a word, to whatever the evaluator
+/// had decided. Being able to fix a wrong fact and have it stay fixed is the
+/// whole proposition.
+#[test]
+fn a_hand_correction_survives_a_ledger_rebuild() {
+    let conn = init_memory_connection().expect("db");
+    let conversation_id = "conversation-correction";
+    let soul = new_default_soul("Aurora");
+    upsert_soul(&conn, &soul).expect("soul");
+    ensure_conversation(&conn, conversation_id, &soul.character_id).expect("conversation");
+    let mut world = create_legacy_session_world_from_soul(&conn, &soul).expect("world");
+    world.knowledge = state_engine::disclosure::seed_baseline_knowledge(
+        "preset_male",
+        "Aurora",
+        0,
+        state_engine::disclosure::RelationshipStage::Strangers,
+    );
+    upsert_session_world(&conn, &world).expect("seed");
+    let branch = create_session_branch(&conn, conversation_id, &soul, &world).expect("branch");
+    insert_message_and_get_id(&conn, conversation_id, "assistant", "Opening").expect("opening");
+
+    let proposition = world.knowledge[0].proposition.clone();
+    let patch = state_engine::patch::WorldPatch {
+        knowledge_operations: vec![state_engine::patch::KnowledgeOperationPatch {
+            operation: "record".into(),
+            holder_entity_id: Some("preset_male".into()),
+            proposition: Some(proposition.clone()),
+            status: Some("knows".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    crate::commands::session::commit_world_patch(&conn, conversation_id, &mut world, patch)
+        .expect("commit");
+
+    let status_of = |world: &state_engine::setting::SessionWorld| {
+        world
+            .knowledge
+            .iter()
+            .find(|entry| entry.is_active && entry.proposition == proposition)
+            .map(|entry| entry.status.as_label().to_string())
+    };
+    let stored = get_session_world(&conn, &world.world_id).expect("stored");
+    assert_eq!(status_of(&stored).as_deref(), Some("knows"));
+
+    let rebuilt = rebuild_session_state(&conn, conversation_id, &branch.branch_id).expect("replay");
+
+    assert_eq!(
+        status_of(&rebuilt.session_world).as_deref(),
+        Some("knows"),
+        "the correction was in the cache but never in the ledger"
+    );
+}

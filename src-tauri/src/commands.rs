@@ -13888,17 +13888,27 @@ fn sanitize_state_updater_patch(
                 world_patch
                     .active_plot_resolve
                     .push("Establish the first scene".into());
-                world_patch
-                    .active_plot_resolve
-                    .push("Establish the first scene - Aurora is alone, expecting company, or has just let someone in.".into());
+                // A second, longer spelling used to be resolved alongside it,
+                // naming a specific character and her specific evening. It
+                // matched nothing in any stored world, so it was only ever a
+                // character's name sitting in the engine's cleanup path.
                 world_patch.active_plot_add.push(plot.into());
             }
         }
         cleanup_stale_active_plots(soul, world_patch, &turn_text);
         if is_retcon_or_correction_text(user_text) {
             world_patch.retcon_scope.get_or_insert("latest_turn".into());
+            // This used to seed one canned sentence about a phone for every
+            // correction anyone made — the engine answering "the user corrected
+            // something" by inventing a reason about a device nobody had
+            // mentioned. Say only what is known: something was withdrawn.
             world_patch.correction_note.get_or_insert_with(|| {
-                "Retcon: phone did not buzz because notifications were off / no vibration / screen wake disabled.".into()
+                if user_text.to_ascii_lowercase().contains("phone") {
+                    "Retcon: the phone event the user corrected is not objective world state."
+                        .into()
+                } else {
+                    "Retcon: the detail the user corrected is not objective world state.".into()
+                }
             });
         }
         if world_patch.is_empty_for_commands() {
